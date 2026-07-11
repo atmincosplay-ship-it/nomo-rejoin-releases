@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
-# NOMO REJOIN V4.10
+# NOMO REJOIN V4.12
 #
-# V4.10 — MARKET / GAG AUTOEXEC TEMPLATE
-# - QOL: AutoExec Manager option 7 installs a fixed place-aware loader template.
-# - TEMPLATE: Grow a Garden (126884695634066) loads PJYuhuuk; Trade World
-#             (129954712878723) loads DNeJi4nC; every other place exits.
-# - SAFE: Writes a separate nomo_market_loader.lua file and does not overwrite
-#         the Pet Counter or nomo_autoexec.lua.
-# - SCOPE: No rejoin, timeout, PID, solver, backend, or routing logic changed.
+# V4.12 — PACKAGE-SCOPED CAPTCHA UI OVERRIDE
+# - FIX: A visible Roblox "Verifying you're not a bot" / "Start Puzzle"
+#        screen now overrides a fresh Lua heartbeat. Fresh state no longer makes
+#        a blocked clone appear Online/Ingame.
+# - SAFE: Automatic detection trusts package-scoped uiautomator text only; text
+#         from one floating clone is never broadcast to the other packages.
+# - SOLVER: A visible challenge starts one solver job without pre-restarting the
+#           package. Other clones keep running and queued opens for that package
+#           are cancelled while the challenge is visible.
+# - FIX: Provider NO_CAPTCHA is treated as a false negative when the same
+#        package-scoped verification UI is still visible. The package is held
+#        and retried only after the existing 10-minute cooldown.
 #
-# V4.09 — MARKET TIMEOUT / NO_CAPTCHA DOUBLE-RESTART FIX
-# - CORE FIX: NO_CAPTCHA keeps the current open instead of scheduling a second
-#             hard restart after a Market timeout recovery.
-# - SAFE: CAPTCHA_SUCCESS still receives one clean recovery rejoin.
-# - SCOPE: No stale thresholds, PID matching, routing, or Hatcher logic changed.
+# V4.11 — CUSTOM LUA INPUT TERMINATOR FIX
+# - FIX: AutoExec Manager option 3 now finishes pasted scripts with a line
+#        containing only STOP instead of END.
+# - FIX: Normal Lua `end` lines are preserved and no longer stop input early.
+# - SCOPE: QOL-only; no rejoin, PID, solver, backend, or routing logic changed.
 #
 import os
 import re
@@ -41,7 +46,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.10"
+__version__ = "V4.12"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -225,6 +230,13 @@ DEFAULT_CONFIG = {
     "login_challenge_skip_blocked_packages": True,
     "login_challenge_webhook_url": "",
     "login_challenge_alert_cooldown_seconds": 1800,
+
+    # V4.12: package-scoped Android UI text can reveal a live Roblox verification
+    # overlay even while the Lua heartbeat remains fresh behind it. This signal
+    # overrides Online/Ingame, but never falls back to unscoped text automatically.
+    "captcha_ui_override_enabled": True,
+    "captcha_ui_retry_seconds": 600,
+    "captcha_ui_require_package_scope": True,
 
     # CAPTCHA solver. A bare host uses /api/captcha/solve; a URL that already
     # contains a path is used exactly as entered. Automatic jobs start only after
@@ -1229,6 +1241,12 @@ def apply_update_migrations(cfg):
         set_cfg("login_challenge_webhook_url", "")
     if _int_cfg(cfg.get("login_challenge_alert_cooldown_seconds"), 0) <= 0:
         set_cfg("login_challenge_alert_cooldown_seconds", 1800)
+    if "captcha_ui_override_enabled" not in cfg:
+        set_cfg("captcha_ui_override_enabled", True)
+    if _int_cfg(cfg.get("captcha_ui_retry_seconds"), 0) < 600:
+        set_cfg("captcha_ui_retry_seconds", 600)
+    if "captcha_ui_require_package_scope" not in cfg:
+        set_cfg("captcha_ui_require_package_scope", True)
 
     # V3.59/V3.60: stale runtime queue self-heal. This replaces manual
     # rm runtime.json for interrupted open/wait cycles, but waits longer so it
@@ -2614,7 +2632,7 @@ def note_color(note):
     # RED — unresolved problems
     for k in ("captcha on screen", "kicked", "disconnect", "expired", "offline",
               "dead", "error", "fail", "invalid", "banned", "no server",
-              "crash", "challenge", "manual"):
+              "crash", "challenge", "verification", "manual"):
         if k in n:
             return RED
 
@@ -5423,6 +5441,32 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
             rt_tab["android_disconnect_candidate_at"] = 0
             rt_tab["android_disconnect_candidate_count"] = 0
 
+    # V4.12: a visible package-scoped verification overlay outranks a fresh Lua
+    # heartbeat. Do this before clean_fresh/manual checks so blocked accounts can
+    # never be displayed as healthy merely because scripts still run behind it.
+    captcha_ui_alive = bool(raw_alive) and package_alive(pkg, cfg)
+    captcha_ui = android_login_challenge_ui_detail(pkg, cfg, force=False) if captcha_ui_alive else None
+    if captcha_ui:
+        detail = ",".join(captcha_ui.get("hits", []) or []) or "verification UI"
+        rt_tab["captcha_ui_visible"] = True
+        rt_tab["captcha_ui_detail"] = detail
+        rt_tab["captcha_ui_last_seen_at"] = now()
+        return {
+            "pkg": pkg, "user": tab.get("user_name", pkg), "alive": bool(raw_alive),
+            "state": state, "state_err": err, "fresh": False, "clean_fresh": False,
+            "pets": int(state.get("pet_count", 0) or 0) if state else "-",
+            "eggs": int(state.get("egg_total", 0) or 0) if state else "-",
+            "age": state_age_seconds(state) if state else "-",
+            "status": "Captcha", "note": "verification UI detected",
+            "bad": "ui_challenge", "visible_window": True,
+            "ui_challenge_detail": captcha_ui,
+        }
+    elif rt_tab.get("captcha_ui_visible"):
+        # The shared snapshot has moved past the challenge. Fresh state below can
+        # clear any false-negative hold without reopening the package.
+        rt_tab["captcha_ui_visible"] = False
+        rt_tab["captcha_ui_detail"] = ""
+
     age = state_age_seconds(state) if state else "-"
     pets = int(state.get("pet_count", 0) or 0) if state else "-"
     eggs = int(state.get("egg_total", 0) or 0) if state else "-"
@@ -5609,12 +5653,73 @@ def maybe_queue_solver_busy_retry(open_queue, tab, target, rt_tab, cfg, health):
     return health.get("status", "Loading"), "SERVER_BUSY retry queue failed", True
 
 
+def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, health):
+    """Handle one package-scoped visible challenge without restarting the clone."""
+    if str((health or {}).get("bad") or "") != "ui_challenge":
+        return None
+
+    pkg = str((tab or {}).get("package", "") or "")
+    cancel_queued_package(open_queue, pkg)
+    rt_tab["captcha_ui_visible"] = True
+    rt_tab["captcha_ui_last_seen_at"] = now()
+
+    if solver_job_running(pkg):
+        note = solver_job_note(pkg)
+        rt_tab["note"] = note
+        return "Solving", note, True
+
+    retry_at = int(rt_tab.get("captcha_ui_retry_at", 0) or 0)
+    if retry_at > now():
+        left = max(1, retry_at - now())
+        note = f"verification UI; solver retry in {format_age(left)}"
+        rt_tab["note"] = note
+        return "Captcha", note, True
+
+    started, note = start_solver_job(
+        tab, cfg, rt, rt_tab,
+        "visible package-scoped verification UI",
+    )
+    if started:
+        clear_hold(pkg)
+        rt_tab["manual_login_needed"] = False
+        rt_tab["manual_login_reason"] = ""
+        rt_tab["manual_login_detail"] = ""
+        rt_tab["note"] = note
+        save_runtime(rt)
+        return "Solving", note, True
+
+    low = str(note or "").lower()
+    if "retry in" in low or "cooldown" in low:
+        cooldown = max(600, int(cfg.get("captcha_ui_retry_seconds", 600) or 600))
+        last_attempt = int(rt_tab.get("solver_last_attempt", 0) or 0)
+        rt_tab["captcha_ui_retry_at"] = max(now() + 1, last_attempt + cooldown)
+        rt_tab["note"] = note
+        return "Captcha", note, True
+
+    # Solver is disabled/misconfigured or this package has no usable cookie. Hold
+    # only this clone; do not let stale/dead routing start a hard-rejoin loop.
+    rt_tab["manual_login_needed"] = True
+    rt_tab["manual_login_reason"] = "visible verification UI"
+    rt_tab["manual_login_detail"] = str(note or "solver unavailable")
+    rt_tab["manual_login_detected_at"] = now()
+    rt_tab["note"] = str(note or "verification requires manual action")
+    set_hold(pkg, rt_tab["note"])
+    save_runtime(rt)
+    return "Captcha", rt_tab["note"], True
+
+
 def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=None, mode="market"):
     """SHARED rejoin engine for both Market and Hatcher."""
     pkg = tab.get("package")
     state = health.get("state")
     alive = bool(health.get("alive"))
     bad = str(health.get("bad") or "")
+
+    captcha_action = apply_visible_captcha_ui_action(
+        open_queue, tab, target, rt_tab, cfg, rt, health
+    )
+    if captcha_action is not None:
+        return captcha_action
 
     busy_action = maybe_queue_solver_busy_retry(open_queue, tab, target, rt_tab, cfg, health)
     if busy_action is not None:
@@ -5786,7 +5891,12 @@ def capture_android_ui_snapshot(cfg, force=False):
     """
     global _ANDROID_UI_SNAPSHOT_CACHE
 
-    if not cfg.get("android_disconnect_ui_detection_enabled", True) and not force:
+    ui_needed = (
+        cfg.get("android_disconnect_ui_detection_enabled", True)
+        or cfg.get("captcha_ui_override_enabled", True)
+        or cfg.get("login_challenge_ui_detection_enabled", True)
+    )
+    if not ui_needed and not force:
         return _ANDROID_UI_SNAPSHOT_CACHE
 
     t = now()
@@ -5877,7 +5987,73 @@ def android_disconnect_ui_detail(pkg, cfg):
     }
 
 
-def ui_login_challenge_detection(tab, cfg):
+def android_login_challenge_ui_detail(pkg, cfg, force=False):
+    """Return a strong package-scoped Roblox verification signal.
+
+    Automatic dashboard decisions must never use snapshot.all_text because four
+    floating clone windows can be present at once. Only nodes whose Android
+    package matches this exact clone are trusted here.
+    """
+    if not cfg.get("captcha_ui_override_enabled", True):
+        return None
+    if not cfg.get("login_challenge_ui_detection_enabled", True):
+        return None
+
+    texts, _ = android_ui_text_for_package(str(pkg or ""), cfg, force=force)
+    if not texts:
+        return None
+
+    joined = "\n".join(str(x) for x in texts if str(x or "").strip())
+    low = joined.lower()
+    strong_terms = [
+        "verifying you're not a bot",
+        "verifying you are not a bot",
+        "please solve this challenge so we know you are a real person",
+        "please solve this challenge",
+        "start puzzle",
+        "solve this puzzle",
+        "solve this challenge",
+        "complete the challenge",
+        "human verification",
+        "prove you are human",
+        "arkose",
+        "fun captcha",
+    ]
+    hits = [term for term in strong_terms if term in low]
+
+    # Permit the exact screenshot wording split across separate nodes. Generic
+    # "Verification" or "Security" by itself is intentionally never enough.
+    if not hits and "verification" in low and "real person" in low:
+        hits = ["verification + real person"]
+    if not hits and "not a bot" in low and ("verification" in low or "security" in low):
+        hits = ["not a bot"]
+    if not hits:
+        return None
+
+    return {
+        "title": "Roblox Verification",
+        "text": joined,
+        "reason": "android_package_scoped_captcha_ui",
+        "hits": hits[:5],
+    }
+
+
+def clear_captcha_ui_runtime(rt_tab):
+    changed = False
+    for key, value in (
+        ("captcha_ui_visible", False),
+        ("captcha_ui_detail", ""),
+        ("captcha_ui_last_seen_at", 0),
+        ("captcha_ui_false_negative", False),
+        ("captcha_ui_retry_at", 0),
+    ):
+        if rt_tab.get(key) != value:
+            rt_tab[key] = value
+            changed = True
+    return changed
+
+
+def ui_login_challenge_detection(tab, cfg, force=True, allow_unscoped=True):
     """Package-scoped Android UI CAPTCHA detection.
 
     Roblox's native/WebView challenge is not always exposed to uiautomator. A
@@ -5885,10 +6061,10 @@ def ui_login_challenge_detection(tab, cfg):
     login, sign-up, continue, security, or verify text is never enough.
     """
     pkg = str((tab or {}).get("package", "") or "")
-    snapshot = capture_android_ui_snapshot(cfg, force=True)
+    snapshot = capture_android_ui_snapshot(cfg, force=force)
     scoped, _ = android_ui_text_for_package(pkg, cfg, force=False)
     all_text = list(snapshot.get("all_text", []) or [])
-    source = scoped if scoped else all_text
+    source = scoped if scoped else (all_text if allow_unscoped else [])
     low = " ".join(source).lower()
 
     # These screens block joining but are not CAPTCHA challenges. Sending them
@@ -5899,7 +6075,7 @@ def ui_login_challenge_detection(tab, cfg):
         "parental restriction", "account restrictions"
     ]
     manual_hits = [t for t in manual_gate_terms if t in low]
-    scope_note = "package-scoped" if scoped else "unscoped"
+    scope_note = "package-scoped" if scoped else ("unscoped" if allow_unscoped else "no package-scoped text")
     if manual_hits:
         return True, f"ui manual join block {scope_note} " + ",".join(manual_hits[:4])
 
@@ -5968,7 +6144,7 @@ def detect_and_mark_manual_login(tab, cfg, rt, rt_tab, reason):
 
     # UI detection (optional)
     if cfg.get("login_challenge_ui_detection_enabled", True):
-        ui_hit, ui_detail = ui_login_challenge_detection(tab, cfg)
+        ui_hit, ui_detail = ui_login_challenge_detection(tab, cfg, force=False, allow_unscoped=False)
         details.append(ui_detail)
         if ui_hit is True:
             detected = True
@@ -6021,7 +6197,7 @@ def maybe_clear_manual_login_prejoin(tab, cfg, rt, rt_tab, min_interval=120):
     rt_tab["manual_login_last_recover_check"] = now()
     cookie = cached_cookie_for_package(tab.get("package", ""))
     api_hit, api_detail = roblox_cookie_detection(cookie) if cookie else (None, "api skipped no cookie")
-    ui_hit, ui_detail = ui_login_challenge_detection(tab, cfg) if cfg.get("login_challenge_ui_detection_enabled", True) else (None, "ui skipped")
+    ui_hit, ui_detail = ui_login_challenge_detection(tab, cfg, force=True, allow_unscoped=False) if cfg.get("login_challenge_ui_detection_enabled", True) else (None, "ui skipped")
 
     if api_hit is False and ui_hit is not True:
         clear_manual_login_block(rt_tab)
@@ -6119,6 +6295,16 @@ def wait_until_fresh_after_open(tab, cfg, rt, opened_at, timeout_override=None, 
 
         # build a status note for the table
         status_note = ""
+        visible_captcha = android_login_challenge_ui_detail(pkg, cfg, force=False) if alive else None
+        if visible_captcha:
+            solver_status, solver_note = handle_detected_solver_challenge(
+                tab, cfg, rt, rt_tab, "visible package-scoped verification UI"
+            )
+            rt_tab["captcha_ui_visible"] = True
+            rt_tab["captcha_ui_last_seen_at"] = now()
+            rt_tab["note"] = solver_note
+            save_runtime(rt)
+            return False, "solver pending" if solver_status == "Solving" else "manual challenge"
         if state_disconnect_ui(state):
             status_note = state_disconnect_note(state)
         elif state_login_challenge_detail(state):
@@ -6145,6 +6331,7 @@ def wait_until_fresh_after_open(tab, cfg, rt, opened_at, timeout_override=None, 
 
         if fresh:
             clear_manual_login_block(rt_tab)
+            clear_captcha_ui_runtime(rt_tab)
             rt_tab["solver_busy_retry_pending"] = False
             rt_tab["solver_busy_retry_at"] = 0
             save_runtime(rt)
@@ -6580,6 +6767,7 @@ def start_rejoin(cfg):
                 age = int(state.get("age", 999999) or 999999)
                 if health.get("clean_fresh"):
                     clear_manual_login_block(rt_tab)
+                    clear_captcha_ui_runtime(rt_tab)
 
             # -----------------------------------------------------
             # SHARED REJOIN ENGINE
@@ -6642,7 +6830,7 @@ def start_rejoin(cfg):
                             note = "hop queued"
 
             due_refresh, refresh_left = periodic_hard_refresh_due(rt_tab, cfg)
-            if due_refresh and not open_queue and not queue_has(open_queue, pkg) and not solver_job_running(pkg):
+            if due_refresh and not rj_handled and not open_queue and not queue_has(open_queue, pkg) and not solver_job_running(pkg):
                 if (not manual_login_blocked(rt_tab, cfg)) or cfg.get("periodic_hard_refresh_include_manual", True):
                     added, _ = queue_open(
                         open_queue, tab, target, "periodic hard refresh",
@@ -8681,6 +8869,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                 ready_pet = pets >= ready_at
                 if health.get("clean_fresh"):
                     clear_manual_login_block(rt_tab)
+                    clear_captcha_ui_runtime(rt_tab)
 
                 problem_code, problem_note = hatcher_teleport_problem(tab, state, hcfg, cfg)
                 if problem_code:
@@ -8849,11 +9038,20 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                 status = "Queued" if added else "Manual"
                 note = "challenge rejoin queued; solver checks after open" if added else "challenge already queued"
 
+            # V4.12: visible package-scoped verification UI outranks every
+            # stale/dead/routing decision above. Remove only this package's queued
+            # opens and solve/hold it without restarting the other clones.
+            captcha_action = apply_visible_captcha_ui_action(
+                open_queue, tab, "hatcher", rt_tab, cfg, rt, health
+            )
+            if captcha_action is not None:
+                status, note, _ = captcha_action
+
             # V3.84: no pool-wide provider scan here. The old-state hard queue
             # gets its normal turn; its wait-after-open performs one CAPTCHA check.
 
             due_refresh, refresh_left = periodic_hard_refresh_due(rt_tab, cfg)
-            if due_refresh and not open_queue and not queue_has(open_queue, pkg) and not solver_job_running(pkg):
+            if due_refresh and captcha_action is None and not open_queue and not queue_has(open_queue, pkg) and not solver_job_running(pkg):
                 if ((not manual_login_blocked(rt_tab, cfg)) or cfg.get("periodic_hard_refresh_include_manual", True)) and not (state and state_login_challenge_detail(state)):
                     added, _ = queue_open(
                         open_queue, tab, "hatcher", "periodic hard refresh",
@@ -9789,13 +9987,13 @@ def autoexec_write_custom(cfg):
     raw_name = input(f"Filename [{AUTOEXEC_DEFAULT_CUSTOM_FILE}]: ")
     filename = _safe_autoexec_filename(raw_name, AUTOEXEC_DEFAULT_CUSTOM_FILE)
     print("")
-    print(col(f"Paste Lua for {filename}. Finish with a line containing only END.", YELLOW))
+    print(col(f"Paste Lua for {filename}. Finish with a line containing only STOP.", YELLOW))
     print(col("Type CANCEL on its own line to abort.", DIM))
     lines = []
     while True:
         line_text = input()
         marker = clean_terminal_input(line_text).upper()
-        if marker == "END":
+        if marker == "STOP":
             break
         if marker == "CANCEL":
             lines = []
@@ -11448,7 +11646,7 @@ def _solver_probe_worker(package, tab, cookie, cfg_snapshot, place_id):
             provider_cookie = ""
 
         if cfg_snapshot.get("login_challenge_ui_detection_enabled", True):
-            ui_hit, ui_detail = ui_login_challenge_detection(tab, cfg_snapshot)
+            ui_hit, ui_detail = ui_login_challenge_detection(tab, cfg_snapshot, force=False, allow_unscoped=False)
             details.append(ui_detail)
             locally_detected = locally_detected or (ui_hit is True)
 
@@ -11747,6 +11945,37 @@ def poll_solver_jobs(cfg, rt, open_queue):
             or bool(job.get("ok"))
         )
 
+        # V4.12: the provider can return NO_CAPTCHA even while Roblox visibly
+        # shows "Verifying you're not a bot". Recheck a fresh package-scoped UI
+        # snapshot before clearing anything. A still-visible challenge is a false
+        # negative: keep this package open/held and retry only after cooldown.
+        if no_captcha_result:
+            visible_ui = android_login_challenge_ui_detail(pkg, cfg, force=True)
+            if visible_ui:
+                retry_after = max(
+                    600,
+                    int(cfg.get("captcha_ui_retry_seconds", 600) or 600),
+                    int(cfg.get("solver_retry_cooldown_seconds", 600) or 600),
+                )
+                cancel_queued_package(open_queue, pkg)
+                rt_tab["captcha_ui_visible"] = True
+                rt_tab["captcha_ui_false_negative"] = True
+                rt_tab["captcha_ui_last_seen_at"] = now()
+                rt_tab["captcha_ui_retry_at"] = now() + retry_after
+                rt_tab["solver_state"] = "false_negative"
+                rt_tab["solver_last_error"] = "provider NO_CAPTCHA while verification UI remains visible"
+                rt_tab["manual_login_needed"] = False
+                rt_tab["manual_login_reason"] = ""
+                rt_tab["manual_login_detail"] = ""
+                rt_tab["note"] = f"NO_CAPTCHA false negative; retry in {format_age(retry_after)}"
+                set_hold(pkg, "verification UI still visible after provider NO_CAPTCHA")
+                log_activity(
+                    f"solver NO_CAPTCHA false negative; verification UI still visible; retry in {format_age(retry_after)}",
+                    pkg, YELLOW,
+                )
+                changed = True
+                continue
+
         # V4.09: keep NO_CAPTCHA separate from CAPTCHA_SUCCESS. The provider
         # returning NO_CAPTCHA means there was nothing to solve, so a package that
         # has just been opened must not be PID-stopped and opened again. This was
@@ -11760,6 +11989,7 @@ def poll_solver_jobs(cfg, rt, open_queue):
 
             clear_hold(pkg)
             clear_manual_login_block(rt_tab)
+            clear_captcha_ui_runtime(rt_tab)
             rt_tab["solver_busy_retry_pending"] = False
             rt_tab["solver_busy_retry_at"] = 0
             rt_tab["solver_state"] = "success" if solved_result else "clear"
