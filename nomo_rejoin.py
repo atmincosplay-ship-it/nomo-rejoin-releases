@@ -1,27 +1,19 @@
 #!/usr/bin/env python3
-# NOMO REJOIN V4.15
+# NOMO REJOIN V4.16
+#
+# V4.16 — ONE-SECRET NEW DEVICE SETUP
+# - FIX: Option 13 now uses NOMO's canonical Cloudflare/D1 Worker URL
+#        automatically on a fresh device.
+# - SETUP: New Redfinger setup asks only for NOMO_SECRET when no saved backend
+#          configuration exists; the Worker URL is displayed but not requested.
+# - COMPAT: Existing complete custom Cloudflare credentials are still reusable.
+#           Alternate Worker URLs remain configurable from Backend settings.
 #
 # V4.15 — ALIVE RECOVERY WITHOUT WINDOW COLLAPSE
-# - CORE: Kicked, disconnect, stale, no-state, CAPTCHA, and solver-retry
-#         recoveries now soft-relaunch an ALIVE target package first instead of
-#         immediately killing its PID.
-# - FIX: Redfinger/App Cloner can hide every floating clone window when one
-#        freeform task is killed. Healthy sibling processes were not actually
-#        being killed, but the layout looked like every clone had stopped.
-# - FALLBACK: If the target still produces no fresh state after the short
-#             alive-recovery timeout, NOMO may hard-stop only that target once.
-# - SOLVER: The fallback belongs to the same recovery and is marked skip-solver,
-#           so the provider is never submitted twice for one recovery attempt.
-# - SAFE: Dead packages and explicit manual force-restart actions still use the
-#         verified exact-PID hard-open path. No am force-stop, killall, or pkill.
-#
-# V4.14 — SOLVER ONCE BEFORE EVERY REAL REJOIN
-# - CORE: Every actual NOMO-triggered package open/rejoin submits that package
-#         to the configured solver exactly once before Roblox is launched.
-# - FLOW: CAPTCHA_SUCCESS and NO_CAPTCHA both continue the original queued open
-#         exactly once; dashboard checks cannot resubmit the same generation.
-# - RESULTS: INVALID_COOKIES holds only that package; SERVER_BUSY schedules one
-#            delayed retry; other failures can continue one original open.
+# - CORE: Alive kicked/stale/disconnected packages soft-relaunch first so one
+#         recovery does not collapse the other App Cloner floating windows.
+# - FALLBACK: Only the affected target may receive one exact-PID hard fallback.
+# - SOLVER: The fallback remains in the same generation and cannot resubmit.
 #
 import os
 import re
@@ -50,7 +42,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.15"
+__version__ = "V4.16"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -179,6 +171,7 @@ def request_stop():
 
 DEFAULT_MARKET_LINK = "roblox://experiences/start?placeId=129954712878723"
 DEFAULT_RESTOCK_LINK = "roblox://experiences/start?placeId=126884695634066"
+DEFAULT_CLOUDFLARE_WORKER_URL = "https://nomo-rejoin.atmincosplay.workers.dev"
 
 DEFAULT_WORKSPACE_SYNC_COMMAND = (
     'cd /storage/emulated/0 && '
@@ -508,7 +501,7 @@ DEFAULT_CONFIG = {
     "jsonbin_api_key": "",
     "jsonbin_key_header": "X-Master-Key",
     "jsonbin_timeout_seconds": 8,
-    "cloudflare_worker_url": "",
+    "cloudflare_worker_url": DEFAULT_CLOUDFLARE_WORKER_URL,
     "cloudflare_secret": "",
     "cloudflare_timeout_seconds": 8,
     "jsonbin_cache_seconds": 600,
@@ -647,7 +640,7 @@ DEFAULT_HATCHER_CONFIG = {
     "jsonbin_api_key": "YOUR_KEY",
     "jsonbin_key_header": "X-Master-Key",
     "jsonbin_timeout_seconds": 10,
-    "cloudflare_worker_url": "",
+    "cloudflare_worker_url": DEFAULT_CLOUDFLARE_WORKER_URL,
     "cloudflare_secret": "",
     "cloudflare_timeout_seconds": 8,
 
@@ -1143,6 +1136,12 @@ def apply_update_migrations(cfg):
         set_cfg("hatcher_alive_old_state_hard_force_enabled", True)
     # Also enable the generic alive-stale rejoin as a second safety net.
     set_cfg("hatcher_rejoin_alive_stale", True)
+
+    # V4.16: NOMO uses one shared D1 Worker. Fresh-device setup should only
+    # require NOMO_SECRET, while still preserving any real custom Worker URL.
+    current_cf_url = str(cfg.get("cloudflare_worker_url", "") or "").strip()
+    if not current_cf_url or is_placeholder_value(current_cf_url):
+        set_cfg("cloudflare_worker_url", DEFAULT_CLOUDFLARE_WORKER_URL)
 
     market_old = str(cfg.get("market_link", "") or "").strip()
     market_known_old = {
@@ -13905,29 +13904,44 @@ def _setup_secret(prompt="NOMO secret"):
 
 
 def _setup_configure_cloudflare(cfg):
-    """Configure the shared Cloudflare/D1 credentials and return (cfg, hcfg, ok)."""
+    """Configure Cloudflare/D1; fresh devices only need NOMO_SECRET."""
     cfg = load_config()
     hcfg = load_hatcher_config()
-    existing_url = cloudflare_base_url(cfg) or cloudflare_base_url(hcfg)
-    existing_secret = str(cfg.get("cloudflare_secret") or hcfg.get("cloudflare_secret") or "").strip()
+    saved_url = cloudflare_base_url(cfg) or cloudflare_base_url(hcfg)
+    saved_secret = str(cfg.get("cloudflare_secret") or hcfg.get("cloudflare_secret") or "").strip()
+
+    saved_complete = (
+        saved_url
+        and saved_secret
+        and not is_placeholder_value(saved_url)
+        and not is_placeholder_value(saved_secret)
+    )
 
     clear()
     banner("SETUP: CLOUDFLARE / D1", cfg)
-    if existing_url and existing_secret and not is_placeholder_value(existing_url) and not is_placeholder_value(existing_secret):
-        print(f"Worker: {existing_url}")
-        print(f"Secret: {mask_secret(existing_secret)}")
-        if _setup_yes_no("Reuse these existing backend credentials?", True):
-            worker_url, secret = existing_url, existing_secret
-        else:
-            worker_url = clean_terminal_input(input("Worker URL: ")).rstrip("/")
-            secret = _setup_secret()
-    else:
-        print(col("No complete Cloudflare/D1 config was found.", YELLOW))
-        worker_url = clean_terminal_input(input("Worker URL: ")).rstrip("/")
-        secret = _setup_secret()
 
-    if not worker_url or is_placeholder_value(worker_url) or not secret or is_placeholder_value(secret):
-        print(col("Backend setup skipped: URL or secret is missing.", RED))
+    if saved_complete:
+        print(f"Worker: {saved_url}")
+        print(f"Secret: {mask_secret(saved_secret)}")
+        if _setup_yes_no("Reuse these existing backend credentials?", True):
+            worker_url, secret = saved_url, saved_secret
+        else:
+            # Option 13 remains one-secret setup. A custom URL can still be set
+            # from the normal Backend settings menu before running the wizard.
+            configured_url = str(cfg.get("cloudflare_worker_url") or "").strip().rstrip("/")
+            worker_url = configured_url if configured_url and not is_placeholder_value(configured_url) else DEFAULT_CLOUDFLARE_WORKER_URL
+            print(f"Worker: {worker_url}")
+            secret = _setup_secret("NOMO secret")
+    else:
+        configured_url = str(cfg.get("cloudflare_worker_url") or hcfg.get("cloudflare_worker_url") or "").strip().rstrip("/")
+        worker_url = configured_url if configured_url and not is_placeholder_value(configured_url) else DEFAULT_CLOUDFLARE_WORKER_URL
+        print(col("Using NOMO's shared Cloudflare/D1 backend.", CYAN))
+        print(f"Worker: {worker_url}")
+        print(col("Only the NOMO secret is required on this device.", DIM))
+        secret = _setup_secret("NOMO secret")
+
+    if not secret or is_placeholder_value(secret):
+        print(col("Backend setup skipped: NOMO secret is missing.", RED))
         return cfg, hcfg, False
 
     for target in (cfg, hcfg):
