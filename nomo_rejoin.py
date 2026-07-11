@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
-# NOMO REJOIN V4.06
+# NOMO REJOIN V4.08
 #
-# V4.06 — BUILT-IN UPDATE MANAGER
-# - NEW: Main menu option 15 adds check, install, version, source, backup,
-#        rollback, and nomo/gag launcher-repair tools.
-# - SAFE: GitHub Raw updates are downloaded to a temporary file, rejected when
-#         they look like HTML/error pages, verified for NOMO/version markers,
-#         compiled with py_compile, backed up, and installed atomically.
-# - CLI: `nomo update`, `nomo version`, `nomo rollback`, and `nomo source` are
-#        handled by NOMO itself; the repaired launcher only starts the local app.
-# - BACKUP: Timestamped Python backups are stored in Download/nomo_rejoin/backups.
+# V4.08 — PERFORMANCE-ONLY PASS
+# - PERF: Hatcher dashboards save the shared runtime once per completed cycle
+#         instead of once per package.
+# - PERF: Hatcher backend reporting now follows heartbeat_interval (default 60s)
+#         while local package/state checks remain at check_interval (default 10s).
+# - PERF: Backend reporting reuses state already read by the dashboard, avoiding
+#         a second read of every Hatcher state file.
+# - PERF: Package-scoped Android UI fallback snapshots are cached for 25 seconds
+#         by default instead of 5 seconds; direct Lua popup detection is unchanged.
+# - PERF: activity.log rotates at 1 MiB and keeps two backups.
+# - SCOPE: No stale thresholds, queue decisions, links, PID logic, stop/open logic,
+#          CAPTCHA behavior, or Market/Hatcher routing were changed.
 #
-# V4.05 — SAFE DIAGNOSTICS EXPORT
-# - NEW: Main menu option 14 exports one redacted diagnostics ZIP.
-# - NEW: Includes package/PID status, state freshness, full AutoExec paths,
-#        runtimes, recent activity, backend health, and device information.
-# - SAFE: Credentials, cookies, webhooks, and private-server codes are redacted.
+# V4.07 — AUTOEXEC RENAME / MOVE MANAGER
+# - NEW: AutoExec Manager option 6 safely renames one script in place or moves
+#        one/multiple scripts from one package to one destination package.
+# - SAFE: Move writes through a temporary file, verifies SHA-256, and removes
+#         the source only after the destination is confirmed.
+# - SAFE: Existing targets can be overwritten, skipped, or cancelled; failed
+#         moves leave the original source untouched.
+# - UI: Shows complete source/destination paths and a per-file result summary.
 #
 import os
 import re
@@ -43,7 +49,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.06"
+__version__ = "V4.08"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -396,7 +402,7 @@ DEFAULT_CONFIG = {
     # cached and shared across every package in the dashboard cycle. Detection is
     # package-scoped only, so text from one clone can never mark all clones.
     "android_disconnect_ui_detection_enabled": True,
-    "android_ui_snapshot_cache_seconds": 5,
+    "android_ui_snapshot_cache_seconds": 25,
     "android_ui_snapshot_timeout_seconds": 15,
     # Require the same package-scoped native popup in two dashboard snapshots.
     # This blocks transient/stale accessibility dumps from restarting a healthy clone.
@@ -792,6 +798,37 @@ def date_time_text():
 # ============================================================
 _ACTIVITY_LOG = []          # list of (ts, package, action, color)
 _ACTIVITY_MAX = 200         # keep last N in memory
+_ACTIVITY_ROTATE_LAST_CHECK = 0
+_ACTIVITY_LOG_MAX_BYTES = 1 * 1024 * 1024
+_ACTIVITY_LOG_BACKUPS = 2
+_ACTIVITY_LOG_ROTATE_CHECK_SECONDS = 60
+
+
+def _rotate_activity_log_if_needed():
+    """Rotate activity.log cheaply, checking at most once per minute."""
+    global _ACTIVITY_ROTATE_LAST_CHECK
+    t = now()
+    if t - int(_ACTIVITY_ROTATE_LAST_CHECK or 0) < _ACTIVITY_LOG_ROTATE_CHECK_SECONDS:
+        return
+    _ACTIVITY_ROTATE_LAST_CHECK = t
+
+    path = BASE_DIR / "activity.log"
+    try:
+        if not path.exists() or path.stat().st_size < _ACTIVITY_LOG_MAX_BYTES:
+            return
+
+        # activity.log.2 is oldest, activity.log.1 is newest rotated copy.
+        oldest = BASE_DIR / f"activity.log.{_ACTIVITY_LOG_BACKUPS}"
+        if oldest.exists():
+            oldest.unlink()
+        for idx in range(_ACTIVITY_LOG_BACKUPS - 1, 0, -1):
+            src = BASE_DIR / f"activity.log.{idx}"
+            dst = BASE_DIR / f"activity.log.{idx + 1}"
+            if src.exists():
+                os.replace(str(src), str(dst))
+        os.replace(str(path), str(BASE_DIR / "activity.log.1"))
+    except Exception:
+        pass
 
 
 def log_activity(action, pkg="", color=None):
@@ -813,6 +850,7 @@ def log_activity(action, pkg="", color=None):
 
     # Also write to a rolling log file so history survives restarts.
     try:
+        _rotate_activity_log_if_needed()
         line = f"[{date_time_text()}] {short_pkg(pkg) if pkg else '-':<8} {action}\n"
         with open(BASE_DIR / "activity.log", "a") as f:
             f.write(line)
@@ -1256,6 +1294,15 @@ def apply_update_migrations(cfg):
         set_cfg("hatcher_disconnect_ui_hard_force", True)
     if "hatcher_disconnect_ui_retry_seconds" not in cfg:
         set_cfg("hatcher_disconnect_ui_retry_seconds", 15)
+    # V4.08 performance-only migration: keep the package-scoped Android UI
+    # fallback, but avoid an expensive uiautomator dump every 10-second cycle.
+    # Only replace the known old/default 1..5 second values; custom slower values
+    # are preserved. Direct Lua popup flags remain immediate.
+    if _int_cfg(cfg.get("_nomo_perf_migration"), 0) < 408:
+        if _int_cfg(cfg.get("android_ui_snapshot_cache_seconds"), 5) <= 5:
+            set_cfg("android_ui_snapshot_cache_seconds", 25)
+        set_cfg("_nomo_perf_migration", 408)
+
     if _int_cfg(cfg.get("android_disconnect_confirmations_required"), 0) < 2:
         set_cfg("android_disconnect_confirmations_required", 2)
     if _int_cfg(cfg.get("android_disconnect_confirmation_window_seconds"), 0) <= 0:
@@ -5744,7 +5791,7 @@ def capture_android_ui_snapshot(cfg, force=False):
         return _ANDROID_UI_SNAPSHOT_CACHE
 
     t = now()
-    cache_seconds = int(cfg.get("android_ui_snapshot_cache_seconds", 5) or 5)
+    cache_seconds = int(cfg.get("android_ui_snapshot_cache_seconds", 25) or 25)
     if not force and int(_ANDROID_UI_SNAPSHOT_CACHE.get("ts", 0) or 0) > 0:
         if t - int(_ANDROID_UI_SNAPSHOT_CACHE.get("ts", 0) or 0) < max(1, cache_seconds):
             return _ANDROID_UI_SNAPSHOT_CACHE
@@ -7579,7 +7626,7 @@ def update_hatcher_runtime(profile_name, hcfg, entry):
     save_hatcher_runtime(rt)
 
 
-def hatcher_report_once(hcfg, force=True):
+def hatcher_report_once(hcfg, force=True, state_cache=None):
     hatcher_apply_main_backend_if_missing(hcfg, None, save=True)
 
     if not hcfg.get("enabled", True):
@@ -7599,7 +7646,12 @@ def hatcher_report_once(hcfg, force=True):
     for prof in profiles:
         eff = hatcher_effective(hcfg, prof)
         name = str(eff.get("hatcher_name", "hatcher")).strip() or "hatcher"
-        state, state_err = hatcher_read_state(eff)
+        pkg = str(eff.get("package", "") or "")
+        cached = state_cache.get(pkg) if isinstance(state_cache, dict) else None
+        if isinstance(cached, tuple) and len(cached) == 2:
+            state, state_err = cached
+        else:
+            state, state_err = hatcher_read_state(eff)
         entry = hatcher_entry(eff, state, state_err)
         status = str(entry.get("status", "")).lower()
 
@@ -7920,6 +7972,7 @@ def start_hatcher_reporter(main_cfg=None):
     loops = 0
     open_queue = []
     last_msg = "not uploaded yet"
+    last_report_at = 0
 
     def current_tabs():
         cur_hcfg = load_hatcher_config()
@@ -7981,6 +8034,7 @@ def start_hatcher_reporter(main_cfg=None):
             pass
         hcfg, tabs = current_tabs()
         rows = []
+        report_state_cache = {}
 
         for tab in tabs:
             pkg = tab["package"]
@@ -7988,6 +8042,7 @@ def start_hatcher_reporter(main_cfg=None):
             rt_tab["target"] = "hatcher"
             raw_alive = package_alive(pkg, cfg)
             state, err = read_state(tab)
+            report_state_cache[pkg] = (state, err)
             alive = raw_alive or (state is not None and not state_disconnect_ui(state) and int(state.get("age", 999999) or 999999) <= int(cfg.get("state_stale_seconds", 180) or 180))
             note = "ok"
             pets = "-"
@@ -8142,11 +8197,20 @@ def start_hatcher_reporter(main_cfg=None):
                 "session": format_session(rt_tab),
                 "note": note,
             })
-            save_runtime(rt)
 
-        ok, msg = hatcher_report_once(hcfg, force=False)
-        tag = "OK" if ok else "ERR"
-        last_msg = f"[{date_time_text()}] {tag}: {msg}"
+        # One atomic shared-runtime write after all package rows are updated.
+        save_runtime(rt)
+
+        # Backend/reporting cadence is independent from the 10-second local
+        # health loop. Reuse this cycle's state reads when a report is due.
+        report_interval = max(10, int(hcfg.get("heartbeat_interval", 60) or 60))
+        if last_report_at <= 0 or now() - last_report_at >= report_interval:
+            ok, msg = hatcher_report_once(
+                hcfg, force=False, state_cache=report_state_cache
+            )
+            last_report_at = now()
+            tag = "OK" if ok else "ERR"
+            last_msg = f"[{date_time_text()}] {tag}: {msg}"
         hatcher_rejoin_status_screen(rows, hcfg, cfg, session_start, loops, last_msg)
 
         if open_queue and cfg.get("smart_open_queue", True):
@@ -8509,6 +8573,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
     loops = 0
     open_queue = []
     last_msg = "not uploaded yet"
+    last_report_at = 0
 
     def current_tabs():
         cur_hcfg = load_hatcher_config()
@@ -8570,6 +8635,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
             pass
         hcfg, tabs = current_tabs()
         rows = []
+        report_state_cache = {}
 
         for tab in tabs:
             pkg = tab["package"]
@@ -8578,6 +8644,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
 
             raw_alive = package_alive(pkg, cfg)
             state, err = read_state(tab)
+            report_state_cache[pkg] = (state, err)
             alive = raw_alive or (state is not None and not state_disconnect_ui(state) and int(state.get("age", 999999) or 999999) <= int(cfg.get("state_stale_seconds", 180) or 180))
             prof = None
             for p in hatcher_profiles(hcfg, enabled_only=True):
@@ -8812,11 +8879,20 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                 "session": format_session(rt_tab),
                 "note": note,
             })
-            save_runtime(rt)
 
-        ok, msg = hatcher_report_once(hcfg, force=False)
-        tag = "OK" if ok else "ERR"
-        last_msg = f"[{date_time_text()}] {tag}: {msg}"
+        # One atomic shared-runtime write after all package rows are updated.
+        save_runtime(rt)
+
+        # Backend/reporting cadence is independent from the 10-second local
+        # health loop. Reuse this cycle's state reads when a report is due.
+        report_interval = max(10, int(hcfg.get("heartbeat_interval", 60) or 60))
+        if last_report_at <= 0 or now() - last_report_at >= report_interval:
+            ok, msg = hatcher_report_once(
+                hcfg, force=False, state_cache=report_state_cache
+            )
+            last_report_at = now()
+            tag = "OK" if ok else "ERR"
+            last_msg = f"[{date_time_text()}] {tag}: {msg}"
         hatcher_rejoin_status_screen(rows, hcfg, cfg, session_start, loops, last_msg)
         print(col("  Hatcher: alive old state 5m..6h => hard-force affected tab; >6h ignored.", GREEN))
 
@@ -9908,6 +9984,264 @@ def autoexec_copy_files(cfg):
     ))
     pause()
 
+
+def _autoexec_sha256(path):
+    """Return a SHA-256 digest for a local AutoExec file."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _autoexec_safe_move(source_path, target_path, overwrite=False):
+    """Move one file without deleting the source until the target is verified.
+
+    Returns ``(status, note)`` where status is moved, skipped, unchanged, or failed.
+    """
+    source_path = Path(source_path)
+    target_path = Path(target_path)
+    try:
+        try:
+            if source_path.resolve() == target_path.resolve():
+                return "unchanged", "source and destination are identical"
+        except Exception:
+            if str(source_path) == str(target_path):
+                return "unchanged", "source and destination are identical"
+
+        if not source_path.exists() or not source_path.is_file():
+            return "failed", "source file is missing"
+        if target_path.exists() and not overwrite:
+            return "skipped", "destination already exists"
+
+        data_hash = _autoexec_sha256(source_path)
+        source_size = source_path.stat().st_size
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = target_path.with_name(
+            f".{target_path.name}.nomo-move-{os.getpid()}-{int(time.time() * 1000)}.tmp"
+        )
+
+        try:
+            with open(source_path, "rb") as src, open(temp_path, "wb") as dst:
+                shutil.copyfileobj(src, dst, length=1024 * 1024)
+                dst.flush()
+                try:
+                    os.fsync(dst.fileno())
+                except Exception:
+                    pass
+
+            if temp_path.stat().st_size != source_size:
+                raise RuntimeError("temporary copy size mismatch")
+            if _autoexec_sha256(temp_path) != data_hash:
+                raise RuntimeError("temporary copy checksum mismatch")
+
+            os.replace(str(temp_path), str(target_path))
+            if not target_path.exists() or target_path.stat().st_size != source_size:
+                raise RuntimeError("destination verification failed")
+            if _autoexec_sha256(target_path) != data_hash:
+                raise RuntimeError("destination checksum mismatch")
+
+            source_path.unlink()
+            return "moved", "verified and source removed"
+        finally:
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except Exception:
+                pass
+    except Exception as exc:
+        return "failed", str(exc)
+
+
+def autoexec_rename_move_files(cfg):
+    """Rename one AutoExec script or move selected scripts to one package."""
+    tabs = autoexec_tabs(cfg)
+    tab_map = {str(t.get("package") or ""): t for t in tabs if t.get("package")}
+    if not tab_map:
+        print(col("No configured packages have AutoExec paths.", RED))
+        pause()
+        return
+
+    source_pkgs = choose_packages_common(
+        cfg,
+        "AUTOEXEC RENAME/MOVE: SOURCE PACKAGE",
+        multi=False,
+        include_discovered=False,
+        configured_only=True,
+    )
+    if not source_pkgs:
+        return
+    source_pkg = source_pkgs[0]
+    source_tab = tab_map.get(source_pkg)
+    if source_tab is None:
+        print(col("Source package has no configured AutoExec path.", RED))
+        pause()
+        return
+
+    clear()
+    banner(f"RENAME/MOVE FROM {short_pkg(source_pkg)}", cfg)
+    source_mode = _choose_autoexec_location(cfg, allow_both=False, selected_tabs=[source_tab])
+    if source_mode is None:
+        return
+
+    records, empty_dirs = _collect_autoexec_files([source_tab], source_mode)
+    records = [
+        rec for rec in records
+        if rec["path"].suffix.lower() in _AUTOEXEC_ALLOWED_SUFFIXES
+    ]
+    clear()
+    banner("AUTOEXEC RENAME / MOVE", cfg)
+    if not records:
+        print(col("No Lua/script files found in the selected source folder.", YELLOW))
+        for pkg, note in empty_dirs:
+            print(col(f"{short_pkg(pkg)}: {note}", DIM))
+        pause()
+        return
+
+    _print_autoexec_file_table(records, cfg)
+    chosen = _choose_autoexec_records(records, "Choose file(s) to rename/move", multi=True)
+    if not chosen:
+        return
+
+    print("")
+    print("1. Rename in the same package")
+    print("2. Move to another package")
+    print("0. Back")
+    valid_actions = {"0", "2"}
+    if len(chosen) == 1:
+        valid_actions.add("1")
+    else:
+        print(col("Rename is available only when one file is selected.", DIM))
+    while True:
+        action = read_menu_choice("Select: ", valid=valid_actions)
+        if action is not None:
+            break
+        allowed = "1, 2, or 0" if len(chosen) == 1 else "2 or 0"
+        print(col(f"Invalid choice. Use {allowed}.", RED))
+    if action == "0":
+        return
+
+    destination_tab = source_tab
+    new_name = None
+    operation_label = "RENAME"
+
+    if action == "1":
+        source_record = chosen[0]
+        raw_name = input(f"New filename [{source_record['path'].name}]: ")
+        new_name = _safe_autoexec_filename(raw_name, source_record["path"].name)
+        if new_name == source_record["path"].name:
+            print(col("Filename is unchanged; nothing to do.", YELLOW))
+            pause()
+            return
+    else:
+        destination_pkgs = choose_packages_common(
+            cfg,
+            "AUTOEXEC MOVE: DESTINATION PACKAGE",
+            multi=False,
+            include_discovered=False,
+            configured_only=True,
+        )
+        if not destination_pkgs:
+            return
+        destination_pkg = destination_pkgs[0]
+        if destination_pkg == source_pkg:
+            print(col("Choose a different package for Move. Use Rename for the same package.", RED))
+            pause()
+            return
+        destination_tab = tab_map.get(destination_pkg)
+        if destination_tab is None:
+            print(col("Destination package has no configured AutoExec path.", RED))
+            pause()
+            return
+        operation_label = "MOVE"
+        if len(chosen) == 1:
+            raw_name = input(f"Destination filename [{chosen[0]['path'].name}]: ")
+            new_name = _safe_autoexec_filename(raw_name, chosen[0]["path"].name)
+
+    clear()
+    banner(f"AUTOEXEC {operation_label}: DESTINATION", cfg)
+    destination_mode = _choose_autoexec_location(
+        cfg, allow_both=False, selected_tabs=[destination_tab]
+    )
+    if destination_mode is None:
+        return
+    destination_dirs = autoexec_dirs_for_tab(destination_tab, destination_mode)
+    if not destination_dirs:
+        print(col("Destination AutoExec path could not be resolved.", RED))
+        pause()
+        return
+    destination_folder = destination_dirs[0][1]
+
+    targets = []
+    for rec in chosen:
+        filename = new_name if len(chosen) == 1 and new_name else rec["path"].name
+        targets.append((rec, destination_folder / filename))
+
+    conflicts = [(rec, target) for rec, target in targets if target.exists()]
+    overwrite = False
+    if conflicts:
+        print("")
+        print(col("Existing destination file(s):", YELLOW))
+        for rec, target in conflicts:
+            try:
+                same = rec["path"].resolve() == target.resolve()
+            except Exception:
+                same = str(rec["path"]) == str(target)
+            if not same:
+                print(f"  - {target}")
+        print("")
+        print("1. Overwrite existing destination file(s)")
+        print("2. Skip existing destination file(s)")
+        print("0. Cancel")
+        conflict = read_menu_choice("Select: ", valid={"0", "1", "2"})
+        if conflict in {None, "0"}:
+            print(col("Cancelled; nothing changed.", YELLOW))
+            pause()
+            return
+        overwrite = conflict == "1"
+
+    clear()
+    banner(f"CONFIRM AUTOEXEC {operation_label}", cfg)
+    print(col(f"Source package: {source_pkg}", BOLD))
+    print(col(f"Destination package: {destination_tab.get('package')}", BOLD))
+    print("")
+    for rec, target in targets:
+        print(f"  {rec['path']}\n    -> {target}")
+    print("")
+    if overwrite:
+        print(col("Existing target files will be overwritten.", YELLOW))
+    confirm = clean_terminal_input(input(f"Proceed with {operation_label.lower()}? [Y/n]: ")).lower()
+    if confirm in {"n", "no"}:
+        print(col("Cancelled; nothing changed.", YELLOW))
+        pause()
+        return
+
+    counts = {"moved": 0, "skipped": 0, "unchanged": 0, "failed": 0}
+    results = []
+    for rec, target in targets:
+        status, note = _autoexec_safe_move(rec["path"], target, overwrite=overwrite)
+        counts[status] = counts.get(status, 0) + 1
+        results.append((rec["path"], target, status, note))
+
+    clear()
+    banner(f"AUTOEXEC {operation_label} RESULTS", cfg)
+    for source_path, target, status, note in results:
+        color = GREEN if status == "moved" else (YELLOW if status in {"skipped", "unchanged"} else RED)
+        print(col(f"{status.upper()}: {source_path.name}", color))
+        print(col(f"  {source_path}", DIM))
+        print(col(f"  -> {target}", DIM))
+        if note:
+            print(col(f"  {note}", DIM if status != "failed" else RED))
+    print("")
+    summary_color = GREEN if counts["failed"] == 0 else YELLOW
+    print(col(
+        "Done. "
+        f"Moved {counts['moved']}; skipped {counts['skipped']}; "
+        f"unchanged {counts['unchanged']}; failed {counts['failed']}.",
+        summary_color,
+    ))
+    pause()
+
 def autoexec_menu(cfg):
     while True:
         cfg = load_config()
@@ -9921,12 +10255,13 @@ def autoexec_menu(cfg):
             ("3", "Write/replace custom Lua file", CYAN, WHITE),
             ("4", "Delete selected AutoExec files", RED, WHITE),
             ("5", "Copy Lua between packages", MAGENTA, WHITE),
+            ("6", "Rename/move AutoExec files", CYAN, WHITE),
             ("0", "Back", RED, WHITE),
         ]
         draw_boxed_menu(rows, cfg)
         print("")
         print(col(f"Pet Counter source: {'bundled v3.0' if BUNDLED_PET_COUNTER_FILE.exists() else 'network fallback'}", DIM))
-        choice = read_menu_choice("\nOption: ", valid={"0", "1", "2", "3", "4", "5"})
+        choice = read_menu_choice("\nOption: ", valid={"0", "1", "2", "3", "4", "5", "6"})
         if choice is None:
             print(col("Invalid option. Use one of the numbers shown.", RED))
             time.sleep(1)
@@ -9943,6 +10278,8 @@ def autoexec_menu(cfg):
             autoexec_delete_files(cfg)
         elif choice == "5":
             autoexec_copy_files(cfg)
+        elif choice == "6":
+            autoexec_rename_move_files(cfg)
 
 
 def export_cookies(selected_packages=None):
