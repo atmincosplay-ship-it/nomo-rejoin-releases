@@ -1,24 +1,21 @@
 #!/usr/bin/env python3
-# NOMO REJOIN V4.04
+# NOMO REJOIN V4.05
+#
+# V4.05 — SAFE DIAGNOSTICS EXPORT
+# - NEW: Main menu option 14 exports one redacted diagnostics ZIP.
+# - NEW: Includes package/PID status, state freshness, full resolved AutoExec
+#        paths, runtime snapshots, recent activity, backend health, and device/
+#        Termux/Python information.
+# - SAFE: Cookies, API keys, secrets, webhooks, authorization values, and private
+#         server access/link codes are removed before anything is written.
+# - QOL: ZIP is saved under Download/nomo_rejoin/diagnostics with an exact path
+#        and file size printed after export.
 #
 # V4.04 — PROJECT RENAME / SAFE LOCAL MIGRATION
-# - RENAME: Canonical local folder is now /storage/emulated/0/Download/nomo_rejoin
-#           and the main file is nomo_rejoin.py.
-# - RENAME: State writer folder is now nomo_rejoiner; the reader still accepts
-#           legacy gag_rejoiner state files during migration.
-# - RENAME: Bundled counter is NOMO Pet Counter v3.0 and uses
-#           getgenv().NOMO_PET_COUNTER (legacy alias kept).
-# - MIGRATE: On first launch, existing nomo.json, runtime, logs, cookie cache,
-#           templates, and exports are copied from the old local folder if the
-#           new folder does not already contain them.
-# - COMPAT: The old `gag` command remains an alias for the new `nomo` command.
-# - CHANGE: AutoExec Pet Counter install prefers the bundled local v3.0 source;
-#           the network loader remains only as a fallback.
-#
-# V4.03 — AUTOEXEC PATH FIX / DEFAULT-YES SETUP
-# - FIX: Removed the invalid Arceus X/Workspace/autoexec destination entirely.
-# - UI : AutoExec tools show each complete resolved path.
-# - CHANGE: Recommended setup confirmations default to YES.
+# - RENAME: Canonical folder/file are Download/nomo_rejoin/nomo_rejoin.py.
+# - RENAME: State writer folder is nomo_rejoiner; legacy gag_rejoiner is accepted.
+# - RENAME: Bundled counter is NOMO Pet Counter v3.0.
+# - COMPAT: The old `gag` command remains an alias for `nomo`.
 #
 import os
 import re
@@ -36,6 +33,9 @@ import urllib.parse
 import sqlite3
 import threading
 import getpass
+import hashlib
+import platform
+import zipfile
 from pathlib import Path
 from datetime import datetime
 
@@ -43,7 +43,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.04"
+__version__ = "V4.05"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -2404,6 +2404,7 @@ MAIN_MENU_ITEMS = [
     ("11", "Global config"),
     ("12", "AutoExec manager"),
     ("13", "New Redfinger setup wizard"),
+    ("14", "Export diagnostics ZIP"),
     ("0",  "Exit"),
 ]
 
@@ -12965,6 +12966,423 @@ def mode_menu(cfg):
             print("Invalid choice.")
             time.sleep(1)
 
+
+# ============================================================
+# V4.05 SAFE DIAGNOSTICS EXPORT
+# ============================================================
+
+_DIAG_SECRET_KEY_PARTS = (
+    "cookie", "secret", "password", "passwd", "authorization",
+    "api_key", "apikey", "access_token", "refresh_token", "webhook",
+)
+_DIAG_PRIVATE_CODE_KEYS = {
+    "accesscode", "access_code", "linkcode", "link_code",
+    "private_server_access_code", "private_server_link_code",
+    "privateserveraccesscode", "privateserverlinkcode",
+}
+_DIAG_ROBLOX_COOKIE_RE = re.compile(
+    r"(?:_\|WARNING:-DO-NOT-SHARE-THIS\.[^\s\"'<>]+|\.ROBLOSECURITY\s*[=:]\s*[^\s\"'<>]+)",
+    re.IGNORECASE,
+)
+_DIAG_AUTH_RE = re.compile(
+    r"(?im)^\s*(authorization|x-master-key|x-api-key)\s*[:=]\s*.+$"
+)
+_DIAG_QUERY_CODE_RE = re.compile(
+    r"(?i)([?&](?:accessCode|privateServerLinkCode|linkCode|shareCode|code)=)[^&#\s]+"
+)
+
+
+def _diag_redact_text(value):
+    """Redact credentials/codes from free-form text before exporting it."""
+    text = str(value or "")
+    text = _DIAG_ROBLOX_COOKIE_RE.sub("[REDACTED ROBLOX COOKIE]", text)
+    text = _DIAG_AUTH_RE.sub(lambda m: f"{m.group(1)}: [REDACTED]", text)
+    text = _DIAG_QUERY_CODE_RE.sub(lambda m: m.group(1) + "[REDACTED]", text)
+    return text
+
+
+def _diag_key_is_secret(key):
+    low = str(key or "").strip().lower().replace("-", "_")
+    if low in _DIAG_PRIVATE_CODE_KEYS:
+        return True
+    return any(part in low for part in _DIAG_SECRET_KEY_PARTS)
+
+
+def _diag_redact_obj(value, key_hint=""):
+    """Recursively produce a JSON-safe, redacted copy."""
+    if _diag_key_is_secret(key_hint):
+        if value in (None, "", [], {}):
+            return value
+        return "[REDACTED]"
+    if isinstance(value, dict):
+        return {
+            str(k): _diag_redact_obj(v, str(k))
+            for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple, set)):
+        return [_diag_redact_obj(v, key_hint) for v in value]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, bytes):
+        return f"<bytes:{len(value)}>"
+    if isinstance(value, str):
+        return _diag_redact_text(value)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return _diag_redact_text(repr(value))
+
+
+def _diag_json_text(value):
+    return json.dumps(_diag_redact_obj(value), indent=2, ensure_ascii=False, sort_keys=True)
+
+
+def _diag_local_command(cmd, timeout=12):
+    """Run a Termux-local command without forcing it through su."""
+    try:
+        p = subprocess.run(
+            cmd,
+            shell=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+        )
+        return {"code": int(p.returncode), "output": _diag_redact_text((p.stdout or "").strip())}
+    except subprocess.TimeoutExpired:
+        return {"code": 124, "output": f"timeout after {timeout}s"}
+    except Exception as e:
+        return {"code": -1, "output": _diag_redact_text(str(e))}
+
+
+def _diag_android_command(cmd, cfg, timeout=12):
+    code, out = shell_timeout(cmd, cfg, capture=True, timeout=timeout)
+    return {"code": int(code), "output": _diag_redact_text(out)}
+
+
+def _diag_file_info(path):
+    p = Path(path) if path else None
+    result = {"path": str(p) if p else "", "exists": bool(p and p.exists())}
+    if not p or not p.exists():
+        return result
+    try:
+        st = p.stat()
+        result.update({
+            "size_bytes": int(st.st_size),
+            "modified_unix": int(st.st_mtime),
+            "modified_local": datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+        })
+    except Exception as e:
+        result["stat_error"] = str(e)
+    return result
+
+
+def _diag_script_info():
+    try:
+        script_path = Path(__file__).resolve()
+    except Exception:
+        script_path = Path(__file__)
+    info = _diag_file_info(script_path)
+    try:
+        h = hashlib.sha256()
+        with open(script_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        info["sha256"] = h.hexdigest()
+    except Exception as e:
+        info["sha256_error"] = str(e)
+    info["nomo_version"] = __version__
+    return info
+
+
+def _diag_package_record(entry, cfg):
+    pkg = str(entry.get("package") or "")
+    tab = entry.get("tab") or next(
+        (t for t in cfg.get("tabs", []) if t.get("package") == pkg),
+        {"package": pkg, "user_name": entry.get("username", pkg), "stat_file": ""},
+    )
+    try:
+        pids = package_pids(pkg, cfg)
+    except Exception as e:
+        pids = []
+        pid_error = str(e)
+    else:
+        pid_error = ""
+
+    try:
+        state_path = resolve_state_path(tab)
+        state, state_err = read_state(tab)
+    except Exception as e:
+        state_path, state, state_err = None, None, str(e)
+
+    autoexec = []
+    try:
+        autoexec = [
+            {"label": label, **_diag_file_info(folder)}
+            for label, folder in autoexec_dirs_for_tab(tab, "1")
+        ]
+    except Exception as e:
+        autoexec = [{"error": str(e)}]
+
+    resolve_cmd = f"cmd package resolve-activity --brief {shlex.quote(pkg)} 2>/dev/null | tail -n 1"
+    resolved = _diag_android_command(resolve_cmd, cfg, timeout=8) if pkg else {"code": -1, "output": "no package"}
+
+    state_summary = None
+    if isinstance(state, dict):
+        keep = (
+            "username", "pet_count", "egg_total", "age", "ts", "write_seq",
+            "script_uptime", "place_id", "job_id", "private_server_id",
+            "private_server_owner_id", "private_server_known", "is_private_server",
+            "server_type", "counter_version", "disconnected",
+            "disconnect_observed_ts", "disconnect_reason", "disconnect_title",
+            "disconnect_text", "disconnect_code",
+        )
+        state_summary = {k: state.get(k) for k in keep if k in state}
+
+    return _diag_redact_obj({
+        "package": pkg,
+        "username": entry.get("username", tab.get("user_name", pkg)),
+        "enabled": bool(entry.get("enabled", tab.get("enabled", False))),
+        "configured": bool(entry.get("configured", bool(entry.get("tab")))),
+        "installed": bool(entry.get("installed", False)),
+        "alive": bool(pids),
+        "pids": pids,
+        "pid_error": pid_error,
+        "resolved_activity": resolved,
+        "configured_state_file": str(tab.get("stat_file") or tab.get("state_file") or ""),
+        "resolved_state_file": _diag_file_info(state_path),
+        "state_read_error": state_err,
+        "state": state_summary,
+        "autoexec_paths": autoexec,
+    })
+
+
+def _diag_activity_tail(max_lines=300):
+    path = BASE_DIR / "activity.log"
+    if not path.exists():
+        return "activity.log does not exist\n"
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        text = "".join(lines[-max(1, int(max_lines)):])
+        # Keep the ZIP small if one line unexpectedly contains a huge payload.
+        return _diag_redact_text(text[-500000:])
+    except Exception as e:
+        return f"Could not read activity.log: {_diag_redact_text(e)}\n"
+
+
+def _diag_summary_text(report):
+    lines = [
+        f"NOMO REJOIN DIAGNOSTICS {report.get('nomo_version', '')}",
+        f"Created: {report.get('created_local', '')}",
+        f"Mode: {report.get('active_mode', '')}",
+        f"Base directory: {report.get('base_dir', '')}",
+        "",
+        "BACKEND",
+        f"  OK: {report.get('backend', {}).get('ok')}",
+        f"  Status: {report.get('backend', {}).get('message', '')}",
+        "",
+        "PACKAGES",
+    ]
+    for item in report.get("packages", []):
+        state = item.get("state") or {}
+        age = state.get("age", "-")
+        lines.append(
+            f"  {item.get('package','?')}: installed={item.get('installed')} "
+            f"enabled={item.get('enabled')} alive={item.get('alive')} "
+            f"pids={item.get('pids', [])} state_age={age} "
+            f"counter={state.get('counter_version', '-') or '-'}"
+        )
+        lines.append(f"    state: {item.get('resolved_state_file', {}).get('path', '')}")
+        paths = item.get("autoexec_paths") or []
+        if paths:
+            for p in paths:
+                lines.append(f"    autoexec: {p.get('path', p.get('error', ''))}")
+        else:
+            lines.append("    autoexec: unresolved")
+    issues = report.get("issues", [])
+    lines.extend(["", "DETECTED ISSUES"])
+    if issues:
+        lines.extend(f"  - {x}" for x in issues)
+    else:
+        lines.append("  None detected by the exporter.")
+    lines.extend([
+        "",
+        "PRIVACY",
+        "  Credentials, cookies, webhook URLs, authorization values, and private-server codes",
+        "  are redacted. Review files before sharing outside your own troubleshooting chat.",
+        "",
+    ])
+    return _diag_redact_text("\n".join(lines))
+
+
+def build_diagnostics_report(cfg):
+    """Collect a redacted diagnostics snapshot. This never modifies rejoin state."""
+    hcfg = load_hatcher_config()
+    rt_market = load_runtime()
+    rt_hatcher = load_hatcher_runtime()
+
+    try:
+        backend_ok, backend_msg = backend_health_check(cfg)
+    except Exception as e:
+        backend_ok, backend_msg = False, f"health check exception: {e}"
+
+    entries = package_registry_entries(cfg, include_discovered=True)
+    packages = []
+    for entry in entries:
+        try:
+            packages.append(_diag_package_record(entry, cfg))
+        except Exception as e:
+            packages.append(_diag_redact_obj({
+                "package": entry.get("package", "?"),
+                "collection_error": str(e),
+            }))
+
+    try:
+        usage = shutil.disk_usage(BASE_DIR)
+        storage = {
+            "total_bytes": int(usage.total),
+            "used_bytes": int(usage.used),
+            "free_bytes": int(usage.free),
+        }
+    except Exception as e:
+        storage = {"error": str(e)}
+
+    system_info = {
+        "python_version": sys.version,
+        "python_executable": sys.executable,
+        "platform": platform.platform(),
+        "uname": list(platform.uname()),
+        "cwd": os.getcwd(),
+        "uid": os.getuid() if hasattr(os, "getuid") else None,
+        "gid": os.getgid() if hasattr(os, "getgid") else None,
+        "term": os.environ.get("TERM", ""),
+        "prefix": os.environ.get("PREFIX", ""),
+        "home": os.environ.get("HOME", ""),
+        "storage": storage,
+        "commands": {
+            "id": _diag_local_command("id"),
+            "python_version": _diag_local_command("python --version 2>&1"),
+            "termux_info": _diag_local_command("command -v termux-info >/dev/null 2>&1 && termux-info || echo 'termux-info unavailable'", 20),
+            "android_props": _diag_android_command(
+                "printf 'model='; getprop ro.product.model; "
+                "printf 'android='; getprop ro.build.version.release; "
+                "printf 'sdk='; getprop ro.build.version.sdk; "
+                "printf 'abi='; getprop ro.product.cpu.abi; "
+                "printf 'manufacturer='; getprop ro.product.manufacturer",
+                cfg,
+                timeout=10,
+            ),
+            "su_id": _diag_android_command("id", cfg, timeout=8),
+        },
+    }
+
+    issues = []
+    if not backend_ok:
+        issues.append(f"Backend health: {backend_msg}")
+    enabled_pkgs = [x for x in packages if x.get("enabled")]
+    if not enabled_pkgs:
+        issues.append("No enabled packages are configured.")
+    for item in enabled_pkgs:
+        pkg = item.get("package", "?")
+        if not item.get("installed"):
+            issues.append(f"{pkg}: configured but Android package was not found.")
+        if not item.get("alive"):
+            issues.append(f"{pkg}: no exact package PID is running.")
+        state = item.get("state") or {}
+        state_file = item.get("resolved_state_file") or {}
+        if not state_file.get("exists"):
+            issues.append(f"{pkg}: state file is missing.")
+        else:
+            age = state.get("age")
+            try:
+                if int(age) > int(cfg.get("state_stale_seconds", 180)):
+                    issues.append(f"{pkg}: state is stale ({format_age(age)} old).")
+            except Exception:
+                pass
+        paths = item.get("autoexec_paths") or []
+        if not paths:
+            issues.append(f"{pkg}: AutoExec path could not be resolved.")
+        else:
+            for p in paths:
+                if p.get("error"):
+                    issues.append(f"{pkg}: AutoExec resolve error: {p.get('error')}")
+
+    report = {
+        "nomo_version": __version__,
+        "created_unix": now(),
+        "created_local": date_time_text(),
+        "active_mode": active_rejoin_mode(cfg),
+        "base_dir": str(BASE_DIR),
+        "script": _diag_script_info(),
+        "backend": {
+            "provider": backend_provider(cfg),
+            "enabled": bool(cfg.get("jsonbin_hatchers_enabled", False)),
+            "ok": bool(backend_ok),
+            "message": _diag_redact_text(backend_msg),
+        },
+        "system": system_info,
+        "packages": packages,
+        "issues": issues,
+        "files": {
+            "nomo_json": _diag_file_info(NOMO_FILE),
+            "activity_log": _diag_file_info(BASE_DIR / "activity.log"),
+            "bundled_counter": _diag_file_info(BUNDLED_PET_COUNTER_FILE),
+        },
+        "config_redacted": _diag_redact_obj(cfg),
+        "hatcher_config_redacted": _diag_redact_obj(hcfg),
+        "runtime_market_redacted": _diag_redact_obj(rt_market),
+        "runtime_hatcher_redacted": _diag_redact_obj(rt_hatcher),
+    }
+    return _diag_redact_obj(report)
+
+
+def export_diagnostics_zip(cfg):
+    """Write a safe troubleshooting ZIP and show its full Android path."""
+    clear()
+    banner("EXPORT DIAGNOSTICS", cfg)
+    print(col("Collecting package, state, backend, AutoExec, and device information...", CYAN))
+    print(col("Cookies, API keys, secrets, webhooks, and private-server codes are removed.", DIM))
+    try:
+        report = build_diagnostics_report(cfg)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_dir = BASE_DIR / "diagnostics"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        zip_path = out_dir / f"NOMO_DIAGNOSTICS_{__version__}_{stamp}.zip"
+
+        files = {
+            "README.txt": (
+                "NOMO Rejoin diagnostics export.\n"
+                "All known credentials and private-server access/link codes were redacted.\n"
+                "Review before sharing outside your own troubleshooting chat.\n"
+            ),
+            "summary.txt": _diag_summary_text(report),
+            "report.json": json.dumps(report, indent=2, ensure_ascii=False, sort_keys=True),
+            "config_redacted.json": _diag_json_text(report.get("config_redacted", {})),
+            "hatcher_config_redacted.json": _diag_json_text(report.get("hatcher_config_redacted", {})),
+            "runtime_market_redacted.json": _diag_json_text(report.get("runtime_market_redacted", {})),
+            "runtime_hatcher_redacted.json": _diag_json_text(report.get("runtime_hatcher_redacted", {})),
+            "packages_state_paths.json": _diag_json_text(report.get("packages", [])),
+            "activity_tail.log": _diag_activity_tail(300),
+        }
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+            for name, text in files.items():
+                zf.writestr(name, _diag_redact_text(text))
+
+        size = zip_path.stat().st_size
+        print("")
+        print(col("Diagnostics ZIP created.", GREEN))
+        print(col("Full path:", BOLD))
+        print(str(zip_path))
+        print(f"Size: {size / 1024:.1f} KB")
+        print(f"Detected issues: {len(report.get('issues', []))}")
+        log_activity(f"diagnostics exported -> {zip_path.name}", "", GREEN)
+    except Exception as e:
+        print("")
+        print(col(f"Diagnostics export failed: {_diag_redact_text(e)}", RED))
+    pause()
+
+
 def select_package_menu(cfg):
     while True:
         cfg = load_config()
@@ -13163,6 +13581,11 @@ def main():
 
         elif choice == "13":
             new_redfinger_setup_wizard(cfg)
+            cfg = load_config()
+            normalize_active_mode_flags(cfg)
+
+        elif choice == "14":
+            export_diagnostics_zip(cfg)
             cfg = load_config()
             normalize_active_mode_flags(cfg)
 
