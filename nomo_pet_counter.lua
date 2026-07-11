@@ -1,17 +1,19 @@
 --========================================================--
 --                    NOMO PET COUNTER
---                  v3.1 AUTO PLAY
+--              v3.2 ONE-SHOT AUTO PLAY
 --========================================================--
 -- Writes per-account state to:
 --   nomo_rejoiner/<username>_state.json
 --
+-- v3.2:
+-- - PERF: Removed the repeated PlayerGui/GetDescendants loading-screen scan.
+-- - CHANGE: Sends exactly ONE bottom-edge click after the game loads plus a
+--           configurable delay. No prompt detection, watcher, retry, or loop.
+-- - SAFE: Defaults to bottom-right, slightly inside the Android gesture edge.
+--
 -- v3.1:
--- - NEW: Auto-dismisses Grow a Garden's 100% loading splash when the exact
---        "Click Anywhere to Play" prompt is visible.
--- - SAFE: Tries the real GuiButton first, then uses bottom-right / bottom-left
---         edge clicks instead of the screen center.
--- - SAFE: The watcher stops as soon as the prompt disappears and has a strict
---         attempt/time limit, so it cannot keep clicking during normal play.
+-- - Added prompt-scanning auto play. Replaced in v3.2 because repeated full UI
+--   scans could stutter lower-memory Redfinger instances.
 --
 -- v3.0:
 -- - RENAME: NOMO GAG Pet Counter -> NOMO Pet Counter.
@@ -60,7 +62,7 @@ local Config = getgenv().NOMO_PET_COUNTER
 
 Config.Enabled = true
 Config.Stop = false
-Config.Version = "v3.1-auto-play"
+Config.Version = "v3.2-one-shot-auto-play"
 
 Config.WriteFolder = Config.WriteFolder or "nomo_rejoiner"
 
@@ -94,15 +96,17 @@ if Config.FuzzyPetNameMatch == nil then
     Config.FuzzyPetNameMatch = true
 end
 
--- Grow a Garden loading splash helper. This only reacts to the exact
--- "Click Anywhere to Play" text and stops once that prompt disappears.
+-- Grow a Garden loading splash helper — zero-scan mode.
+-- It waits for Roblox game.Loaded, waits a small fixed delay, then sends exactly
+-- one edge click. It never searches PlayerGui and never runs a retry loop.
 if Config.AutoSkipLoadingScreen == nil then
     Config.AutoSkipLoadingScreen = true
 end
-Config.LoadingCheckEvery = tonumber(Config.LoadingCheckEvery or 1.25) or 1.25
-Config.LoadingRetryDelay = tonumber(Config.LoadingRetryDelay or 2) or 2
-Config.LoadingMaxAttempts = math.max(1, tonumber(Config.LoadingMaxAttempts or 5) or 5)
-Config.LoadingWatcherSeconds = math.max(30, tonumber(Config.LoadingWatcherSeconds or 240) or 240)
+Config.LoadingClickDelay = math.max(0, tonumber(Config.LoadingClickDelay or 5) or 5)
+Config.LoadingClickSide = lower(Config.LoadingClickSide or "right")
+if Config.LoadingClickSide ~= "left" then
+    Config.LoadingClickSide = "right"
+end
 
 -- Edge-click ratios. Kept slightly inside the actual edge so Android gesture /
 -- navigation zones do not swallow the click.
@@ -504,131 +508,17 @@ local function countPetsAndEggs()
 end
 
 --========================================================--
--- Grow a Garden loading splash auto-skip
+-- Grow a Garden loading splash one-shot edge click
 --========================================================--
 
 local LOADING_SKIP = {
-    detected = false,
+    detected = false, -- intentionally unknown: v3.2 does not scan PlayerGui
     active = false,
-    skipped = false,
+    skipped = false,  -- true means the one click was sent successfully
     attempts = 0,
     last_action = "",
     last_ts = 0,
 }
-
-local function guiObjectVisible(obj)
-    local current = obj
-    local depth = 0
-
-    while current and depth < 20 do
-        depth += 1
-
-        local ok, hidden = pcall(function()
-            if current:IsA("GuiObject") and current.Visible == false then
-                return true
-            end
-            if current:IsA("LayerCollector") and current.Enabled == false then
-                return true
-            end
-            return false
-        end)
-
-        if ok and hidden then
-            return false
-        end
-
-        current = current.Parent
-    end
-
-    return true
-end
-
-local function normalizePromptText(text)
-    local value = lower(text)
-    value = string.gsub(value, "%s+", " ")
-    value = string.gsub(value, "^%s+", "")
-    value = string.gsub(value, "%s+$", "")
-    return value
-end
-
-local function nearestGuiButton(obj)
-    local current = obj
-    local depth = 0
-
-    while current and depth < 8 do
-        depth += 1
-        local ok, isButton = pcall(function()
-            return current:IsA("GuiButton")
-        end)
-        if ok and isButton then
-            return current
-        end
-        current = current.Parent
-    end
-
-    return nil
-end
-
-local function findLoadingPlayPrompt()
-    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-    if not playerGui then
-        return nil, nil
-    end
-
-    local descendants = {}
-    local ok = pcall(function()
-        descendants = playerGui:GetDescendants()
-    end)
-    if not ok then
-        return nil, nil
-    end
-
-    for _, obj in ipairs(descendants) do
-        local class = obj.ClassName
-        if class == "TextLabel" or class == "TextButton" or class == "TextBox" then
-            local okText, text = pcall(function()
-                return obj.Text
-            end)
-
-            if okText and text and text ~= "" then
-                local normalized = normalizePromptText(text)
-                if string.find(normalized, "click anywhere to play", 1, true)
-                    and guiObjectVisible(obj) then
-                    return obj, nearestGuiButton(obj)
-                end
-            end
-        end
-    end
-
-    return nil, nil
-end
-
-local function activateLoadingButton(button)
-    if not button then
-        return false, "no gui button"
-    end
-
-    local activated = false
-
-    local okActivate = pcall(function()
-        button:Activate()
-    end)
-    activated = activated or okActivate
-
-    if type(firesignal) == "function" then
-        local okSignal = pcall(function()
-            firesignal(button.Activated)
-        end)
-        activated = activated or okSignal
-
-        local okClick = pcall(function()
-            firesignal(button.MouseButton1Click)
-        end)
-        activated = activated or okClick
-    end
-
-    return activated, activated and "gui button" or "gui activation unavailable"
-end
 
 local function edgeScreenClick(side)
     if not VirtualInputManager then
@@ -666,69 +556,46 @@ local function recordLoadingAction(action)
     LOADING_SKIP.last_action = tostring(action or "")
     LOADING_SKIP.last_ts = now()
     if Config.Debug then
-        print("[NOMO PET COUNTER] loading skip:", LOADING_SKIP.last_action)
+        print("[NOMO PET COUNTER] loading click:", LOADING_SKIP.last_action)
     end
 end
 
-local function runLoadingSkipWatcher()
+local function runLoadingOneShotClick()
     if not Config.AutoSkipLoadingScreen then
         return
     end
 
-    local deadline = os.clock() + Config.LoadingWatcherSeconds
-    local nextAttemptAt = 0
-    local sawPrompt = false
+    LOADING_SKIP.active = true
 
-    while Config.Enabled and not Config.Stop and os.clock() <= deadline do
-        local prompt, button = findLoadingPlayPrompt()
-
-        if prompt then
-            sawPrompt = true
-            LOADING_SKIP.detected = true
-            LOADING_SKIP.active = true
-
-            if LOADING_SKIP.attempts < Config.LoadingMaxAttempts
-                and os.clock() >= nextAttemptAt then
-                LOADING_SKIP.attempts += 1
-
-                local ok, action
-                if LOADING_SKIP.attempts == 1 and button then
-                    ok, action = activateLoadingButton(button)
-                    if not ok then
-                        ok, action = edgeScreenClick("right")
-                    end
-                elseif LOADING_SKIP.attempts % 2 == 0 then
-                    ok, action = edgeScreenClick("right")
-                else
-                    ok, action = edgeScreenClick("left")
-                end
-
-                recordLoadingAction(
-                    string.format("attempt %d/%d: %s%s",
-                        LOADING_SKIP.attempts,
-                        Config.LoadingMaxAttempts,
-                        tostring(action or "unknown"),
-                        ok and "" or " [failed]")
-                )
-
-                nextAttemptAt = os.clock() + Config.LoadingRetryDelay
-            end
-        elseif sawPrompt then
-            LOADING_SKIP.active = false
-            LOADING_SKIP.skipped = LOADING_SKIP.attempts > 0
-            recordLoadingAction(
-                LOADING_SKIP.skipped and "loading prompt dismissed" or "loading prompt disappeared"
-            )
-            return
+    -- Event wait only; this does not scan any UI tree.
+    if not game:IsLoaded() then
+        local loadedOk = pcall(function()
+            game.Loaded:Wait()
+        end)
+        if not loadedOk then
+            recordLoadingAction("game.Loaded wait failed")
         end
-
-        task.wait(Config.LoadingCheckEvery)
     end
 
+    task.wait(Config.LoadingClickDelay)
+
+    if not Config.Enabled or Config.Stop then
+        LOADING_SKIP.active = false
+        recordLoadingAction("one-shot click cancelled: counter stopped")
+        return
+    end
+
+    LOADING_SKIP.attempts = 1
+    local ok, action = edgeScreenClick(Config.LoadingClickSide)
+    LOADING_SKIP.skipped = ok
     LOADING_SKIP.active = false
-    if sawPrompt and not LOADING_SKIP.skipped then
-        recordLoadingAction("watcher stopped before prompt was dismissed")
-    end
+
+    recordLoadingAction(
+        string.format("one-shot after %.1fs: %s%s",
+            Config.LoadingClickDelay,
+            tostring(action or "unknown"),
+            ok and "" or " [failed]")
+    )
 end
 
 --========================================================--
@@ -1274,11 +1141,11 @@ print("[NOMO PET COUNTER] " .. tostring(Config.Version) .. "  (for NOMO REJOIN V
 print("[NOMO PET COUNTER] account = " .. tostring(LocalPlayer.Name))
 print("[NOMO PET COUNTER] writing -> " .. tostring(Config.WriteFile))
 print("[NOMO PET COUNTER] ^ the harness must look for this SAME filename.")
-print("[NOMO PET COUNTER] loading auto-skip = " .. tostring(Config.AutoSkipLoadingScreen))
+print("[NOMO PET COUNTER] one-shot loading click = " .. tostring(Config.AutoSkipLoadingScreen) .. " after " .. tostring(Config.LoadingClickDelay) .. "s, side=" .. tostring(Config.LoadingClickSide))
 print("========================================")
 
--- Start the loading watcher independently so state writing never waits for UI.
-task.spawn(runLoadingSkipWatcher)
+-- Send one delayed edge click independently so state writing never waits for it.
+task.spawn(runLoadingOneShotClick)
 
 -- Write immediately once so age starts refreshing.
 pcall(writeState)
