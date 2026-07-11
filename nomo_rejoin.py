@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
-# NOMO REJOIN V4.05
+# NOMO REJOIN V4.06
+#
+# V4.06 — BUILT-IN UPDATE MANAGER
+# - NEW: Main menu option 15 adds check, install, version, source, backup,
+#        rollback, and nomo/gag launcher-repair tools.
+# - SAFE: GitHub Raw updates are downloaded to a temporary file, rejected when
+#         they look like HTML/error pages, verified for NOMO/version markers,
+#         compiled with py_compile, backed up, and installed atomically.
+# - CLI: `nomo update`, `nomo version`, `nomo rollback`, and `nomo source` are
+#        handled by NOMO itself; the repaired launcher only starts the local app.
+# - BACKUP: Timestamped Python backups are stored in Download/nomo_rejoin/backups.
 #
 # V4.05 — SAFE DIAGNOSTICS EXPORT
 # - NEW: Main menu option 14 exports one redacted diagnostics ZIP.
-# - NEW: Includes package/PID status, state freshness, full resolved AutoExec
-#        paths, runtime snapshots, recent activity, backend health, and device/
-#        Termux/Python information.
-# - SAFE: Cookies, API keys, secrets, webhooks, authorization values, and private
-#         server access/link codes are removed before anything is written.
-# - QOL: ZIP is saved under Download/nomo_rejoin/diagnostics with an exact path
-#        and file size printed after export.
-#
-# V4.04 — PROJECT RENAME / SAFE LOCAL MIGRATION
-# - RENAME: Canonical folder/file are Download/nomo_rejoin/nomo_rejoin.py.
-# - RENAME: State writer folder is nomo_rejoiner; legacy gag_rejoiner is accepted.
-# - RENAME: Bundled counter is NOMO Pet Counter v3.0.
-# - COMPAT: The old `gag` command remains an alias for `nomo`.
+# - NEW: Includes package/PID status, state freshness, full AutoExec paths,
+#        runtimes, recent activity, backend health, and device information.
+# - SAFE: Credentials, cookies, webhooks, and private-server codes are redacted.
 #
 import os
 import re
@@ -43,10 +43,17 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.05"
+__version__ = "V4.06"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
+NOMO_APP_FILE = BASE_DIR / "nomo_rejoin.py"
+NOMO_BACKUP_DIR = BASE_DIR / "backups"
+NOMO_UPDATE_URL = (
+    "https://raw.githubusercontent.com/atmincosplay-ship-it/"
+    "nomo-rejoin-releases/refs/heads/main/nomo_rejoin.py"
+)
+NOMO_UPDATE_MAX_BYTES = 8 * 1024 * 1024
 
 
 def _migrate_legacy_base_dir_once():
@@ -210,6 +217,8 @@ DEFAULT_TABS = [
 DEFAULT_CONFIG = {
     "use_su": True,
     "use_color": True,
+    "update_source_url": NOMO_UPDATE_URL,
+    "update_timeout_seconds": 45,
 
     "cookie_webhook_url": "",   # stored locally, never hardcoded
     "login_challenge_detection_enabled": True,
@@ -2405,6 +2414,7 @@ MAIN_MENU_ITEMS = [
     ("12", "AutoExec manager"),
     ("13", "New Redfinger setup wizard"),
     ("14", "Export diagnostics ZIP"),
+    ("15", "NOMO update manager"),
     ("0",  "Exit"),
 ]
 
@@ -13382,6 +13392,469 @@ def export_diagnostics_zip(cfg):
         print(col(f"Diagnostics export failed: {_diag_redact_text(e)}", RED))
     pause()
 
+# ============================================================
+# BUILT-IN UPDATE MANAGER
+# ============================================================
+
+_UPDATE_VERSION_RE = re.compile(
+    r'(?m)^__version__\s*=\s*["\'](V\d+(?:\.\d+)+)["\']'
+)
+
+
+def nomo_update_source_url(cfg=None):
+    value = ""
+    if isinstance(cfg, dict):
+        value = str(cfg.get("update_source_url", "") or "").strip()
+    return value or NOMO_UPDATE_URL
+
+
+def _nomo_version_from_text(text):
+    match = _UPDATE_VERSION_RE.search(str(text or ""))
+    return match.group(1) if match else ""
+
+
+def _nomo_version_tuple(value):
+    nums = re.findall(r"\d+", str(value or ""))
+    return tuple(int(x) for x in nums) if nums else (0,)
+
+
+def _nomo_fetch_remote_source(cfg):
+    """Download the configured GitHub Raw source without modifying local files."""
+    url = nomo_update_source_url(cfg)
+    timeout = max(10, int(cfg.get("update_timeout_seconds", 45) or 45))
+    separator = "&" if "?" in url else "?"
+    request_url = f"{url}{separator}nomo_cache_bust={int(time.time())}"
+    req = urllib.request.Request(
+        request_url,
+        headers={
+            "User-Agent": f"NOMO-Rejoin/{__version__}",
+            "Accept": "text/plain, application/octet-stream;q=0.9, */*;q=0.1",
+            "Cache-Control": "no-cache",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            content_type = str(response.headers.get("Content-Type", "") or "").lower()
+            raw = response.read(NOMO_UPDATE_MAX_BYTES + 1)
+            status = int(getattr(response, "status", 200) or 200)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"HTTP {e.code}: {e.reason}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"network error: {getattr(e, 'reason', e)}") from e
+    except Exception as e:
+        raise RuntimeError(f"download failed: {e}") from e
+
+    if status < 200 or status >= 300:
+        raise RuntimeError(f"HTTP status {status}")
+    if len(raw) > NOMO_UPDATE_MAX_BYTES:
+        raise RuntimeError(f"remote file is larger than {NOMO_UPDATE_MAX_BYTES // 1024 // 1024} MB")
+    if len(raw) < 10_000:
+        raise RuntimeError(f"remote file is suspiciously small ({len(raw)} bytes)")
+
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError as e:
+        raise RuntimeError("remote file is not valid UTF-8 Python source") from e
+
+    beginning = text.lstrip()[:300].lower()
+    if "text/html" in content_type or beginning.startswith("<!doctype html") or beginning.startswith("<html"):
+        raise RuntimeError("remote server returned HTML instead of Python")
+    if "# nomo rejoin" not in text[:3000].lower():
+        raise RuntimeError("remote file is missing the NOMO REJOIN header")
+    if "def main(" not in text or "if __name__" not in text:
+        raise RuntimeError("remote file is missing required NOMO entry points")
+
+    remote_version = _nomo_version_from_text(text)
+    if not remote_version:
+        raise RuntimeError("remote file has no readable __version__")
+    return text, remote_version, url
+
+
+def _nomo_compile_source_file(path):
+    """Run Python's real py_compile module and remove its temporary pycache."""
+    path = Path(path)
+    result = subprocess.run(
+        [sys.executable, "-m", "py_compile", str(path)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=60,
+    )
+    pycache = path.parent / "__pycache__"
+    try:
+        if pycache.exists():
+            shutil.rmtree(pycache)
+    except Exception:
+        pass
+    if result.returncode != 0:
+        detail = (result.stdout or "py_compile failed").strip()
+        raise RuntimeError(cut(detail, 500))
+    return True
+
+
+def _nomo_unique_backup_path(version, reason="backup"):
+    NOMO_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    safe_version = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(version or "unknown"))
+    safe_reason = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(reason or "backup"))
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    candidate = NOMO_BACKUP_DIR / f"nomo_rejoin_{safe_version}_{safe_reason}_{stamp}.py"
+    index = 2
+    while candidate.exists():
+        candidate = NOMO_BACKUP_DIR / f"nomo_rejoin_{safe_version}_{safe_reason}_{stamp}_{index}.py"
+        index += 1
+    return candidate
+
+
+def _nomo_backup_current(reason="pre_update"):
+    source = NOMO_APP_FILE if NOMO_APP_FILE.exists() else Path(__file__).resolve()
+    if not source.exists():
+        return None
+    try:
+        current_text = source.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        current_text = ""
+    version = _nomo_version_from_text(current_text) or __version__
+    backup = _nomo_unique_backup_path(version, reason)
+    shutil.copy2(source, backup)
+    return backup
+
+
+def _nomo_write_update_atomically(source_text):
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+    temp_path = BASE_DIR / ".nomo_rejoin.update.tmp.py"
+    try:
+        temp_path.write_text(source_text, encoding="utf-8")
+        os.chmod(temp_path, 0o755)
+        _nomo_compile_source_file(temp_path)
+        os.replace(str(temp_path), str(NOMO_APP_FILE))
+        os.chmod(NOMO_APP_FILE, 0o755)
+    finally:
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except Exception:
+            pass
+
+
+def nomo_check_update(cfg, *, print_result=True):
+    source, remote_version, url = _nomo_fetch_remote_source(cfg)
+    local_version = __version__
+    comparison = (
+        1 if _nomo_version_tuple(remote_version) > _nomo_version_tuple(local_version)
+        else -1 if _nomo_version_tuple(remote_version) < _nomo_version_tuple(local_version)
+        else 0
+    )
+    if print_result:
+        print(f"Local:  {local_version}")
+        print(f"Remote: {remote_version}")
+        print(f"Source: {url}")
+        if comparison > 0:
+            print(col("Update available.", GREEN))
+        elif comparison == 0:
+            print(col("Already on the latest version.", GREEN))
+        else:
+            print(col("Remote source is older than this local build.", YELLOW))
+    return {
+        "source": source,
+        "local_version": local_version,
+        "remote_version": remote_version,
+        "url": url,
+        "comparison": comparison,
+    }
+
+
+def nomo_install_latest_update(cfg, *, force=False, restart=False, interactive=True):
+    """Install the GitHub Raw source after full validation and a timestamped backup."""
+    print(col("Downloading and validating NOMO Rejoin...", CYAN))
+    info = nomo_check_update(cfg, print_result=True)
+    comparison = info["comparison"]
+    remote_version = info["remote_version"]
+
+    if comparison < 0 and not force:
+        print(col("Blocked: the remote build is older. Use a backup rollback instead.", RED))
+        return False
+    if comparison == 0 and not force:
+        if not interactive:
+            print(col("Nothing installed; local and remote versions match.", YELLOW))
+            return True
+        if not _setup_yes_no("Reinstall the same version?", default=False):
+            print(col("Update cancelled.", YELLOW))
+            return False
+
+    backup = _nomo_backup_current("pre_update")
+    _nomo_write_update_atomically(info["source"])
+
+    print(col(f"Installed NOMO Rejoin {remote_version}.", GREEN))
+    print(f"Target: {NOMO_APP_FILE}")
+    if backup:
+        print(f"Backup: {backup}")
+    log_activity(f"updated NOMO -> {remote_version}", "", GREEN)
+
+    if restart:
+        do_restart = True
+        if interactive:
+            do_restart = _setup_yes_no("Restart NOMO now?", default=True)
+        if do_restart:
+            print(col("Restarting NOMO...", CYAN))
+            reset_terminal()
+            os.execv(sys.executable, [sys.executable, str(NOMO_APP_FILE)])
+    return True
+
+
+def _nomo_list_backups():
+    if not NOMO_BACKUP_DIR.exists():
+        return []
+    backups = [p for p in NOMO_BACKUP_DIR.glob("nomo_rejoin_*.py") if p.is_file()]
+    return sorted(backups, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def _nomo_backup_description(path):
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        version = _nomo_version_from_text(text) or "unknown"
+        size = path.stat().st_size / 1024
+        when = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+        return version, size, when
+    except Exception:
+        return "unknown", 0.0, "unknown"
+
+
+def nomo_print_backups(cfg):
+    backups = _nomo_list_backups()
+    if not backups:
+        print(col("No NOMO Python backups found.", YELLOW))
+        print(f"Folder: {NOMO_BACKUP_DIR}")
+        return []
+    rows = []
+    for index, backup in enumerate(backups, 1):
+        version, size, when = _nomo_backup_description(backup)
+        rows.append([
+            (str(index), CYAN),
+            (version, WHITE),
+            (when, WHITE),
+            (f"{size:.1f} KB", WHITE, True),
+            (backup.name, DIM),
+        ])
+    draw_table(["No", "Version", "Created", "Size", "File"], rows,
+               [3, 8, 19, 9, 42], cfg)
+    print(f"Folder: {NOMO_BACKUP_DIR}")
+    return backups
+
+
+def nomo_restore_backup(backup, cfg, *, restart=False, interactive=True):
+    backup = Path(backup)
+    if not backup.exists() or not backup.is_file():
+        raise RuntimeError("selected backup does not exist")
+    _nomo_compile_source_file(backup)
+    text = backup.read_text(encoding="utf-8")
+    version = _nomo_version_from_text(text)
+    if not version or "# NOMO REJOIN" not in text[:3000]:
+        raise RuntimeError("selected file is not a valid NOMO Rejoin backup")
+
+    current_backup = _nomo_backup_current("pre_rollback")
+    temp_path = BASE_DIR / ".nomo_rejoin.rollback.tmp.py"
+    try:
+        shutil.copy2(backup, temp_path)
+        _nomo_compile_source_file(temp_path)
+        os.replace(str(temp_path), str(NOMO_APP_FILE))
+        os.chmod(NOMO_APP_FILE, 0o755)
+    finally:
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except Exception:
+            pass
+
+    print(col(f"Rolled back to {version}.", GREEN))
+    print(f"Restored: {backup}")
+    if current_backup:
+        print(f"Current build preserved as: {current_backup}")
+    log_activity(f"rolled back NOMO -> {version}", "", YELLOW)
+
+    if restart:
+        do_restart = True
+        if interactive:
+            do_restart = _setup_yes_no("Restart NOMO now?", default=True)
+        if do_restart:
+            print(col("Restarting NOMO...", CYAN))
+            reset_terminal()
+            os.execv(sys.executable, [sys.executable, str(NOMO_APP_FILE)])
+    return True
+
+
+def nomo_repair_launchers():
+    """Install tiny local-only nomo/gag launchers; update logic stays in Python."""
+    prefix = Path(os.environ.get("PREFIX") or "/data/data/com.termux/files/usr")
+    bin_dir = prefix / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    nomo_cmd = bin_dir / "nomo"
+    gag_cmd = bin_dir / "gag"
+    script = f'''#!/data/data/com.termux/files/usr/bin/bash
+APP={shlex.quote(str(NOMO_APP_FILE))}
+PYTHON={shlex.quote(str(prefix / "bin" / "python"))}
+if [ ! -f "$APP" ]; then
+  echo "NOMO Rejoin is missing: $APP"
+  exit 1
+fi
+if [ ! -x "$PYTHON" ]; then
+  PYTHON="$(command -v python)"
+fi
+exec "$PYTHON" "$APP" "$@"
+'''
+    temp = bin_dir / ".nomo.launcher.tmp"
+    temp.write_text(script, encoding="utf-8")
+    os.chmod(temp, 0o755)
+    os.replace(str(temp), str(nomo_cmd))
+    try:
+        if gag_cmd.exists() or gag_cmd.is_symlink():
+            gag_cmd.unlink()
+        gag_cmd.symlink_to(nomo_cmd)
+    except Exception:
+        shutil.copy2(nomo_cmd, gag_cmd)
+        os.chmod(gag_cmd, 0o755)
+    return nomo_cmd, gag_cmd
+
+
+def nomo_auto_repair_launchers_once(cfg):
+    """Replace the old shell updater once V4.06 is running from the canonical file."""
+    if cfg.get("_v406_launcher_repaired_once"):
+        return False
+    try:
+        if not NOMO_APP_FILE.exists():
+            return False
+        nomo_repair_launchers()
+        cfg["_v406_launcher_repaired_once"] = True
+        save_config(cfg)
+        return True
+    except Exception:
+        return False
+
+
+def nomo_update_manager(cfg):
+    while True:
+        cfg = load_config()
+        clear()
+        banner("NOMO UPDATE MANAGER", cfg)
+        print(f"Local version: {__version__}")
+        print(f"App file:      {NOMO_APP_FILE}")
+        print("")
+        rows = [
+            ("1", "Check for update", CYAN, WHITE),
+            ("2", "Install latest update", CYAN, WHITE),
+            ("3", "Show local / remote version", CYAN, WHITE),
+            ("4", "View update source", CYAN, WHITE),
+            ("5", "List backups", CYAN, WHITE),
+            ("6", "Roll back selected backup", CYAN, WHITE),
+            ("7", "Repair nomo / gag commands", CYAN, WHITE),
+            ("0", "Back", RED, WHITE),
+        ]
+        draw_boxed_menu(rows, cfg)
+        choice = read_menu_choice("\nChoose: ", {"0", "1", "2", "3", "4", "5", "6", "7"})
+        if choice == "0":
+            return
+        if choice is None:
+            print(col("Invalid choice.", RED))
+            time.sleep(1)
+            continue
+
+        clear()
+        banner("NOMO UPDATE MANAGER", cfg)
+        try:
+            if choice in {"1", "3"}:
+                nomo_check_update(cfg, print_result=True)
+                pause()
+            elif choice == "2":
+                nomo_install_latest_update(cfg, restart=True, interactive=True)
+                pause()
+            elif choice == "4":
+                print(col("GitHub Raw update source:", BOLD))
+                print(nomo_update_source_url(cfg))
+                print("")
+                print(col("Local target:", BOLD))
+                print(NOMO_APP_FILE)
+                print("")
+                print("Updates happen only when you choose Install or run `nomo update`.")
+                pause()
+            elif choice == "5":
+                nomo_print_backups(cfg)
+                pause()
+            elif choice == "6":
+                backups = nomo_print_backups(cfg)
+                if not backups:
+                    pause()
+                    continue
+                raw = clean_terminal_input(input("\nBackup number (0 cancels): "))
+                if raw in {"", "0"}:
+                    continue
+                try:
+                    index = int(raw) - 1
+                except Exception:
+                    index = -1
+                if not (0 <= index < len(backups)):
+                    print(col("Invalid backup number.", RED))
+                    pause()
+                    continue
+                selected = backups[index]
+                version, _, _ = _nomo_backup_description(selected)
+                print(f"Selected: {selected.name} ({version})")
+                if _setup_yes_no("Restore this backup?", default=False):
+                    nomo_restore_backup(selected, cfg, restart=True, interactive=True)
+                else:
+                    print(col("Rollback cancelled.", YELLOW))
+                pause()
+            elif choice == "7":
+                nomo_cmd, gag_cmd = nomo_repair_launchers()
+                print(col("Launchers repaired.", GREEN))
+                print(f"nomo: {nomo_cmd}")
+                print(f"gag:  {gag_cmd}")
+                print("")
+                print("Supported commands:")
+                print("  nomo")
+                print("  nomo update")
+                print("  nomo version")
+                print("  nomo rollback")
+                print("  nomo source")
+                pause()
+        except Exception as e:
+            print(col(f"Update manager error: {e}", RED))
+            pause()
+
+
+def handle_nomo_cli_command():
+    """Handle launcher subcommands. Return True when a command was consumed."""
+    if len(sys.argv) < 2:
+        return False
+    command = clean_terminal_input(sys.argv[1]).lower()
+    if command not in {"update", "install", "version", "rollback", "source", "repo", "repair"}:
+        print("Usage: nomo [update|version|rollback|source|repair]")
+        return True
+
+    cfg = load_config()
+    try:
+        if command in {"update", "install"}:
+            force = any(str(x).lower() in {"--force", "-f"} for x in sys.argv[2:])
+            nomo_install_latest_update(cfg, force=force, restart=False, interactive=False)
+        elif command == "version":
+            nomo_check_update(cfg, print_result=True)
+        elif command in {"source", "repo"}:
+            print(nomo_update_source_url(cfg))
+        elif command == "repair":
+            nomo_cmd, gag_cmd = nomo_repair_launchers()
+            print(f"Repaired: {nomo_cmd}")
+            print(f"Alias:    {gag_cmd}")
+        elif command == "rollback":
+            backups = _nomo_list_backups()
+            if not backups:
+                print(f"No backups found in {NOMO_BACKUP_DIR}")
+                return True
+            nomo_restore_backup(backups[0], cfg, restart=False, interactive=False)
+        return True
+    except Exception as e:
+        print(f"NOMO command failed: {e}")
+        return True
+
 
 def select_package_menu(cfg):
     while True:
@@ -13493,6 +13966,7 @@ def select_package_menu(cfg):
 
 def main():
     cfg = load_config()
+    nomo_auto_repair_launchers_once(cfg)
 
     while True:
         reset_terminal()
@@ -13589,6 +14063,11 @@ def main():
             cfg = load_config()
             normalize_active_mode_flags(cfg)
 
+        elif choice == "15":
+            nomo_update_manager(cfg)
+            cfg = load_config()
+            normalize_active_mode_flags(cfg)
+
         elif choice == "0":
             print("Bye.")
             return
@@ -13600,7 +14079,8 @@ def main():
 
 if __name__ == "__main__":
     try:
-        main()
+        if not handle_nomo_cli_command():
+            main()
     except KeyboardInterrupt:
         request_stop()
         reset_terminal()
