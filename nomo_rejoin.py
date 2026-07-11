@@ -1,24 +1,29 @@
 #!/usr/bin/env python3
-# NOMO REJOIN V4.12
+# NOMO REJOIN V4.14
 #
-# V4.12 — PACKAGE-SCOPED CAPTCHA UI OVERRIDE
-# - FIX: A visible Roblox "Verifying you're not a bot" / "Start Puzzle"
-#        screen now overrides a fresh Lua heartbeat. Fresh state no longer makes
-#        a blocked clone appear Online/Ingame.
-# - SAFE: Automatic detection trusts package-scoped uiautomator text only; text
-#         from one floating clone is never broadcast to the other packages.
-# - SOLVER: A visible challenge starts one solver job without pre-restarting the
-#           package. Other clones keep running and queued opens for that package
-#           are cancelled while the challenge is visible.
-# - FIX: Provider NO_CAPTCHA is treated as a false negative when the same
-#        package-scoped verification UI is still visible. The package is held
-#        and retried only after the existing 10-minute cooldown.
+# V4.14 — SOLVER ONCE BEFORE EVERY REAL REJOIN
+# - CORE: Every actual NOMO-triggered package open/rejoin submits that package
+#         to the configured solver exactly once before Roblox is launched.
+# - FLOW: CAPTCHA_SUCCESS and NO_CAPTCHA both continue the original queued open
+#         exactly once; the solver result never creates a duplicate restart.
+# - SAFE: The queue item carries a unique open-generation token, so dashboard
+#         checks and wait loops cannot resubmit the same rejoin attempt.
+# - RESULTS: INVALID_COOKIES holds only that package; SERVER_BUSY schedules one
+#            delayed retry; other provider errors may continue the original open
+#            once without resubmitting, using the configurable safe default.
+# - COMPAT: Visual CAPTCHA detection remains optional and disabled by default;
+#           auto-layout stays available as a separate tool.
 #
-# V4.11 — CUSTOM LUA INPUT TERMINATOR FIX
-# - FIX: AutoExec Manager option 3 now finishes pasted scripts with a line
-#        containing only STOP instead of END.
-# - FIX: Normal Lua `end` lines are preserved and no longer stop input early.
-# - SCOPE: QOL-only; no rejoin, PID, solver, backend, or routing logic changed.
+# V4.13 — CAPTCHA-SAFE AUTO LAYOUT / VISUAL DETECTOR
+# - NEW: Built-in layout manager calculates a clone grid from the active package
+#        count and reserves a visible Termux area instead of covering a clone.
+# - NEW: For four clones, the default visual layout is 3x2: A/B/C on the top row,
+#        D at bottom-left, with Termux occupying the unused bottom-right area.
+# - NEW: One raw in-memory screencap every 30 seconds checks each saved package
+#        rectangle for the white Roblox verification panel + green Start Puzzle
+#        button. No OCR, no PNG file writes, and two hits are required.
+# - SAFE: Applying layout is manual/one-time because it stops only selected clone
+#        PIDs and closes Termux Float. It never reapplies during the rejoin loop.
 #
 import os
 import re
@@ -39,6 +44,7 @@ import getpass
 import hashlib
 import platform
 import zipfile
+import struct
 from pathlib import Path
 from datetime import datetime
 
@@ -46,7 +52,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.12"
+__version__ = "V4.14"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -238,10 +244,40 @@ DEFAULT_CONFIG = {
     "captcha_ui_retry_seconds": 600,
     "captcha_ui_require_package_scope": True,
 
+    # V4.13: lightweight screenshot fallback for Redfinger builds whose Roblox
+    # verification WebView is invisible to uiautomator. Disabled until the user
+    # applies the built-in layout once, which saves exact package rectangles.
+    "captcha_visual_detection_enabled": False,
+    "captcha_visual_scan_seconds": 30,
+    "captcha_visual_confirmations_required": 2,
+    "captcha_visual_min_white_ratio": 0.42,
+    "captcha_visual_min_green_ratio": 0.004,
+    "captcha_visual_layout_cells": {},
+    "captcha_visual_layout_screen": [],
+    "captcha_visual_layout_applied_at": 0,
+
+    # Shared values used by the built-in layout manager and visual detector.
+    "layout_gap": 8,
+    "layout_top": 60,
+    "layout_right_safe": 55,
+    "layout_termux_x": 670,
+    "layout_termux_y": 420,
+    "layout_termux_width": 540,
+    "layout_termux_height": 280,
+
     # CAPTCHA solver. A bare host uses /api/captcha/solve; a URL that already
     # contains a path is used exactly as entered. Automatic jobs start only after
     # a real challenge is detected and run outside the dashboard/main loop.
     "solver_enabled": False,
+    # V4.14: one provider submission immediately before every actual NOMO open.
+    # The unique queue generation prevents duplicate submissions during the same
+    # rejoin attempt. Healthy packages skipped at startup never reach this gate.
+    "solver_once_per_rejoin": True,
+    # When the provider itself errors/times out (not INVALID_COOKIES/SERVER_BUSY),
+    # still perform the original required rejoin once. No second solver request is
+    # made for that generation.
+    "solver_preflight_open_on_failure": True,
+    "solver_preflight_server_busy_retry_seconds": 600,
     "solver_endpoint": "https://solver.wintercode.dev",
     "solver_api_key": "",
     "solver_place_id": "126884695634066",
@@ -1203,6 +1239,15 @@ def apply_update_migrations(cfg):
     # CAPTCHA_SUCCESS and immediately hard-restarted a package that had just opened.
     if cfg.get("solver_rejoin_on_no_captcha") is not False:
         set_cfg("solver_rejoin_on_no_captcha", False)
+    # V4.14: solver runs once before each real queued open. This supersedes the
+    # old wait-until-stale probe for those queue items without changing disabled
+    # solver behavior.
+    if cfg.get("solver_once_per_rejoin") is not True:
+        set_cfg("solver_once_per_rejoin", True)
+    if "solver_preflight_open_on_failure" not in cfg:
+        set_cfg("solver_preflight_open_on_failure", True)
+    if _int_cfg(cfg.get("solver_preflight_server_busy_retry_seconds"), 0) < 600:
+        set_cfg("solver_preflight_server_busy_retry_seconds", 600)
     if "manual_hold_after_solver_rejoin_timeout" not in cfg:
         set_cfg("manual_hold_after_solver_rejoin_timeout", True)
 
@@ -1247,6 +1292,16 @@ def apply_update_migrations(cfg):
         set_cfg("captcha_ui_retry_seconds", 600)
     if "captcha_ui_require_package_scope" not in cfg:
         set_cfg("captcha_ui_require_package_scope", True)
+    if "captcha_visual_detection_enabled" not in cfg:
+        set_cfg("captcha_visual_detection_enabled", False)
+    if _int_cfg(cfg.get("captcha_visual_scan_seconds"), 0) < 15:
+        set_cfg("captcha_visual_scan_seconds", 30)
+    if _int_cfg(cfg.get("captcha_visual_confirmations_required"), 0) < 2:
+        set_cfg("captcha_visual_confirmations_required", 2)
+    if not isinstance(cfg.get("captcha_visual_layout_cells"), dict):
+        set_cfg("captcha_visual_layout_cells", {})
+    if not isinstance(cfg.get("captcha_visual_layout_screen"), list):
+        set_cfg("captcha_visual_layout_screen", [])
 
     # V3.59/V3.60: stale runtime queue self-heal. This replaces manual
     # rm runtime.json for interrupted open/wait cycles, but waits longer so it
@@ -2479,6 +2534,7 @@ MAIN_MENU_ITEMS = [
     ("13", "New Redfinger setup wizard"),
     ("14", "Export diagnostics ZIP"),
     ("15", "NOMO update manager"),
+    ("16", "Layout / visual CAPTCHA"),
     ("0",  "Exit"),
 ]
 
@@ -4779,6 +4835,39 @@ def queue_position(open_queue, pkg):
     return 0
 
 
+def _new_open_generation(package):
+    """Unique token for one real queued open/rejoin attempt."""
+    return f"{time.time_ns()}:{str(package or '')}"
+
+
+def _find_queued_generation(open_queue, package, generation):
+    package = str(package or "")
+    generation = str(generation or "")
+    for item in open_queue or []:
+        if (
+            str((item.get("tab") or {}).get("package", "")) == package
+            and str(item.get("open_generation", "")) == generation
+        ):
+            return item
+    return None
+
+
+def _pop_queued_generation(open_queue, package, generation):
+    package = str(package or "")
+    generation = str(generation or "")
+    for idx, item in enumerate(list(open_queue or [])):
+        if (
+            str((item.get("tab") or {}).get("package", "")) == package
+            and str(item.get("open_generation", "")) == generation
+        ):
+            return open_queue.pop(idx)
+    return None
+
+
+def _remove_queued_generation(open_queue, package, generation):
+    return _pop_queued_generation(open_queue, package, generation) is not None
+
+
 def queue_open(open_queue, tab, target, reason, force=False, skip_if_alive=False, mode="hard", front=False, bypass_manual=False, metadata=None):
     pkg = tab.get("package")
     if queue_has(open_queue, pkg):
@@ -4793,6 +4882,7 @@ def queue_open(open_queue, tab, target, reason, force=False, skip_if_alive=False
         "queued_at": now(),
         "bypass_manual": bool(bypass_manual),
         "retries": 0,
+        "open_generation": _new_open_generation(pkg),
     }
     if isinstance(metadata, dict):
         item.update(metadata)
@@ -5654,12 +5744,15 @@ def maybe_queue_solver_busy_retry(open_queue, tab, target, rt_tab, cfg, health):
 
 
 def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, health):
-    """Handle one package-scoped visible challenge without restarting the clone."""
+    """Turn one package-scoped visible challenge into one queued rejoin.
+
+    V4.14 never submits the solver directly from a dashboard scan. The queued
+    generation owns one pre-open solver request, then one Roblox launch.
+    """
     if str((health or {}).get("bad") or "") != "ui_challenge":
         return None
 
     pkg = str((tab or {}).get("package", "") or "")
-    cancel_queued_package(open_queue, pkg)
     rt_tab["captcha_ui_visible"] = True
     rt_tab["captcha_ui_last_seen_at"] = now()
 
@@ -5671,39 +5764,31 @@ def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, he
     retry_at = int(rt_tab.get("captcha_ui_retry_at", 0) or 0)
     if retry_at > now():
         left = max(1, retry_at - now())
-        note = f"verification UI; solver retry in {format_age(left)}"
+        note = f"verification UI; next rejoin check in {format_age(left)}"
         rt_tab["note"] = note
         return "Captcha", note, True
 
-    started, note = start_solver_job(
-        tab, cfg, rt, rt_tab,
-        "visible package-scoped verification UI",
+    if queue_has(open_queue, pkg):
+        note = "verification UI; rejoin already queued"
+        rt_tab["note"] = note
+        return "Queued", note, True
+
+    added, _ = queue_open(
+        open_queue, tab, target, "visible verification preflight rejoin",
+        force=True, mode="hard_force", bypass_manual=True,
+        metadata={"bypass_recheck": True},
     )
-    if started:
+    if added:
         clear_hold(pkg)
         rt_tab["manual_login_needed"] = False
         rt_tab["manual_login_reason"] = ""
         rt_tab["manual_login_detail"] = ""
-        rt_tab["note"] = note
+        rt_tab["note"] = "verification UI; solver-before-open queued"
         save_runtime(rt)
-        return "Solving", note, True
+        log_activity("verification UI; queued one solver-before-open rejoin", pkg, YELLOW)
+        return "Queued", rt_tab["note"], True
 
-    low = str(note or "").lower()
-    if "retry in" in low or "cooldown" in low:
-        cooldown = max(600, int(cfg.get("captcha_ui_retry_seconds", 600) or 600))
-        last_attempt = int(rt_tab.get("solver_last_attempt", 0) or 0)
-        rt_tab["captcha_ui_retry_at"] = max(now() + 1, last_attempt + cooldown)
-        rt_tab["note"] = note
-        return "Captcha", note, True
-
-    # Solver is disabled/misconfigured or this package has no usable cookie. Hold
-    # only this clone; do not let stale/dead routing start a hard-rejoin loop.
-    rt_tab["manual_login_needed"] = True
-    rt_tab["manual_login_reason"] = "visible verification UI"
-    rt_tab["manual_login_detail"] = str(note or "solver unavailable")
-    rt_tab["manual_login_detected_at"] = now()
-    rt_tab["note"] = str(note or "verification requires manual action")
-    set_hold(pkg, rt_tab["note"])
+    rt_tab["note"] = "verification UI; queue failed"
     save_runtime(rt)
     return "Captcha", rt_tab["note"], True
 
@@ -5742,7 +5827,7 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
             force=True, mode="hard_force", bypass_manual=True,
             metadata={"bypass_recheck": True},
         )
-        return ("Queued" if added else "Manual"),                ("challenge rejoin queued; solver checks after open" if added else "challenge already queued"), True
+        return ("Queued" if added else "Manual"),                ("challenge rejoin queued; solver runs before open" if added else "challenge already queued"), True
 
     # --- disconnect / kick popup: always kill+open ---
     if bad == "disconnect" or (state and state_disconnect_ui(state)):
@@ -5987,6 +6072,198 @@ def android_disconnect_ui_detail(pkg, cfg):
     }
 
 
+
+_VISUAL_CAPTCHA_CACHE = {
+    "ts": 0,
+    "width": 0,
+    "height": 0,
+    "raw_candidates": {},
+    "metrics": {},
+    "error": "not captured",
+}
+_VISUAL_CAPTCHA_CONFIRM = {}
+
+
+def _capture_screencap_raw(cfg, timeout=10):
+    """Capture Android raw framebuffer bytes in memory; no temporary image file."""
+    try:
+        cmd = ["su", "-c", "screencap"] if cfg.get("use_su", True) else ["screencap"]
+        p = subprocess.run(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=max(3, int(timeout or 10)),
+        )
+        if p.returncode != 0 or not p.stdout:
+            return None, "screencap unavailable"
+        data = p.stdout
+        if data.startswith(b"\x89PNG\r\n\x1a\n"):
+            return None, "screencap returned PNG; raw mode unavailable"
+        if len(data) < 16:
+            return None, "short raw screencap"
+        width, height, pixel_format = struct.unpack_from("<III", data, 0)
+        if width <= 0 or height <= 0 or width > 10000 or height > 10000:
+            return None, "invalid raw screencap header"
+        expected = int(width) * int(height) * 4
+        if len(data) - 12 == expected:
+            header = 12
+        elif len(data) - 16 == expected:
+            header = 16
+        elif len(data) - 16 > expected:
+            header = 16
+        elif len(data) - 12 > expected:
+            header = 12
+        else:
+            header = None
+        if header is None:
+            return None, f"unsupported screencap size {len(data)} for {width}x{height}"
+        pixels = memoryview(data)[header:header + expected]
+        return {
+            "width": int(width),
+            "height": int(height),
+            "format": int(pixel_format),
+            "pixels": pixels,
+        }, ""
+    except subprocess.TimeoutExpired:
+        return None, "screencap timeout"
+    except Exception as exc:
+        return None, f"screencap error: {cut(str(exc), 80)}"
+
+
+def _visual_cell_metrics(frame, rect):
+    """Sample one app cell for a white panel and green Start Puzzle button."""
+    width = int(frame["width"])
+    height = int(frame["height"])
+    pixels = frame["pixels"]
+    try:
+        left, top, right, bottom = [int(x) for x in rect]
+    except Exception:
+        return {"candidate": False, "white_ratio": 0.0, "green_ratio": 0.0, "samples": 0}
+    left = max(0, min(width - 1, left))
+    right = max(left + 1, min(width, right))
+    top = max(0, min(height - 1, top))
+    bottom = max(top + 1, min(height, bottom))
+    cw = right - left
+    ch = bottom - top
+    if cw < 80 or ch < 80:
+        return {"candidate": False, "white_ratio": 0.0, "green_ratio": 0.0, "samples": 0}
+    x1 = left + int(cw * 0.06)
+    x2 = right - int(cw * 0.06)
+    y1 = top + int(ch * 0.12)
+    y2 = bottom - int(ch * 0.06)
+    step = max(4, min(10, min(cw, ch) // 45))
+    white = total = 0
+    green = green_total = 0
+    green_y1 = top + int(ch * 0.55)
+    green_y2 = bottom - int(ch * 0.06)
+    green_x1 = left + int(cw * 0.20)
+    green_x2 = right - int(cw * 0.20)
+    for y in range(y1, y2, step):
+        row = y * width * 4
+        for x in range(x1, x2, step):
+            i = row + x * 4
+            r = int(pixels[i])
+            g = int(pixels[i + 1])
+            b = int(pixels[i + 2])
+            total += 1
+            if r >= 215 and g >= 215 and b >= 215 and max(r, g, b) - min(r, g, b) <= 38:
+                white += 1
+            if green_x1 <= x < green_x2 and green_y1 <= y < green_y2:
+                green_total += 1
+                if g >= 120 and g - r >= 22 and g - b >= 18:
+                    green += 1
+    return {
+        "candidate": False,
+        "white_ratio": (white / total) if total else 0.0,
+        "green_ratio": (green / green_total) if green_total else 0.0,
+        "samples": total,
+    }
+
+
+def capture_visual_captcha_snapshot(cfg, force=False):
+    """Capture once and analyze every saved package rectangle."""
+    global _VISUAL_CAPTCHA_CACHE
+    if not cfg.get("captcha_visual_detection_enabled", False) and not force:
+        return _VISUAL_CAPTCHA_CACHE
+    cells = cfg.get("captcha_visual_layout_cells")
+    if not isinstance(cells, dict) or not cells:
+        _VISUAL_CAPTCHA_CACHE = {
+            "ts": now(), "width": 0, "height": 0,
+            "raw_candidates": {}, "metrics": {}, "error": "visual layout not applied",
+        }
+        return _VISUAL_CAPTCHA_CACHE
+    t = now()
+    scan_seconds = max(15, int(cfg.get("captcha_visual_scan_seconds", 30) or 30))
+    if not force and int(_VISUAL_CAPTCHA_CACHE.get("ts", 0) or 0) > 0:
+        if t - int(_VISUAL_CAPTCHA_CACHE.get("ts", 0) or 0) < scan_seconds:
+            return _VISUAL_CAPTCHA_CACHE
+    frame, error = _capture_screencap_raw(cfg, timeout=10)
+    if not frame:
+        _VISUAL_CAPTCHA_CACHE = {
+            "ts": t, "width": 0, "height": 0,
+            "raw_candidates": {}, "metrics": {}, "error": error,
+        }
+        return _VISUAL_CAPTCHA_CACHE
+    saved_screen = cfg.get("captcha_visual_layout_screen") or []
+    if len(saved_screen) >= 2:
+        try:
+            if int(saved_screen[0]) != frame["width"] or int(saved_screen[1]) != frame["height"]:
+                _VISUAL_CAPTCHA_CACHE = {
+                    "ts": t, "width": frame["width"], "height": frame["height"],
+                    "raw_candidates": {}, "metrics": {},
+                    "error": "screen size changed; reapply layout",
+                }
+                return _VISUAL_CAPTCHA_CACHE
+        except Exception:
+            pass
+    white_min = float(cfg.get("captcha_visual_min_white_ratio", 0.42) or 0.42)
+    green_min = float(cfg.get("captcha_visual_min_green_ratio", 0.004) or 0.004)
+    metrics = {}
+    raw_candidates = {}
+    for pkg, rect in cells.items():
+        m = _visual_cell_metrics(frame, rect)
+        candidate = bool(m["white_ratio"] >= white_min and m["green_ratio"] >= green_min)
+        m["candidate"] = candidate
+        metrics[str(pkg)] = m
+        raw_candidates[str(pkg)] = candidate
+    _VISUAL_CAPTCHA_CACHE = {
+        "ts": t, "width": frame["width"], "height": frame["height"],
+        "raw_candidates": raw_candidates, "metrics": metrics, "error": "",
+    }
+    return _VISUAL_CAPTCHA_CACHE
+
+
+def visual_captcha_detail(pkg, cfg, force=False, bypass_confirm=False):
+    """Return a confirmed package-scoped screenshot challenge signal."""
+    snapshot = capture_visual_captcha_snapshot(cfg, force=force)
+    pkg = str(pkg or "")
+    metrics = (snapshot.get("metrics") or {}).get(pkg) or {}
+    candidate = bool((snapshot.get("raw_candidates") or {}).get(pkg, False))
+    snap_ts = int(snapshot.get("ts", 0) or 0)
+    rec = _VISUAL_CAPTCHA_CONFIRM.setdefault(pkg, {"count": 0, "snapshot_ts": 0, "last_seen": 0})
+    if snap_ts and snap_ts != int(rec.get("snapshot_ts", 0) or 0):
+        rec["snapshot_ts"] = snap_ts
+        if candidate:
+            rec["count"] = int(rec.get("count", 0) or 0) + 1
+            rec["last_seen"] = snap_ts
+        else:
+            rec["count"] = 0
+    required = max(2, int(cfg.get("captcha_visual_confirmations_required", 2) or 2))
+    if not candidate or (not bypass_confirm and int(rec.get("count", 0) or 0) < required):
+        return None
+    return {
+        "title": "Roblox Verification",
+        "text": (
+            f"visual white={float(metrics.get('white_ratio', 0.0)):.3f} "
+            f"green={float(metrics.get('green_ratio', 0.0)):.3f}"
+        ),
+        "reason": "android_package_scoped_visual_captcha",
+        "hits": ["visual verification panel", "green start-puzzle button"],
+        "visual_metrics": metrics,
+    }
+
+
 def android_login_challenge_ui_detail(pkg, cfg, force=False):
     """Return a strong package-scoped Roblox verification signal.
 
@@ -6001,7 +6278,7 @@ def android_login_challenge_ui_detail(pkg, cfg, force=False):
 
     texts, _ = android_ui_text_for_package(str(pkg or ""), cfg, force=force)
     if not texts:
-        return None
+        return visual_captcha_detail(pkg, cfg, force=force, bypass_confirm=False)
 
     joined = "\n".join(str(x) for x in texts if str(x or "").strip())
     low = joined.lower()
@@ -6028,7 +6305,7 @@ def android_login_challenge_ui_detail(pkg, cfg, force=False):
     if not hits and "not a bot" in low and ("verification" in low or "security" in low):
         hits = ["not a bot"]
     if not hits:
-        return None
+        return visual_captcha_detail(pkg, cfg, force=force, bypass_confirm=False)
 
     return {
         "title": "Roblox Verification",
@@ -6092,8 +6369,17 @@ def ui_login_challenge_detection(tab, cfg, force=True, allow_unscoped=True):
     login_only = [t for t in ["log in", "login", "sign up"] if t in low]
     if login_only:
         return False, f"ui login text only ({scope_note}); not captcha"
+    visual = visual_captcha_detail(pkg, cfg, force=force, bypass_confirm=True)
+    if visual:
+        metrics = visual.get("visual_metrics", {}) or {}
+        return True, (
+            "visual captcha package-scoped "
+            f"white={float(metrics.get('white_ratio', 0.0)):.3f} "
+            f"green={float(metrics.get('green_ratio', 0.0)):.3f}"
+        )
+    visual_error = str(capture_visual_captcha_snapshot(cfg, force=False).get("error", "") or "")
     if not source:
-        return None, "ui has no accessible text"
+        return None, "ui has no accessible text" + (("; " + visual_error) if visual_error else "")
     return False, f"ui no strong captcha text ({scope_note})"
 
 
@@ -6297,17 +6583,31 @@ def wait_until_fresh_after_open(tab, cfg, rt, opened_at, timeout_override=None, 
         status_note = ""
         visible_captcha = android_login_challenge_ui_detail(pkg, cfg, force=False) if alive else None
         if visible_captcha:
+            rt_tab["captcha_ui_visible"] = True
+            rt_tab["captcha_ui_last_seen_at"] = now()
+            if not allow_solver_probe and cfg.get("solver_once_per_rejoin", True):
+                retry_after = max(600, int(cfg.get("solver_retry_cooldown_seconds", 600) or 600))
+                rt_tab["captcha_ui_retry_at"] = now() + retry_after
+                rt_tab["note"] = f"verification remains after one solver check; retry rejoin in {format_age(retry_after)}"
+                save_runtime(rt)
+                log_activity("verification remains after solver-before-open; no duplicate submit", pkg, YELLOW)
+                return False, "manual challenge"
             solver_status, solver_note = handle_detected_solver_challenge(
                 tab, cfg, rt, rt_tab, "visible package-scoped verification UI"
             )
-            rt_tab["captcha_ui_visible"] = True
-            rt_tab["captcha_ui_last_seen_at"] = now()
             rt_tab["note"] = solver_note
             save_runtime(rt)
             return False, "solver pending" if solver_status == "Solving" else "manual challenge"
         if state_disconnect_ui(state):
             status_note = state_disconnect_note(state)
         elif state_login_challenge_detail(state):
+            if not allow_solver_probe and cfg.get("solver_once_per_rejoin", True):
+                retry_after = max(600, int(cfg.get("solver_retry_cooldown_seconds", 600) or 600))
+                rt_tab["captcha_ui_retry_at"] = now() + retry_after
+                rt_tab["note"] = f"challenge remains after one solver check; retry rejoin in {format_age(retry_after)}"
+                save_runtime(rt)
+                log_activity("challenge remains after solver-before-open; no duplicate submit", pkg, YELLOW)
+                return False, "manual challenge"
             solver_status, solver_note = handle_detected_solver_challenge(
                 tab, cfg, rt, rt_tab, state_login_challenge_detail(state)
             )
@@ -6350,9 +6650,99 @@ def wait_until_fresh_after_open(tab, cfg, rt, opened_at, timeout_override=None, 
     return False, "fresh timeout"
 
 
+def solver_preflight_before_open(open_queue, item, tab, rt_tab, pkg, target, cfg, rt):
+    """Gate one queue generation on exactly one solver request before launch.
+
+    Returns (state, item): state is ready, waiting, or handled. Waiting keeps the
+    queue item; handled means it was held/removed and must not be opened.
+    """
+    if (
+        not cfg.get("solver_enabled", False)
+        or not cfg.get("solver_once_per_rejoin", True)
+        or item.get("skip_solver_once")
+    ):
+        return "ready", item
+
+    generation = str(item.get("open_generation", "") or "")
+    if not generation:
+        generation = _new_open_generation(pkg)
+        item["open_generation"] = generation
+
+    if item.get("solver_preflight_done"):
+        item["skip_solver_probe"] = True
+        return "ready", item
+
+    if item.get("solver_preflight_waiting"):
+        if solver_job_completion_state(pkg):
+            # poll_solver_jobs needs the generation present in the real queue so
+            # it can unlock/remove exactly that item.
+            open_queue.insert(0, item)
+            poll_solver_jobs(cfg, rt, open_queue)
+            updated = _pop_queued_generation(open_queue, pkg, generation)
+            if updated is None:
+                return "handled", None
+            item = updated
+            if item.get("solver_preflight_done"):
+                return "ready", item
+
+        if solver_job_running(pkg):
+            open_queue.append(item)
+            rt_tab["note"] = solver_job_note(pkg)
+            save_runtime(rt)
+            return "waiting", item
+
+        # A vanished in-memory job should not permanently wedge this queue item.
+        item["solver_preflight_waiting"] = False
+
+    started, note = start_solver_job(
+        tab, cfg, rt, rt_tab,
+        reason=f"before rejoin: {item.get('reason', 'queued open')}",
+        force=True,
+        phase="preopen",
+        open_generation=generation,
+        target_override=target,
+    )
+    if started:
+        item["solver_preflight_waiting"] = True
+        open_queue.append(item)
+        rt_tab["note"] = note
+        save_runtime(rt)
+        return "waiting", item
+
+    note_l = str(note or "").lower()
+    if "invalid/expired" in note_l or "no package cookie" in note_l:
+        rt_tab["manual_login_needed"] = True
+        rt_tab["manual_login_reason"] = "invalid or missing package cookie"
+        rt_tab["manual_login_detail"] = str(note)
+        rt_tab["manual_login_detected_at"] = now()
+        rt_tab["note"] = str(note)
+        set_hold(pkg, str(note))
+        log_activity(f"solver preflight blocked open: {cut(note, 80)}", pkg, RED)
+        save_runtime(rt)
+        return "handled", None
+
+    # Misconfiguration or a local precheck problem must not destroy the original
+    # rejoin need. Continue once, but mark this generation checked so the
+    # post-open wait cannot submit it again.
+    item["solver_preflight_done"] = True
+    item["solver_result"] = "SOLVER_SKIPPED"
+    item["skip_solver_once"] = True
+    item["skip_solver_probe"] = True
+    rt_tab["note"] = f"solver skipped; opening once: {cut(note, 60)}"
+    log_activity(f"solver skipped before open; original rejoin continues: {cut(note, 75)}", pkg, YELLOW)
+    save_runtime(rt)
+    return "ready", item
+
+
 def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0):
     if not open_queue:
         return False
+
+    # A pre-open solver may finish between dashboard ticks. Apply its result
+    # while the matching generation is still in the queue.
+    poll_solver_jobs(cfg, rt, open_queue)
+    if not open_queue:
+        return True
 
     item = open_queue.pop(0)
     tab = item["tab"]
@@ -6426,6 +6816,13 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0):
             rt_tab["note"] = f"stagger wait {max(1, stagger - since)}s"
             save_runtime(rt)
             return True
+
+    preflight_state, preflight_item = solver_preflight_before_open(
+        open_queue, item, tab, rt_tab, pkg, target, cfg, rt
+    )
+    if preflight_state != "ready":
+        return True
+    item = preflight_item or item
 
     if cfg.get("workspace_sync_enabled", False) and cfg.get("workspace_sync_before_open", True) and workspace_sync_allowed_for_mode(cfg):
         run_workspace_sync(cfg, rt, reason=f"before open {pkg}", force=False)
@@ -9027,7 +9424,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
 
             # A Lua-reported CAPTCHA outranks stale/dead routing, but the
             # provider is never called from the middle-session dashboard. Queue
-            # one package rejoin; wait-after-open owns the single provider call.
+            # one package rejoin; the queued generation owns one pre-open provider call.
             if health.get("bad") == "challenge" or (state and state_login_challenge_detail(state)):
                 cancel_queued_package(open_queue, pkg)
                 added, _ = queue_open(
@@ -9036,7 +9433,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                     metadata={"bypass_recheck": True},
                 )
                 status = "Queued" if added else "Manual"
-                note = "challenge rejoin queued; solver checks after open" if added else "challenge already queued"
+                note = "challenge rejoin queued; solver runs before open" if added else "challenge already queued"
 
             # V4.12: visible package-scoped verification UI outranks every
             # stale/dead/routing decision above. Remove only this package's queued
@@ -9048,7 +9445,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                 status, note, _ = captcha_action
 
             # V3.84: no pool-wide provider scan here. The old-state hard queue
-            # gets its normal turn; its wait-after-open performs one CAPTCHA check.
+            # gets its normal turn; its queued generation performs one solver check before opening.
 
             due_refresh, refresh_left = periodic_hard_refresh_due(rt_tab, cfg)
             if due_refresh and captcha_action is None and not open_queue and not queue_has(open_queue, pkg) and not solver_job_running(pkg):
@@ -11568,6 +11965,8 @@ def solver_job_note(package):
         timeout = int(job.get("timeout", 180) or 180)
         if job.get("phase") == "probe":
             return f"checking captcha {elapsed}/{timeout}s"
+        if job.get("phase") == "preopen":
+            return f"solver before open {elapsed}/{timeout}s"
         return f"solver running {elapsed}/{timeout}s"
 
 
@@ -11807,7 +12206,7 @@ def _solver_worker(package, cookie, cfg_snapshot, place_id):
             job["finished_at"] = now()
 
 
-def start_solver_job(tab, cfg, rt, rt_tab, reason, force=False):
+def start_solver_job(tab, cfg, rt, rt_tab, reason, force=False, phase="solve", open_generation="", target_override=""):
     pkg = str((tab or {}).get("package", "") or "")
     if not pkg:
         return False, "solver: missing package"
@@ -11842,7 +12241,7 @@ def start_solver_job(tab, cfg, rt, rt_tab, reason, force=False):
 
     place_id = solver_place_id_for_tab(tab, cfg)
     timeout = max(15, int(cfg.get("solver_timeout_seconds", 180) or 180))
-    target = str(rt_tab.get("target", "") or ("hatcher" if (tab or {}).get("server_link") else "market"))
+    target = str(target_override or rt_tab.get("target", "") or ("hatcher" if (tab or {}).get("server_link") else "market"))
     cfg_snapshot = {
         "solver_enabled": True,
         "solver_endpoint": str(cfg.get("solver_endpoint", "") or ""),
@@ -11856,7 +12255,8 @@ def start_solver_job(tab, cfg, rt, rt_tab, reason, force=False):
         "tab": dict(tab or {}),
         "target": target,
         "reason": str(reason or "challenge"),
-        "phase": "solve",
+        "phase": str(phase or "solve"),
+        "open_generation": str(open_generation or ""),
         "started_at": now(),
         "timeout": timeout,
         "done": False,
@@ -11870,9 +12270,10 @@ def start_solver_job(tab, cfg, rt, rt_tab, reason, force=False):
     rt_tab["solver_started_at"] = job["started_at"]
     rt_tab["solver_last_attempt"] = job["started_at"]
     rt_tab["solver_reason"] = job["reason"]
-    rt_tab["note"] = "solver starting"
+    rt_tab["note"] = "solver before open" if job["phase"] == "preopen" else "solver starting"
     save_runtime(rt)
-    log_activity(f"solver started: {cut(job['reason'], 60)}", pkg, CYAN)
+    prefix = "solver before open" if job["phase"] == "preopen" else "solver started"
+    log_activity(f"{prefix}: {cut(job['reason'], 60)}", pkg, CYAN)
 
     thread = threading.Thread(
         target=_solver_worker,
@@ -11944,6 +12345,85 @@ def poll_solver_jobs(cfg, rt, open_queue):
             status_code in {"CAPTCHA_SUCCESS", "SUCCESS", "SOLVED", "COMPLETED", "OK"}
             or bool(job.get("ok"))
         )
+
+        # V4.14: pre-open jobs do not create a second queue entry. They unlock
+        # the original generation exactly once, so CAPTCHA_SUCCESS and
+        # NO_CAPTCHA both lead to one Roblox launch—not open -> solve -> reopen.
+        if str(job.get("phase", "")) == "preopen":
+            generation = str(job.get("open_generation", "") or "")
+            queued_item = _find_queued_generation(open_queue, pkg, generation)
+            detail = _solver_probe_detail(response)
+
+            if no_captcha_result or solved_result:
+                result_label = "NO_CAPTCHA" if no_captcha_result else "CAPTCHA_SUCCESS"
+                clear_hold(pkg)
+                clear_manual_login_block(rt_tab)
+                clear_captcha_ui_runtime(rt_tab)
+                rt_tab["solver_busy_retry_pending"] = False
+                rt_tab["solver_busy_retry_at"] = 0
+                rt_tab["solver_state"] = "success" if solved_result else "clear"
+                rt_tab["solver_last_success"] = now()
+                rt_tab["solver_last_error"] = ""
+                rt_tab["solver_last_probe"] = detail
+                rt_tab["note"] = f"{result_label}; opening once"
+                if queued_item is not None:
+                    queued_item["solver_preflight_waiting"] = False
+                    queued_item["solver_preflight_done"] = True
+                    queued_item["solver_result"] = result_label
+                    queued_item["skip_solver_once"] = True
+                    queued_item["skip_solver_probe"] = True
+                    queued_item["bypass_recheck_after_solver"] = False
+                    log_activity(f"solver {result_label}; original rejoin unlocked", pkg, GREEN)
+                else:
+                    log_activity(f"solver {result_label}; queue generation no longer exists", pkg, YELLOW)
+                changed = True
+                continue
+
+            err = _solver_error_text(response)
+            rt_tab["solver_state"] = "failed"
+            rt_tab["solver_last_error"] = err
+
+            if status_code in {"SERVER_BUSY", "BUSY", "RATE_LIMITED", "TOO_MANY_REQUESTS"}:
+                retry_after = max(
+                    600,
+                    int(cfg.get("solver_preflight_server_busy_retry_seconds", 600) or 600),
+                )
+                _remove_queued_generation(open_queue, pkg, generation)
+                rt_tab["solver_busy_retry_pending"] = True
+                rt_tab["solver_busy_retry_at"] = now() + retry_after
+                rt_tab["note"] = f"SERVER_BUSY; retry rejoin in {format_age(retry_after)}"
+                log_activity(f"solver SERVER_BUSY before open; retry in {format_age(retry_after)}", pkg, YELLOW)
+            elif status_code in {"INVALID_COOKIES", "INVALID_COOKIE", "UNAUTHORIZED", "AUTH_FAILED"}:
+                _remove_queued_generation(open_queue, pkg, generation)
+                rt_tab["solver_busy_retry_pending"] = False
+                rt_tab["solver_busy_retry_at"] = 0
+                rt_tab["manual_login_needed"] = True
+                rt_tab["manual_login_reason"] = "invalid package cookie"
+                rt_tab["manual_login_detail"] = err
+                rt_tab["manual_login_detected_at"] = now()
+                rt_tab["note"] = "INVALID_COOKIES - refresh account cookie"
+                set_hold(pkg, "solver rejected invalid/expired package cookie")
+                log_activity("solver INVALID_COOKIES before open; package held", pkg, RED)
+            elif cfg.get("solver_preflight_open_on_failure", True):
+                rt_tab["note"] = f"solver error; opening once: {cut(err, 60)}"
+                if queued_item is not None:
+                    queued_item["solver_preflight_waiting"] = False
+                    queued_item["solver_preflight_done"] = True
+                    queued_item["solver_result"] = "SOLVER_ERROR"
+                    queued_item["skip_solver_once"] = True
+                    queued_item["skip_solver_probe"] = True
+                log_activity(f"solver error before open; original rejoin continues once: {cut(err, 70)}", pkg, YELLOW)
+            else:
+                _remove_queued_generation(open_queue, pkg, generation)
+                rt_tab["manual_login_needed"] = True
+                rt_tab["manual_login_reason"] = "solver failed before rejoin"
+                rt_tab["manual_login_detail"] = err
+                rt_tab["manual_login_detected_at"] = now()
+                rt_tab["note"] = f"solver failed before open: {cut(err, 70)}"
+                set_hold(pkg, f"solver failed before open: {err}")
+                log_activity(f"solver failed before open; package held: {cut(err, 70)}", pkg, RED)
+            changed = True
+            continue
 
         # V4.12: the provider can return NO_CAPTCHA even while Roblox visibly
         # shows "Verifying you're not a bot". Recheck a fresh package-scoped UI
@@ -12018,6 +12498,7 @@ def poll_solver_jobs(cfg, rt, open_queue):
                     metadata={
                         "solver_recovery": True,
                         "solver_result": result_label,
+                        "skip_solver_once": True,
                         "skip_solver_probe": True,
                         "bypass_recheck": True,
                     },
@@ -14586,6 +15067,268 @@ def select_package_menu(cfg):
             print(col("Invalid choice.", RED))
             time.sleep(1)
 
+
+# ============================================================
+# V4.13 CAPTCHA-SAFE AUTO LAYOUT
+# ============================================================
+
+_TERMUX_FLOAT_PREF = "/data/data/com.termux.window/shared_prefs/com.termux.window_preferences.xml"
+
+
+def _screen_size(cfg):
+    code, out = shell_timeout("wm size", cfg, capture=True, timeout=5)
+    matches = re.findall(r"(\d+)x(\d+)", out or "")
+    if matches:
+        width, height = [int(x) for x in matches[-1]]
+    else:
+        width, height = 1280, 720
+    if height > width:
+        width, height = height, width
+    return width, height
+
+
+def _layout_active_packages(cfg):
+    installed = set(get_installed_packages())
+    result = []
+    for tab in cfg.get("tabs", []):
+        pkg = str(tab.get("package") or "").strip()
+        if pkg and tab.get("enabled", True) and pkg in installed and pkg not in result:
+            result.append(pkg)
+    return result
+
+
+def _layout_shape_for_count(count):
+    count = max(1, int(count or 1))
+    if count <= 5:
+        return 3, 2
+    if count <= 7:
+        return 4, 2
+    if count <= 9:
+        return 5, 2
+    if count <= 11:
+        return 4, 3
+    return 5, 3
+
+
+def _compute_captcha_safe_layout(cfg, packages=None):
+    packages = list(packages or _layout_active_packages(cfg))
+    width, height = _screen_size(cfg)
+    gap = max(0, int(cfg.get("layout_gap", 8) or 8))
+    top = max(0, int(cfg.get("layout_top", 60) or 60))
+    right_safe = max(0, int(cfg.get("layout_right_safe", 55) or 55))
+    cols, rows = _layout_shape_for_count(len(packages))
+    cw = max(120, (width - right_safe - (cols + 1) * gap) // cols)
+    ch = max(120, (height - top - (rows + 1) * gap) // rows)
+    cells = {}
+    for index, pkg in enumerate(packages):
+        col_idx = index % cols
+        row_idx = index // cols
+        left = gap + col_idx * (cw + gap)
+        cell_top = top + gap + row_idx * (ch + gap)
+        cells[pkg] = [left, cell_top, left + cw, cell_top + ch]
+    if len(packages) <= 4:
+        termux = [
+            int(cfg.get("layout_termux_x", 670) or 670),
+            int(cfg.get("layout_termux_y", 420) or 420),
+            int(cfg.get("layout_termux_width", 540) or 540),
+            int(cfg.get("layout_termux_height", 280) or 280),
+        ]
+    else:
+        reserved_index = cols * rows - 1
+        col_idx = reserved_index % cols
+        row_idx = reserved_index // cols
+        left = gap + col_idx * (cw + gap)
+        cell_top = top + gap + row_idx * (ch + gap)
+        termux = [left, cell_top, cw, ch]
+    return {
+        "screen": [width, height], "cols": cols, "rows": rows,
+        "cell_size": [cw, ch], "cells": cells, "termux": termux,
+    }
+
+
+def _app_cloner_pref_file(pkg, cfg):
+    pkg = str(pkg or "").strip()
+    if not pkg or not re.fullmatch(r"[A-Za-z0-9._-]+", pkg):
+        return ""
+    cmd = (
+        f'for f in /data/data/{pkg}/shared_prefs/*.xml; do '
+        '[ -f "$f" ] && grep -q app_cloner_current_window "$f" && { echo "$f"; break; }; '
+        'done'
+    )
+    code, out = shell_timeout(cmd, cfg, capture=True, timeout=8)
+    return out.splitlines()[0].strip() if code == 0 and out.strip() else ""
+
+
+def _set_app_cloner_bounds(pkg, rect, cfg):
+    pref = _app_cloner_pref_file(pkg, cfg)
+    if not pref:
+        return False, "App Cloner window XML not found"
+    left, top, right, bottom = [int(x) for x in rect]
+    stopped, stop_note = force_stop_package(pkg, cfg, tries=2, wait_after=0.5, settle=0.5)
+    if not stopped:
+        return False, stop_note
+    expr = "; ".join([
+        rf's/app_cloner_current_window_left" value="[0-9-]+/app_cloner_current_window_left" value="{left}/',
+        rf's/app_cloner_current_window_top" value="[0-9-]+/app_cloner_current_window_top" value="{top}/',
+        rf's/app_cloner_current_window_right" value="[0-9-]+/app_cloner_current_window_right" value="{right}/',
+        rf's/app_cloner_current_window_bottom" value="[0-9-]+/app_cloner_current_window_bottom" value="{bottom}/',
+    ])
+    code, out = shell_timeout(
+        f"sed -i -E {shlex.quote(expr)} {shlex.quote(pref)}",
+        cfg, capture=True, timeout=8,
+    )
+    if code != 0:
+        return False, cut(out or f"sed error {code}", 100)
+    return True, f"{left},{top},{right},{bottom}"
+
+
+def _set_termux_float_bounds(termux, cfg):
+    x, y, width, height = [int(v) for v in termux]
+    expr = "; ".join([
+        rf's/window_width" value="[0-9-]+/window_width" value="{width}/',
+        rf's/window_height" value="[0-9-]+/window_height" value="{height}/',
+        rf's/window_x" value="[0-9-]+/window_x" value="{x}/',
+        rf's/window_y" value="[0-9-]+/window_y" value="{y}/',
+    ])
+    cmd = (
+        f"[ -f {shlex.quote(_TERMUX_FLOAT_PREF)} ] || exit 3; "
+        f"sed -i -E {shlex.quote(expr)} {shlex.quote(_TERMUX_FLOAT_PREF)}"
+    )
+    code, out = shell_timeout(cmd, cfg, capture=True, timeout=8)
+    if code != 0:
+        return False, cut(out or "Termux Float XML not found", 100)
+    force_stop_package("com.termux.window", cfg, tries=2, wait_after=0.3, settle=0.3)
+    return True, f"x={x} y={y} w={width} h={height}"
+
+
+def _layout_preview(layout, cfg):
+    print(f"Screen : {layout['screen'][0]}x{layout['screen'][1]}")
+    print(f"Grid   : {layout['cols']}x{layout['rows']}")
+    print(f"Cell   : {layout['cell_size'][0]}x{layout['cell_size'][1]}")
+    print("")
+    for pkg, rect in layout["cells"].items():
+        print(f"  {short_pkg(pkg):<12} {rect[0]},{rect[1]} -> {rect[2]},{rect[3]}")
+    tx, ty, tw, th = layout["termux"]
+    print(f"  {'Termux Float':<12} x={tx} y={ty} w={tw} h={th}")
+
+
+def apply_captcha_safe_layout(cfg):
+    packages = _layout_active_packages(cfg)
+    if not packages:
+        print(col("No enabled installed packages found.", RED))
+        pause()
+        return
+    layout = _compute_captcha_safe_layout(cfg, packages)
+    clear()
+    banner("APPLY CAPTCHA-SAFE LAYOUT", cfg)
+    _layout_preview(layout, cfg)
+    print("")
+    print(col("This stops only the selected clone PIDs and closes Termux Float once.", YELLOW))
+    print(col("It does not run again automatically during rejoin.", DIM))
+    confirm = input("\nApply this layout? [Y/n]: ").strip().lower()
+    if confirm in {"n", "no"}:
+        return
+    results = []
+    successful_cells = {}
+    for pkg, rect in layout["cells"].items():
+        ok, note = _set_app_cloner_bounds(pkg, rect, cfg)
+        results.append((pkg, ok, note))
+        if ok:
+            successful_cells[pkg] = rect
+    termux_ok, termux_note = _set_termux_float_bounds(layout["termux"], cfg)
+    cfg["captcha_visual_layout_cells"] = successful_cells
+    cfg["captcha_visual_layout_screen"] = layout["screen"]
+    cfg["captcha_visual_layout_applied_at"] = now()
+    cfg["captcha_visual_detection_enabled"] = bool(successful_cells)
+    save_config(cfg)
+    clear()
+    banner("LAYOUT RESULTS", cfg)
+    for pkg, ok, note in results:
+        print(f"  {short_pkg(pkg):<12} {col('OK' if ok else 'FAILED', GREEN if ok else RED)}  {note}")
+    print(f"  {'Termux Float':<12} {col('OK' if termux_ok else 'FAILED', GREEN if termux_ok else YELLOW)}  {termux_note}")
+    print("")
+    print(col("Visual CAPTCHA detection enabled for successfully mapped packages.", GREEN))
+    print(col("Reopen Termux Float, then use Option 1 to start NOMO normally.", DIM))
+    pause()
+
+
+def test_visual_captcha_layout(cfg):
+    clear()
+    banner("VISUAL CAPTCHA TEST", cfg)
+    cells = cfg.get("captcha_visual_layout_cells") or {}
+    if not cells:
+        print(col("No saved layout. Apply option 2 first.", RED))
+        pause()
+        return
+    snap = capture_visual_captcha_snapshot(cfg, force=True)
+    print(f"Screen: {snap.get('width', 0)}x{snap.get('height', 0)}")
+    if snap.get("error"):
+        print(col(f"Error: {snap.get('error')}", RED))
+        pause()
+        return
+    print("")
+    for pkg in cells:
+        m = (snap.get("metrics") or {}).get(pkg) or {}
+        raw = bool((snap.get("raw_candidates") or {}).get(pkg, False))
+        print(
+            f"  {short_pkg(pkg):<12} {col('MATCH' if raw else 'clear', YELLOW if raw else GREEN)}  "
+            f"white={float(m.get('white_ratio', 0.0)):.3f} "
+            f"green={float(m.get('green_ratio', 0.0)):.3f}"
+        )
+    print("")
+    print(col("Automatic mode requires two matching scans, 30 seconds apart.", DIM))
+    pause()
+
+
+def layout_visual_menu(cfg):
+    while True:
+        cfg = load_config()
+        clear()
+        banner("LAYOUT / VISUAL CAPTCHA", cfg)
+        enabled = bool(cfg.get("captcha_visual_detection_enabled", False))
+        mapped = len(cfg.get("captcha_visual_layout_cells") or {})
+        print(f"Visual detector: {col('Enable' if enabled else 'Disable', GREEN if enabled else RED)}")
+        print(f"Mapped packages: {mapped}")
+        print("")
+        rows = [
+            ("1", "Preview calculated auto layout", CYAN, WHITE),
+            ("2", "Apply CAPTCHA-safe auto layout", GREEN, WHITE),
+            ("3", "Test visual detector once", CYAN, WHITE),
+            ("4", "Enable/disable visual detector", YELLOW, WHITE),
+            ("5", "Clear saved visual layout", RED, WHITE),
+            ("0", "Back", RED, WHITE),
+        ]
+        draw_boxed_menu(rows, cfg)
+        choice = read_menu_choice("\nOption: ", valid={"0", "1", "2", "3", "4", "5"})
+        if choice == "0":
+            return
+        if choice == "1":
+            clear()
+            banner("AUTO LAYOUT PREVIEW", cfg)
+            _layout_preview(_compute_captcha_safe_layout(cfg), cfg)
+            print("")
+            print(col("Four clones use 3x2 so Termux does not cover nokaD.", DIM))
+            pause()
+        elif choice == "2":
+            apply_captcha_safe_layout(cfg)
+        elif choice == "3":
+            test_visual_captcha_layout(cfg)
+        elif choice == "4":
+            if not cfg.get("captcha_visual_layout_cells"):
+                print(col("Apply the layout first so package rectangles are known.", RED))
+                pause()
+                continue
+            cfg["captcha_visual_detection_enabled"] = not enabled
+            save_config(cfg)
+        elif choice == "5":
+            if input("Type CLEAR to remove saved layout mapping: ").strip() == "CLEAR":
+                cfg["captcha_visual_layout_cells"] = {}
+                cfg["captcha_visual_layout_screen"] = []
+                cfg["captcha_visual_layout_applied_at"] = 0
+                cfg["captcha_visual_detection_enabled"] = False
+                save_config(cfg)
+
+
 def main():
     cfg = load_config()
     nomo_auto_repair_launchers_once(cfg)
@@ -14687,6 +15430,11 @@ def main():
 
         elif choice == "15":
             nomo_update_manager(cfg)
+            cfg = load_config()
+            normalize_active_mode_flags(cfg)
+
+        elif choice == "16":
+            layout_visual_menu(cfg)
             cfg = load_config()
             normalize_active_mode_flags(cfg)
 
