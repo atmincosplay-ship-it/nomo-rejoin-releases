@@ -1,24 +1,19 @@
 #!/usr/bin/env python3
-# NOMO REJOIN V4.09
+# NOMO REJOIN V4.10
+#
+# V4.10 — MARKET / GAG AUTOEXEC TEMPLATE
+# - QOL: AutoExec Manager option 7 installs a fixed place-aware loader template.
+# - TEMPLATE: Grow a Garden (126884695634066) loads PJYuhuuk; Trade World
+#             (129954712878723) loads DNeJi4nC; every other place exits.
+# - SAFE: Writes a separate nomo_market_loader.lua file and does not overwrite
+#         the Pet Counter or nomo_autoexec.lua.
+# - SCOPE: No rejoin, timeout, PID, solver, backend, or routing logic changed.
 #
 # V4.09 — MARKET TIMEOUT / NO_CAPTCHA DOUBLE-RESTART FIX
-# - CORE FIX: NO_CAPTCHA no longer schedules another hard force-stop after the
-#             package has already been opened and is waiting for fresh state.
-# - CORE FIX: Cancels only that package's pending duplicate recovery and keeps
-#             the current Roblox process open during the normal post-open grace.
-# - SAFE: CAPTCHA_SUCCESS still receives one clean recovery rejoin because a
-#         solved challenge can require reconnecting; NO_CAPTCHA means no solve
-#         occurred and therefore does not need a second restart.
-# - UI: Activity log now says "NO_CAPTCHA; current open kept" instead of
-#       "rejoin queued", making it clear no additional PID stop will happen.
-# - SCOPE: No stale thresholds, package PID matching, Market routing, Hatcher
-#          behavior, links, or normal timeout values were changed.
-#
-# V4.08 — PERFORMANCE-ONLY PASS
-# - PERF: Hatcher runtime saves/reporting/state reads were reduced.
-# - PERF: Android UI fallback cache increased to 25 seconds.
-# - PERF: activity.log rotates at 1 MiB and keeps two backups.
-# - SCOPE: Rejoin decisions and stop/open logic were unchanged.
+# - CORE FIX: NO_CAPTCHA keeps the current open instead of scheduling a second
+#             hard restart after a Market timeout recovery.
+# - SAFE: CAPTCHA_SUCCESS still receives one clean recovery rejoin.
+# - SCOPE: No stale thresholds, PID matching, routing, or Hatcher logic changed.
 #
 import os
 import re
@@ -46,7 +41,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.09"
+__version__ = "V4.10"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -9345,6 +9340,20 @@ end
 fn()
 '''
 
+MARKET_LOADER_AUTOEXEC_TEMPLATE = r'''-- NOMO Market / GAG loader template
+if game.PlaceId == 126884695634066 then
+    -- Grow a Garden
+    print("grow a garden")
+    loadstring(game:HttpGet("https://pastebin.com/raw/PJYuhuuk"))()
+elseif game.PlaceId == 129954712878723 then
+    -- Trade World
+    print("trade world")
+    loadstring(game:HttpGet("https://pastebin.com/raw/DNeJi4nC"))()
+else
+    return
+end
+'''
+
 BUNDLED_PET_COUNTER_FILE = BASE_DIR / "nomo_pet_counter.lua"
 
 
@@ -9361,6 +9370,7 @@ def pet_counter_autoexec_source():
 
 AUTOEXEC_DEFAULT_CUSTOM_FILE = "nomo_autoexec.lua"
 AUTOEXEC_PET_COUNTER_FILE = "nomo_pet_counter.lua"
+AUTOEXEC_MARKET_LOADER_FILE = "nomo_market_loader.lua"
 _AUTOEXEC_ALLOWED_SUFFIXES = {".lua", ".luau", ".txt"}
 
 
@@ -9740,6 +9750,30 @@ def autoexec_install_pet_counter(cfg):
         path_mode,
         AUTOEXEC_PET_COUNTER_FILE,
         counter_source,
+        cfg,
+        replace_prompt=False,
+    )
+
+
+def autoexec_install_market_loader(cfg):
+    selected = _autoexec_selected_tabs(cfg, "AUTOEXEC: ADD MARKET / GAG LOADER")
+    if not selected:
+        return
+    path_mode = _choose_autoexec_location(cfg, allow_both=True, selected_tabs=selected)
+    if path_mode is None:
+        return
+    clear()
+    banner("MARKET / GAG LOADER TEMPLATE", cfg)
+    print(col("File: " + AUTOEXEC_MARKET_LOADER_FILE, BOLD))
+    print(MARKET_LOADER_AUTOEXEC_TEMPLATE.rstrip())
+    print("")
+    print(col("Grow a Garden and Trade World use separate fixed loaders.", DIM))
+    print(col("This creates a separate file and does not overwrite the Pet Counter or nomo_autoexec.lua.", DIM))
+    _write_autoexec_script(
+        selected,
+        path_mode,
+        AUTOEXEC_MARKET_LOADER_FILE,
+        MARKET_LOADER_AUTOEXEC_TEMPLATE,
         cfg,
         replace_prompt=False,
     )
@@ -10260,12 +10294,13 @@ def autoexec_menu(cfg):
             ("4", "Delete selected AutoExec files", RED, WHITE),
             ("5", "Copy Lua between packages", MAGENTA, WHITE),
             ("6", "Rename/move AutoExec files", CYAN, WHITE),
+            ("7", "Add/update Market loader template", GREEN, WHITE),
             ("0", "Back", RED, WHITE),
         ]
         draw_boxed_menu(rows, cfg)
         print("")
-        print(col(f"Pet Counter source: {'bundled v3.0' if BUNDLED_PET_COUNTER_FILE.exists() else 'network fallback'}", DIM))
-        choice = read_menu_choice("\nOption: ", valid={"0", "1", "2", "3", "4", "5", "6"})
+        print(col(f"Pet Counter source: {'bundled local file' if BUNDLED_PET_COUNTER_FILE.exists() else 'network fallback'}", DIM))
+        choice = read_menu_choice("\nOption: ", valid={"0", "1", "2", "3", "4", "5", "6", "7"})
         if choice is None:
             print(col("Invalid option. Use one of the numbers shown.", RED))
             time.sleep(1)
@@ -10284,6 +10319,8 @@ def autoexec_menu(cfg):
             autoexec_copy_files(cfg)
         elif choice == "6":
             autoexec_rename_move_files(cfg)
+        elif choice == "7":
+            autoexec_install_market_loader(cfg)
 
 
 def export_cookies(selected_packages=None):
