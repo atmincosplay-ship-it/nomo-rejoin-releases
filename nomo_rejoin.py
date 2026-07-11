@@ -1,27 +1,24 @@
 #!/usr/bin/env python3
-# NOMO REJOIN V4.08
+# NOMO REJOIN V4.09
+#
+# V4.09 — MARKET TIMEOUT / NO_CAPTCHA DOUBLE-RESTART FIX
+# - CORE FIX: NO_CAPTCHA no longer schedules another hard force-stop after the
+#             package has already been opened and is waiting for fresh state.
+# - CORE FIX: Cancels only that package's pending duplicate recovery and keeps
+#             the current Roblox process open during the normal post-open grace.
+# - SAFE: CAPTCHA_SUCCESS still receives one clean recovery rejoin because a
+#         solved challenge can require reconnecting; NO_CAPTCHA means no solve
+#         occurred and therefore does not need a second restart.
+# - UI: Activity log now says "NO_CAPTCHA; current open kept" instead of
+#       "rejoin queued", making it clear no additional PID stop will happen.
+# - SCOPE: No stale thresholds, package PID matching, Market routing, Hatcher
+#          behavior, links, or normal timeout values were changed.
 #
 # V4.08 — PERFORMANCE-ONLY PASS
-# - PERF: Hatcher dashboards save the shared runtime once per completed cycle
-#         instead of once per package.
-# - PERF: Hatcher backend reporting now follows heartbeat_interval (default 60s)
-#         while local package/state checks remain at check_interval (default 10s).
-# - PERF: Backend reporting reuses state already read by the dashboard, avoiding
-#         a second read of every Hatcher state file.
-# - PERF: Package-scoped Android UI fallback snapshots are cached for 25 seconds
-#         by default instead of 5 seconds; direct Lua popup detection is unchanged.
+# - PERF: Hatcher runtime saves/reporting/state reads were reduced.
+# - PERF: Android UI fallback cache increased to 25 seconds.
 # - PERF: activity.log rotates at 1 MiB and keeps two backups.
-# - SCOPE: No stale thresholds, queue decisions, links, PID logic, stop/open logic,
-#          CAPTCHA behavior, or Market/Hatcher routing were changed.
-#
-# V4.07 — AUTOEXEC RENAME / MOVE MANAGER
-# - NEW: AutoExec Manager option 6 safely renames one script in place or moves
-#        one/multiple scripts from one package to one destination package.
-# - SAFE: Move writes through a temporary file, verifies SHA-256, and removes
-#         the source only after the destination is confirmed.
-# - SAFE: Existing targets can be overwritten, skipped, or cancelled; failed
-#         moves leave the original source untouched.
-# - UI: Shows complete source/destination paths and a per-file result summary.
+# - SCOPE: Rejoin decisions and stop/open logic were unchanged.
 #
 import os
 import re
@@ -49,7 +46,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.08"
+__version__ = "V4.09"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -261,7 +258,10 @@ DEFAULT_CONFIG = {
     # configured provider to make the authoritative check once for that open.
     "solver_provider_probe_on_no_state": True,
     "solver_rejoin_on_success": True,
-    # After CAPTCHA_SUCCESS/NO_CAPTCHA, allow one clean rejoin. If that rejoin
+    # NO_CAPTCHA means the provider found nothing to solve. Do not kill/open the
+    # package a second time after the current open already started.
+    "solver_rejoin_on_no_captcha": False,
+    # After CAPTCHA_SUCCESS, allow one clean rejoin. If that rejoin
     # still produces no fresh state, isolate only that package instead of
     # entering another solver/homepage hard-retry loop.
     "manual_hold_after_solver_rejoin_timeout": True,
@@ -1192,6 +1192,10 @@ def apply_update_migrations(cfg):
         set_cfg("solver_provider_probe_on_no_state", True)
     if "solver_rejoin_on_success" not in cfg:
         set_cfg("solver_rejoin_on_success", True)
+    # V4.09: force the safe default. Older builds treated NO_CAPTCHA exactly like
+    # CAPTCHA_SUCCESS and immediately hard-restarted a package that had just opened.
+    if cfg.get("solver_rejoin_on_no_captcha") is not False:
+        set_cfg("solver_rejoin_on_no_captcha", False)
     if "manual_hold_after_solver_rejoin_timeout" not in cfg:
         set_cfg("manual_hold_after_solver_rejoin_timeout", True)
 
@@ -11706,10 +11710,13 @@ def poll_solver_jobs(cfg, rt, open_queue):
             or bool(job.get("ok"))
         )
 
-        # V3.85: NO_CAPTCHA means the account is already clear/unblocked. Treat it
-        # exactly like CAPTCHA_SUCCESS for recovery: clear package holds and rejoin
-        # only that package once. The normal per-open + 10-minute provider cooldown
-        # still prevents continuous submissions.
+        # V4.09: keep NO_CAPTCHA separate from CAPTCHA_SUCCESS. The provider
+        # returning NO_CAPTCHA means there was nothing to solve, so a package that
+        # has just been opened must not be PID-stopped and opened again. This was
+        # the MARKET timeout double-restart shown as:
+        #   open ok -> solver NO_CAPTCHA -> queued hard force
+        # CAPTCHA_SUCCESS still gets one recovery rejoin because reconnecting can
+        # be required after the challenge is actually solved.
         if no_captcha_result or solved_result:
             result_label = "NO_CAPTCHA" if no_captcha_result else "CAPTCHA_SUCCESS"
             detail = _solver_probe_detail(response)
@@ -11722,15 +11729,22 @@ def poll_solver_jobs(cfg, rt, open_queue):
             rt_tab["solver_last_success"] = now()
             rt_tab["solver_last_error"] = ""
             rt_tab["solver_last_probe"] = detail
-            rt_tab["note"] = f"{result_label} - rejoin queued"
 
-            activity = f"solver {result_label}; rejoin queued"
-            if detail:
-                activity += " - " + cut(detail, 70)
-            log_activity(activity, pkg, GREEN)
-
+            # Remove only stale/duplicate queue entries for this package. Never
+            # disturb another clone's queued recovery.
             cancel_queued_package(open_queue, pkg)
-            if cfg.get("solver_rejoin_on_success", True):
+
+            should_rejoin = bool(cfg.get("solver_rejoin_on_success", True))
+            if no_captcha_result:
+                should_rejoin = bool(cfg.get("solver_rejoin_on_no_captcha", False))
+
+            if should_rejoin:
+                rt_tab["note"] = f"{result_label} - rejoin queued"
+                activity = f"solver {result_label}; rejoin queued"
+                if detail:
+                    activity += " - " + cut(detail, 70)
+                log_activity(activity, pkg, GREEN)
+
                 added, _ = queue_open(
                     open_queue, tab, target, f"solver {result_label.lower()} rejoin",
                     force=True, mode="hard_force", bypass_manual=True,
@@ -11744,7 +11758,11 @@ def poll_solver_jobs(cfg, rt, open_queue):
                 if not added:
                     rt_tab["note"] = f"{result_label} - already queued"
             else:
-                rt_tab["note"] = result_label
+                rt_tab["note"] = f"{result_label} - current open kept; waiting state"
+                activity = f"solver {result_label}; current open kept (no extra restart)"
+                if detail:
+                    activity += " - " + cut(detail, 70)
+                log_activity(activity, pkg, GREEN)
 
             changed = True
             continue
