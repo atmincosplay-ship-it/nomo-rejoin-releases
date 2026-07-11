@@ -1,29 +1,27 @@
 #!/usr/bin/env python3
-# NOMO REJOIN V4.14
+# NOMO REJOIN V4.15
+#
+# V4.15 — ALIVE RECOVERY WITHOUT WINDOW COLLAPSE
+# - CORE: Kicked, disconnect, stale, no-state, CAPTCHA, and solver-retry
+#         recoveries now soft-relaunch an ALIVE target package first instead of
+#         immediately killing its PID.
+# - FIX: Redfinger/App Cloner can hide every floating clone window when one
+#        freeform task is killed. Healthy sibling processes were not actually
+#        being killed, but the layout looked like every clone had stopped.
+# - FALLBACK: If the target still produces no fresh state after the short
+#             alive-recovery timeout, NOMO may hard-stop only that target once.
+# - SOLVER: The fallback belongs to the same recovery and is marked skip-solver,
+#           so the provider is never submitted twice for one recovery attempt.
+# - SAFE: Dead packages and explicit manual force-restart actions still use the
+#         verified exact-PID hard-open path. No am force-stop, killall, or pkill.
 #
 # V4.14 — SOLVER ONCE BEFORE EVERY REAL REJOIN
 # - CORE: Every actual NOMO-triggered package open/rejoin submits that package
 #         to the configured solver exactly once before Roblox is launched.
 # - FLOW: CAPTCHA_SUCCESS and NO_CAPTCHA both continue the original queued open
-#         exactly once; the solver result never creates a duplicate restart.
-# - SAFE: The queue item carries a unique open-generation token, so dashboard
-#         checks and wait loops cannot resubmit the same rejoin attempt.
+#         exactly once; dashboard checks cannot resubmit the same generation.
 # - RESULTS: INVALID_COOKIES holds only that package; SERVER_BUSY schedules one
-#            delayed retry; other provider errors may continue the original open
-#            once without resubmitting, using the configurable safe default.
-# - COMPAT: Visual CAPTCHA detection remains optional and disabled by default;
-#           auto-layout stays available as a separate tool.
-#
-# V4.13 — CAPTCHA-SAFE AUTO LAYOUT / VISUAL DETECTOR
-# - NEW: Built-in layout manager calculates a clone grid from the active package
-#        count and reserves a visible Termux area instead of covering a clone.
-# - NEW: For four clones, the default visual layout is 3x2: A/B/C on the top row,
-#        D at bottom-left, with Termux occupying the unused bottom-right area.
-# - NEW: One raw in-memory screencap every 30 seconds checks each saved package
-#        rectangle for the white Roblox verification panel + green Start Puzzle
-#        button. No OCR, no PNG file writes, and two hits are required.
-# - SAFE: Applying layout is manual/one-time because it stops only selected clone
-#        PIDs and closes Termux Float. It never reapplies during the rejoin loop.
+#            delayed retry; other failures can continue one original open.
 #
 import os
 import re
@@ -52,7 +50,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.14"
+__version__ = "V4.15"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -369,6 +367,14 @@ DEFAULT_CONFIG = {
     # the homepage and triggered a hard fallback anyway, so this removes the
     # wasted attempt + timeout. `kill` is isolated so hard never cascades.
     "disable_soft_rejoin": True,
+
+    # V4.15: An alive Roblox clone should first receive a package-scoped deep
+    # link without killing its PID. Killing one App Cloner freeform task can
+    # visually collapse every sibling window even when their processes survive.
+    # A target-only exact-PID hard retry remains available after this timeout.
+    "alive_recovery_soft_first": True,
+    "alive_recovery_soft_timeout_seconds": 90,
+    "alive_recovery_hard_fallback": True,
 
     # Pool-wide stagger: minimum seconds between any two hard opens across ALL
     # clones. Spaces out restarts so reloads don't overlap (memory spikes) and
@@ -1273,6 +1279,15 @@ def apply_update_migrations(cfg):
         set_cfg("homepage_stuck_fallback_seconds", 240)
     if "homepage_stuck_max_hard_retries" not in cfg:
         set_cfg("homepage_stuck_max_hard_retries", 1)
+
+    # V4.15: avoid collapsing every App Cloner/freeform window when only one
+    # alive target needs recovery. Existing configs receive the safe default.
+    if "alive_recovery_soft_first" not in cfg:
+        set_cfg("alive_recovery_soft_first", True)
+    if _int_cfg(cfg.get("alive_recovery_soft_timeout_seconds"), 0) < 30:
+        set_cfg("alive_recovery_soft_timeout_seconds", 90)
+    if "alive_recovery_hard_fallback" not in cfg:
+        set_cfg("alive_recovery_hard_fallback", True)
 
     if "login_challenge_detection_enabled" not in cfg:
         set_cfg("login_challenge_detection_enabled", True)
@@ -4744,6 +4759,32 @@ def target_link(tab, cfg, target, rt_tab=None, rt=None):
     return cfg.get("market_link")
 
 
+def _alive_recovery_soft_allowed(reason, pkg_alive, cfg):
+    """Return True for automatic recovery of an already-running target.
+
+    Explicit manual force actions and the second-stage hard fallback are never
+    downgraded. This is intentionally reason-scoped so startup/dead-package
+    opens keep their original hard behavior.
+    """
+    if not pkg_alive or not cfg.get("alive_recovery_soft_first", True):
+        return False
+    low = str(reason or "").strip().lower()
+    if not low:
+        return False
+    blocked = (
+        "manual force", "force restart", "homepage/no-state hard retry",
+        "soft fallback hard", "soft failed hard",
+    )
+    if any(token in low for token in blocked):
+        return False
+    recovery_tokens = (
+        "kick", "disconnect", "alive old state", "alive no-state",
+        "stale", "visible verification", "join challenge",
+        "server_busy", "solver server_busy", "captcha",
+    )
+    return any(token in low for token in recovery_tokens)
+
+
 def open_target(tab, rt_tab, cfg, target, reason, force=False, rt=None, mode="hard"):
     if not force and not can_open(rt_tab, cfg):
         return False, "cooldown"
@@ -4759,8 +4800,14 @@ def open_target(tab, rt_tab, cfg, target, reason, force=False, rt=None, mode="ha
     hard_force = mode_s in ["hard_force", "force", "force_stop", "force-stop"]
     pkg_alive = package_alive(tab["package"], cfg, fresh=True)
 
-    # MASTER SWITCH: when soft rejoin is disabled, EVERY open is a hard kill+open.
-    if cfg.get("disable_soft_rejoin", True):
+    # V4.15: `disable_soft_rejoin` still disables ordinary/scheduled soft hops,
+    # but it must not turn every ALIVE recovery into an immediate PID kill. On
+    # Redfinger/App Cloner that target-only kill can collapse all floating task
+    # windows even though sibling processes remain alive. First send the deep
+    # link to the target without stopping it; _do_open_cycle() owns one hard
+    # fallback if the target still cannot produce fresh state.
+    alive_soft_recovery = _alive_recovery_soft_allowed(reason, pkg_alive, cfg)
+    if cfg.get("disable_soft_rejoin", True) and not alive_soft_recovery:
         soft = False
         hard_force = True
         require_stop = True
@@ -4772,6 +4819,10 @@ def open_target(tab, rt_tab, cfg, target, reason, force=False, rt=None, mode="ha
         if target == "restock":
             rt_tab["last_gain_ts"] = now()
         return ok, note
+
+    if alive_soft_recovery:
+        soft = True
+        hard_force = False
 
     # Soft hop only makes sense when the package is alive.
     if soft and not pkg_alive:
@@ -6845,11 +6896,14 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0):
 
 
 def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_hard, cfg, rt):
-    """The actual kill -> open -> wait-for-fresh cycle for exactly ONE package."""
-    opening_screen(tab, target, cfg, 1, max(1, len(open_queue) + 1), mode=mode)
+    """The actual target-only open -> wait-for-fresh cycle for one package."""
+    display_mode = str(mode or "hard")
+    if _alive_recovery_soft_allowed(reason, package_alive(pkg, cfg, fresh=True), cfg):
+        display_mode = "alive-soft-first"
+    opening_screen(tab, target, cfg, 1, max(1, len(open_queue) + 1), mode=display_mode)
     rt_tab["note"] = f"opening -> {target}"
     save_runtime(rt)
-    log_activity(f"opening -> {target} ({mode})", pkg)
+    log_activity(f"opening -> {target} ({display_mode})", pkg)
     ok, msg = open_target(tab, rt_tab, cfg, target, reason, force=item.get("force", False), rt=rt, mode=mode)
     opened_at = int(rt_tab.get("last_open", now()))
     # Record pool-wide hard-open time for the stagger gate.
@@ -6863,7 +6917,10 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
         actual_open_mode = str(rt_tab.get("last_open_mode", mode) or mode).lower()
 
         if actual_open_mode == "soft":
-            timeout = int(cfg.get("soft_hop_wait_fresh_seconds", 240))
+            if _alive_recovery_soft_allowed(reason, True, cfg):
+                timeout = max(30, int(cfg.get("alive_recovery_soft_timeout_seconds", 90) or 90))
+            else:
+                timeout = int(cfg.get("soft_hop_wait_fresh_seconds", 240))
         elif cfg.get("homepage_stuck_hard_fallback_enabled", True):
             normal_timeout = int(cfg.get("open_wait_fresh_seconds", 240) or 240)
             homepage_timeout = int(cfg.get("homepage_stuck_fallback_seconds", 75) or 75)
@@ -6912,7 +6969,11 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
             retries_done = int(item.get("homepage_hard_retries", 0) or 0)
             max_retries = int(cfg.get("homepage_stuck_max_hard_retries", 1) or 0)
 
-            if cfg.get("homepage_stuck_hard_fallback_enabled", True) and retries_done < max_retries:
+            allow_hard_fallback = cfg.get("homepage_stuck_hard_fallback_enabled", True)
+            if actual_open_mode == "soft" and _alive_recovery_soft_allowed(reason, True, cfg):
+                allow_hard_fallback = bool(cfg.get("alive_recovery_hard_fallback", True))
+
+            if allow_hard_fallback and retries_done < max_retries:
                 added, _ = queue_open(
                     open_queue,
                     tab,
@@ -6921,6 +6982,15 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                     force=True,
                     mode="hard_force",
                     front=False,
+                    metadata={
+                        # This is stage two of the same recovery. The solver
+                        # already ran before the soft attempt, so never submit it
+                        # again merely because a target-only hard retry is needed.
+                        "solver_preflight_done": True,
+                        "skip_solver_once": True,
+                        "skip_solver_probe": True,
+                        "solver_result": str(item.get("solver_result", "") or ""),
+                    },
                 )
                 if added:
                     retry_item = next(
