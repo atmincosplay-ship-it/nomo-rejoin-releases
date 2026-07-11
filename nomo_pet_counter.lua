@@ -1,30 +1,19 @@
 --========================================================--
 --                    NOMO PET COUNTER
---              v3.2 ONE-SHOT AUTO PLAY
+--             v3.3 MULTI-CLICK AUTO PLAY
 --========================================================--
 -- Writes per-account state to:
 --   nomo_rejoiner/<username>_state.json
 --
+-- v3.3:
+-- - CHANGE: Sends two edge clicks by default: the first after game.Loaded +
+--           5 seconds, then one more 10 seconds later.
+-- - SAFE: Alternates bottom-right and bottom-left, with no UI scan or watcher.
+-- - CONFIG: LoadingClickCount can be set to 1-5; default is 2.
+--
 -- v3.2:
--- - PERF: Removed the repeated PlayerGui/GetDescendants loading-screen scan.
--- - CHANGE: Sends exactly ONE bottom-edge click after the game loads plus a
---           configurable delay. No prompt detection, watcher, retry, or loop.
--- - SAFE: Defaults to bottom-right, slightly inside the Android gesture edge.
---
--- v3.1:
--- - Added prompt-scanning auto play. Replaced in v3.2 because repeated full UI
---   scans could stutter lower-memory Redfinger instances.
---
--- v3.0:
--- - RENAME: NOMO GAG Pet Counter -> NOMO Pet Counter.
--- - RENAME: state folder gag_rejoiner -> nomo_rejoiner.
--- - RENAME: primary global table is getgenv().NOMO_PET_COUNTER.
--- - COMPAT: stops/aliases the legacy NOMO_GAG_COUNTER table so old loaders
---           can transition without duplicate loops.
---
--- v2.6:
--- - FIX: removed client reads of PrivateServerId/PrivateServerOwnerId that
---        caused executor console spam; server privacy remains unknown client-side.
+-- - PERF: Removed repeated PlayerGui/GetDescendants loading-screen scanning.
+-- - CHANGE: Replaced prompt detection with a fixed delayed edge click.
 --========================================================--
 
 local Players = game:GetService("Players")
@@ -62,7 +51,7 @@ local Config = getgenv().NOMO_PET_COUNTER
 
 Config.Enabled = true
 Config.Stop = false
-Config.Version = "v3.2-one-shot-auto-play"
+Config.Version = "v3.3-multi-click-auto-play"
 
 Config.WriteFolder = Config.WriteFolder or "nomo_rejoiner"
 
@@ -97,15 +86,21 @@ if Config.FuzzyPetNameMatch == nil then
 end
 
 -- Grow a Garden loading splash helper — zero-scan mode.
--- It waits for Roblox game.Loaded, waits a small fixed delay, then sends exactly
--- one edge click. It never searches PlayerGui and never runs a retry loop.
+-- It waits for Roblox game.Loaded, sends one delayed edge click, then sends one
+-- more edge click after a fixed interval. It never searches PlayerGui and never
+-- watches the UI continuously.
 if Config.AutoSkipLoadingScreen == nil then
     Config.AutoSkipLoadingScreen = true
 end
 Config.LoadingClickDelay = math.max(0, tonumber(Config.LoadingClickDelay or 5) or 5)
-Config.LoadingClickSide = lower(Config.LoadingClickSide or "right")
+Config.LoadingClickInterval = math.max(1, tonumber(Config.LoadingClickInterval or 10) or 10)
+Config.LoadingClickCount = math.clamp(math.floor(tonumber(Config.LoadingClickCount or 2) or 2), 1, 5)
+Config.LoadingClickSide = string.lower(tostring(Config.LoadingClickSide or "right"))
 if Config.LoadingClickSide ~= "left" then
     Config.LoadingClickSide = "right"
+end
+if Config.LoadingAlternateSides == nil then
+    Config.LoadingAlternateSides = true
 end
 
 -- Edge-click ratios. Kept slightly inside the actual edge so Android gesture /
@@ -508,13 +503,13 @@ local function countPetsAndEggs()
 end
 
 --========================================================--
--- Grow a Garden loading splash one-shot edge click
+-- Grow a Garden loading splash fixed multi-edge clicks
 --========================================================--
 
 local LOADING_SKIP = {
-    detected = false, -- intentionally unknown: v3.2 does not scan PlayerGui
+    detected = false, -- intentionally unknown: v3.3 does not scan PlayerGui
     active = false,
-    skipped = false,  -- true means the one click was sent successfully
+    skipped = false,  -- true means at least one configured click was sent
     attempts = 0,
     last_action = "",
     last_ts = 0,
@@ -560,7 +555,11 @@ local function recordLoadingAction(action)
     end
 end
 
-local function runLoadingOneShotClick()
+local function oppositeSide(side)
+    return side == "left" and "right" or "left"
+end
+
+local function runLoadingEdgeClicks()
     if not Config.AutoSkipLoadingScreen then
         return
     end
@@ -579,23 +578,39 @@ local function runLoadingOneShotClick()
 
     task.wait(Config.LoadingClickDelay)
 
-    if not Config.Enabled or Config.Stop then
-        LOADING_SKIP.active = false
-        recordLoadingAction("one-shot click cancelled: counter stopped")
-        return
+    local side = Config.LoadingClickSide
+    local sentAny = false
+
+    for attempt = 1, Config.LoadingClickCount do
+        if not Config.Enabled or Config.Stop then
+            recordLoadingAction(
+                string.format("loading clicks cancelled after %d/%d", LOADING_SKIP.attempts, Config.LoadingClickCount)
+            )
+            break
+        end
+
+        LOADING_SKIP.attempts = attempt
+        local ok, action = edgeScreenClick(side)
+        sentAny = sentAny or ok
+        LOADING_SKIP.skipped = sentAny
+
+        recordLoadingAction(
+            string.format("loading click %d/%d: %s%s",
+                attempt,
+                Config.LoadingClickCount,
+                tostring(action or "unknown"),
+                ok and "" or " [failed]")
+        )
+
+        if attempt < Config.LoadingClickCount then
+            if Config.LoadingAlternateSides then
+                side = oppositeSide(side)
+            end
+            task.wait(Config.LoadingClickInterval)
+        end
     end
 
-    LOADING_SKIP.attempts = 1
-    local ok, action = edgeScreenClick(Config.LoadingClickSide)
-    LOADING_SKIP.skipped = ok
     LOADING_SKIP.active = false
-
-    recordLoadingAction(
-        string.format("one-shot after %.1fs: %s%s",
-            Config.LoadingClickDelay,
-            tostring(action or "unknown"),
-            ok and "" or " [failed]")
-    )
 end
 
 --========================================================--
@@ -1141,11 +1156,15 @@ print("[NOMO PET COUNTER] " .. tostring(Config.Version) .. "  (for NOMO REJOIN V
 print("[NOMO PET COUNTER] account = " .. tostring(LocalPlayer.Name))
 print("[NOMO PET COUNTER] writing -> " .. tostring(Config.WriteFile))
 print("[NOMO PET COUNTER] ^ the harness must look for this SAME filename.")
-print("[NOMO PET COUNTER] one-shot loading click = " .. tostring(Config.AutoSkipLoadingScreen) .. " after " .. tostring(Config.LoadingClickDelay) .. "s, side=" .. tostring(Config.LoadingClickSide))
+print("[NOMO PET COUNTER] loading edge clicks = " .. tostring(Config.AutoSkipLoadingScreen)
+    .. ", count=" .. tostring(Config.LoadingClickCount)
+    .. ", first-after=" .. tostring(Config.LoadingClickDelay) .. "s"
+    .. ", interval=" .. tostring(Config.LoadingClickInterval) .. "s"
+    .. ", start-side=" .. tostring(Config.LoadingClickSide))
 print("========================================")
 
--- Send one delayed edge click independently so state writing never waits for it.
-task.spawn(runLoadingOneShotClick)
+-- Send fixed delayed edge clicks independently so state writing never waits for them.
+task.spawn(runLoadingEdgeClicks)
 
 -- Write immediately once so age starts refreshing.
 pcall(writeState)
