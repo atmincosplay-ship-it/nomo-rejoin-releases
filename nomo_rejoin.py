@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
-# NOMO REJOIN V4.21
+# NOMO REJOIN V4.22
+#
+# V4.22 — DISCONNECT RECOVERY LOOP GUARD
+# - FIX: A fresh Lua heartbeat no longer counts as recovery success while the
+#        same kicked/disconnected popup is still reported.
+# - FIX: One popup incident now gets one soft attempt and at most one exact-PID
+#        hard fallback; it cannot enqueue a new hard-force every 15 seconds.
+# - HOLD: If the popup survives both attempts, only that package waits 5 minutes
+#         before another recovery generation. Healthy sibling clones are untouched.
+# - SAFE: Clears the incident/cooldown immediately when a clean state returns.
 #
 # V4.21 — BUILT-IN FLOATING WINDOW FIX
-# - FIX: Noka/App Cloner packages now launch normally and never receive Android
-#        --windowingMode 5 while built-in clone floating is enabled.
-# - DEFAULT: Forced Android freeform is OFF on fresh installs.
-# - MIGRATE: Existing saved true/5 settings are disabled once automatically.
-# - SAFE: Layout coordinates remain supported; only the duplicate Android
-#         freeform layer is removed.
-#
-# V4.20 — AUTOMATIC HATCHER ALLOWLIST SYNC
-# - AUTO: Hatcher mode reads the current D1 Market registry at startup and then
-#         every 30 minutes while running.
-# - SMART: Each private server is updated only when the Market-user fingerprint
-#          changed or its previous sync failed; unchanged lists cause no PATCH.
-# - SAFE: Sync is additive only, never recreates servers, never removes users,
-#         and never stops/reopens Roblox packages.
+# - FIX: Noka/App Cloner packages launch normally without Android
+#        --windowingMode 5; built-in clone floating remains in control.
+# - DEFAULT/MIGRATE: Forced Android freeform is disabled for Noka clones.
 #
 import os
 import re
@@ -44,7 +42,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.21"
+__version__ = "V4.22"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -487,6 +485,9 @@ DEFAULT_CONFIG = {
     # Soft intent often cannot recover from PandoraHub session-expired popups.
     "hatcher_disconnect_ui_hard_force": True,
     "hatcher_disconnect_ui_retry_seconds": 15,
+    # One continuous popup incident gets one soft attempt + one hard fallback.
+    # If both fail, isolate only that package before allowing a new generation.
+    "disconnect_ui_incident_cooldown_seconds": 300,
 
     # V3.75: Hatcher-only hard recovery for the real Redfinger/Roblox case where
     # Android still reports Roblox alive, but the state file is very old or missing
@@ -1402,6 +1403,8 @@ def apply_update_migrations(cfg):
         set_cfg("hatcher_disconnect_ui_hard_force", True)
     if "hatcher_disconnect_ui_retry_seconds" not in cfg:
         set_cfg("hatcher_disconnect_ui_retry_seconds", 15)
+    if _int_cfg(cfg.get("disconnect_ui_incident_cooldown_seconds"), 0) < 60:
+        set_cfg("disconnect_ui_incident_cooldown_seconds", 300)
     # V4.08 performance-only migration: keep the package-scoped Android UI
     # fallback, but avoid an expensive uiautomator dump every 10-second cycle.
     # Only replace the known old/default 1..5 second values; custom slower values
@@ -5353,6 +5356,22 @@ def queue_hatcher_alive_old_state_hard(open_queue, tab, rt_tab, hcfg, cfg, age_o
     return False, "already queued", True
 
 
+def clear_disconnect_ui_incident(rt_tab):
+    """Clear one continuous kick/disconnect recovery incident."""
+    changed = False
+    for key, value in (
+        ("disconnect_ui_since", 0),
+        ("last_disconnect_ui_open", 0),
+        ("disconnect_ui_hold_until", 0),
+        ("disconnect_ui_recovery_active", False),
+        ("disconnect_ui_recovery_stage", ""),
+    ):
+        if rt_tab.get(key) != value:
+            rt_tab[key] = value
+            changed = True
+    return changed
+
+
 def queue_disconnect_ui_rejoin(open_queue, tab, target, rt_tab, cfg):
     if not cfg.get("disconnect_ui_rejoin_enabled", True):
         return False, "kick popup wait"
@@ -5360,6 +5379,15 @@ def queue_disconnect_ui_rejoin(open_queue, tab, target, rt_tab, cfg):
     t = now()
     if not int(rt_tab.get("disconnect_ui_since", 0) or 0):
         rt_tab["disconnect_ui_since"] = t
+
+    hold_until = int(rt_tab.get("disconnect_ui_hold_until", 0) or 0)
+    if hold_until > t:
+        return False, f"kick recovery hold {max(1, hold_until - t)}s"
+
+    # While one soft->hard recovery sequence owns this popup, the dashboard must
+    # not create another queue generation just because the Lua heartbeat is fresh.
+    if rt_tab.get("disconnect_ui_recovery_active"):
+        return False, "kick recovery active"
 
     retry = int(cfg.get("disconnect_ui_retry_seconds", 60) or 60)
     if target == "hatcher":
@@ -5378,9 +5406,15 @@ def queue_disconnect_ui_rejoin(open_queue, tab, target, rt_tab, cfg):
 
     # V3.88: FIFO, not front insertion. A later D popup must not jump ahead of
     # an already-waiting B popup. Single-flight still recovers only one package.
-    added, anote = queue_open(open_queue, tab, target, "kick/disconnect popup", force=True, mode=mode, front=False)
+    added, anote = queue_open(
+        open_queue, tab, target, "kick/disconnect popup",
+        force=True, mode=mode, front=False,
+        metadata={"disconnect_recovery": True, "disconnect_recovery_stage": "initial"},
+    )
     if added:
         rt_tab["last_disconnect_ui_open"] = t
+        rt_tab["disconnect_ui_recovery_active"] = True
+        rt_tab["disconnect_ui_recovery_stage"] = "initial"
         return True, (f"kick {mode} queued" if mode != "soft" else "kick soft queued")
     if anote == "already queued":
         return False, "already queued"
@@ -5938,6 +5972,7 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
 
         # fresh -> healthy, skip
         if age <= stale_limit and state_is_clean(state):
+            clear_disconnect_ui_incident(rt_tab)
             return ("Ingame" if alive else "Loading"), "ok", False
 
         # old state but still loading (inside our grace window) -> wait
@@ -6712,13 +6747,19 @@ def wait_until_fresh_after_open(tab, cfg, rt, opened_at, timeout_override=None, 
 
         wait_fresh_screen(tab, cfg, elapsed, timeout, alive, state, err, status_note)
 
-        if fresh:
+        clean_fresh = bool(
+            fresh
+            and not state_disconnect_ui(state)
+            and not state_login_challenge_detail(state)
+        )
+        if clean_fresh:
             clear_manual_login_block(rt_tab)
             clear_captcha_ui_runtime(rt_tab)
+            clear_disconnect_ui_incident(rt_tab)
             rt_tab["solver_busy_retry_pending"] = False
             rt_tab["solver_busy_retry_at"] = 0
             save_runtime(rt)
-            log_activity("fresh state - rejoin complete", pkg, GREEN)
+            log_activity("fresh clean state - rejoin complete", pkg, GREEN)
             return True, "fresh"
     
         if not alive and elapsed >= 20:
@@ -7001,6 +7042,24 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
             retries_done = int(item.get("homepage_hard_retries", 0) or 0)
             max_retries = int(cfg.get("homepage_stuck_max_hard_retries", 1) or 0)
 
+            # V4.22: one continuous popup gets one initial soft attempt and at
+            # most one target-only hard fallback. If the popup is still latched
+            # after that, hold only this package instead of starting a new hard
+            # generation every hatcher retry interval.
+            if item.get("disconnect_recovery") and retries_done >= max_retries:
+                cooldown = max(60, int(cfg.get("disconnect_ui_incident_cooldown_seconds", 300) or 300))
+                cancel_queued_package(open_queue, pkg)
+                rt_tab["disconnect_ui_recovery_active"] = False
+                rt_tab["disconnect_ui_recovery_stage"] = "hold"
+                rt_tab["disconnect_ui_hold_until"] = now() + cooldown
+                rt_tab["note"] = f"kick popup survived recovery; retry in {format_age(cooldown)}"
+                log_activity(
+                    f"kick popup survived soft+hard recovery; package held {format_age(cooldown)}",
+                    pkg, RED,
+                )
+                save_runtime(rt)
+                return True
+
             allow_hard_fallback = cfg.get("homepage_stuck_hard_fallback_enabled", True)
             if actual_open_mode == "soft" and _alive_recovery_soft_allowed(reason, True, cfg):
                 allow_hard_fallback = bool(cfg.get("alive_recovery_hard_fallback", True))
@@ -7022,6 +7081,8 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                         "skip_solver_once": True,
                         "skip_solver_probe": True,
                         "solver_result": str(item.get("solver_result", "") or ""),
+                        "disconnect_recovery": bool(item.get("disconnect_recovery")),
+                        "disconnect_recovery_stage": "hard_fallback" if item.get("disconnect_recovery") else "",
                     },
                 )
                 if added:
@@ -9529,6 +9590,11 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                 else:
                     rt_tab["hatcher_no_state_since"] = 0
                     status = "Offline"
+
+            # Clear a previous incident as soon as the counter reports a clean
+            # state again, even if it healed without NOMO opening the package.
+            if state and state_is_clean(state):
+                clear_disconnect_ui_incident(rt_tab)
 
             # V3.53: direct Lua-detected disconnect/kick popup
             if state and alive and state_disconnect_ui(state) and cfg.get("rejoin_if_crash", True):
