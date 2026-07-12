@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-# NOMO REJOIN V4.25
+# NOMO REJOIN V4.26
+#
+# V4.26 — KICK QUEUE DEADLOCK FIX
+# - FIX: Kicked/Disconnected recovery now bypasses stale manual-login holds, so a
+#        confirmed Error 267 cannot be popped from the queue before PID recovery.
+# - FIX: Missing/invalid solver cookies no longer discard a kick-recovery item;
+#        NOMO skips the solver for that generation and still restarts the target PID once.
+# - FIX: The persisted kick lock remains owned by the real queue item instead of
+#        repeating "stale kick recovery lock cleared / queued" every dashboard tick.
+# - SAFE: Recovery still targets only the affected package PID; no killall/pkill.
 #
 # V4.25 — KICKED STATUS = TARGET PID RESTART
-# - CORE: A confirmed Kicked/Disconnected state now bypasses the fresh-state
-#         safety recheck, because the counter can keep writing behind Error 267.
-# - CORE: The affected package goes through one solver preflight, then NOMO stops
-#         only that package's exact PID and opens it once.
-# - FIX : Fresh state can no longer cancel a queued kick recovery and create the
-#         repeated "stale kick recovery lock cleared / queued" loop.
+# - CORE: Confirmed Kicked/Disconnected bypasses fresh-state cancellation and
+#         performs one solver preflight plus one target-only PID restart.
 # - SAFE: No am force-stop, killall, or pkill is used by this recovery path.
-#
-# V4.24 — ORPHAN KICK-RECOVERY LOCK FIX
-# - FIX: A persisted disconnect recovery lock is repaired after NOMO restarts.
-# - SCOPE: Keeps exact-PID recovery and built-in App Cloner 2x2 bounds.
 #
 import os
 import re
@@ -41,7 +42,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.25"
+__version__ = "V4.26"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -5521,7 +5522,7 @@ def queue_disconnect_ui_rejoin(open_queue, tab, target, rt_tab, cfg):
     # an already-waiting B popup. Single-flight still recovers only one package.
     added, anote = queue_open(
         open_queue, tab, target, "kick/disconnect popup",
-        force=True, mode=mode, front=False,
+        force=True, mode=mode, front=False, bypass_manual=True,
         metadata={
             "disconnect_recovery": True,
             "disconnect_recovery_stage": "initial",
@@ -6955,6 +6956,20 @@ def solver_preflight_before_open(open_queue, item, tab, rt_tab, pkg, target, cfg
 
     note_l = str(note or "").lower()
     if "invalid/expired" in note_l or "no package cookie" in note_l:
+        # For an already-running client that visibly reports Kicked/Disconnected,
+        # the restart must not disappear merely because cookie extraction failed.
+        # Skip the provider for this one generation and still restart only the
+        # affected PID. A genuine logged-out client will surface after reopening.
+        if item.get("disconnect_recovery"):
+            item["solver_preflight_done"] = True
+            item["solver_result"] = "SOLVER_SKIPPED_COOKIE"
+            item["skip_solver_once"] = True
+            item["skip_solver_probe"] = True
+            rt_tab["note"] = f"solver cookie unavailable; restarting kicked package once"
+            log_activity("solver cookie unavailable; kick PID recovery continues once", pkg, YELLOW)
+            save_runtime(rt)
+            return "ready", item
+
         rt_tab["manual_login_needed"] = True
         rt_tab["manual_login_reason"] = "invalid or missing package cookie"
         rt_tab["manual_login_detail"] = str(note)
@@ -6996,7 +7011,10 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0):
     reason = item.get("reason", "queued open")
     mode = str(item.get("mode", "hard") or "hard").lower()
 
-    if manual_login_blocked(rt_tab, cfg) and not item.get("bypass_manual"):
+    # A confirmed kick/disconnect is an in-session failure, not a reason to let
+    # an older persisted manual-login hold discard the recovery item. Kick items
+    # are allowed to perform one target-only restart even when that stale flag exists.
+    if manual_login_blocked(rt_tab, cfg) and not item.get("bypass_manual") and not item.get("disconnect_recovery"):
         recovered, detail = maybe_clear_manual_login_prejoin(tab, cfg, rt, rt_tab)
         if not recovered:
             rt_tab["note"] = rt_tab.get("note") or "needs manual login"
