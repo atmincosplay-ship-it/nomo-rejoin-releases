@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
-# NOMO REJOIN V4.23
+# NOMO REJOIN V4.24
+#
+# V4.24 — ORPHAN KICK-RECOVERY LOCK FIX
+# - FIX: A persisted disconnect_ui_recovery_active flag can no longer block a
+#        kicked package forever after NOMO is updated, stopped, or restarted.
+# - FIX: When no live queue item and no solver job owns the incident, NOMO clears
+#        the orphan lock and immediately queues one clean target-only recovery.
+# - UI : Activity log reports "stale kick recovery lock cleared" so the repair
+#        is visible instead of leaving the package on Kicked indefinitely.
+# - SCOPE: Keeps V4.23 exact-PID recovery and built-in App Cloner 2x2 bounds.
 #
 # V4.23 — APP CLONER WINDOW + KICK RECOVERY ROLLBACK
-# - FIX: Removed alive soft-open recovery for Noka clones. Sending another
-#        plain VIEW intent to an already-open App Cloner task caused duplicate,
-#        cascaded, or overlapping floating windows.
-# - FIX: Confirmed kick/disconnect recovery now performs one exact-PID restart
-#        only. If the popup survives that clean restart, only that package is
-#        held for 5 minutes; there is no second hard retry in the same incident.
-# - FIX: Before a stopped Noka clone is launched, NOMO restores that package's
-#        built-in App Cloner window bounds using the normal 2x2 layout.
-# - FIX: Four-clone layout preview/apply is back to 2x2. Android
-#        --windowingMode remains disabled.
-#
-# V4.22 — DISCONNECT RECOVERY LOOP GUARD
-# - FIX: Fresh Lua heartbeat does not count as recovery while a kick popup stays.
-# - HOLD: One continuous popup incident is isolated instead of queue-spamming.
+# - FIX: Removed alive soft-open recovery for Noka clones and Android freeform.
+# - FIX: Kick recovery performs one exact-PID restart and one incident hold.
+# - FIX: Restores the target clone's built-in App Cloner 2x2 bounds before open.
 #
 import os
 import re
@@ -44,7 +42,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.23"
+__version__ = "V4.24"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -5490,10 +5488,20 @@ def queue_disconnect_ui_rejoin(open_queue, tab, target, rt_tab, cfg):
     if hold_until > t:
         return False, f"kick recovery hold {max(1, hold_until - t)}s"
 
-    # While one soft->hard recovery sequence owns this popup, the dashboard must
-    # not create another queue generation just because the Lua heartbeat is fresh.
+    # While one recovery sequence owns this popup, the dashboard must not create
+    # another generation. The flag is persisted in runtime, though, so an update,
+    # Termux stop, or process restart can leave it True after the in-memory queue
+    # and solver job are gone. Detect that orphaned lock and repair it immediately.
     if rt_tab.get("disconnect_ui_recovery_active"):
-        return False, "kick recovery active"
+        pkg = str((tab or {}).get("package", "") or "")
+        live_owner = bool(queue_has(open_queue, pkg) or solver_job_running(pkg))
+        if live_owner:
+            return False, "kick recovery active"
+
+        rt_tab["disconnect_ui_recovery_active"] = False
+        rt_tab["disconnect_ui_recovery_stage"] = ""
+        rt_tab["last_disconnect_ui_open"] = 0
+        log_activity("stale kick recovery lock cleared", pkg, YELLOW)
 
     retry = int(cfg.get("disconnect_ui_retry_seconds", 60) or 60)
     if target == "hatcher":
