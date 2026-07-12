@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
-# NOMO REJOIN V4.26
+# NOMO REJOIN V4.31
 #
-# V4.26 — KICK QUEUE DEADLOCK FIX
-# - FIX: Kicked/Disconnected recovery now bypasses stale manual-login holds, so a
-#        confirmed Error 267 cannot be popped from the queue before PID recovery.
-# - FIX: Missing/invalid solver cookies no longer discard a kick-recovery item;
-#        NOMO skips the solver for that generation and still restarts the target PID once.
-# - FIX: The persisted kick lock remains owned by the real queue item instead of
-#        repeating "stale kick recovery lock cleared / queued" every dashboard tick.
-# - SAFE: Recovery still targets only the affected package PID; no killall/pkill.
+# V4.31 — OPTION 13 AUTOMATIC LAYOUT
+# - NEW: New Redfinger Setup automatically selects Auto layout for the packages
+#        chosen in Option 13, applies each App Cloner floating rectangle once,
+#        and saves the same rectangles for CAPTCHA/face-lock detection.
+# - SAFE: Termux Float bounds are written during setup but Termux is not killed;
+#         the reserved cell takes effect the next time Termux Float is reopened.
+# - CLEAN: Runtime rejoin still never moves or resizes any window.
 #
-# V4.25 — KICKED STATUS = TARGET PID RESTART
-# - CORE: Confirmed Kicked/Disconnected bypasses fresh-state cancellation and
-#         performs one solver preflight plus one target-only PID restart.
-# - SAFE: No am force-stop, killall, or pkill is used by this recovery path.
+# V4.30 — LAYOUT-FOLLOWING VISUAL DETECTOR
+# - NEW: Option 16 can select Auto, 2x2, 3x2, 4x2, 5x2, 4x3, or 5x3.
+#        The exact rectangles applied once to App Cloner are saved and reused by
+#        CAPTCHA detection, face-lock detection, and every manual visual test.
+# - CLEAN: Rejoin now performs only exact-PID stop + plain am start. It never
+#          restores bounds, resizes windows, or uses Android freeform at runtime.
+# - SAFE: Auto layout reserves a spare grid cell for Termux whenever possible.
 #
 import os
 import re
@@ -42,7 +44,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.26"
+__version__ = "V4.31"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -235,17 +237,38 @@ DEFAULT_CONFIG = {
     "captcha_ui_retry_seconds": 600,
     "captcha_ui_require_package_scope": True,
 
-    # V4.13: lightweight screenshot fallback for Redfinger builds whose Roblox
-    # verification WebView is invisible to uiautomator. Disabled until the user
-    # applies the built-in layout once, which saves exact package rectangles.
-    "captcha_visual_detection_enabled": False,
-    "captcha_visual_scan_seconds": 30,
+    # V4.29: screenshot CAPTCHA fallback for Redfinger builds whose Roblox
+    # verification WebView is invisible to uiautomator. It uses the clone's
+    # saved Option 16 package rectangle, runs only while Loading, and shares the same
+    # raw screenshot used by face-lock detection.
+    "captcha_visual_detection_enabled": True,
+    "captcha_visual_loading_only": True,
+    "captcha_visual_screenshot_only": True,
+    "captcha_visual_scan_seconds": 15,
     "captcha_visual_confirmations_required": 2,
     "captcha_visual_min_white_ratio": 0.42,
     "captcha_visual_min_green_ratio": 0.004,
-    "captcha_visual_layout_cells": {},
-    "captcha_visual_layout_screen": [],
-    "captcha_visual_layout_applied_at": 0,
+    # Generic one-time floating layout mapping. Both CAPTCHA and face-lock
+    # detectors read these exact package rectangles; runtime rejoin never moves them.
+    "visual_layout_template": "auto",
+    "visual_layout_cells": {},
+    "visual_layout_screen": [],
+    "visual_layout_applied_at": 0,
+
+    # V4.27: Account Locked / suspicious-activity popup detection. This does not
+    # depend on Android accessibility text. One raw screencap is split by the
+    # saved Option 16 package bounds, then a strict light-modal + blue-button
+    # signature must appear twice before the package is isolated.
+    "face_lock_visual_detection_enabled": True,
+    # Performance guard: only screenshot while a package is actually Loading
+    # (alive with no clean/fresh state). Online packages are never scanned.
+    "face_lock_visual_loading_only": True,
+    "face_lock_visual_scan_seconds": 15,
+    "face_lock_visual_confirmations_required": 2,
+    "face_lock_visual_min_panel_ratio": 0.30,
+    "face_lock_visual_min_blue_ratio": 0.035,
+    "face_lock_visual_min_left_gray_ratio": 0.10,
+    "face_lock_auto_hold": True,
 
     # Shared values used by the built-in layout manager and visual detector.
     "layout_gap": 8,
@@ -370,8 +393,6 @@ DEFAULT_CONFIG = {
     "alive_recovery_soft_first": False,
     "alive_recovery_soft_timeout_seconds": 90,
     "alive_recovery_hard_fallback": False,
-    "restore_clone_builtin_bounds_before_open": True,
-    "clone_builtin_layout_mode": "2x2",
 
     # Pool-wide stagger: minimum seconds between any two hard opens across ALL
     # clones. Spaces out restarts so reloads don't overlap (memory spikes) and
@@ -471,15 +492,6 @@ DEFAULT_CONFIG = {
     "minimized_window_detection_enabled": True,
     "minimized_window_reopen_enabled": False,  # status-only; dumpsys is not package-safe enough
     "minimized_window_reopen_mode": "soft",
-    # Redfinger uses Android freeform/floating tasks. A plain `am start` can hide
-    # every peer window even though their processes and Lua heartbeats remain
-    # alive. Ask ActivityManager to launch the recovered clone in freeform mode.
-    # Noka/App Cloner already supplies its own floating window. Adding Android
-    # freeform again creates duplicate/empty task shells, so it is disabled.
-    "preserve_multiwindow_on_launch": False,
-    "launch_windowing_mode": 0,
-    "disable_android_freeform_for_clone_packages": True,
-
     # Hatcher popup/session-expired handling:
     # If the Roblox-side state writer directly sees a kicked/disconnected/session-expired
     # popup while hatcher mode is active, hard force-stop + reopen the hatcher server.
@@ -1299,18 +1311,11 @@ def apply_update_migrations(cfg):
 
     # V4.23: roll back alive soft-open recovery. On App Cloner builds a second
     # VIEW intent to an already-open task creates duplicate/cascaded windows.
-    # Use one exact-PID target restart and restore its built-in bounds before open.
+    # Runtime recovery is exact-PID stop + one plain launch only.
     if _int_cfg(cfg.get("_nomo_app_cloner_recovery_migration"), 0) < 423:
         set_cfg("alive_recovery_soft_first", False)
         set_cfg("alive_recovery_hard_fallback", False)
-        set_cfg("restore_clone_builtin_bounds_before_open", True)
-        set_cfg("clone_builtin_layout_mode", "2x2")
         set_cfg("disconnect_recovery_wait_seconds", 60)
-        # The old visual CAPTCHA layout stored 3x2 rectangles. Disable/clear it
-        # so those stale rectangles cannot be reused for window restoration.
-        set_cfg("captcha_visual_detection_enabled", False)
-        set_cfg("captcha_visual_layout_cells", {})
-        set_cfg("captcha_visual_layout_screen", [])
         set_cfg("_nomo_app_cloner_recovery_migration", 423)
     if _int_cfg(cfg.get("alive_recovery_soft_timeout_seconds"), 0) < 30:
         set_cfg("alive_recovery_soft_timeout_seconds", 90)
@@ -1333,16 +1338,72 @@ def apply_update_migrations(cfg):
         set_cfg("captcha_ui_retry_seconds", 600)
     if "captcha_ui_require_package_scope" not in cfg:
         set_cfg("captcha_ui_require_package_scope", True)
+    # V4.29: visual CAPTCHA detection is cheap enough when limited to Loading.
+    # Force the low-overhead defaults for existing configs and prefer the raw
+    # screenshot because uiautomator cannot see Roblox WebViews on this device.
+    if _int_cfg(cfg.get("_nomo_loading_visual_migration"), 0) < 429:
+        set_cfg("captcha_visual_detection_enabled", True)
+        set_cfg("captcha_visual_loading_only", True)
+        set_cfg("captcha_visual_screenshot_only", True)
+        set_cfg("captcha_visual_scan_seconds", 15)
+        set_cfg("captcha_visual_confirmations_required", 2)
+        set_cfg("_nomo_loading_visual_migration", 429)
     if "captcha_visual_detection_enabled" not in cfg:
-        set_cfg("captcha_visual_detection_enabled", False)
-    if _int_cfg(cfg.get("captcha_visual_scan_seconds"), 0) < 15:
-        set_cfg("captcha_visual_scan_seconds", 30)
+        set_cfg("captcha_visual_detection_enabled", True)
+    if cfg.get("captcha_visual_loading_only") is not True:
+        set_cfg("captcha_visual_loading_only", True)
+    if cfg.get("captcha_visual_screenshot_only") is not True:
+        set_cfg("captcha_visual_screenshot_only", True)
+    if _int_cfg(cfg.get("captcha_visual_scan_seconds"), 0) < 10:
+        set_cfg("captcha_visual_scan_seconds", 15)
     if _int_cfg(cfg.get("captcha_visual_confirmations_required"), 0) < 2:
         set_cfg("captcha_visual_confirmations_required", 2)
-    if not isinstance(cfg.get("captcha_visual_layout_cells"), dict):
-        set_cfg("captcha_visual_layout_cells", {})
-    if not isinstance(cfg.get("captcha_visual_layout_screen"), list):
-        set_cfg("captcha_visual_layout_screen", [])
+    # V4.30: one generic saved layout drives every visual detector. Migrate any
+    # V4.29 rectangles, then delete obsolete runtime freeform/bounds controls.
+    if _int_cfg(cfg.get("_nomo_layout_follow_migration"), 0) < 430:
+        old_cells = cfg.get("captcha_visual_layout_cells")
+        old_screen = cfg.get("captcha_visual_layout_screen")
+        old_applied = cfg.get("captcha_visual_layout_applied_at")
+        if isinstance(old_cells, dict) and old_cells and not cfg.get("visual_layout_cells"):
+            set_cfg("visual_layout_cells", old_cells)
+        if isinstance(old_screen, list) and old_screen and not cfg.get("visual_layout_screen"):
+            set_cfg("visual_layout_screen", old_screen)
+        if old_applied and not cfg.get("visual_layout_applied_at"):
+            set_cfg("visual_layout_applied_at", old_applied)
+        if not str(cfg.get("visual_layout_template", "")).strip():
+            set_cfg("visual_layout_template", "auto")
+        for obsolete in (
+            "captcha_visual_layout_cells", "captcha_visual_layout_screen",
+            "captcha_visual_layout_applied_at", "restore_clone_builtin_bounds_before_open",
+            "clone_builtin_layout_mode", "preserve_multiwindow_on_launch",
+            "launch_windowing_mode", "disable_android_freeform_for_clone_packages",
+        ):
+            if obsolete in cfg:
+                cfg.pop(obsolete, None)
+                changed = True
+        set_cfg("_nomo_layout_follow_migration", 430)
+    if not isinstance(cfg.get("visual_layout_cells"), dict):
+        set_cfg("visual_layout_cells", {})
+    if not isinstance(cfg.get("visual_layout_screen"), list):
+        set_cfg("visual_layout_screen", [])
+    template = str(cfg.get("visual_layout_template", "auto") or "auto").strip().lower()
+    if template not in {"auto", "2x2", "3x2", "4x2", "5x2", "4x3", "5x3"}:
+        set_cfg("visual_layout_template", "auto")
+
+    # V4.27: strict screenshot-only face-lock isolation. Never use generic
+    # accessibility text for this gate and never auto-submit the paid unlock API.
+    if "face_lock_visual_detection_enabled" not in cfg:
+        set_cfg("face_lock_visual_detection_enabled", True)
+    # V4.28: face-lock screenshots are useful only before the package reaches a
+    # clean/fresh in-game heartbeat. Force this low-overhead guard for old configs.
+    if cfg.get("face_lock_visual_loading_only") is not True:
+        set_cfg("face_lock_visual_loading_only", True)
+    if _int_cfg(cfg.get("face_lock_visual_scan_seconds"), 0) < 10:
+        set_cfg("face_lock_visual_scan_seconds", 15)
+    if _int_cfg(cfg.get("face_lock_visual_confirmations_required"), 0) < 2:
+        set_cfg("face_lock_visual_confirmations_required", 2)
+    if "face_lock_auto_hold" not in cfg:
+        set_cfg("face_lock_auto_hold", True)
 
     # V3.59/V3.60: stale runtime queue self-heal. This replaces manual
     # rm runtime.json for interrupted open/wait cycles, but waits longer so it
@@ -1390,18 +1451,6 @@ def apply_update_migrations(cfg):
     set_cfg("minimized_window_reopen_enabled", False)
     if "minimized_window_reopen_mode" not in cfg:
         set_cfg("minimized_window_reopen_mode", "soft")
-    # V4.21: Noka/App Cloner has built-in floating windows. The older Android
-    # --windowingMode 5 layer creates empty/duplicate task shells and overlapping
-    # windows. Disable it once for existing installs and keep clone packages
-    # protected even if an old config later restores the stale values.
-    if _int_cfg(cfg.get("_nomo_builtin_floating_migration"), 0) < 421:
-        set_cfg("preserve_multiwindow_on_launch", False)
-        set_cfg("launch_windowing_mode", 0)
-        set_cfg("disable_android_freeform_for_clone_packages", True)
-        set_cfg("_nomo_builtin_floating_migration", 421)
-    elif "disable_android_freeform_for_clone_packages" not in cfg:
-        set_cfg("disable_android_freeform_for_clone_packages", True)
-
     if "start_skip_if_state_fresh_enabled" not in cfg:
         set_cfg("start_skip_if_state_fresh_enabled", True)
     if "start_skip_fresh_state_seconds" not in cfg:
@@ -2180,85 +2229,6 @@ def _is_noka_clone_package(pkg):
     )
 
 
-def _clone_slot_index(pkg, cfg):
-    """Return stable zero-based clone slot, preferring the A/B/C/D suffix."""
-    pkg_s = str(pkg or "").strip()
-    match = re.search(r"\.noka([A-Za-z])$", pkg_s)
-    if match:
-        return max(0, ord(match.group(1).upper()) - ord("A"))
-
-    clone_packages = []
-    for tab in (cfg or {}).get("tabs", []):
-        candidate = str((tab or {}).get("package", "") or "").strip()
-        if candidate and _is_noka_clone_package(candidate) and candidate not in clone_packages:
-            clone_packages.append(candidate)
-    try:
-        return clone_packages.index(pkg_s)
-    except ValueError:
-        return 0
-
-
-def _clone_builtin_rect(pkg, cfg):
-    """Calculate the App Cloner built-in floating bounds for one package."""
-    try:
-        width, height = _screen_size(cfg)
-    except Exception:
-        width, height = 1280, 720
-
-    gap = max(0, int((cfg or {}).get("layout_gap", 8) or 8))
-    top = max(0, int((cfg or {}).get("layout_top", 60) or 60))
-    right_safe = max(0, int((cfg or {}).get("layout_right_safe", 55) or 55))
-
-    enabled_clones = []
-    for tab in (cfg or {}).get("tabs", []):
-        candidate = str((tab or {}).get("package", "") or "").strip()
-        if candidate and _is_noka_clone_package(candidate) and candidate not in enabled_clones:
-            enabled_clones.append(candidate)
-    count = max(4, len(enabled_clones))
-    cols, rows = _layout_shape_for_count(count)
-
-    cell_w = max(120, (width - right_safe - (cols + 1) * gap) // cols)
-    cell_h = max(120, (height - top - (rows + 1) * gap) // rows)
-    index = _clone_slot_index(pkg, cfg)
-    max_cells = max(1, cols * rows)
-    index = min(max_cells - 1, max(0, index))
-    col_idx = index % cols
-    row_idx = index // cols
-    left = gap + col_idx * (cell_w + gap)
-    cell_top = top + gap + row_idx * (cell_h + gap)
-    return [left, cell_top, left + cell_w, cell_top + cell_h]
-
-
-def _restore_clone_builtin_bounds(pkg, cfg):
-    """Restore App Cloner's own window rectangle without starting another task."""
-    if not _is_noka_clone_package(pkg):
-        return False, "not a Noka clone"
-    if not (cfg or {}).get("restore_clone_builtin_bounds_before_open", True):
-        return False, "built-in bounds restore disabled"
-
-    try:
-        pref = _app_cloner_pref_file(pkg, cfg)
-    except Exception as exc:
-        return False, f"window XML lookup failed: {exc}"
-    if not pref:
-        return False, "App Cloner window XML not found"
-
-    left, top, right, bottom = _clone_builtin_rect(pkg, cfg)
-    expr = "; ".join([
-        rf's/app_cloner_current_window_left" value="[0-9-]+/app_cloner_current_window_left" value="{left}/',
-        rf's/app_cloner_current_window_top" value="[0-9-]+/app_cloner_current_window_top" value="{top}/',
-        rf's/app_cloner_current_window_right" value="[0-9-]+/app_cloner_current_window_right" value="{right}/',
-        rf's/app_cloner_current_window_bottom" value="[0-9-]+/app_cloner_current_window_bottom" value="{bottom}/',
-    ])
-    code, out = shell_timeout(
-        f"sed -i -E {shlex.quote(expr)} {shlex.quote(pref)}",
-        cfg, capture=True, timeout=8,
-    )
-    if code != 0:
-        return False, cut(out or f"sed error {code}", 100)
-    return True, f"{left},{top},{right},{bottom}"
-
-
 def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop=True, skip_force_stop=False):
     if not link or str(link).startswith("PUT_"):
         return False, "no link"
@@ -2273,12 +2243,6 @@ def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop
             log_activity(f"hard open aborted: {cut(stop_note, 80)}", pkg, RED)
             return False, f"stop failed: {cut(stop_note, 60)}"
 
-        restored, restore_note = _restore_clone_builtin_bounds(pkg, cfg)
-        if restored:
-            log_activity(f"built-in bounds restored: {restore_note}", pkg, CYAN)
-        elif _is_noka_clone_package(pkg):
-            log_activity(f"built-in bounds not restored: {cut(restore_note, 70)}", pkg, YELLOW)
-
     if should_clear_cache_for_open(cfg, soft):
         clear_package_cache(pkg, cfg, rt_tab=rt_tab, reason=reason)
 
@@ -2287,29 +2251,6 @@ def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop
         f"-d {shlex.quote(link)} "
         f"-p {shlex.quote(pkg)}"
     )
-
-    # Noka/App Cloner already owns the floating-window layer. Applying Android
-    # freeform a second time creates empty blue task shells and broken overlap.
-    # Regular non-clone packages may still opt into Android freeform manually.
-    built_in_floating_clone = _is_noka_clone_package(pkg)
-    use_freeform = bool(cfg.get("preserve_multiwindow_on_launch", False))
-    if (
-        built_in_floating_clone
-        and cfg.get("disable_android_freeform_for_clone_packages", True)
-    ):
-        use_freeform = False
-
-    windowing_mode = int(cfg.get("launch_windowing_mode", 0) or 0)
-    if use_freeform and windowing_mode > 0:
-        cmd = f"am start --windowingMode {windowing_mode} {base_args}"
-        code, out = shell_timeout(cmd, cfg, capture=True, timeout=15)
-        if code == 0:
-            log_activity(f"opened in windowingMode {windowing_mode}", pkg, GREEN)
-            return True, "soft hop freeform" if soft else "opened freeform"
-
-        # Some older/custom Android builds reject --windowingMode. Fall back to
-        # the old launch command rather than leaving the selected package closed.
-        log_activity("freeform launch rejected; plain launch fallback", pkg, YELLOW)
 
     cmd = "am start " + base_args
     code, out = shell_timeout(cmd, cfg, capture=True, timeout=15)
@@ -5769,11 +5710,64 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
             rt_tab["android_disconnect_candidate_at"] = 0
             rt_tab["android_disconnect_candidate_count"] = 0
 
-    # V4.12: a visible package-scoped verification overlay outranks a fresh Lua
-    # heartbeat. Do this before clean_fresh/manual checks so blocked accounts can
-    # never be displayed as healthy merely because scripts still run behind it.
-    captcha_ui_alive = bool(raw_alive) and package_alive(pkg, cfg)
-    captcha_ui = android_login_challenge_ui_detail(pkg, cfg, force=False) if captcha_ui_alive else None
+    # V4.29: both visual blockers are checked only before a clean/fresh game
+    # heartbeat newer than the current open generation exists. This produces no
+    # screenshot/uiautomator overhead during normal Online sessions.
+    loading_online_proof = bool(
+        state_is_clean_fresh(state, cfg)
+        and not state_is_old_after_open(state, rt_tab)
+    )
+    face_lock_loading_only = bool(cfg.get("face_lock_visual_loading_only", True))
+    face_lock_scan_eligible = bool(raw_alive) and (
+        (not face_lock_loading_only) or (not loading_online_proof)
+    )
+    if not face_lock_scan_eligible:
+        clear_visual_face_lock_confirmation(pkg)
+        # A post-open clean heartbeat proves Roblox reached the game, so any old
+        # visual face-lock hold is now obsolete and can safely self-clear.
+        if str(rt_tab.get("manual_login_reason", "") or "") == "face_lock":
+            clear_manual_login_block(rt_tab)
+            clear_hold(pkg)
+            log_activity("clean in-game state; face-lock hold cleared", pkg, GREEN)
+    face_lock = visual_face_lock_detail(pkg, cfg, force=False) if face_lock_scan_eligible else None
+    if face_lock:
+        first_hit = not bool(rt_tab.get("face_lock_detected"))
+        detail = str(face_lock.get("text", "") or "account locked")
+        rt_tab["face_lock_detected"] = True
+        rt_tab["face_lock_detail"] = detail
+        rt_tab["face_lock_last_seen_at"] = now()
+        if not int(rt_tab.get("face_lock_detected_at", 0) or 0):
+            rt_tab["face_lock_detected_at"] = now()
+        if cfg.get("face_lock_auto_hold", True):
+            rt_tab["manual_login_needed"] = True
+            rt_tab["manual_login_reason"] = "face_lock"
+            rt_tab["manual_login_detail"] = detail
+            rt_tab["manual_login_detected_at"] = int(rt_tab.get("face_lock_detected_at", now()) or now())
+            rt_tab["note"] = "account locked; use Recovery Tools"
+            if first_hit:
+                set_hold(pkg, "face_lock")
+                log_activity("FACE LOCK detected; package held for manual verification", pkg, RED)
+        return {
+            "pkg": pkg, "user": tab.get("user_name", pkg), "alive": bool(raw_alive),
+            "state": state, "state_err": err, "fresh": False, "clean_fresh": False,
+            "pets": int(state.get("pet_count", 0) or 0) if state else "-",
+            "eggs": int(state.get("egg_total", 0) or 0) if state else "-",
+            "age": state_age_seconds(state) if state else "-",
+            "status": "Face Lock", "note": "account locked; manual verification",
+            "bad": "face_lock", "visible_window": True,
+            "face_lock_detail": face_lock,
+        }
+
+    # V4.29: visual CAPTCHA uses the same Loading-only gate and shared raw frame
+    # as face lock. Once the package has a clean post-open heartbeat, clear stale
+    # screenshot confirmations and perform no more visual/accessibility checks.
+    captcha_loading_only = bool(cfg.get("captcha_visual_loading_only", True))
+    captcha_scan_eligible = bool(raw_alive) and (
+        (not captcha_loading_only) or (not loading_online_proof)
+    )
+    if not captcha_scan_eligible:
+        clear_visual_captcha_confirmation(pkg)
+    captcha_ui = android_login_challenge_ui_detail(pkg, cfg, force=False) if captcha_scan_eligible else None
     if captcha_ui:
         detail = ",".join(captcha_ui.get("hits", []) or []) or "verification UI"
         rt_tab["captcha_ui_visible"] = True
@@ -5814,11 +5808,14 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
         visible_window, visible_note = package_visible_window(pkg, cfg)
 
     if manual_login_blocked(rt_tab, cfg) and not state_login_challenge_detail(state):
+        face_locked = str(rt_tab.get("manual_login_reason", "") or "") == "face_lock" or bool(rt_tab.get("face_lock_detected"))
         return {
             "pkg": pkg, "user": tab.get("user_name", pkg), "alive": bool(raw_alive),
             "state": state, "state_err": err, "fresh": fresh, "clean_fresh": clean_fresh,
-            "pets": pets, "eggs": eggs, "age": age, "status": "Manual",
-            "note": rt_tab.get("note") or "needs manual login", "bad": "manual",
+            "pets": pets, "eggs": eggs, "age": age,
+            "status": "Face Lock" if face_locked else "Manual",
+            "note": ("account locked; use Recovery Tools" if face_locked else (rt_tab.get("note") or "needs manual login")),
+            "bad": "face_lock" if face_locked else "manual",
             "visible_window": visible_window,
         }
 
@@ -5895,6 +5892,12 @@ def apply_common_health_action(open_queue, tab, target, rt_tab, cfg, rt, health,
     pkg = tab.get("package")
     bad = str(health.get("bad") or "")
     state = health.get("state")
+
+    if bad == "face_lock":
+        removed = cancel_queued_package(open_queue, pkg)
+        if removed:
+            log_activity(f"face lock hold cancelled {removed} queued reopen(s)", pkg, YELLOW)
+        return "Face Lock", health.get("note", "account locked; manual verification"), False
 
     if bad in ("manual", "challenge"):
         return health.get("status", ""), health.get("note", ""), False
@@ -6140,6 +6143,7 @@ def clear_manual_login_block(rt_tab):
     rt_tab["manual_login_reason"] = ""
     rt_tab["manual_login_detail"] = ""
     rt_tab["manual_login_detected_at"] = 0
+    clear_face_lock_runtime(rt_tab)
     rt_tab.pop("solver_attempted", None)  # legacy V3.80 field
     rt_tab["note"] = "manual login cleared"
     return True
@@ -6312,6 +6316,32 @@ def android_disconnect_ui_detail(pkg, cfg):
 
 
 
+_LOADING_VISUAL_FRAME_CACHE = {
+    "ts": 0,
+    "frame": None,
+    "error": "not captured",
+}
+
+
+def _capture_loading_visual_frame(cfg, force=False):
+    """One in-memory screencap shared by loading CAPTCHA and face-lock checks."""
+    global _LOADING_VISUAL_FRAME_CACHE
+    t = now()
+    captcha_seconds = max(10, int(cfg.get("captcha_visual_scan_seconds", 15) or 15))
+    face_seconds = max(10, int(cfg.get("face_lock_visual_scan_seconds", 15) or 15))
+    scan_seconds = min(captcha_seconds, face_seconds)
+    if not force and int(_LOADING_VISUAL_FRAME_CACHE.get("ts", 0) or 0) > 0:
+        if t - int(_LOADING_VISUAL_FRAME_CACHE.get("ts", 0) or 0) < scan_seconds:
+            return _LOADING_VISUAL_FRAME_CACHE
+    frame, error = _capture_screencap_raw(cfg, timeout=10)
+    _LOADING_VISUAL_FRAME_CACHE = {
+        "ts": t,
+        "frame": frame,
+        "error": error or "",
+    }
+    return _LOADING_VISUAL_FRAME_CACHE
+
+
 _VISUAL_CAPTCHA_CACHE = {
     "ts": 0,
     "width": 0,
@@ -6420,42 +6450,56 @@ def _visual_cell_metrics(frame, rect):
     }
 
 
+def _loading_visual_rect_for_package(pkg, cfg):
+    """Return the exact rectangle saved when Option 16 applied the layout.
+
+    No 2x2/3x2 guessing is allowed: if the user selects 5x2, both detectors and
+    manual tests follow those saved 5x2 cells until Option 16 is applied again.
+    """
+    saved = (cfg or {}).get("visual_layout_cells") or {}
+    rect = saved.get(str(pkg or "")) if isinstance(saved, dict) else None
+    if isinstance(rect, (list, tuple)) and len(rect) == 4:
+        try:
+            return [int(x) for x in rect]
+        except Exception:
+            return None
+    return None
+
+
 def capture_visual_captcha_snapshot(cfg, force=False):
-    """Capture once and analyze every saved package rectangle."""
+    """Analyze one shared raw screenshot using package-scoped clone rectangles."""
     global _VISUAL_CAPTCHA_CACHE
-    if not cfg.get("captcha_visual_detection_enabled", False) and not force:
+    if not cfg.get("captcha_visual_detection_enabled", True) and not force:
         return _VISUAL_CAPTCHA_CACHE
-    cells = cfg.get("captcha_visual_layout_cells")
-    if not isinstance(cells, dict) or not cells:
+
+    cells = {}
+    for tab in (cfg or {}).get("tabs", []):
+        pkg = str((tab or {}).get("package", "") or "")
+        if not pkg or pkg in cells:
+            continue
+        rect = _loading_visual_rect_for_package(pkg, cfg)
+        if rect:
+            cells[pkg] = rect
+    if not cells:
         _VISUAL_CAPTCHA_CACHE = {
             "ts": now(), "width": 0, "height": 0,
-            "raw_candidates": {}, "metrics": {}, "error": "visual layout not applied",
+            "raw_candidates": {}, "metrics": {}, "error": "no package visual rectangles",
         }
         return _VISUAL_CAPTCHA_CACHE
-    t = now()
-    scan_seconds = max(15, int(cfg.get("captcha_visual_scan_seconds", 30) or 30))
-    if not force and int(_VISUAL_CAPTCHA_CACHE.get("ts", 0) or 0) > 0:
-        if t - int(_VISUAL_CAPTCHA_CACHE.get("ts", 0) or 0) < scan_seconds:
-            return _VISUAL_CAPTCHA_CACHE
-    frame, error = _capture_screencap_raw(cfg, timeout=10)
+
+    shared = _capture_loading_visual_frame(cfg, force=force)
+    t = int(shared.get("ts", now()) or now())
+    if not force and int(_VISUAL_CAPTCHA_CACHE.get("ts", 0) or 0) == t:
+        return _VISUAL_CAPTCHA_CACHE
+    frame = shared.get("frame")
+    error = str(shared.get("error", "") or "")
     if not frame:
         _VISUAL_CAPTCHA_CACHE = {
             "ts": t, "width": 0, "height": 0,
             "raw_candidates": {}, "metrics": {}, "error": error,
         }
         return _VISUAL_CAPTCHA_CACHE
-    saved_screen = cfg.get("captcha_visual_layout_screen") or []
-    if len(saved_screen) >= 2:
-        try:
-            if int(saved_screen[0]) != frame["width"] or int(saved_screen[1]) != frame["height"]:
-                _VISUAL_CAPTCHA_CACHE = {
-                    "ts": t, "width": frame["width"], "height": frame["height"],
-                    "raw_candidates": {}, "metrics": {},
-                    "error": "screen size changed; reapply layout",
-                }
-                return _VISUAL_CAPTCHA_CACHE
-        except Exception:
-            pass
+
     white_min = float(cfg.get("captcha_visual_min_white_ratio", 0.42) or 0.42)
     green_min = float(cfg.get("captcha_visual_min_green_ratio", 0.004) or 0.004)
     metrics = {}
@@ -6464,8 +6508,9 @@ def capture_visual_captcha_snapshot(cfg, force=False):
         m = _visual_cell_metrics(frame, rect)
         candidate = bool(m["white_ratio"] >= white_min and m["green_ratio"] >= green_min)
         m["candidate"] = candidate
-        metrics[str(pkg)] = m
-        raw_candidates[str(pkg)] = candidate
+        m["rect"] = list(rect)
+        metrics[pkg] = m
+        raw_candidates[pkg] = candidate
     _VISUAL_CAPTCHA_CACHE = {
         "ts": t, "width": frame["width"], "height": frame["height"],
         "raw_candidates": raw_candidates, "metrics": metrics, "error": "",
@@ -6503,6 +6548,206 @@ def visual_captcha_detail(pkg, cfg, force=False, bypass_confirm=False):
     }
 
 
+def clear_visual_captcha_confirmation(pkg):
+    """Forget pending screenshot CAPTCHA hits after the package reaches game."""
+    pkg = str(pkg or "")
+    if pkg:
+        _VISUAL_CAPTCHA_CONFIRM.pop(pkg, None)
+
+
+_FACE_LOCK_VISUAL_CACHE = {
+    "ts": 0,
+    "width": 0,
+    "height": 0,
+    "raw_candidates": {},
+    "metrics": {},
+    "error": "not captured",
+}
+_FACE_LOCK_VISUAL_CONFIRM = {}
+
+
+def _face_lock_rect_for_package(pkg, cfg):
+    """Resolve the package's on-screen rectangle without accessibility APIs."""
+    return _loading_visual_rect_for_package(pkg, cfg)
+
+
+def _face_lock_cell_metrics(frame, rect):
+    """Detect the Account Locked modal by geometry/colors, never OCR.
+
+    Strong signature inside one clone cell:
+      * a large neutral light modal in the center;
+      * a blue Continue button in the lower-right half;
+      * a neutral gray Sign out button beside it.
+    """
+    width = int(frame["width"])
+    height = int(frame["height"])
+    pixels = frame["pixels"]
+    try:
+        left, top, right, bottom = [int(x) for x in rect]
+    except Exception:
+        return {
+            "candidate": False, "panel_ratio": 0.0, "blue_ratio": 0.0,
+            "left_gray_ratio": 0.0, "samples": 0,
+        }
+    left = max(0, min(width - 1, left))
+    right = max(left + 1, min(width, right))
+    top = max(0, min(height - 1, top))
+    bottom = max(top + 1, min(height, bottom))
+    cw, ch = right - left, bottom - top
+    if cw < 120 or ch < 100:
+        return {
+            "candidate": False, "panel_ratio": 0.0, "blue_ratio": 0.0,
+            "left_gray_ratio": 0.0, "samples": 0,
+        }
+
+    step = max(3, min(8, min(cw, ch) // 55))
+    # Modal region is deliberately broad to tolerate window title bars/scaling.
+    px1, px2 = left + int(cw * 0.13), left + int(cw * 0.84)
+    py1, py2 = top + int(ch * 0.20), top + int(ch * 0.88)
+    # Roblox Account Locked uses two side-by-side buttons around the lower middle.
+    lx1, lx2 = left + int(cw * 0.16), left + int(cw * 0.48)
+    bx1, bx2 = left + int(cw * 0.45), left + int(cw * 0.80)
+    by1, by2 = top + int(ch * 0.48), top + int(ch * 0.72)
+
+    panel = panel_total = 0
+    blue = blue_total = 0
+    left_gray = left_total = 0
+    for y in range(py1, py2, step):
+        row = y * width * 4
+        for x in range(px1, px2, step):
+            i = row + x * 4
+            r = int(pixels[i]); g = int(pixels[i + 1]); b = int(pixels[i + 2])
+            panel_total += 1
+            # Roblox modal is a neutral light gray/white rectangle.
+            if min(r, g, b) >= 175 and max(r, g, b) - min(r, g, b) <= 34:
+                panel += 1
+            if by1 <= y < by2 and bx1 <= x < bx2:
+                blue_total += 1
+                # Continue button: saturated Roblox blue.
+                if b >= 145 and b - r >= 45 and b - g >= 22 and g >= 55:
+                    blue += 1
+            if by1 <= y < by2 and lx1 <= x < lx2:
+                left_total += 1
+                # Sign-out button: pale neutral gray, not white background.
+                if 145 <= r <= 235 and abs(r - g) <= 22 and abs(g - b) <= 22:
+                    left_gray += 1
+
+    return {
+        "candidate": False,
+        "panel_ratio": (panel / panel_total) if panel_total else 0.0,
+        "blue_ratio": (blue / blue_total) if blue_total else 0.0,
+        "left_gray_ratio": (left_gray / left_total) if left_total else 0.0,
+        "samples": panel_total,
+    }
+
+
+def capture_visual_face_lock_snapshot(cfg, force=False):
+    """Capture one raw screenshot and analyze all configured clone cells."""
+    global _FACE_LOCK_VISUAL_CACHE
+    if not cfg.get("face_lock_visual_detection_enabled", True) and not force:
+        return _FACE_LOCK_VISUAL_CACHE
+    t = now()
+    scan_seconds = max(10, int(cfg.get("face_lock_visual_scan_seconds", 15) or 15))
+    if not force and int(_FACE_LOCK_VISUAL_CACHE.get("ts", 0) or 0) > 0:
+        if t - int(_FACE_LOCK_VISUAL_CACHE.get("ts", 0) or 0) < scan_seconds:
+            return _FACE_LOCK_VISUAL_CACHE
+
+    shared = _capture_loading_visual_frame(cfg, force=force)
+    t = int(shared.get("ts", t) or t)
+    frame = shared.get("frame")
+    error = str(shared.get("error", "") or "")
+    if not frame:
+        _FACE_LOCK_VISUAL_CACHE = {
+            "ts": t, "width": 0, "height": 0,
+            "raw_candidates": {}, "metrics": {}, "error": error,
+        }
+        return _FACE_LOCK_VISUAL_CACHE
+
+    panel_min = float(cfg.get("face_lock_visual_min_panel_ratio", 0.30) or 0.30)
+    blue_min = float(cfg.get("face_lock_visual_min_blue_ratio", 0.035) or 0.035)
+    left_min = float(cfg.get("face_lock_visual_min_left_gray_ratio", 0.10) or 0.10)
+    metrics = {}
+    raw = {}
+    packages = []
+    for tab in (cfg or {}).get("tabs", []):
+        pkg = str((tab or {}).get("package", "") or "")
+        if pkg and pkg not in packages:
+            packages.append(pkg)
+    for pkg in packages:
+        rect = _face_lock_rect_for_package(pkg, cfg)
+        if not rect:
+            continue
+        m = _face_lock_cell_metrics(frame, rect)
+        candidate = bool(
+            m["panel_ratio"] >= panel_min
+            and m["blue_ratio"] >= blue_min
+            and m["left_gray_ratio"] >= left_min
+        )
+        m["candidate"] = candidate
+        m["rect"] = list(rect)
+        metrics[pkg] = m
+        raw[pkg] = candidate
+
+    _FACE_LOCK_VISUAL_CACHE = {
+        "ts": t, "width": frame["width"], "height": frame["height"],
+        "raw_candidates": raw, "metrics": metrics, "error": "",
+    }
+    return _FACE_LOCK_VISUAL_CACHE
+
+
+def clear_visual_face_lock_confirmation(pkg):
+    """Forget pending visual hits once a package is clean/fresh again."""
+    pkg = str(pkg or "")
+    if pkg:
+        _FACE_LOCK_VISUAL_CONFIRM.pop(pkg, None)
+
+
+def visual_face_lock_detail(pkg, cfg, force=False, bypass_confirm=False):
+    """Return a confirmed package-scoped Account Locked visual signal."""
+    snapshot = capture_visual_face_lock_snapshot(cfg, force=force)
+    pkg = str(pkg or "")
+    metrics = (snapshot.get("metrics") or {}).get(pkg) or {}
+    candidate = bool((snapshot.get("raw_candidates") or {}).get(pkg, False))
+    snap_ts = int(snapshot.get("ts", 0) or 0)
+    rec = _FACE_LOCK_VISUAL_CONFIRM.setdefault(
+        pkg, {"count": 0, "snapshot_ts": 0, "last_seen": 0}
+    )
+    if snap_ts and snap_ts != int(rec.get("snapshot_ts", 0) or 0):
+        rec["snapshot_ts"] = snap_ts
+        if candidate:
+            rec["count"] = int(rec.get("count", 0) or 0) + 1
+            rec["last_seen"] = snap_ts
+        else:
+            rec["count"] = 0
+    required = max(2, int(cfg.get("face_lock_visual_confirmations_required", 2) or 2))
+    if not candidate or (not bypass_confirm and int(rec.get("count", 0) or 0) < required):
+        return None
+    return {
+        "title": "Roblox Account Locked",
+        "text": (
+            f"visual panel={float(metrics.get('panel_ratio', 0.0)):.3f} "
+            f"blue={float(metrics.get('blue_ratio', 0.0)):.3f} "
+            f"left_gray={float(metrics.get('left_gray_ratio', 0.0)):.3f}"
+        ),
+        "reason": "android_package_scoped_visual_face_lock",
+        "hits": ["light account-lock modal", "blue Continue button", "gray Sign out button"],
+        "visual_metrics": metrics,
+    }
+
+
+def clear_face_lock_runtime(rt_tab):
+    changed = False
+    for key, value in (
+        ("face_lock_detected", False),
+        ("face_lock_detail", ""),
+        ("face_lock_detected_at", 0),
+        ("face_lock_last_seen_at", 0),
+    ):
+        if rt_tab.get(key) != value:
+            rt_tab[key] = value
+            changed = True
+    return changed
+
 def android_login_challenge_ui_detail(pkg, cfg, force=False):
     """Return a strong package-scoped Roblox verification signal.
 
@@ -6515,9 +6760,17 @@ def android_login_challenge_ui_detail(pkg, cfg, force=False):
     if not cfg.get("login_challenge_ui_detection_enabled", True):
         return None
 
+    # V4.29: screenshot-first. On this Redfinger, uiautomator sees Termux rather
+    # than Roblox WebViews, so automatic Loading checks should not pay for both.
+    visual = visual_captcha_detail(pkg, cfg, force=force, bypass_confirm=False)
+    if visual:
+        return visual
+    if cfg.get("captcha_visual_screenshot_only", True):
+        return None
+
     texts, _ = android_ui_text_for_package(str(pkg or ""), cfg, force=force)
     if not texts:
-        return visual_captcha_detail(pkg, cfg, force=force, bypass_confirm=False)
+        return None
 
     joined = "\n".join(str(x) for x in texts if str(x or "").strip())
     low = joined.lower()
@@ -6544,7 +6797,7 @@ def android_login_challenge_ui_detail(pkg, cfg, force=False):
     if not hits and "not a bot" in low and ("verification" in low or "security" in low):
         hits = ["not a bot"]
     if not hits:
-        return visual_captcha_detail(pkg, cfg, force=force, bypass_confirm=False)
+        return None
 
     return {
         "title": "Roblox Verification",
@@ -14410,6 +14663,81 @@ def ensure_cookie_for_package(pkg, cfg=None):
         return cookie
     return None
 
+
+def test_face_lock_detection_menu(cfg):
+    selected = choose_packages_common(
+        cfg, "TEST FACE-LOCK VISUAL DETECTION", multi=False,
+        installed_only=True, include_discovered=True,
+    )
+    if not selected:
+        return
+    pkg = selected[0]
+    print(col("Capturing one package-scoped raw screenshot (no OCR/uiautomator)...", DIM))
+    snap = capture_visual_face_lock_snapshot(cfg, force=True)
+    metrics = (snap.get("metrics") or {}).get(pkg) or {}
+    detail = visual_face_lock_detail(pkg, cfg, force=False, bypass_confirm=True)
+    print("")
+    print(f"Package : {pkg}")
+    print(f"Rect    : {metrics.get('rect', _face_lock_rect_for_package(pkg, cfg))}")
+    print(f"Panel   : {float(metrics.get('panel_ratio', 0.0)):.3f}")
+    print(f"Blue    : {float(metrics.get('blue_ratio', 0.0)):.3f}")
+    print(f"LeftGray: {float(metrics.get('left_gray_ratio', 0.0)):.3f}")
+    if detail:
+        print(col("MATCH: Account Locked visual signature detected.", RED))
+        print(col("Automatic mode requires the same match twice before holding.", DIM))
+    else:
+        error = str(snap.get("error", "") or "")
+        print(col("NO MATCH: face-lock signature not detected.", YELLOW))
+        if error:
+            print(col(f"Capture note: {error}", DIM))
+    pause()
+
+
+def resume_face_locked_package(cfg):
+    selected = choose_packages_common(
+        cfg, "RESUME FACE-LOCKED PACKAGE", multi=False,
+        installed_only=False, include_discovered=True,
+    )
+    if not selected:
+        return
+    pkg = selected[0]
+    rt = load_runtime()
+    rt_tab = get_runtime_tab(rt, pkg)
+    was_face_lock = bool(rt_tab.get("face_lock_detected")) or str(rt_tab.get("manual_login_reason", "")) == "face_lock"
+    clear_face_lock_runtime(rt_tab)
+    clear_manual_login_block(rt_tab)
+    clear_hold(pkg)
+    rt_tab["note"] = "face lock cleared manually"
+    save_runtime(rt)
+    print(col(f"Face-lock hold cleared for {pkg}.", GREEN))
+    if not was_face_lock:
+        print(col("No saved face-lock flag existed; hold/manual flags were still cleared.", YELLOW))
+
+    restart = input("Restart this package now? [Y/n]: ").strip().lower() not in {"n", "no"}
+    if not restart:
+        pause()
+        return
+    tab = next((dict(t) for t in cfg.get("tabs", []) if t.get("package") == pkg), None)
+    if not tab:
+        print(col("Package is not configured in NOMO; cleared only.", YELLOW))
+        pause()
+        return
+    mode = active_rejoin_mode(cfg)
+    target = "market"
+    if mode == "hatcher":
+        hcfg = load_hatcher_config()
+        prof = next((p for p in hatcher_profiles(hcfg) if p.get("package") == pkg), None)
+        if prof:
+            tab["server_link"] = prof.get("server_link", "")
+        target = "hatcher"
+    ok, note = open_target(
+        tab, rt_tab, cfg, target,
+        "manual face-lock resume", force=True, rt=rt, mode="hard_force",
+    )
+    save_runtime(rt)
+    print(col(("Restart started: " if ok else "Restart failed: ") + str(note), GREEN if ok else RED))
+    pause()
+
 def recovery_menu(cfg):
     while True:
         clear()
@@ -14420,6 +14748,8 @@ def recovery_menu(cfg):
         print("4. Clear hold for one package")
         print("5. Clear manual flag for one package")
         print("6. Test login/CAPTCHA detection for one package")
+        print("7. Test face-lock visual detection for one package")
+        print("8. Clear/resume one face-locked package")
         print("0. Back")
         drain_stdin()
         ch = input("\nChoose: ").strip()
@@ -14491,6 +14821,10 @@ def recovery_menu(cfg):
                 pause()
         elif ch == "6":
             test_login_challenge_detection_menu(cfg)
+        elif ch == "7":
+            test_face_lock_detection_menu(cfg)
+        elif ch == "8":
+            resume_face_locked_package(cfg)
         else:
             print("Invalid choice.")
             time.sleep(1)
@@ -14912,6 +15246,7 @@ def new_redfinger_setup_wizard(cfg=None):
     first_upload = None
     reg_results = []
     setup_place_id = None
+    auto_layout_result = None
 
     # All three roles ask once for a Place ID. Enter keeps GAG as the default.
     # HATCHER/LOCAL use it for server creation; MARKET saves it for solver routing.
@@ -14959,6 +15294,25 @@ def new_redfinger_setup_wizard(cfg=None):
         save_hatcher_config(hcfg)
 
     clear()
+    banner("SETUP: AUTO FLOATING LAYOUT", cfg)
+    print(col("Auto layout for selected packages: YES (automatic)", GREEN))
+    print(col("App Cloner windows are placed once; runtime rejoin never moves them.", DIM))
+    print(col("Termux Float is not stopped during setup; its reserved cell applies after reopen.", DIM))
+    print("")
+    auto_layout_result = _apply_auto_layout_from_setup(cfg, selected)
+    if auto_layout_result.get("results"):
+        for pkg, ok, note in auto_layout_result["results"]:
+            print(f"  {short_pkg(pkg):<12} {col('OK' if ok else 'FAILED', GREEN if ok else RED)}  {note}")
+    print(
+        f"  {'Termux Float':<12} "
+        f"{col('SAVED' if auto_layout_result.get('termux_ok') else 'SKIP', GREEN if auto_layout_result.get('termux_ok') else YELLOW)}  "
+        f"{auto_layout_result.get('termux_note') or '-'}"
+    )
+    if auto_layout_result.get("error"):
+        print(col(f"Auto layout warning: {auto_layout_result['error']}", YELLOW))
+    cfg = load_config()
+
+    clear()
     banner("SETUP COMPLETE", cfg)
     print(f"Role       : {col(role_label, GREEN)}")
     print(f"Packages   : {', '.join(short_pkg(p) for p in selected)}")
@@ -15003,7 +15357,18 @@ def new_redfinger_setup_wizard(cfg=None):
             print(f"D1 report: {col('DISABLED', CYAN)}")
 
     print("")
-    print(col("Next: restart/re-execute the executor if the Pet Counter was newly installed, then use Option 1.", DIM))
+    print(col("Auto layout:", BOLD))
+    if auto_layout_result:
+        layout_state = "READY" if auto_layout_result.get("ok") else ("PARTIAL" if auto_layout_result.get("partial") else "FAILED")
+        layout_color = GREEN if layout_state == "READY" else (YELLOW if layout_state == "PARTIAL" else RED)
+        print(f"  Grid       : Auto -> {auto_layout_result.get('resolved', '-')}")
+        print(f"  Detector   : {col(layout_state, layout_color)} ({len(auto_layout_result.get('cells') or {})}/{len(selected)} packages mapped)")
+        print(f"  Termux     : {col('saved for next reopen' if auto_layout_result.get('termux_ok') else 'not changed', GREEN if auto_layout_result.get('termux_ok') else YELLOW)}")
+    else:
+        print(f"  {col('NOT RUN', YELLOW)}")
+
+    print("")
+    print(col("Next: restart/re-execute the executor if the Pet Counter was newly installed, reopen Termux Float for its saved cell, then use Option 1.", DIM))
     pause()
 
 
@@ -16048,7 +16413,7 @@ def select_package_menu(cfg):
 
 
 # ============================================================
-# V4.13 CAPTCHA-SAFE AUTO LAYOUT
+# V4.30 ONE-TIME FLOATING LAYOUT + SAVED VISUAL CROPS
 # ============================================================
 
 _TERMUX_FLOAT_PREF = "/data/data/com.termux.window/shared_prefs/com.termux.window_preferences.xml"
@@ -16076,19 +16441,46 @@ def _layout_active_packages(cfg):
     return result
 
 
-def _layout_shape_for_count(count):
+_VISUAL_LAYOUT_TEMPLATES = {
+    "auto": None,
+    "2x2": (2, 2),
+    "3x2": (3, 2),
+    "4x2": (4, 2),
+    "5x2": (5, 2),
+    "4x3": (4, 3),
+    "5x3": (5, 3),
+}
+
+
+def _auto_layout_shape_for_count(count):
+    """Pick a grid with at least one spare cell for Termux Float."""
     count = max(1, int(count or 1))
-    if count <= 4:
-        return 2, 2
-    if count <= 6:
+    if count <= 5:
         return 3, 2
-    if count <= 8:
+    if count <= 7:
         return 4, 2
-    if count <= 10:
+    if count <= 9:
         return 5, 2
-    if count <= 12:
+    if count <= 11:
         return 4, 3
     return 5, 3
+
+
+def _selected_layout_shape(cfg, count):
+    template = str((cfg or {}).get("visual_layout_template", "auto") or "auto").strip().lower()
+    if template not in _VISUAL_LAYOUT_TEMPLATES:
+        template = "auto"
+    shape = _VISUAL_LAYOUT_TEMPLATES[template]
+    cols, rows = shape if shape else _auto_layout_shape_for_count(count)
+    if cols * rows < count:
+        raise ValueError(f"{template} has {cols * rows} cells but {count} packages are enabled")
+    return template, cols, rows
+
+
+def _rects_overlap(a, b):
+    al, at, ar, ab = [int(x) for x in a]
+    bl, bt, br, bb = [int(x) for x in b]
+    return max(al, bl) < min(ar, br) and max(at, bt) < min(ab, bb)
 
 
 def _compute_captcha_safe_layout(cfg, packages=None):
@@ -16097,33 +16489,42 @@ def _compute_captcha_safe_layout(cfg, packages=None):
     gap = max(0, int(cfg.get("layout_gap", 8) or 8))
     top = max(0, int(cfg.get("layout_top", 60) or 60))
     right_safe = max(0, int(cfg.get("layout_right_safe", 55) or 55))
-    cols, rows = _layout_shape_for_count(len(packages))
-    cw = max(120, (width - right_safe - (cols + 1) * gap) // cols)
-    ch = max(120, (height - top - (rows + 1) * gap) // rows)
+    template, cols, rows = _selected_layout_shape(cfg, len(packages))
+    cw = max(80, (width - right_safe - (cols + 1) * gap) // cols)
+    ch = max(80, (height - top - (rows + 1) * gap) // rows)
     cells = {}
-    for index, pkg in enumerate(packages):
+    all_cells = []
+    for index in range(cols * rows):
         col_idx = index % cols
         row_idx = index // cols
         left = gap + col_idx * (cw + gap)
         cell_top = top + gap + row_idx * (ch + gap)
-        cells[pkg] = [left, cell_top, left + cw, cell_top + ch]
-    if len(packages) <= 4:
-        termux = [
-            int(cfg.get("layout_termux_x", 670) or 670),
-            int(cfg.get("layout_termux_y", 420) or 420),
-            int(cfg.get("layout_termux_width", 540) or 540),
-            int(cfg.get("layout_termux_height", 280) or 280),
-        ]
+        all_cells.append([left, cell_top, left + cw, cell_top + ch])
+    for index, pkg in enumerate(packages):
+        cells[pkg] = list(all_cells[index])
+
+    # A spare grid cell is the safest Termux location. Explicit full grids such
+    # as 2x2 with four clones still work, but retain the user's custom Termux box
+    # and clearly warn when it overlaps a detector crop.
+    spare = all_cells[-1] if len(all_cells) > len(packages) else None
+    if spare:
+        termux = [spare[0], spare[1], spare[2] - spare[0], spare[3] - spare[1]]
+        termux_rect = list(spare)
+        termux_source = "spare grid cell"
     else:
-        reserved_index = cols * rows - 1
-        col_idx = reserved_index % cols
-        row_idx = reserved_index // cols
-        left = gap + col_idx * (cw + gap)
-        cell_top = top + gap + row_idx * (ch + gap)
-        termux = [left, cell_top, cw, ch]
+        tx = int(cfg.get("layout_termux_x", 670) or 670)
+        ty = int(cfg.get("layout_termux_y", 420) or 420)
+        tw = int(cfg.get("layout_termux_width", 540) or 540)
+        th = int(cfg.get("layout_termux_height", 280) or 280)
+        termux = [tx, ty, tw, th]
+        termux_rect = [tx, ty, tx + tw, ty + th]
+        termux_source = "custom saved position"
+    overlaps = [pkg for pkg, rect in cells.items() if _rects_overlap(rect, termux_rect)]
     return {
-        "screen": [width, height], "cols": cols, "rows": rows,
-        "cell_size": [cw, ch], "cells": cells, "termux": termux,
+        "screen": [width, height], "template": template,
+        "cols": cols, "rows": rows, "cell_size": [cw, ch],
+        "cells": cells, "termux": termux, "termux_source": termux_source,
+        "termux_overlaps": overlaps,
     }
 
 
@@ -16163,7 +16564,7 @@ def _set_app_cloner_bounds(pkg, rect, cfg):
     return True, f"{left},{top},{right},{bottom}"
 
 
-def _set_termux_float_bounds(termux, cfg):
+def _set_termux_float_bounds(termux, cfg, restart=True):
     x, y, width, height = [int(v) for v in termux]
     expr = "; ".join([
         rf's/window_width" value="[0-9-]+/window_width" value="{width}/',
@@ -16178,19 +16579,119 @@ def _set_termux_float_bounds(termux, cfg):
     code, out = shell_timeout(cmd, cfg, capture=True, timeout=8)
     if code != 0:
         return False, cut(out or "Termux Float XML not found", 100)
-    force_stop_package("com.termux.window", cfg, tries=2, wait_after=0.3, settle=0.3)
-    return True, f"x={x} y={y} w={width} h={height}"
+    if restart:
+        force_stop_package("com.termux.window", cfg, tries=2, wait_after=0.3, settle=0.3)
+        suffix = ""
+    else:
+        suffix = " (takes effect when Termux Float reopens)"
+    return True, f"x={x} y={y} w={width} h={height}{suffix}"
+
+
+def _apply_auto_layout_from_setup(cfg, packages):
+    """Apply Option 13's Auto grid once and save detector rectangles.
+
+    Termux Float preferences are written without stopping the currently running
+    Termux window, so the setup wizard can finish and show its summary.
+    """
+    packages = [str(pkg or "").strip() for pkg in (packages or []) if str(pkg or "").strip()]
+    if not packages:
+        return {"ok": False, "error": "no packages", "results": []}
+
+    cfg = load_config()
+    cfg["visual_layout_template"] = "auto"
+    save_config(cfg)
+    try:
+        layout = _compute_captcha_safe_layout(cfg, packages)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "results": []}
+
+    results = []
+    successful_cells = {}
+    for pkg, rect in layout["cells"].items():
+        ok, note = _set_app_cloner_bounds(pkg, rect, cfg)
+        results.append((pkg, ok, note))
+        if ok:
+            successful_cells[pkg] = list(rect)
+
+    termux_ok, termux_note = _set_termux_float_bounds(layout["termux"], cfg, restart=False)
+    cfg = load_config()
+    cfg["visual_layout_template"] = "auto"
+    cfg["visual_layout_cells"] = successful_cells
+    cfg["visual_layout_screen"] = list(layout["screen"])
+    cfg["visual_layout_applied_at"] = now()
+    cfg["captcha_visual_detection_enabled"] = bool(successful_cells)
+    cfg["face_lock_visual_detection_enabled"] = bool(successful_cells)
+    save_config(cfg)
+
+    return {
+        "ok": len(successful_cells) == len(packages),
+        "partial": bool(successful_cells) and len(successful_cells) != len(packages),
+        "template": "auto",
+        "resolved": f"{layout['cols']}x{layout['rows']}",
+        "cells": successful_cells,
+        "results": results,
+        "termux_ok": termux_ok,
+        "termux_note": termux_note,
+        "overlaps": list(layout.get("termux_overlaps") or []),
+        "error": "" if successful_cells else "no package bounds were applied",
+    }
 
 
 def _layout_preview(layout, cfg):
-    print(f"Screen : {layout['screen'][0]}x{layout['screen'][1]}")
-    print(f"Grid   : {layout['cols']}x{layout['rows']}")
-    print(f"Cell   : {layout['cell_size'][0]}x{layout['cell_size'][1]}")
+    selected = str(layout.get("template", "auto"))
+    resolved = f"{layout['cols']}x{layout['rows']}"
+    print(f"Screen   : {layout['screen'][0]}x{layout['screen'][1]}")
+    print(f"Template : {selected}" + (f" -> {resolved}" if selected == "auto" else ""))
+    print(f"Cell     : {layout['cell_size'][0]}x{layout['cell_size'][1]}")
     print("")
     for pkg, rect in layout["cells"].items():
         print(f"  {short_pkg(pkg):<12} {rect[0]},{rect[1]} -> {rect[2]},{rect[3]}")
     tx, ty, tw, th = layout["termux"]
-    print(f"  {'Termux Float':<12} x={tx} y={ty} w={tw} h={th}")
+    print(f"  {'Termux Float':<12} x={tx} y={ty} w={tw} h={th} ({layout['termux_source']})")
+    overlaps = layout.get("termux_overlaps") or []
+    if overlaps:
+        names = ", ".join(short_pkg(x) for x in overlaps)
+        print("")
+        print(col(f"WARNING: Termux overlaps detector crop(s): {names}", RED))
+        print(col("Choose a larger grid such as 3x2/5x2 to keep every clone visible.", YELLOW))
+
+
+def choose_visual_layout_template(cfg):
+    packages = _layout_active_packages(cfg)
+    choices = ["auto", "2x2", "3x2", "4x2", "5x2", "4x3", "5x3"]
+    while True:
+        clear()
+        banner("SELECT FLOATING GRID", cfg)
+        current = str(cfg.get("visual_layout_template", "auto") or "auto").lower()
+        print(f"Enabled packages: {len(packages)}")
+        print(f"Current template: {col(current, CYAN)}")
+        print("")
+        rows = []
+        for idx, name in enumerate(choices, 1):
+            if name == "auto":
+                c, r = _auto_layout_shape_for_count(len(packages))
+                note = f"Auto ({c}x{r}, reserves Termux cell)"
+            else:
+                c, r = [int(x) for x in name.split("x", 1)]
+                fit = "fits" if c * r >= len(packages) else "too small"
+                note = f"{name} ({c*r} cells, {fit})"
+            rows.append((str(idx), note, GREEN if name == current else CYAN, WHITE))
+        rows.append(("0", "Back", RED, WHITE))
+        draw_boxed_menu(rows, cfg)
+        valid = {str(i) for i in range(0, len(choices) + 1)}
+        choice = read_menu_choice("\nGrid: ", valid=valid)
+        if choice == "0":
+            return False
+        selected = choices[int(choice) - 1]
+        if selected != "auto":
+            c, r = [int(x) for x in selected.split("x", 1)]
+            if c * r < len(packages):
+                print(col(f"{selected} cannot fit {len(packages)} enabled packages.", RED))
+                pause()
+                continue
+        cfg["visual_layout_template"] = selected
+        save_config(cfg)
+        return True
 
 
 def apply_captcha_safe_layout(cfg):
@@ -16199,13 +16700,18 @@ def apply_captcha_safe_layout(cfg):
         print(col("No enabled installed packages found.", RED))
         pause()
         return
-    layout = _compute_captcha_safe_layout(cfg, packages)
+    try:
+        layout = _compute_captcha_safe_layout(cfg, packages)
+    except ValueError as exc:
+        print(col(str(exc), RED))
+        pause()
+        return
     clear()
-    banner("APPLY CAPTCHA-SAFE LAYOUT", cfg)
+    banner("APPLY FLOATING LAYOUT ONCE", cfg)
     _layout_preview(layout, cfg)
     print("")
-    print(col("This stops only the selected clone PIDs and closes Termux Float once.", YELLOW))
-    print(col("It does not run again automatically during rejoin.", DIM))
+    print(col("This stops only the selected clone PIDs and writes App Cloner bounds once.", YELLOW))
+    print(col("Normal rejoin never moves, resizes, or restores any window afterward.", GREEN))
     confirm = input("\nApply this layout? [Y/n]: ").strip().lower()
     if confirm in {"n", "no"}:
         return
@@ -16215,12 +16721,13 @@ def apply_captcha_safe_layout(cfg):
         ok, note = _set_app_cloner_bounds(pkg, rect, cfg)
         results.append((pkg, ok, note))
         if ok:
-            successful_cells[pkg] = rect
+            successful_cells[pkg] = list(rect)
     termux_ok, termux_note = _set_termux_float_bounds(layout["termux"], cfg)
-    cfg["captcha_visual_layout_cells"] = successful_cells
-    cfg["captcha_visual_layout_screen"] = layout["screen"]
-    cfg["captcha_visual_layout_applied_at"] = now()
+    cfg["visual_layout_cells"] = successful_cells
+    cfg["visual_layout_screen"] = list(layout["screen"])
+    cfg["visual_layout_applied_at"] = now()
     cfg["captcha_visual_detection_enabled"] = bool(successful_cells)
+    cfg["face_lock_visual_detection_enabled"] = bool(successful_cells)
     save_config(cfg)
     clear()
     banner("LAYOUT RESULTS", cfg)
@@ -16228,36 +16735,47 @@ def apply_captcha_safe_layout(cfg):
         print(f"  {short_pkg(pkg):<12} {col('OK' if ok else 'FAILED', GREEN if ok else RED)}  {note}")
     print(f"  {'Termux Float':<12} {col('OK' if termux_ok else 'FAILED', GREEN if termux_ok else YELLOW)}  {termux_note}")
     print("")
-    print(col("Visual CAPTCHA detection enabled for successfully mapped packages.", GREEN))
-    print(col("Reopen Termux Float, then use Option 1 to start NOMO normally.", DIM))
+    print(col("Saved rectangles now drive CAPTCHA + face-lock detection and manual tests.", GREEN))
+    print(col("Reopen Termux Float, then start NOMO normally.", DIM))
     pause()
 
 
 def test_visual_captcha_layout(cfg):
     clear()
-    banner("VISUAL CAPTCHA TEST", cfg)
-    cells = cfg.get("captcha_visual_layout_cells") or {}
+    banner("VISUAL DETECTOR TEST", cfg)
+    cells = cfg.get("visual_layout_cells") or {}
     if not cells:
-        print(col("No saved layout. Apply option 2 first.", RED))
+        print(col("No saved package rectangles. Apply the layout once first.", RED))
         pause()
         return
-    snap = capture_visual_captcha_snapshot(cfg, force=True)
-    print(f"Screen: {snap.get('width', 0)}x{snap.get('height', 0)}")
-    if snap.get("error"):
-        print(col(f"Error: {snap.get('error')}", RED))
+    captcha = capture_visual_captcha_snapshot(cfg, force=True)
+    face = capture_visual_face_lock_snapshot(cfg, force=False)
+    width = captcha.get("width", 0) or face.get("width", 0)
+    height = captcha.get("height", 0) or face.get("height", 0)
+    print(f"Screen: {width}x{height}")
+    error = str(captcha.get("error", "") or face.get("error", "") or "")
+    if error:
+        print(col(f"Error: {error}", RED))
         pause()
         return
     print("")
     for pkg in cells:
-        m = (snap.get("metrics") or {}).get(pkg) or {}
-        raw = bool((snap.get("raw_candidates") or {}).get(pkg, False))
+        cm = (captcha.get("metrics") or {}).get(pkg) or {}
+        fm = (face.get("metrics") or {}).get(pkg) or {}
+        cap = bool((captcha.get("raw_candidates") or {}).get(pkg, False))
+        locked = bool((face.get("raw_candidates") or {}).get(pkg, False))
+        status = "CAPTCHA" if cap else ("FACE LOCK" if locked else "clear")
+        status_color = YELLOW if cap else (RED if locked else GREEN)
+        print(f"  {short_pkg(pkg):<12} {col(status, status_color)}  rect={cells[pkg]}")
         print(
-            f"  {short_pkg(pkg):<12} {col('MATCH' if raw else 'clear', YELLOW if raw else GREEN)}  "
-            f"white={float(m.get('white_ratio', 0.0)):.3f} "
-            f"green={float(m.get('green_ratio', 0.0)):.3f}"
+            f"    captcha white={float(cm.get('white_ratio', 0.0)):.3f} "
+            f"green={float(cm.get('green_ratio', 0.0)):.3f} | "
+            f"face panel={float(fm.get('panel_ratio', 0.0)):.3f} "
+            f"blue={float(fm.get('blue_ratio', 0.0)):.3f} "
+            f"gray={float(fm.get('left_gray_ratio', 0.0)):.3f}"
         )
     print("")
-    print(col("Automatic mode requires two matching scans, 30 seconds apart.", DIM))
+    print(col("Automatic mode still scans only Loading packages and requires two matches.", DIM))
     pause()
 
 
@@ -16265,48 +16783,59 @@ def layout_visual_menu(cfg):
     while True:
         cfg = load_config()
         clear()
-        banner("LAYOUT / VISUAL CAPTCHA", cfg)
+        banner("FLOATING LAYOUT / VISUAL DETECTOR", cfg)
         enabled = bool(cfg.get("captcha_visual_detection_enabled", False))
-        mapped = len(cfg.get("captcha_visual_layout_cells") or {})
+        mapped = len(cfg.get("visual_layout_cells") or {})
+        template = str(cfg.get("visual_layout_template", "auto") or "auto")
+        print(f"Selected grid : {col(template, CYAN)}")
         print(f"Visual detector: {col('Enable' if enabled else 'Disable', GREEN if enabled else RED)}")
         print(f"Mapped packages: {mapped}")
         print("")
         rows = [
-            ("1", "Preview calculated auto layout", CYAN, WHITE),
-            ("2", "Apply CAPTCHA-safe auto layout", GREEN, WHITE),
-            ("3", "Test visual detector once", CYAN, WHITE),
-            ("4", "Enable/disable visual detector", YELLOW, WHITE),
-            ("5", "Clear saved visual layout", RED, WHITE),
+            ("1", "Choose grid template", CYAN, WHITE),
+            ("2", "Preview selected layout", CYAN, WHITE),
+            ("3", "Apply layout once + save detector rectangles", GREEN, WHITE),
+            ("4", "Test CAPTCHA + face-lock detector once", CYAN, WHITE),
+            ("5", "Enable/disable visual detector", YELLOW, WHITE),
+            ("6", "Clear saved detector rectangles", RED, WHITE),
             ("0", "Back", RED, WHITE),
         ]
         draw_boxed_menu(rows, cfg)
-        choice = read_menu_choice("\nOption: ", valid={"0", "1", "2", "3", "4", "5"})
+        choice = read_menu_choice("\nOption: ", valid={"0", "1", "2", "3", "4", "5", "6"})
         if choice == "0":
             return
         if choice == "1":
-            clear()
-            banner("AUTO LAYOUT PREVIEW", cfg)
-            _layout_preview(_compute_captcha_safe_layout(cfg), cfg)
-            print("")
-            print(col("Four clones use the normal built-in App Cloner 2x2 layout.", DIM))
-            pause()
+            choose_visual_layout_template(cfg)
         elif choice == "2":
-            apply_captcha_safe_layout(cfg)
+            clear()
+            banner("LAYOUT PREVIEW", cfg)
+            try:
+                _layout_preview(_compute_captcha_safe_layout(cfg), cfg)
+            except ValueError as exc:
+                print(col(str(exc), RED))
+            print("")
+            print(col("Preview only. No package or Termux window is changed.", DIM))
+            pause()
         elif choice == "3":
-            test_visual_captcha_layout(cfg)
+            apply_captcha_safe_layout(cfg)
         elif choice == "4":
-            if not cfg.get("captcha_visual_layout_cells"):
-                print(col("Apply the layout first so package rectangles are known.", RED))
+            test_visual_captcha_layout(cfg)
+        elif choice == "5":
+            if not cfg.get("visual_layout_cells"):
+                print(col("Apply the layout once so package rectangles are known.", RED))
                 pause()
                 continue
-            cfg["captcha_visual_detection_enabled"] = not enabled
+            new_state = not enabled
+            cfg["captcha_visual_detection_enabled"] = new_state
+            cfg["face_lock_visual_detection_enabled"] = new_state
             save_config(cfg)
-        elif choice == "5":
-            if input("Type CLEAR to remove saved layout mapping: ").strip() == "CLEAR":
-                cfg["captcha_visual_layout_cells"] = {}
-                cfg["captcha_visual_layout_screen"] = []
-                cfg["captcha_visual_layout_applied_at"] = 0
+        elif choice == "6":
+            if input("Type CLEAR to remove saved detector rectangles: ").strip() == "CLEAR":
+                cfg["visual_layout_cells"] = {}
+                cfg["visual_layout_screen"] = []
+                cfg["visual_layout_applied_at"] = 0
                 cfg["captcha_visual_detection_enabled"] = False
+                cfg["face_lock_visual_detection_enabled"] = False
                 save_config(cfg)
 
 
