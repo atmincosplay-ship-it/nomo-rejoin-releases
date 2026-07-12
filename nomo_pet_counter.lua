@@ -1,9 +1,17 @@
 --========================================================--
 --                    NOMO PET COUNTER
---             v3.3 MULTI-CLICK AUTO PLAY
+--       v3.4 STABLE ZERO-FILLED EGG CATALOG
 --========================================================--
 -- Writes per-account state to:
 --   nomo_rejoiner/<username>_state.json
+--
+-- v3.4:
+-- - EGG CATALOG: Reads the full egg-name catalog from Grow a Garden registry
+--                modules and keeps every egg key in state, including count 0.
+-- - STABLE CLOUD DATA: Egg names no longer disappear from Cloudflare when an
+--                      account temporarily owns zero of that egg.
+-- - SAFE FALLBACK: Observed inventory egg names and Config.ExtraEggNames are
+--                  merged into the catalog and never removed during runtime.
 --
 -- v3.3:
 -- - CHANGE: Sends two edge clicks by default: the first after game.Loaded +
@@ -18,6 +26,7 @@
 
 local Players = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local GuiService = game:GetService("GuiService")
 local VirtualInputManager = nil
@@ -51,7 +60,7 @@ local Config = getgenv().NOMO_PET_COUNTER
 
 Config.Enabled = true
 Config.Stop = false
-Config.Version = "v3.3-multi-click-auto-play"
+Config.Version = "v3.4-stable-egg-catalog"
 
 Config.WriteFolder = Config.WriteFolder or "nomo_rejoiner"
 
@@ -108,6 +117,19 @@ end
 Config.LoadingRightX = tonumber(Config.LoadingRightX or 0.94) or 0.94
 Config.LoadingLeftX = tonumber(Config.LoadingLeftX or 0.06) or 0.06
 Config.LoadingBottomY = tonumber(Config.LoadingBottomY or 0.88) or 0.88
+
+-- Stable egg catalog. The full registry is read occasionally, then every
+-- discovered egg name is retained for the rest of the session. This means the
+-- `eggs` JSON object always includes zero-count entries instead of making an
+-- egg disappear when the account owns none.
+if Config.IncludeZeroCountEggs == nil then
+    Config.IncludeZeroCountEggs = true
+end
+Config.EggCatalogRefreshSeconds = math.max(60, tonumber(Config.EggCatalogRefreshSeconds or 600) or 600)
+Config.EggCatalogRetrySeconds = math.max(5, tonumber(Config.EggCatalogRetrySeconds or 15) or 15)
+if type(Config.ExtraEggNames) ~= "table" then
+    Config.ExtraEggNames = {}
+end
 
 --========================================================--
 -- File helpers
@@ -471,9 +493,204 @@ local function getUniqueId(inst)
     return inst:GetFullName()
 end
 
+--========================================================--
+-- Stable Grow a Garden egg catalog
+--========================================================--
+
+local EGG_CATALOG = {}
+local EGG_CATALOG_LAST_SCAN = 0
+local EGG_CATALOG_SOURCE = "none"
+local EGG_CATALOG_SCAN_LIMIT = 20000
+
+local EGG_NAME_FIELDS = {
+    name = true,
+    displayname = true,
+    itemname = true,
+    eggname = true,
+    egg_name = true,
+    peteggname = true,
+    title = true,
+}
+
+local function normalizeEggCatalogName(value)
+    if type(value) ~= "string" then
+        return nil
+    end
+
+    local name = value
+    name = string.gsub(name, "%s*%[x%d+%]%s*", "")
+    name = string.gsub(name, "%s*%b[]%s*", "")
+    name = string.gsub(name, "^%s+", "")
+    name = string.gsub(name, "%s+$", "")
+    name = string.gsub(name, "%s+", " ")
+
+    if #name < 5 or #name > 80 then
+        return nil
+    end
+
+    -- Real GAG egg item names end in "Egg". Requiring that suffix avoids
+    -- collecting registry field names such as EggData, EggIcon or EggChance.
+    if not string.match(lower(name), " egg$") then
+        return nil
+    end
+
+    return name
+end
+
+local function addEggCatalogName(value)
+    local name = normalizeEggCatalogName(value)
+    if not name then
+        return false
+    end
+
+    if EGG_CATALOG[name] then
+        return false
+    end
+
+    EGG_CATALOG[name] = true
+    return true
+end
+
+local function extractEggNamesFromTable(value, depth, visited, budget)
+    if type(value) ~= "table" or depth > 5 or budget.count >= EGG_CATALOG_SCAN_LIMIT then
+        return
+    end
+    if visited[value] then
+        return
+    end
+    visited[value] = true
+
+    for key, item in pairs(value) do
+        budget.count += 1
+        if budget.count >= EGG_CATALOG_SCAN_LIMIT then
+            break
+        end
+
+        if type(key) == "string" then
+            addEggCatalogName(key)
+        end
+
+        if type(item) == "string" then
+            local keyName = type(key) == "string" and lower(key) or ""
+            if EGG_NAME_FIELDS[keyName] or string.match(lower(item), " egg$") then
+                addEggCatalogName(item)
+            end
+        elseif type(item) == "table" then
+            extractEggNamesFromTable(item, depth + 1, visited, budget)
+        end
+    end
+end
+
+local function inspectEggRegistryInstance(inst, sourceNames)
+    if not inst then
+        return
+    end
+
+    table.insert(sourceNames, inst:GetFullName())
+
+    if inst:IsA("ModuleScript") then
+        local ok, data = pcall(require, inst)
+        if ok and type(data) == "table" then
+            extractEggNamesFromTable(data, 0, {}, {count = 0})
+        end
+        return
+    end
+
+    -- Some game versions expose each egg as a child instead of a module table.
+    local ok, children = pcall(function()
+        return inst:GetChildren()
+    end)
+    if ok then
+        for _, child in ipairs(children) do
+            addEggCatalogName(child.Name)
+            if child:IsA("ModuleScript") then
+                local okModule, data = pcall(require, child)
+                if okModule and type(data) == "table" then
+                    extractEggNamesFromTable(data, 0, {}, {count = 0})
+                end
+            end
+        end
+    end
+end
+
+local function discoverEggCatalog(force)
+    local clockNow = os.clock()
+    local hasCatalog = next(EGG_CATALOG) ~= nil
+    local interval = hasCatalog and Config.EggCatalogRefreshSeconds or Config.EggCatalogRetrySeconds
+
+    if not force and EGG_CATALOG_LAST_SCAN > 0 and clockNow - EGG_CATALOG_LAST_SCAN < interval then
+        return
+    end
+    EGG_CATALOG_LAST_SCAN = clockNow
+
+    -- Manual extras are useful as a safe fallback when a game update renames or
+    -- temporarily hides a registry module.
+    for _, name in pairs(Config.ExtraEggNames) do
+        addEggCatalogName(name)
+    end
+
+    local candidates = {}
+    local seenInstances = {}
+
+    local function addCandidate(inst)
+        if inst and not seenInstances[inst] then
+            seenInstances[inst] = true
+            table.insert(candidates, inst)
+        end
+    end
+
+    local dataFolder = ReplicatedStorage:FindFirstChild("Data")
+    local petRegistry = dataFolder and dataFolder:FindFirstChild("PetRegistry")
+    for _, root in ipairs({petRegistry, dataFolder, ReplicatedStorage}) do
+        if root then
+            for _, candidateName in ipairs({"PetEggs", "PetEggData", "EggData", "EggRegistry"}) do
+                addCandidate(root:FindFirstChild(candidateName))
+            end
+        end
+    end
+
+    -- Targeted recursive fallback. This searches only four exact names and runs
+    -- at most once per refresh interval; it does not continuously scan the UI.
+    if #candidates == 0 then
+        for _, candidateName in ipairs({"PetEggs", "PetEggData", "EggData", "EggRegistry"}) do
+            addCandidate(ReplicatedStorage:FindFirstChild(candidateName, true))
+        end
+    end
+
+    local sourceNames = {}
+    for _, inst in ipairs(candidates) do
+        pcall(inspectEggRegistryInstance, inst, sourceNames)
+    end
+
+    if #sourceNames > 0 then
+        EGG_CATALOG_SOURCE = table.concat(sourceNames, "; ")
+    elseif next(EGG_CATALOG) ~= nil then
+        EGG_CATALOG_SOURCE = "cached/observed"
+    else
+        EGG_CATALOG_SOURCE = "registry unavailable"
+    end
+end
+
+local function sortedEggCatalog()
+    local names = {}
+    for name in pairs(EGG_CATALOG) do
+        table.insert(names, name)
+    end
+    table.sort(names)
+    return names
+end
+
 local function countPetsAndEggs()
+    discoverEggCatalog(false)
+
     local petsSeen = {}
     local eggs = {}
+
+    if Config.IncludeZeroCountEggs then
+        for name in pairs(EGG_CATALOG) do
+            eggs[name] = 0
+        end
+    end
 
     for _, container in ipairs(getContainers()) do
         local children = {}
@@ -487,6 +704,7 @@ local function countPetsAndEggs()
                 petsSeen[getUniqueId(inst)] = true
             elseif looksLikeEgg(inst) then
                 local eggName = getEggName(inst)
+                addEggCatalogName(eggName)
                 eggs[eggName] = (eggs[eggName] or 0) + 1
             end
         end
@@ -1043,6 +1261,10 @@ local function buildState()
         pet_count = petCount,
         egg_total = eggTotal,
         eggs = eggs,
+        egg_catalog = sortedEggCatalog(),
+        egg_catalog_count = countTable(EGG_CATALOG),
+        egg_catalog_source = EGG_CATALOG_SOURCE,
+        egg_counts_include_zero = Config.IncludeZeroCountEggs == true,
 
         ts = now(),
         write_seq = WRITE_SEQ,
