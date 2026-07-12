@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-# NOMO REJOIN V4.16
+# NOMO REJOIN V4.17
 #
-# V4.16 — ONE-SECRET NEW DEVICE SETUP
-# - FIX: Option 13 now uses NOMO's canonical Cloudflare/D1 Worker URL
-#        automatically on a fresh device.
-# - SETUP: New Redfinger setup asks only for NOMO_SECRET when no saved backend
-#          configuration exists; the Worker URL is displayed but not requested.
-# - COMPAT: Existing complete custom Cloudflare credentials are still reusable.
-#           Alternate Worker URLs remain configurable from Backend settings.
+# V4.17 — FULL-AUTO THREE-ROLE SETUP
+# - NEW: Option 13 adds LOCAL REJOIN ONLY as a third setup role.
+# - AUTO: Recommended setup steps now run automatically for MARKET, HATCHER,
+#         and LOCAL roles; no repeated Y/n questions are shown.
+# - LOCAL: Installs the Pet Counter, creates/reuses per-package private servers,
+#          and saves links locally without D1 reporting or Market allowlisting.
+# - SAFE: Free/reused private servers are automatic. Any paid Robux creation
+#         still requires typing the explicit BUY amount.
 #
-# V4.15 — ALIVE RECOVERY WITHOUT WINDOW COLLAPSE
-# - CORE: Alive kicked/stale/disconnected packages soft-relaunch first so one
-#         recovery does not collapse the other App Cloner floating windows.
-# - FALLBACK: Only the affected target may receive one exact-PID hard fallback.
-# - SOLVER: The fallback remains in the same generation and cannot resubmit.
+# V4.16 — ONE-SECRET NEW-DEVICE SETUP
+# - FIX: Option 13 uses NOMO's canonical Cloudflare/D1 Worker URL automatically.
+# - SETUP: MARKET/HATCHER fresh-device setup asks only for NOMO_SECRET.
+# - SCOPE: Setup-only; V4.15 rejoin behavior remains unchanged.
 #
 import os
 import re
@@ -42,7 +42,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.16"
+__version__ = "V4.17"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -303,6 +303,9 @@ DEFAULT_CONFIG = {
     "active_rejoin_mode": "market",
     "market_mode_enabled": True,
     "hatcher_mode_enabled": False,
+    # Setup-role marker. LOCAL uses the Hatcher keep-alive/server-link engine
+    # while disabling all backend registration and reporting.
+    "local_rejoin_only": False,
 
     # Hatcher safety: when HATCHER mode is enabled, disable scheduled hop /
     # teleport-loop features that belong to Market mode. Soft open stays enabled
@@ -11737,11 +11740,16 @@ def _hatcher_profile_for_package(hcfg, cfg, pkg, username=""):
     return prof
 
 
-def auto_fetch_private_servers(cfg, selected_packages=None, pause_at_end=True):
-    """Fetch/create Hatcher servers and sync D1 Market access.
+def auto_fetch_private_servers(
+    cfg, selected_packages=None, pause_at_end=True, *,
+    sync_market_access=True, automatic=False, place_id_override=None
+):
+    """Fetch/create private servers and optionally sync D1 Market access.
 
-    selected_packages is used by the setup wizard so the user does not need to
-    select the same packages twice. Normal Option 5 > 4 behavior is unchanged.
+    selected_packages avoids a second package picker in Option 13. With
+    automatic=True, the normal free/reuse path uses the default/override place
+    and creates missing servers without Y/n prompts. Paid Robux creation always
+    keeps its explicit BUY confirmation. Normal Option 5 > 4 behavior is unchanged.
     """
     selected = list(selected_packages or [])
     if not selected:
@@ -11751,16 +11759,26 @@ def auto_fetch_private_servers(cfg, selected_packages=None, pause_at_end=True):
         return
     print(col("Runs once from this menu only. It is not part of the rejoin loop.", DIM))
     print(col("Each package uses only its own local cookie.", DIM))
-    print(col("Registered D1 Market user IDs are added to server permissions once.", DIM))
+    if sync_market_access:
+        print(col("Registered D1 Market user IDs are added to server permissions once.", DIM))
+    else:
+        print(col("Specific-user allowlisting is disabled for this local-only setup.", DIM))
     print("")
 
     default_place = "126884695634066"
-    entered = input(f"Hatcher place ID [{default_place}]: ").strip()
-    place_id = entered or default_place
+    if place_id_override is not None:
+        place_id = str(place_id_override or default_place).strip()
+    elif automatic:
+        place_id = default_place
+        print(f"Private-server place ID: {place_id} (automatic)")
+    else:
+        entered = input(f"Hatcher place ID [{default_place}]: ").strip()
+        place_id = entered or default_place
     if not place_id.isdigit():
         print(col("Place ID must be numeric.", RED))
-        pause()
-        return
+        if pause_at_end:
+            pause()
+        return {"changed": False, "results": [], "error": "invalid place id"}
 
     print(f"Resolving universe for place {place_id}...")
     universe_id = get_universe_id_from_place(place_id)
@@ -11782,7 +11800,11 @@ def auto_fetch_private_servers(cfg, selected_packages=None, pause_at_end=True):
         ))
     elif enabled is None:
         print(col(f"Could not verify public private-server settings: {product_err}", YELLOW))
-    create_missing = input("Create a server when the account has none? [Y/n]: ").strip().lower() not in {"n", "no"}
+    create_missing = True if automatic else (
+        input("Create a server when the account has none? [Y/n]: ").strip().lower() not in {"n", "no"}
+    )
+    if automatic:
+        print(col("Create/reuse missing private servers: YES (automatic)", GREEN))
 
     creation_text = (
         f"public enabled, {price if price is not None else 'price unknown'}"
@@ -11802,7 +11824,10 @@ def auto_fetch_private_servers(cfg, selected_packages=None, pause_at_end=True):
             registry_cfg[key] = value
     market_accounts = []
     market_registry_err = ""
-    if backend_provider(registry_cfg) == "cloudflare":
+    if not sync_market_access:
+        market_registry_err = "specific-user allowlisting disabled"
+        print(col("D1 Market allowlisting: SKIPPED (local-only setup)", CYAN))
+    elif backend_provider(registry_cfg) == "cloudflare":
         market_accounts, market_registry_err = cloudflare_read_accounts(registry_cfg, role="market")
         if market_registry_err:
             print(col(f"D1 Market registry unavailable: {market_registry_err}", YELLOW))
@@ -11951,7 +11976,10 @@ def auto_fetch_private_servers(cfg, selected_packages=None, pause_at_end=True):
         else:
             print(col(f"Friends Allowed update failed: {friends_err}", YELLOW))
 
-        market_ids = [a.get("user_id") for a in market_accounts if str(a.get("user_id") or "") != str(user_id or "")]
+        market_ids = (
+            [a.get("user_id") for a in market_accounts if str(a.get("user_id") or "") != str(user_id or "")]
+            if sync_market_access else []
+        )
         allowed_added = []
         allowed_failed = []
         if market_ids and usable.get("id"):
@@ -11964,6 +11992,8 @@ def auto_fetch_private_servers(cfg, selected_packages=None, pause_at_end=True):
                 print(col(f"Specific Market access failed for {len(allowed_failed)} account(s).", YELLOW))
                 for item in allowed_failed[:5]:
                     print(col(f"  {item.get('user_id')}: {cut(item.get('error', ''), 100)}", DIM))
+        elif not sync_market_access:
+            print(col("Specific Market access skipped: local-only setup.", CYAN))
         elif market_registry_err:
             print(col("Specific Market access skipped: D1 registry unavailable.", YELLOW))
         elif not market_ids:
@@ -12003,7 +12033,7 @@ def auto_fetch_private_servers(cfg, selected_packages=None, pause_at_end=True):
     for pkg, result in results:
         color = YELLOW if "FRIENDS FAILED" in result or "SKIPPED" in result or result == "NOT FOUND" else (GREEN if "SAVED" in result else RED)
         print(f"  {short_pkg(pkg):<10} {col(result, color)}")
-    print(col("\nDone. These links will be used on the next Hatcher rejoin; nothing was added to a loop.", GREEN if changed else YELLOW))
+    print(col("\nDone. These links will be used on the next private-server rejoin; nothing was added to a loop.", GREEN if changed else YELLOW))
     if pause_at_end:
         pause()
     return {"changed": changed, "results": results}
@@ -13903,8 +13933,12 @@ def _setup_secret(prompt="NOMO secret"):
     return str(value or "").strip()
 
 
-def _setup_configure_cloudflare(cfg):
-    """Configure Cloudflare/D1; fresh devices only need NOMO_SECRET."""
+def _setup_configure_cloudflare(cfg, automatic=False):
+    """Configure Cloudflare/D1; fresh devices only need NOMO_SECRET.
+
+    Option 13 passes automatic=True so saved credentials are reused without an
+    extra Y/n prompt. The normal settings flow can still ask before replacement.
+    """
     cfg = load_config()
     hcfg = load_hatcher_config()
     saved_url = cloudflare_base_url(cfg) or cloudflare_base_url(hcfg)
@@ -13923,11 +13957,12 @@ def _setup_configure_cloudflare(cfg):
     if saved_complete:
         print(f"Worker: {saved_url}")
         print(f"Secret: {mask_secret(saved_secret)}")
-        if _setup_yes_no("Reuse these existing backend credentials?", True):
+        reuse_saved = True if automatic else _setup_yes_no("Reuse these existing backend credentials?", True)
+        if reuse_saved:
             worker_url, secret = saved_url, saved_secret
+            if automatic:
+                print(col("Reuse saved backend credentials: YES (automatic)", GREEN))
         else:
-            # Option 13 remains one-secret setup. A custom URL can still be set
-            # from the normal Backend settings menu before running the wizard.
             configured_url = str(cfg.get("cloudflare_worker_url") or "").strip().rstrip("/")
             worker_url = configured_url if configured_url and not is_placeholder_value(configured_url) else DEFAULT_CLOUDFLARE_WORKER_URL
             print(f"Worker: {worker_url}")
@@ -14021,19 +14056,28 @@ def _setup_register_market_accounts(cfg, packages):
 
 
 def new_redfinger_setup_wizard(cfg=None):
-    """Guided one-time setup for a fresh Redfinger. Does not start the rejoin loop."""
+    """Full-auto one-time setup for MARKET, HATCHER, or LOCAL roles.
+
+    The user still selects the role/packages and enters NOMO_SECRET for backend
+    roles. All safe recommended actions then run automatically. Paid private
+    server creation remains protected by the explicit BUY confirmation.
+    """
     cfg = load_config() if cfg is None else cfg
     clear()
     banner("NEW REDFINGER SETUP WIZARD", cfg)
-    print(col("This changes local NOMO configuration only and never starts rejoining by itself.", DIM))
+    print(col("Select the role and packages; NOMO performs the safe setup steps automatically.", DIM))
     print("")
     print("1. MARKET Redfinger")
     print("2. HATCHER Redfinger")
+    print("3. LOCAL REJOIN ONLY (no backend / no allowlist)")
     print("0. Cancel")
-    mode_choice = read_menu_choice("Select role: ", {"0", "1", "2"})
+    mode_choice = read_menu_choice("Select role: ", {"0", "1", "2", "3"})
     if mode_choice in {None, "0"}:
         return
-    mode = "market" if mode_choice == "1" else "hatcher"
+
+    role = {"1": "market", "2": "hatcher", "3": "local"}[mode_choice]
+    runtime_mode = "market" if role == "market" else "hatcher"
+    role_label = "LOCAL REJOIN ONLY" if role == "local" else role.upper()
 
     clear()
     banner("SETUP: PACKAGES", cfg)
@@ -14043,7 +14087,7 @@ def new_redfinger_setup_wizard(cfg=None):
     cfg = load_config()
     selected = choose_packages_common(
         cfg,
-        f"SETUP {mode.upper()} ACTIVE PACKAGES",
+        f"SETUP {role_label} ACTIVE PACKAGES",
         multi=True,
         include_discovered=True,
         installed_only=True,
@@ -14052,6 +14096,7 @@ def new_redfinger_setup_wizard(cfg=None):
         print(col("Setup cancelled: no packages selected.", RED))
         pause()
         return
+
     configured = {str(t.get("package") or "") for t in cfg.get("tabs", [])}
     for pkg in selected:
         if pkg not in configured:
@@ -14059,7 +14104,9 @@ def new_redfinger_setup_wizard(cfg=None):
             configured.add(pkg)
     set_enabled_package_set(cfg, selected)
     cfg = load_config()
-    cfg = set_active_rejoin_mode(mode, cfg)
+    cfg["local_rejoin_only"] = role == "local"
+    save_config(cfg)
+    cfg = set_active_rejoin_mode(runtime_mode, cfg)
     hcfg = load_hatcher_config()
     sync_hatcher_profiles_with_tabs(cfg, hcfg)
     save_hatcher_config(hcfg)
@@ -14069,50 +14116,99 @@ def new_redfinger_setup_wizard(cfg=None):
     refresh_usernames_for_packages(cfg, selected)
     cfg = load_config()
 
-    cfg, hcfg, backend_ok = _setup_configure_cloudflare(cfg)
+    # Backend roles ask only for NOMO_SECRET. LOCAL intentionally disables all
+    # registration/reporting while preserving any previously saved credentials.
+    if role == "local":
+        cfg["local_rejoin_only"] = True
+        cfg["jsonbin_hatchers_enabled"] = False
+        save_config(cfg)
+        hcfg = load_hatcher_config()
+        hcfg["enabled"] = False
+        hcfg["jsonbin_hatchers_enabled"] = False
+        save_hatcher_config(hcfg)
+        backend_ok = False
+        print(col("Backend/reporting: DISABLED (local-only role)", CYAN))
+    else:
+        cfg["local_rejoin_only"] = False
+        save_config(cfg)
+        cfg, hcfg, backend_ok = _setup_configure_cloudflare(cfg, automatic=True)
 
-    counter_results = []
-    if _setup_yes_no("Install/update the NOMO Pet Counter AutoExec for selected packages?", True):
-        tabs_by_pkg = {str(t.get("package") or ""): t for t in autoexec_tabs(cfg)}
-        selected_tabs = [tabs_by_pkg[p] for p in selected if p in tabs_by_pkg]
-        _print_autoexec_full_paths(selected_tabs, cfg, "Pet Counter destination path(s)")
-        counter_results = _setup_install_counter_for_packages(cfg, selected, "1")
+    # Automatic YES on every role: always install/update the counter.
+    clear()
+    banner("SETUP: PET COUNTER", cfg)
+    print(col("Install/update NOMO Pet Counter: YES (automatic)", GREEN))
+    tabs_by_pkg = {str(t.get("package") or ""): t for t in autoexec_tabs(cfg)}
+    selected_tabs = [tabs_by_pkg[p] for p in selected if p in tabs_by_pkg]
+    _print_autoexec_full_paths(selected_tabs, cfg, "Pet Counter destination path(s)")
+    counter_results = _setup_install_counter_for_packages(cfg, selected, "1")
 
     mode_ok = False
     mode_msg = "skipped"
     server_result = None
     first_upload = None
-    if mode == "market":
-        if backend_ok and _setup_yes_no("Register these Market accounts to D1 now?", True):
+    reg_results = []
+
+    if role == "market":
+        print(col("Register Market accounts to D1: YES (automatic)", GREEN))
+        if backend_ok:
             mode_ok, mode_msg, reg_results = _setup_register_market_accounts(cfg, selected)
         else:
-            reg_results = []
-    else:
-        reg_results = []
-        if _setup_yes_no("Fetch/create Hatcher private servers and sync Market access now?", True):
-            server_result = auto_fetch_private_servers(cfg, selected_packages=selected, pause_at_end=False)
-            mode_ok = bool((server_result or {}).get("changed"))
-            mode_msg = "private-server setup completed" if mode_ok else "private-server setup made no changes"
-        if backend_ok and _setup_yes_no("Force the first Hatcher D1 report now?", True):
+            mode_msg = "backend unavailable; registration skipped"
+
+    elif role == "hatcher":
+        print(col("Create/reuse Hatcher private servers: YES (automatic)", GREEN))
+        print(col("Sync registered Market access: YES (automatic)", GREEN))
+        server_result = auto_fetch_private_servers(
+            cfg, selected_packages=selected, pause_at_end=False,
+            sync_market_access=True, automatic=True,
+            place_id_override="126884695634066"
+        )
+        mode_ok = bool((server_result or {}).get("changed"))
+        mode_msg = "private-server setup completed" if mode_ok else "private-server setup made no changes"
+        if backend_ok:
+            print(col("Force first Hatcher D1 report: YES (automatic)", GREEN))
             hcfg = load_hatcher_config()
+            hcfg["enabled"] = True
+            save_hatcher_config(hcfg)
             first_upload = hatcher_report_once(hcfg, force=True)
+
+    else:  # local
+        print(col("Create/reuse local private servers: YES (automatic)", GREEN))
+        print(col("D1 reporting and specific-user allowlisting: OFF", CYAN))
+        server_result = auto_fetch_private_servers(
+            cfg, selected_packages=selected, pause_at_end=False,
+            sync_market_access=False, automatic=True,
+            place_id_override="126884695634066"
+        )
+        mode_ok = bool((server_result or {}).get("changed"))
+        mode_msg = "local private-server setup completed" if mode_ok else "local private-server setup made no changes"
+        # auto_fetch writes profile links; re-disable reporting afterward.
+        hcfg = load_hatcher_config()
+        hcfg["enabled"] = False
+        hcfg["jsonbin_hatchers_enabled"] = False
+        save_hatcher_config(hcfg)
 
     clear()
     banner("SETUP COMPLETE", cfg)
-    print(f"Role       : {col(mode.upper(), GREEN)}")
+    print(f"Role       : {col(role_label, GREEN)}")
     print(f"Packages   : {', '.join(short_pkg(p) for p in selected)}")
-    print(f"Backend    : {col('READY' if backend_ok else 'SAVED / CHECK NEEDED', GREEN if backend_ok else YELLOW)}")
+    if role == "local":
+        print(f"Backend    : {col('DISABLED (LOCAL ONLY)', CYAN)}")
+        print(f"Allowlist  : {col('DISABLED', CYAN)}")
+    else:
+        print(f"Backend    : {col('READY' if backend_ok else 'SAVED / CHECK NEEDED', GREEN if backend_ok else YELLOW)}")
     print("")
     print(col("Usernames:", BOLD))
     tabs = {str(t.get("package") or ""): t for t in load_config().get("tabs", [])}
     for pkg in selected:
         print(f"  {short_pkg(pkg):<10} {tabs.get(pkg, {}).get('user_name', '-')}")
-    if counter_results:
-        print("")
-        print(col("Pet Counter:", BOLD))
-        for pkg, ok, note in counter_results:
-            print(f"  {short_pkg(pkg):<10} {col('OK' if ok else 'FAILED', GREEN if ok else RED)}  {note}")
-    if mode == "market":
+
+    print("")
+    print(col("Pet Counter:", BOLD))
+    for pkg, ok, note in counter_results:
+        print(f"  {short_pkg(pkg):<10} {col('OK' if ok else 'FAILED', GREEN if ok else RED)}  {note}")
+
+    if role == "market":
         print("")
         print(f"D1 Market registration: {col(mode_msg, GREEN if mode_ok else YELLOW)}")
         for pkg, ok, note in reg_results:
@@ -14123,6 +14219,9 @@ def new_redfinger_setup_wizard(cfg=None):
         if first_upload is not None:
             ok, msg = first_upload
             print(f"First D1 report: {col('OK' if ok else 'NOT SENT', GREEN if ok else YELLOW)}  {msg}")
+        elif role == "local":
+            print(f"D1 report: {col('DISABLED', CYAN)}")
+
     print("")
     print(col("Next: restart/re-execute the executor if the Pet Counter was newly installed, then use Option 1.", DIM))
     pause()

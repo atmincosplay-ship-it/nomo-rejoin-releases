@@ -1,11 +1,27 @@
-NOMO REJOIN V4.16
+NOMO REJOIN V4.17 — FULL-AUTO THREE-ROLE SETUP
 
-One-secret new-device setup:
-- Option 13 automatically uses https://nomo-rejoin.atmincosplay.workers.dev
-- Fresh devices ask only for NOMO_SECRET.
-- Existing complete custom backend credentials can still be reused.
-- Alternate Worker URLs remain available in Backend settings.
+Option 13 roles:
+1. MARKET
+   - asks for NOMO secret when needed
+   - installs/updates Pet Counter automatically
+   - registers Market accounts to D1 automatically
 
-Install/update:
-Upload nomo_rejoin.py to the GitHub Raw main branch, then run:
-  nomo update && nomo
+2. HATCHER
+   - asks for NOMO secret when needed
+   - installs/updates Pet Counter automatically
+   - creates/reuses private servers automatically
+   - syncs registered Market allowlist automatically
+   - sends the first D1 report automatically
+
+3. LOCAL REJOIN ONLY
+   - no NOMO secret prompt
+   - installs/updates Pet Counter automatically
+   - creates/reuses private servers automatically
+   - no D1 reporting
+   - no Market account registration
+   - no specific-user allowlisting
+
+Safety:
+- Reused/free private servers are automatic.
+- Paid Robux creation still requires typing BUY <price>.
+- Rejoin core remains V4.15 behavior.
