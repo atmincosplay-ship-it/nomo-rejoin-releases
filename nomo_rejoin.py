@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
-# NOMO REJOIN V4.22
+# NOMO REJOIN V4.23
+#
+# V4.23 — APP CLONER WINDOW + KICK RECOVERY ROLLBACK
+# - FIX: Removed alive soft-open recovery for Noka clones. Sending another
+#        plain VIEW intent to an already-open App Cloner task caused duplicate,
+#        cascaded, or overlapping floating windows.
+# - FIX: Confirmed kick/disconnect recovery now performs one exact-PID restart
+#        only. If the popup survives that clean restart, only that package is
+#        held for 5 minutes; there is no second hard retry in the same incident.
+# - FIX: Before a stopped Noka clone is launched, NOMO restores that package's
+#        built-in App Cloner window bounds using the normal 2x2 layout.
+# - FIX: Four-clone layout preview/apply is back to 2x2. Android
+#        --windowingMode remains disabled.
 #
 # V4.22 — DISCONNECT RECOVERY LOOP GUARD
-# - FIX: A fresh Lua heartbeat no longer counts as recovery success while the
-#        same kicked/disconnected popup is still reported.
-# - FIX: One popup incident now gets one soft attempt and at most one exact-PID
-#        hard fallback; it cannot enqueue a new hard-force every 15 seconds.
-# - HOLD: If the popup survives both attempts, only that package waits 5 minutes
-#         before another recovery generation. Healthy sibling clones are untouched.
-# - SAFE: Clears the incident/cooldown immediately when a clean state returns.
-#
-# V4.21 — BUILT-IN FLOATING WINDOW FIX
-# - FIX: Noka/App Cloner packages launch normally without Android
-#        --windowingMode 5; built-in clone floating remains in control.
-# - DEFAULT/MIGRATE: Forced Android freeform is disabled for Noka clones.
+# - FIX: Fresh Lua heartbeat does not count as recovery while a kick popup stays.
+# - HOLD: One continuous popup incident is isolated instead of queue-spamming.
 #
 import os
 import re
@@ -42,7 +44,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.22"
+__version__ = "V4.23"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -364,13 +366,14 @@ DEFAULT_CONFIG = {
     # wasted attempt + timeout. `kill` is isolated so hard never cascades.
     "disable_soft_rejoin": True,
 
-    # V4.15: An alive Roblox clone should first receive a package-scoped deep
-    # link without killing its PID. Killing one App Cloner freeform task can
-    # visually collapse every sibling window even when their processes survive.
-    # A target-only exact-PID hard retry remains available after this timeout.
-    "alive_recovery_soft_first": True,
+    # V4.23: Noka/App Cloner owns its floating task. Re-sending a VIEW intent
+    # to an already-open clone can create duplicate/overlapping floating windows.
+    # Automatic recovery therefore performs one exact-PID target restart.
+    "alive_recovery_soft_first": False,
     "alive_recovery_soft_timeout_seconds": 90,
-    "alive_recovery_hard_fallback": True,
+    "alive_recovery_hard_fallback": False,
+    "restore_clone_builtin_bounds_before_open": True,
+    "clone_builtin_layout_mode": "2x2",
 
     # Pool-wide stagger: minimum seconds between any two hard opens across ALL
     # clones. Spaces out restarts so reloads don't overlap (memory spikes) and
@@ -488,6 +491,7 @@ DEFAULT_CONFIG = {
     # One continuous popup incident gets one soft attempt + one hard fallback.
     # If both fail, isolate only that package before allowing a new generation.
     "disconnect_ui_incident_cooldown_seconds": 300,
+    "disconnect_recovery_wait_seconds": 60,
 
     # V3.75: Hatcher-only hard recovery for the real Redfinger/Roblox case where
     # Android still reports Roblox alive, but the state file is very old or missing
@@ -1295,14 +1299,23 @@ def apply_update_migrations(cfg):
     if "homepage_stuck_max_hard_retries" not in cfg:
         set_cfg("homepage_stuck_max_hard_retries", 1)
 
-    # V4.15: avoid collapsing every App Cloner/freeform window when only one
-    # alive target needs recovery. Existing configs receive the safe default.
-    if "alive_recovery_soft_first" not in cfg:
-        set_cfg("alive_recovery_soft_first", True)
+    # V4.23: roll back alive soft-open recovery. On App Cloner builds a second
+    # VIEW intent to an already-open task creates duplicate/cascaded windows.
+    # Use one exact-PID target restart and restore its built-in bounds before open.
+    if _int_cfg(cfg.get("_nomo_app_cloner_recovery_migration"), 0) < 423:
+        set_cfg("alive_recovery_soft_first", False)
+        set_cfg("alive_recovery_hard_fallback", False)
+        set_cfg("restore_clone_builtin_bounds_before_open", True)
+        set_cfg("clone_builtin_layout_mode", "2x2")
+        set_cfg("disconnect_recovery_wait_seconds", 60)
+        # The old visual CAPTCHA layout stored 3x2 rectangles. Disable/clear it
+        # so those stale rectangles cannot be reused for window restoration.
+        set_cfg("captcha_visual_detection_enabled", False)
+        set_cfg("captcha_visual_layout_cells", {})
+        set_cfg("captcha_visual_layout_screen", [])
+        set_cfg("_nomo_app_cloner_recovery_migration", 423)
     if _int_cfg(cfg.get("alive_recovery_soft_timeout_seconds"), 0) < 30:
         set_cfg("alive_recovery_soft_timeout_seconds", 90)
-    if "alive_recovery_hard_fallback" not in cfg:
-        set_cfg("alive_recovery_hard_fallback", True)
 
     if "login_challenge_detection_enabled" not in cfg:
         set_cfg("login_challenge_detection_enabled", True)
@@ -2159,6 +2172,95 @@ def android_safe_roblox_link(link, cfg=None):
 
     return raw
 
+
+def _is_noka_clone_package(pkg):
+    pkg_l = str(pkg or "").strip().lower()
+    return (
+        pkg_l.startswith("premium.noka")
+        or pkg_l.startswith("free.noka")
+        or ".noka" in pkg_l
+    )
+
+
+def _clone_slot_index(pkg, cfg):
+    """Return stable zero-based clone slot, preferring the A/B/C/D suffix."""
+    pkg_s = str(pkg or "").strip()
+    match = re.search(r"\.noka([A-Za-z])$", pkg_s)
+    if match:
+        return max(0, ord(match.group(1).upper()) - ord("A"))
+
+    clone_packages = []
+    for tab in (cfg or {}).get("tabs", []):
+        candidate = str((tab or {}).get("package", "") or "").strip()
+        if candidate and _is_noka_clone_package(candidate) and candidate not in clone_packages:
+            clone_packages.append(candidate)
+    try:
+        return clone_packages.index(pkg_s)
+    except ValueError:
+        return 0
+
+
+def _clone_builtin_rect(pkg, cfg):
+    """Calculate the App Cloner built-in floating bounds for one package."""
+    try:
+        width, height = _screen_size(cfg)
+    except Exception:
+        width, height = 1280, 720
+
+    gap = max(0, int((cfg or {}).get("layout_gap", 8) or 8))
+    top = max(0, int((cfg or {}).get("layout_top", 60) or 60))
+    right_safe = max(0, int((cfg or {}).get("layout_right_safe", 55) or 55))
+
+    enabled_clones = []
+    for tab in (cfg or {}).get("tabs", []):
+        candidate = str((tab or {}).get("package", "") or "").strip()
+        if candidate and _is_noka_clone_package(candidate) and candidate not in enabled_clones:
+            enabled_clones.append(candidate)
+    count = max(4, len(enabled_clones))
+    cols, rows = _layout_shape_for_count(count)
+
+    cell_w = max(120, (width - right_safe - (cols + 1) * gap) // cols)
+    cell_h = max(120, (height - top - (rows + 1) * gap) // rows)
+    index = _clone_slot_index(pkg, cfg)
+    max_cells = max(1, cols * rows)
+    index = min(max_cells - 1, max(0, index))
+    col_idx = index % cols
+    row_idx = index // cols
+    left = gap + col_idx * (cell_w + gap)
+    cell_top = top + gap + row_idx * (cell_h + gap)
+    return [left, cell_top, left + cell_w, cell_top + cell_h]
+
+
+def _restore_clone_builtin_bounds(pkg, cfg):
+    """Restore App Cloner's own window rectangle without starting another task."""
+    if not _is_noka_clone_package(pkg):
+        return False, "not a Noka clone"
+    if not (cfg or {}).get("restore_clone_builtin_bounds_before_open", True):
+        return False, "built-in bounds restore disabled"
+
+    try:
+        pref = _app_cloner_pref_file(pkg, cfg)
+    except Exception as exc:
+        return False, f"window XML lookup failed: {exc}"
+    if not pref:
+        return False, "App Cloner window XML not found"
+
+    left, top, right, bottom = _clone_builtin_rect(pkg, cfg)
+    expr = "; ".join([
+        rf's/app_cloner_current_window_left" value="[0-9-]+/app_cloner_current_window_left" value="{left}/',
+        rf's/app_cloner_current_window_top" value="[0-9-]+/app_cloner_current_window_top" value="{top}/',
+        rf's/app_cloner_current_window_right" value="[0-9-]+/app_cloner_current_window_right" value="{right}/',
+        rf's/app_cloner_current_window_bottom" value="[0-9-]+/app_cloner_current_window_bottom" value="{bottom}/',
+    ])
+    code, out = shell_timeout(
+        f"sed -i -E {shlex.quote(expr)} {shlex.quote(pref)}",
+        cfg, capture=True, timeout=8,
+    )
+    if code != 0:
+        return False, cut(out or f"sed error {code}", 100)
+    return True, f"{left},{top},{right},{bottom}"
+
+
 def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop=True, skip_force_stop=False):
     if not link or str(link).startswith("PUT_"):
         return False, "no link"
@@ -2168,7 +2270,16 @@ def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop
     if not soft and require_stop and not skip_force_stop:
         stopped, stop_note = force_stop_package(pkg, cfg, tries=3, wait_after=0.8, settle=1.0)
         if not stopped:
-            time.sleep(1.0)
+            # Never send another VIEW intent while the old exact package PID is
+            # still alive. On App Cloner this creates a second/cascaded window.
+            log_activity(f"hard open aborted: {cut(stop_note, 80)}", pkg, RED)
+            return False, f"stop failed: {cut(stop_note, 60)}"
+
+        restored, restore_note = _restore_clone_builtin_bounds(pkg, cfg)
+        if restored:
+            log_activity(f"built-in bounds restored: {restore_note}", pkg, CYAN)
+        elif _is_noka_clone_package(pkg):
+            log_activity(f"built-in bounds not restored: {cut(restore_note, 70)}", pkg, YELLOW)
 
     if should_clear_cache_for_open(cfg, soft):
         clear_package_cache(pkg, cfg, rt_tab=rt_tab, reason=reason)
@@ -2182,12 +2293,7 @@ def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop
     # Noka/App Cloner already owns the floating-window layer. Applying Android
     # freeform a second time creates empty blue task shells and broken overlap.
     # Regular non-clone packages may still opt into Android freeform manually.
-    pkg_l = str(pkg or "").strip().lower()
-    built_in_floating_clone = (
-        pkg_l.startswith("premium.noka")
-        or pkg_l.startswith("free.noka")
-        or ".noka" in pkg_l
-    )
+    built_in_floating_clone = _is_noka_clone_package(pkg)
     use_freeform = bool(cfg.get("preserve_multiwindow_on_launch", False))
     if (
         built_in_floating_clone
@@ -4801,7 +4907,7 @@ def _alive_recovery_soft_allowed(reason, pkg_alive, cfg):
     downgraded. This is intentionally reason-scoped so startup/dead-package
     opens keep their original hard behavior.
     """
-    if not pkg_alive or not cfg.get("alive_recovery_soft_first", True):
+    if not pkg_alive or not cfg.get("alive_recovery_soft_first", False):
         return False
     low = str(reason or "").strip().lower()
     if not low:
@@ -5409,7 +5515,10 @@ def queue_disconnect_ui_rejoin(open_queue, tab, target, rt_tab, cfg):
     added, anote = queue_open(
         open_queue, tab, target, "kick/disconnect popup",
         force=True, mode=mode, front=False,
-        metadata={"disconnect_recovery": True, "disconnect_recovery_stage": "initial"},
+        metadata={
+            "disconnect_recovery": True,
+            "disconnect_recovery_stage": "initial",
+        },
     )
     if added:
         rt_tab["last_disconnect_ui_open"] = t
@@ -6989,7 +7098,9 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
     if ok:
         actual_open_mode = str(rt_tab.get("last_open_mode", mode) or mode).lower()
 
-        if actual_open_mode == "soft":
+        if item.get("disconnect_recovery"):
+            timeout = max(20, int(cfg.get("disconnect_recovery_wait_seconds", 60) or 60))
+        elif actual_open_mode == "soft":
             if _alive_recovery_soft_allowed(reason, True, cfg):
                 timeout = max(30, int(cfg.get("alive_recovery_soft_timeout_seconds", 90) or 90))
             else:
@@ -7046,7 +7157,12 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
             # most one target-only hard fallback. If the popup is still latched
             # after that, hold only this package instead of starting a new hard
             # generation every hatcher retry interval.
-            if item.get("disconnect_recovery") and retries_done >= max_retries:
+            disconnect_hard_attempt_done = bool(
+                item.get("disconnect_recovery") and actual_open_mode != "soft"
+            )
+            if item.get("disconnect_recovery") and (
+                disconnect_hard_attempt_done or retries_done >= max_retries
+            ):
                 cooldown = max(60, int(cfg.get("disconnect_ui_incident_cooldown_seconds", 300) or 300))
                 cancel_queued_package(open_queue, pkg)
                 rt_tab["disconnect_ui_recovery_active"] = False
@@ -15933,13 +16049,15 @@ def _layout_active_packages(cfg):
 
 def _layout_shape_for_count(count):
     count = max(1, int(count or 1))
-    if count <= 5:
+    if count <= 4:
+        return 2, 2
+    if count <= 6:
         return 3, 2
-    if count <= 7:
+    if count <= 8:
         return 4, 2
-    if count <= 9:
+    if count <= 10:
         return 5, 2
-    if count <= 11:
+    if count <= 12:
         return 4, 3
     return 5, 3
 
@@ -16141,7 +16259,7 @@ def layout_visual_menu(cfg):
             banner("AUTO LAYOUT PREVIEW", cfg)
             _layout_preview(_compute_captcha_safe_layout(cfg), cfg)
             print("")
-            print(col("Four clones use 3x2 so Termux does not cover nokaD.", DIM))
+            print(col("Four clones use the normal built-in App Cloner 2x2 layout.", DIM))
             pause()
         elif choice == "2":
             apply_captcha_safe_layout(cfg)
