@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
-# NOMO REJOIN V4.17
+# NOMO REJOIN V4.18
+#
+# V4.18 — SETUP PLACE-ID PROMPT
+# - CHANGE: Option 13 still auto-confirms the safe setup steps, but all three
+#           roles now prompt once for a Place ID.
+# - DEFAULT: Pressing Enter uses Grow a Garden place 126884695634066.
+# - SAVE: HATCHER/LOCAL use it for server creation; all roles save it for solver routing.
+# - SCOPE: Setup-only; V4.15 rejoin behavior remains unchanged.
 #
 # V4.17 — FULL-AUTO THREE-ROLE SETUP
 # - NEW: Option 13 adds LOCAL REJOIN ONLY as a third setup role.
-# - AUTO: Recommended setup steps now run automatically for MARKET, HATCHER,
-#         and LOCAL roles; no repeated Y/n questions are shown.
-# - LOCAL: Installs the Pet Counter, creates/reuses per-package private servers,
-#          and saves links locally without D1 reporting or Market allowlisting.
-# - SAFE: Free/reused private servers are automatic. Any paid Robux creation
-#         still requires typing the explicit BUY amount.
-#
-# V4.16 — ONE-SECRET NEW-DEVICE SETUP
-# - FIX: Option 13 uses NOMO's canonical Cloudflare/D1 Worker URL automatically.
-# - SETUP: MARKET/HATCHER fresh-device setup asks only for NOMO_SECRET.
-# - SCOPE: Setup-only; V4.15 rejoin behavior remains unchanged.
+# - AUTO: Recommended setup steps run automatically for MARKET, HATCHER,
+#         and LOCAL roles; paid Robux creation still requires BUY confirmation.
 #
 import os
 import re
@@ -42,7 +40,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.17"
+__version__ = "V4.18"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -14055,6 +14053,40 @@ def _setup_register_market_accounts(cfg, packages):
     return False, msg, results
 
 
+def _setup_prompt_private_server_place_id(cfg, role):
+    """Prompt once for the private-server Place ID used by setup.
+
+    Blank input always selects Grow a Garden. The choice is saved so solver
+    routing and wrong-place checks match the private server created here.
+    """
+    default_place = "126884695634066"
+    clear()
+    title = "SETUP: PRIVATE SERVER PLACE" if role in {"hatcher", "local"} else "SETUP: DEFAULT PLACE"
+    banner(title, cfg)
+    print(col("Press Enter to use Grow a Garden.", DIM))
+    if role in {"hatcher", "local"}:
+        print(col("Only the Place ID is requested; create/reuse stays automatic.", DIM))
+    else:
+        print(col("Market registration stays automatic; this saves the default solver Place ID.", DIM))
+    print("")
+    while True:
+        entered = clean_terminal_input(input(f"Place ID [{default_place}]: "))
+        place_id = entered or default_place
+        if place_id.isdigit():
+            break
+        print(col("Place ID must contain numbers only.", RED))
+
+    cfg["setup_private_server_place_id"] = place_id
+    cfg["solver_place_id"] = place_id
+    save_config(cfg)
+
+    hcfg = load_hatcher_config()
+    hcfg["expected_place_id"] = place_id
+    save_hatcher_config(hcfg)
+    print(col(f"Using Place ID: {place_id}", GREEN))
+    return place_id
+
+
 def new_redfinger_setup_wizard(cfg=None):
     """Full-auto one-time setup for MARKET, HATCHER, or LOCAL roles.
 
@@ -14147,6 +14179,12 @@ def new_redfinger_setup_wizard(cfg=None):
     server_result = None
     first_upload = None
     reg_results = []
+    setup_place_id = None
+
+    # All three roles ask once for a Place ID. Enter keeps GAG as the default.
+    # HATCHER/LOCAL use it for server creation; MARKET saves it for solver routing.
+    setup_place_id = _setup_prompt_private_server_place_id(cfg, role)
+    cfg = load_config()
 
     if role == "market":
         print(col("Register Market accounts to D1: YES (automatic)", GREEN))
@@ -14161,7 +14199,7 @@ def new_redfinger_setup_wizard(cfg=None):
         server_result = auto_fetch_private_servers(
             cfg, selected_packages=selected, pause_at_end=False,
             sync_market_access=True, automatic=True,
-            place_id_override="126884695634066"
+            place_id_override=setup_place_id
         )
         mode_ok = bool((server_result or {}).get("changed"))
         mode_msg = "private-server setup completed" if mode_ok else "private-server setup made no changes"
@@ -14178,7 +14216,7 @@ def new_redfinger_setup_wizard(cfg=None):
         server_result = auto_fetch_private_servers(
             cfg, selected_packages=selected, pause_at_end=False,
             sync_market_access=False, automatic=True,
-            place_id_override="126884695634066"
+            place_id_override=setup_place_id
         )
         mode_ok = bool((server_result or {}).get("changed"))
         mode_msg = "local private-server setup completed" if mode_ok else "local private-server setup made no changes"
@@ -14192,6 +14230,8 @@ def new_redfinger_setup_wizard(cfg=None):
     banner("SETUP COMPLETE", cfg)
     print(f"Role       : {col(role_label, GREEN)}")
     print(f"Packages   : {', '.join(short_pkg(p) for p in selected)}")
+    if setup_place_id:
+        print(f"Place ID   : {setup_place_id}")
     if role == "local":
         print(f"Backend    : {col('DISABLED (LOCAL ONLY)', CYAN)}")
         print(f"Allowlist  : {col('DISABLED', CYAN)}")
