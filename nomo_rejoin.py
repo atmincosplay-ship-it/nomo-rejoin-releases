@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-# NOMO REJOIN V4.18
+# NOMO REJOIN V4.20
 #
-# V4.18 — SETUP PLACE-ID PROMPT
-# - CHANGE: Option 13 still auto-confirms the safe setup steps, but all three
-#           roles now prompt once for a Place ID.
-# - DEFAULT: Pressing Enter uses Grow a Garden place 126884695634066.
-# - SAVE: HATCHER/LOCAL use it for server creation; all roles save it for solver routing.
-# - SCOPE: Setup-only; V4.15 rejoin behavior remains unchanged.
+# V4.20 — AUTOMATIC HATCHER ALLOWLIST SYNC
+# - AUTO: Hatcher mode reads the current D1 Market registry at startup and then
+#         every 30 minutes while running.
+# - SMART: Each private server is updated only when the Market-user fingerprint
+#          changed or its previous sync failed; unchanged lists cause no PATCH.
+# - SAFE: Sync is additive only, never recreates servers, never removes users,
+#         and never stops/reopens Roblox packages.
+# - COMPAT: Manual private-server setup/sync remains available as a force-sync.
 #
-# V4.17 — FULL-AUTO THREE-ROLE SETUP
-# - NEW: Option 13 adds LOCAL REJOIN ONLY as a third setup role.
-# - AUTO: Recommended setup steps run automatically for MARKET, HATCHER,
-#         and LOCAL roles; paid Robux creation still requires BUY confirmation.
+# V4.19 — PACKAGE / ROBLOXCLONE AUTO-MAPPING FIX
+# - FIX: Installed packages are no longer assigned to RobloxClone folders by
+#        config/list order. Exact state usernames override suffix fallback.
+# - AUTO: Option 13 repairs package -> Workspace -> AutoExec mapping first.
+# - TOOL: Package Manager option 7 repairs an existing device safely.
 #
 import os
 import re
@@ -40,7 +43,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.18"
+__version__ = "V4.20"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -606,6 +609,13 @@ DEFAULT_HATCHER_CONFIG = {
     # Hatcher rejoiner handles those locally; server_link does not change.
     "upload_disconnect_state": False,
     "heartbeat_interval": 60,
+
+    # V4.20: automatically keep existing Hatcher private-server permissions in
+    # sync with the D1 Market registry. The sync is additive only and never
+    # recreates a server or removes an existing allowed user.
+    "auto_market_allowlist_sync_enabled": True,
+    "auto_market_allowlist_sync_on_start": True,
+    "auto_market_allowlist_sync_interval_seconds": 1800,
 
     # Market side can use a hatcher once it has at least this many pets.
     # This uploads only when crossing the threshold, not on every pet change.
@@ -8640,6 +8650,14 @@ def start_hatcher_reporter(main_cfg=None):
 
     hcfg, tabs = current_tabs()
 
+    # V4.20: one additive allowlist check at Hatcher startup. It does not create
+    # servers or touch Roblox processes, and unchanged registry hashes do no PATCH.
+    try:
+        auto_sync_hatcher_market_allowlist(cfg, hcfg, force=False, reason="startup", quiet=True)
+        hcfg, tabs = current_tabs()
+    except Exception as exc:
+        log_activity(f"allowlist startup check failed: {cut(exc, 80)}", "", YELLOW)
+
     # Smart startup
     if cfg.get("open_all_on_start", True):
         for tab in tabs:
@@ -8687,6 +8705,14 @@ def start_hatcher_reporter(main_cfg=None):
         except Exception:
             pass
         hcfg, tabs = current_tabs()
+        try:
+            sync_result = auto_sync_hatcher_market_allowlist(
+                cfg, hcfg, force=False, reason="periodic", quiet=True
+            )
+            if sync_result.get("checked"):
+                hcfg, tabs = current_tabs()
+        except Exception as exc:
+            log_activity(f"allowlist periodic check failed: {cut(exc, 80)}", "", YELLOW)
         rows = []
         report_state_cache = {}
 
@@ -9244,6 +9270,13 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
 
     hcfg, tabs = current_tabs()
 
+    # V4.20: additive D1 Market allowlist sync on Hatcher startup.
+    try:
+        auto_sync_hatcher_market_allowlist(cfg, hcfg, force=False, reason="startup", quiet=True)
+        hcfg, tabs = current_tabs()
+    except Exception as exc:
+        log_activity(f"allowlist startup check failed: {cut(exc, 80)}", "", YELLOW)
+
     # Startup: only open GENUINELY CLOSED hatcher packages. An alive clone may be
     # mid Lua-startup writing its first state.json — reopening it (soft opens can
     # still become a hard kill+open) would kill the counter the user just
@@ -9288,6 +9321,14 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
         except Exception:
             pass
         hcfg, tabs = current_tabs()
+        try:
+            sync_result = auto_sync_hatcher_market_allowlist(
+                cfg, hcfg, force=False, reason="periodic", quiet=True
+            )
+            if sync_result.get("checked"):
+                hcfg, tabs = current_tabs()
+        except Exception as exc:
+            log_activity(f"allowlist periodic check failed: {cut(exc, 80)}", "", YELLOW)
         rows = []
         report_state_cache = {}
 
@@ -9571,7 +9612,15 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
 
 def start_hatcher_reporter_only(main_cfg=None):
     """Reporter-only hatcher mode."""
+    cfg = dict(load_config())
+    if isinstance(main_cfg, dict):
+        cfg.update(main_cfg)
     hcfg = load_hatcher_config()
+    try:
+        auto_sync_hatcher_market_allowlist(cfg, hcfg, force=False, reason="startup", quiet=True)
+        hcfg = load_hatcher_config()
+    except Exception as exc:
+        log_activity(f"allowlist startup check failed: {cut(exc, 80)}", "", YELLOW)
     session_start = now()
     loops = 0
     last_msg = "not uploaded yet"
@@ -9582,6 +9631,14 @@ def start_hatcher_reporter_only(main_cfg=None):
 
         loops += 1
         hcfg = load_hatcher_config()
+        try:
+            sync_result = auto_sync_hatcher_market_allowlist(
+                cfg, hcfg, force=False, reason="periodic", quiet=True
+            )
+            if sync_result.get("checked"):
+                hcfg = load_hatcher_config()
+        except Exception as exc:
+            log_activity(f"allowlist periodic check failed: {cut(exc, 80)}", "", YELLOW)
 
         ok, msg = hatcher_report_once(hcfg, force=False)
         tag = "OK" if ok else "ERR"
@@ -9589,7 +9646,7 @@ def start_hatcher_reporter_only(main_cfg=None):
 
         hatcher_status_screen(hcfg, last_msg=last_msg)
         print("")
-        print(col("Reporter-only mode: no am start, no force-stop, no soft hop, no Roblox touch.", GREEN))
+        print(col("Reporter-only mode: no app start, no force-stop, and no soft hop.", GREEN))
         print(col(f"Uptime: {format_uptime(now() - session_start)} | Checks: {loops}", DIM))
         print(col("Type Q + ENTER to stop / return to Hatching Mode menu", DIM))
 
@@ -9785,8 +9842,255 @@ def get_installed_packages():
         return []
 
 
+def _package_clone_number_hint(pkg):
+    """Return the usual App Cloner folder number encoded by a package suffix.
+
+    free.nokaA / premium.nokaA -> 1, B -> 2, etc. Numeric suffixes are also
+    accepted. This is only a fallback; an exact username match in a real state
+    file always wins.
+    """
+    value = str(pkg or "").strip()
+    letter = re.search(r"([A-Za-z])$", value)
+    if letter and ".noka" in value.lower():
+        return ord(letter.group(1).upper()) - ord("A") + 1
+    number = re.search(r"(\d+)$", value)
+    if number:
+        try:
+            parsed = int(number.group(1))
+            return parsed if parsed > 0 else None
+        except Exception:
+            return None
+    return None
+
+
+def _clone_number_from_state_path(path):
+    match = re.search(r"/RobloxClone(\d{3})(?:/|$)", str(path or "").replace("\\", "/"), re.I)
+    return int(match.group(1)) if match else None
+
+
+def _discover_clone_state_records(storage_root=None):
+    """Return state-file identities grouped by real RobloxClone folder."""
+    root = Path(storage_root or "/storage/emulated/0")
+    records = []
+    try:
+        clone_dirs = sorted(root.glob("RobloxClone[0-9][0-9][0-9]"), key=lambda p: p.name)
+    except Exception:
+        clone_dirs = []
+    for clone_dir in clone_dirs:
+        match = re.search(r"(\d{3})$", clone_dir.name)
+        if not match:
+            continue
+        clone_no = int(match.group(1))
+        workspace = clone_dir / "Arceus X" / "Workspace"
+        for folder_name in (STATE_FOLDER_NAME, LEGACY_STATE_FOLDER_NAME):
+            folder = workspace / folder_name
+            if not folder.exists():
+                continue
+            try:
+                files = list(folder.glob("*_state.json")) + list(folder.glob("state.json"))
+            except Exception:
+                files = []
+            seen_paths = set()
+            for path in files:
+                if str(path) in seen_paths:
+                    continue
+                seen_paths.add(str(path))
+                username = ""
+                ts = 0
+                try:
+                    payload = json.loads(path.read_text())
+                    username = _usable_detected_username(payload.get("username")) or ""
+                    ts = int(payload.get("ts", 0) or 0)
+                except Exception:
+                    payload = {}
+                try:
+                    mtime = int(path.stat().st_mtime)
+                except Exception:
+                    mtime = 0
+                if ts <= 0:
+                    ts = mtime
+                if not username and path.name.endswith("_state.json"):
+                    username = path.name[:-11]
+                records.append({
+                    "clone_no": clone_no,
+                    "path": path,
+                    "username": str(username or ""),
+                    "username_key": _sanitize_state_name(username).lower() if username else "",
+                    "freshness": max(ts, mtime),
+                })
+    return sorted(records, key=lambda item: int(item.get("freshness", 0)), reverse=True)
+
+
+def _canonical_clone_state_path(clone_no, username=""):
+    filename = f"{_sanitize_state_name(username)}_state.json" if username else "state.json"
+    return Path(
+        f"/storage/emulated/0/RobloxClone{int(clone_no):03d}/"
+        f"Arceus X/Workspace/{STATE_FOLDER_NAME}/{filename}"
+    )
+
+
+def auto_map_packages_to_clone_workspaces(
+    cfg, packages=None, *, storage_root=None, resolve_api=True, persist=True, verbose=True
+):
+    """Repair package -> RobloxClone Workspace mapping without touching apps.
+
+    Priority:
+      1. exact package account username == state-file username
+      2. package suffix hint (A=Clone001, B=Clone002, ...)
+      3. currently configured unique clone folder
+      4. next unclaimed discovered clone folder
+
+    The exact state username match prevents package list/config order from
+    swapping free.nokaA/B or premium.nokaA/B.
+    """
+    wanted = set(packages or [t.get("package") for t in cfg.get("tabs", []) if t.get("package")])
+    tabs = [t for t in cfg.get("tabs", []) if t.get("package") in wanted]
+    records = _discover_clone_state_records(storage_root=storage_root)
+    records_by_clone = {}
+    for record in records:
+        records_by_clone.setdefault(record["clone_no"], []).append(record)
+
+    discovered_clones = sorted(records_by_clone)
+    used_clones = set()
+    results = []
+
+    # Resolve package identity first. Cookie/API is package-scoped and therefore
+    # safe to use even when the old stat_file points at the wrong clone folder.
+    identities = {}
+    for tab in tabs:
+        pkg = str(tab.get("package") or "")
+        username = _usable_detected_username(tab.get("user_name"))
+        source = "config"
+        if resolve_api:
+            try:
+                api_username, _ = get_username_from_package_api(pkg)
+            except Exception:
+                api_username = None
+            api_username = _usable_detected_username(api_username)
+            if api_username:
+                username = api_username
+                source = "cookie/API"
+                tab["user_name"] = api_username
+        if username and username.lower() == pkg.lower():
+            username = None
+        identities[pkg] = {"username": username or "", "source": source}
+
+    # Exact username matches are strongest and are assigned first.
+    assignments = {}
+    for tab in tabs:
+        pkg = str(tab.get("package") or "")
+        username = identities[pkg]["username"]
+        key = _sanitize_state_name(username).lower() if username else ""
+        if not key:
+            continue
+        matched = next(
+            (r for r in records if r.get("clone_no") not in used_clones and r.get("username_key") == key),
+            None,
+        )
+        if matched:
+            assignments[pkg] = (matched["clone_no"], matched, "state username match")
+            used_clones.add(matched["clone_no"])
+
+    # Then use stable package suffix hints, never config/list order.
+    for tab in tabs:
+        pkg = str(tab.get("package") or "")
+        if pkg in assignments:
+            continue
+        hint = _package_clone_number_hint(pkg)
+        if hint and hint not in used_clones:
+            best = (records_by_clone.get(hint) or [None])[0]
+            assignments[pkg] = (hint, best, "package suffix")
+            used_clones.add(hint)
+
+    # Preserve a unique existing folder when no better evidence exists.
+    for tab in tabs:
+        pkg = str(tab.get("package") or "")
+        if pkg in assignments:
+            continue
+        current = _clone_number_from_state_path(tab.get("stat_file") or tab.get("state_file"))
+        if current and current not in used_clones:
+            best = (records_by_clone.get(current) or [None])[0]
+            assignments[pkg] = (current, best, "existing path")
+            used_clones.add(current)
+
+    # Final fallback: next real discovered folder, then next free number.
+    next_clone = 1
+    for tab in tabs:
+        pkg = str(tab.get("package") or "")
+        if pkg in assignments:
+            continue
+        available = next((n for n in discovered_clones if n not in used_clones), None)
+        if available is None:
+            while next_clone in used_clones:
+                next_clone += 1
+            available = next_clone
+        best = (records_by_clone.get(available) or [None])[0]
+        assignments[pkg] = (available, best, "next available clone")
+        used_clones.add(available)
+
+    changed = False
+    for tab in tabs:
+        pkg = str(tab.get("package") or "")
+        clone_no, matched, reason = assignments[pkg]
+        username = identities[pkg]["username"]
+        if matched and reason == "state username match":
+            state_path = Path(matched["path"])
+            if not username:
+                username = matched.get("username") or ""
+        else:
+            # Keep the canonical new folder. resolve_state_path() will still read
+            # a fresh existing file in this folder while waiting for the expected
+            # username file to be written.
+            state_path = _canonical_clone_state_path(clone_no, username)
+
+        if username and tab.get("user_name") != username:
+            tab["user_name"] = username
+            changed = True
+        if str(tab.get("stat_file") or "") != str(state_path):
+            tab["stat_file"] = str(state_path)
+            changed = True
+
+        results.append({
+            "package": pkg,
+            "clone_no": clone_no,
+            "username": username or tab.get("user_name") or pkg,
+            "state_file": str(state_path),
+            "reason": reason,
+        })
+
+    if persist:
+        if changed:
+            save_config(cfg)
+        hcfg = load_hatcher_config()
+        profile_map = {str(p.get("package") or ""): p for p in hcfg.get("hatchers", [])}
+        hchanged = False
+        for result in results:
+            prof = profile_map.get(result["package"])
+            if prof is None:
+                continue
+            if str(prof.get("state_file") or "") != result["state_file"]:
+                prof["state_file"] = result["state_file"]
+                hchanged = True
+            if result["username"] and prof.get("hatcher_name") != result["username"]:
+                prof["hatcher_name"] = result["username"]
+                hchanged = True
+        if hchanged:
+            save_hatcher_config(hcfg)
+
+    if verbose:
+        for result in sorted(results, key=lambda item: natural_package_key(item["package"])):
+            print(col(
+                f"{short_pkg(result['package'])} -> RobloxClone{result['clone_no']:03d} "
+                f"-> {result['username']} [{result['reason']}]",
+                GREEN,
+            ))
+            print(col(f"  {result['state_file']}", DIM))
+    return results
+
+
 def _new_tab_for_package(pkg, position=0):
-    idx = max(0, int(position or 0))
+    hint = _package_clone_number_hint(pkg)
+    idx = max(0, int(hint - 1 if hint else (position or 0)))
     if idx < len(DEFAULT_TABS):
         tab = json.loads(json.dumps(DEFAULT_TABS[idx]))
     else:
@@ -11652,6 +11956,185 @@ def add_private_server_allowed_users(cookie, server_id, user_ids, friends_allowe
     return added, failed
 
 
+
+def market_allowlist_fingerprint(accounts):
+    """Stable fingerprint of the D1 Market user IDs used for permission sync."""
+    ids = sorted({
+        str((item or {}).get("user_id") or "").strip()
+        for item in (accounts or [])
+        if isinstance(item, dict) and str(item.get("user_id") or "").strip().isdigit()
+    }, key=lambda value: int(value))
+    return hashlib.sha256("\n".join(ids).encode("utf-8")).hexdigest(), ids
+
+
+def _hatcher_registry_cfg(main_cfg, hcfg):
+    """Build the backend config used to read the shared Market-account registry."""
+    out = dict(main_cfg or {})
+    for key in (
+        "backend_provider", "cloudflare_worker_url", "cloudflare_secret",
+        "cloudflare_timeout_seconds",
+    ):
+        value = (hcfg or {}).get(key)
+        if value not in (None, "") and not is_placeholder_value(value):
+            out[key] = value
+    return out
+
+
+def auto_sync_hatcher_market_allowlist(main_cfg=None, hcfg=None, *, force=False, reason="periodic", quiet=True):
+    """Add current D1 Market users to every existing Hatcher private server.
+
+    This function never creates/replaces a server, never removes users, and never
+    touches Roblox processes. A per-profile registry hash prevents repeated PATCH
+    requests when the Market-account list has not changed.
+    """
+    cfg = dict(load_config()) if main_cfg is None else dict(main_cfg)
+    hcfg = load_hatcher_config() if hcfg is None else hcfg
+
+    result = {
+        "checked": False,
+        "changed": False,
+        "synced_servers": 0,
+        "skipped_servers": 0,
+        "failed_servers": 0,
+        "market_count": 0,
+        "message": "not checked",
+    }
+
+    if bool(cfg.get("local_rejoin_only", False)):
+        result["message"] = "local-only role; allowlist sync disabled"
+        return result
+    if not force and not bool(hcfg.get("auto_market_allowlist_sync_enabled", True)):
+        result["message"] = "auto allowlist sync disabled"
+        return result
+    if not force and reason == "startup" and not bool(hcfg.get("auto_market_allowlist_sync_on_start", True)):
+        result["message"] = "startup allowlist sync disabled"
+        return result
+
+    registry_cfg = _hatcher_registry_cfg(cfg, hcfg)
+    if backend_provider(registry_cfg) != "cloudflare":
+        result["message"] = "Cloudflare backend not enabled"
+        return result
+    if is_placeholder_value(registry_cfg.get("cloudflare_worker_url")) or is_placeholder_value(registry_cfg.get("cloudflare_secret")):
+        result["message"] = "Cloudflare registry credentials missing"
+        return result
+
+    t = now()
+    interval = max(300, int(hcfg.get("auto_market_allowlist_sync_interval_seconds", 1800) or 1800))
+    last_check = int(hcfg.get("auto_market_allowlist_last_check_at", 0) or 0)
+    if not force and last_check > 0 and t - last_check < interval:
+        result["message"] = f"next allowlist check in {max(0, interval - (t - last_check))}s"
+        return result
+
+    # Persist the check time even on a temporary backend failure so a 10-second
+    # dashboard loop cannot hammer D1 repeatedly.
+    hcfg["auto_market_allowlist_last_check_at"] = t
+    result["checked"] = True
+
+    accounts, registry_err = cloudflare_read_accounts(registry_cfg, role="market")
+    if registry_err:
+        hcfg["auto_market_allowlist_last_error"] = str(registry_err)[:300]
+        hcfg["auto_market_allowlist_last_result"] = "registry error"
+        save_hatcher_config(hcfg)
+        result["message"] = f"registry error: {registry_err}"
+        if not quiet:
+            print(col(f"Auto allowlist sync skipped: {registry_err}", YELLOW))
+        return result
+
+    registry_hash, market_ids = market_allowlist_fingerprint(accounts)
+    result["market_count"] = len(market_ids)
+    hcfg["auto_market_allowlist_registry_hash"] = registry_hash
+    hcfg["auto_market_allowlist_market_count"] = len(market_ids)
+    hcfg["auto_market_allowlist_last_error"] = ""
+
+    cache = load_cookie_cache()
+    profiles = hatcher_profiles(hcfg, enabled_only=True)
+    attempted = 0
+
+    for profile in profiles:
+        pkg = str(profile.get("package") or "").strip()
+        server_id = str(profile.get("private_server_id") or "").strip()
+        previous_hash = str(profile.get("private_server_market_allowlist_hash") or "").strip()
+
+        if not server_id:
+            result["skipped_servers"] += 1
+            profile["private_server_market_allowlist_error"] = "missing private_server_id; run manual server setup once"
+            continue
+        if not force and previous_hash == registry_hash:
+            result["skipped_servers"] += 1
+            continue
+
+        attempted += 1
+        cookie = get_cookie_from_package(pkg)
+        if not cookie:
+            cookie = str((cache.get(pkg) or {}).get("cookie") or "").strip()
+        if not cookie:
+            result["failed_servers"] += 1
+            profile["private_server_market_allowlist_error"] = "no local cookie"
+            continue
+
+        _owner_name, owner_id = get_username_from_cookie(cookie, timeout=12)
+        owner_id = str(owner_id or "").strip()
+        target_ids = [uid for uid in market_ids if uid != owner_id]
+
+        # Empty registry (or owner-only registry) needs no permission PATCH, but
+        # the successful no-op is still fingerprinted to avoid hourly retries.
+        if not target_ids:
+            profile["private_server_market_allowlist_hash"] = registry_hash
+            profile["private_server_market_allowlist_synced_at"] = t
+            profile["private_server_market_allowlist_count"] = 0
+            profile["private_server_market_allowlist_error"] = ""
+            profile["private_server_market_users_failed"] = []
+            result["synced_servers"] += 1
+            result["changed"] = True
+            continue
+
+        added, failed = add_private_server_allowed_users(
+            cookie, server_id, target_ids, friends_allowed=True
+        )
+        profile["private_server_market_users_synced"] = len(added)
+        profile["private_server_market_users_failed"] = failed[:20]
+        profile["private_server_market_allowlist_synced_at"] = t
+
+        if failed:
+            result["failed_servers"] += 1
+            profile["private_server_market_allowlist_error"] = (
+                f"{len(failed)} account(s) failed"
+            )
+            # Do not advance the hash. The next scheduled check retries only this
+            # failed server; successful servers remain untouched.
+            log_activity(
+                f"allowlist sync partial {len(added)}/{len(target_ids)}; retry later",
+                pkg, YELLOW,
+            )
+        else:
+            profile["private_server_market_allowlist_hash"] = registry_hash
+            profile["private_server_market_allowlist_count"] = len(target_ids)
+            profile["private_server_market_allowlist_error"] = ""
+            result["synced_servers"] += 1
+            result["changed"] = True
+            log_activity(
+                f"allowlist synced: {len(target_ids)} Market account(s)",
+                pkg, GREEN,
+            )
+
+    hcfg["auto_market_allowlist_last_result"] = (
+        f"synced={result['synced_servers']} failed={result['failed_servers']} "
+        f"skipped={result['skipped_servers']} market={len(market_ids)}"
+    )
+    if result["failed_servers"] == 0:
+        hcfg["auto_market_allowlist_last_success_at"] = t
+    save_hatcher_config(hcfg)
+
+    if attempted == 0:
+        result["message"] = f"allowlist unchanged ({len(market_ids)} Market account(s))"
+    else:
+        result["message"] = hcfg["auto_market_allowlist_last_result"]
+    if not quiet:
+        color = GREEN if result["failed_servers"] == 0 else YELLOW
+        print(col(f"Auto allowlist sync: {result['message']}", color))
+    return result
+
+
 def _private_server_item_from_profile(profile):
     """Recover a previously saved server ID/join code from one hatcher profile."""
     if not isinstance(profile, dict):
@@ -11822,6 +12305,7 @@ def auto_fetch_private_servers(
             registry_cfg[key] = value
     market_accounts = []
     market_registry_err = ""
+    market_registry_hash = ""
     if not sync_market_access:
         market_registry_err = "specific-user allowlisting disabled"
         print(col("D1 Market allowlisting: SKIPPED (local-only setup)", CYAN))
@@ -11830,6 +12314,7 @@ def auto_fetch_private_servers(
         if market_registry_err:
             print(col(f"D1 Market registry unavailable: {market_registry_err}", YELLOW))
         else:
+            market_registry_hash, _market_registry_ids = market_allowlist_fingerprint(market_accounts)
             print(col(f"D1 Market accounts ready for permission sync: {len(market_accounts)}", GREEN if market_accounts else YELLOW))
     else:
         market_registry_err = "Cloudflare backend not enabled"
@@ -12008,6 +12493,11 @@ def auto_fetch_private_servers(
         profile["private_server_permissions_synced_at"] = now()
         profile["private_server_market_users_synced"] = len(allowed_added)
         profile["private_server_market_users_failed"] = allowed_failed[:20]
+        if sync_market_access and not market_registry_err and not allowed_failed and market_registry_hash:
+            profile["private_server_market_allowlist_hash"] = market_registry_hash
+            profile["private_server_market_allowlist_synced_at"] = now()
+            profile["private_server_market_allowlist_count"] = len(market_ids)
+            profile["private_server_market_allowlist_error"] = ""
         profile["private_server_market_registry_error"] = str(market_registry_err or "")[:300]
         profile["private_server_synced_at"] = now()
         changed = True
@@ -14148,6 +14638,15 @@ def new_redfinger_setup_wizard(cfg=None):
     refresh_usernames_for_packages(cfg, selected)
     cfg = load_config()
 
+    clear()
+    banner("SETUP: PACKAGE / WORKSPACE MAPPING", cfg)
+    print(col("Mapping packages from real state usernames first; package suffix is fallback.", DIM))
+    mapping_results = auto_map_packages_to_clone_workspaces(cfg, selected, resolve_api=True, persist=True, verbose=True)
+    cfg = load_config()
+    hcfg = load_hatcher_config()
+    sync_hatcher_profiles_with_tabs(cfg, hcfg)
+    save_hatcher_config(hcfg)
+
     # Backend roles ask only for NOMO_SECRET. LOCAL intentionally disables all
     # registration/reporting while preserving any previously saved credentials.
     if role == "local":
@@ -14242,6 +14741,14 @@ def new_redfinger_setup_wizard(cfg=None):
     tabs = {str(t.get("package") or ""): t for t in load_config().get("tabs", [])}
     for pkg in selected:
         print(f"  {short_pkg(pkg):<10} {tabs.get(pkg, {}).get('user_name', '-')}")
+
+    print("")
+    print(col("Workspace mapping:", BOLD))
+    for item in sorted(mapping_results, key=lambda value: natural_package_key(value["package"])):
+        print(
+            f"  {short_pkg(item['package']):<10} RobloxClone{item['clone_no']:03d}  "
+            f"{item['username']}"
+        )
 
     print("")
     print(col("Pet Counter:", BOLD))
@@ -15210,13 +15717,14 @@ def select_package_menu(cfg):
         print("4. Add custom package name(s)")
         print("5. Remove package(s) from NOMO config")
         print("6. Refresh selected usernames (cookie -> state)")
+        print("7. Auto-map packages to RobloxClone folders")
         print("0. Back")
         drain_stdin()
-        ch = read_menu_choice("\nChoose: ", {"0", "1", "2", "3", "4", "5", "6", "q", "b", "back"})
+        ch = read_menu_choice("\nChoose: ", {"0", "1", "2", "3", "4", "5", "6", "7", "q", "b", "back"})
         if ch in {"0", "q", "b", "back"}:
             return
         if ch is None:
-            print(col("Invalid choice. Use 0-6.", RED))
+            print(col("Invalid choice. Use 0-7.", RED))
             time.sleep(1)
             continue
         if ch == "1":
@@ -15285,6 +15793,21 @@ def select_package_menu(cfg):
                                               include_discovered=False, configured_only=True)
             if selected:
                 refresh_usernames_for_packages(cfg, selected)
+                pause()
+        elif ch == "7":
+            selected = choose_packages_common(cfg, "AUTO-MAP ROBLOXCLONE FOLDERS", multi=True,
+                                              include_discovered=False, configured_only=True)
+            if selected:
+                clear()
+                banner("PACKAGE / ROBLOXCLONE MAPPING", cfg)
+                print(col("No apps will be stopped or opened.", DIM))
+                print("")
+                results = auto_map_packages_to_clone_workspaces(
+                    cfg, selected, resolve_api=True, persist=True, verbose=True
+                )
+                if results:
+                    print(col(f"\nMapped {len(results)} package(s).", GREEN))
+                    print(col("AutoExec and state paths now follow the real RobloxClone folders.", DIM))
                 pause()
         else:
             print(col("Invalid choice.", RED))
