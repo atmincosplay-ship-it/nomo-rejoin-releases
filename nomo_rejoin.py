@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
-# NOMO REJOIN V4.24
+# NOMO REJOIN V4.25
+#
+# V4.25 — KICKED STATUS = TARGET PID RESTART
+# - CORE: A confirmed Kicked/Disconnected state now bypasses the fresh-state
+#         safety recheck, because the counter can keep writing behind Error 267.
+# - CORE: The affected package goes through one solver preflight, then NOMO stops
+#         only that package's exact PID and opens it once.
+# - FIX : Fresh state can no longer cancel a queued kick recovery and create the
+#         repeated "stale kick recovery lock cleared / queued" loop.
+# - SAFE: No am force-stop, killall, or pkill is used by this recovery path.
 #
 # V4.24 — ORPHAN KICK-RECOVERY LOCK FIX
-# - FIX: A persisted disconnect_ui_recovery_active flag can no longer block a
-#        kicked package forever after NOMO is updated, stopped, or restarted.
-# - FIX: When no live queue item and no solver job owns the incident, NOMO clears
-#        the orphan lock and immediately queues one clean target-only recovery.
-# - UI : Activity log reports "stale kick recovery lock cleared" so the repair
-#        is visible instead of leaving the package on Kicked indefinitely.
-# - SCOPE: Keeps V4.23 exact-PID recovery and built-in App Cloner 2x2 bounds.
-#
-# V4.23 — APP CLONER WINDOW + KICK RECOVERY ROLLBACK
-# - FIX: Removed alive soft-open recovery for Noka clones and Android freeform.
-# - FIX: Kick recovery performs one exact-PID restart and one incident hold.
-# - FIX: Restores the target clone's built-in App Cloner 2x2 bounds before open.
+# - FIX: A persisted disconnect recovery lock is repaired after NOMO restarts.
+# - SCOPE: Keeps exact-PID recovery and built-in App Cloner 2x2 bounds.
 #
 import os
 import re
@@ -42,7 +41,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.24"
+__version__ = "V4.25"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -5526,6 +5525,10 @@ def queue_disconnect_ui_rejoin(open_queue, tab, target, rt_tab, cfg):
         metadata={
             "disconnect_recovery": True,
             "disconnect_recovery_stage": "initial",
+            # A kicked client may keep writing a fresh state behind the popup.
+            # Never let the generic fresh-state recheck cancel this target-only
+            # exact-PID restart, or the dashboard will queue it forever.
+            "bypass_recheck": True,
         },
     )
     if added:
