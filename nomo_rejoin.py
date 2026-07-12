@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-# NOMO REJOIN V4.20
+# NOMO REJOIN V4.21
+#
+# V4.21 — BUILT-IN FLOATING WINDOW FIX
+# - FIX: Noka/App Cloner packages now launch normally and never receive Android
+#        --windowingMode 5 while built-in clone floating is enabled.
+# - DEFAULT: Forced Android freeform is OFF on fresh installs.
+# - MIGRATE: Existing saved true/5 settings are disabled once automatically.
+# - SAFE: Layout coordinates remain supported; only the duplicate Android
+#         freeform layer is removed.
 #
 # V4.20 — AUTOMATIC HATCHER ALLOWLIST SYNC
 # - AUTO: Hatcher mode reads the current D1 Market registry at startup and then
@@ -8,13 +16,6 @@
 #          changed or its previous sync failed; unchanged lists cause no PATCH.
 # - SAFE: Sync is additive only, never recreates servers, never removes users,
 #         and never stops/reopens Roblox packages.
-# - COMPAT: Manual private-server setup/sync remains available as a force-sync.
-#
-# V4.19 — PACKAGE / ROBLOXCLONE AUTO-MAPPING FIX
-# - FIX: Installed packages are no longer assigned to RobloxClone folders by
-#        config/list order. Exact state usernames override suffix fallback.
-# - AUTO: Option 13 repairs package -> Workspace -> AutoExec mapping first.
-# - TOOL: Package Manager option 7 repairs an existing device safely.
 #
 import os
 import re
@@ -43,7 +44,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.20"
+__version__ = "V4.21"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -474,8 +475,11 @@ DEFAULT_CONFIG = {
     # Redfinger uses Android freeform/floating tasks. A plain `am start` can hide
     # every peer window even though their processes and Lua heartbeats remain
     # alive. Ask ActivityManager to launch the recovered clone in freeform mode.
-    "preserve_multiwindow_on_launch": True,
-    "launch_windowing_mode": 5,
+    # Noka/App Cloner already supplies its own floating window. Adding Android
+    # freeform again creates duplicate/empty task shells, so it is disabled.
+    "preserve_multiwindow_on_launch": False,
+    "launch_windowing_mode": 0,
+    "disable_android_freeform_for_clone_packages": True,
 
     # Hatcher popup/session-expired handling:
     # If the Roblox-side state writer directly sees a kicked/disconnected/session-expired
@@ -1374,10 +1378,17 @@ def apply_update_migrations(cfg):
     set_cfg("minimized_window_reopen_enabled", False)
     if "minimized_window_reopen_mode" not in cfg:
         set_cfg("minimized_window_reopen_mode", "soft")
-    if "preserve_multiwindow_on_launch" not in cfg:
-        set_cfg("preserve_multiwindow_on_launch", True)
-    if _int_cfg(cfg.get("launch_windowing_mode"), 0) <= 0:
-        set_cfg("launch_windowing_mode", 5)
+    # V4.21: Noka/App Cloner has built-in floating windows. The older Android
+    # --windowingMode 5 layer creates empty/duplicate task shells and overlapping
+    # windows. Disable it once for existing installs and keep clone packages
+    # protected even if an old config later restores the stale values.
+    if _int_cfg(cfg.get("_nomo_builtin_floating_migration"), 0) < 421:
+        set_cfg("preserve_multiwindow_on_launch", False)
+        set_cfg("launch_windowing_mode", 0)
+        set_cfg("disable_android_freeform_for_clone_packages", True)
+        set_cfg("_nomo_builtin_floating_migration", 421)
+    elif "disable_android_freeform_for_clone_packages" not in cfg:
+        set_cfg("disable_android_freeform_for_clone_packages", True)
 
     if "start_skip_if_state_fresh_enabled" not in cfg:
         set_cfg("start_skip_if_state_fresh_enabled", True)
@@ -2165,12 +2176,23 @@ def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop
         f"-p {shlex.quote(pkg)}"
     )
 
-    # V3.87: Redfinger's floating windows can all disappear when a plain
-    # ActivityManager start changes the task/windowing mode. Their fresh Lua
-    # states prove the peers are still alive; this is a window-layout collapse,
-    # not a broad PID stop. Request Android freeform mode for the recovered app.
-    use_freeform = bool(cfg.get("preserve_multiwindow_on_launch", True))
-    windowing_mode = int(cfg.get("launch_windowing_mode", 5) or 5)
+    # Noka/App Cloner already owns the floating-window layer. Applying Android
+    # freeform a second time creates empty blue task shells and broken overlap.
+    # Regular non-clone packages may still opt into Android freeform manually.
+    pkg_l = str(pkg or "").strip().lower()
+    built_in_floating_clone = (
+        pkg_l.startswith("premium.noka")
+        or pkg_l.startswith("free.noka")
+        or ".noka" in pkg_l
+    )
+    use_freeform = bool(cfg.get("preserve_multiwindow_on_launch", False))
+    if (
+        built_in_floating_clone
+        and cfg.get("disable_android_freeform_for_clone_packages", True)
+    ):
+        use_freeform = False
+
+    windowing_mode = int(cfg.get("launch_windowing_mode", 0) or 0)
     if use_freeform and windowing_mode > 0:
         cmd = f"am start --windowingMode {windowing_mode} {base_args}"
         code, out = shell_timeout(cmd, cfg, capture=True, timeout=15)
