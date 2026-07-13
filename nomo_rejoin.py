@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+# V4.43 — HATCHER STARTUP LOADING GRACE
+# - FIX: An already-alive clone with an old state file is no longer PID-stopped
+#        immediately when NOMO starts.
+# - NEW: Existing alive clones receive a 240-second startup observation grace.
+#        During that grace NOMO waits for the game/counter to produce fresh state.
+# - SAFE: No solver preflight and no hard restart are queued during startup grace.
+# - RECOVERY: If state is still old after grace, exact-PID recovery runs normally.
+# - ROLLBACK: Shared GitHub/embedded counter restored to stable v3.9.
+#
 # V4.42 — SLOW-LOAD PROCESS WAIT FIX
 # - FIX: A newly opened clone is no longer declared dead after only 20 seconds.
 # - NEW: Wait up to 120 seconds for the selected package PID to first appear.
@@ -24,7 +33,7 @@
 # - SAFE: Successful downloads are cached locally in the executor workspace.
 # - FALLBACK: If GitHub is unavailable, the last cache is used; if no cache
 #             exists yet, the complete tested v3.9 counter embedded here runs.
-# - UPDATE: The embedded fallback is v4.1-confirmed-booster-schema.
+# - UPDATE: The embedded fallback is v3.9-release-data-counts.
 # - KEEP: V4.38 no-PID-stop Market/Restock routing and exact-PID hard recovery.
 #
 # V4.38 — EMBEDDED DATA-SERVICE COUNTER + SAFE MARKET ROUTING
@@ -110,7 +119,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.42"
+__version__ = "V4.43"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -422,6 +431,10 @@ DEFAULT_CONFIG = {
     # readable state file before the table stops showing "waiting" and surfaces
     # an actionable "check Lua/username" note. Short so it never looks stuck.
     "hatcher_startup_grace_seconds": 75,
+    # When NOMO is started while Roblox clones are already opening, their old
+    # state files remain visible until AutoExec reaches the game. Do not treat
+    # those old files as proof that the live clone is stuck.
+    "hatcher_startup_stale_grace_seconds": 240,
     # V3.79: automatically resolve each package's real username from its cookie
     # (Roblox API) -> fallback state file, so the table always matches the
     # account actually logged in. Makes the manual "get username" step optional.
@@ -1375,6 +1388,8 @@ def apply_update_migrations(cfg):
     # for the full 6-minute post-open window.
     if _int_cfg(cfg.get("hatcher_startup_grace_seconds"), 0) <= 0:
         set_cfg("hatcher_startup_grace_seconds", 75)
+    if _int_cfg(cfg.get("hatcher_startup_stale_grace_seconds"), 0) < 120:
+        set_cfg("hatcher_startup_stale_grace_seconds", 240)
 
     # V3.79: auto username resolution ON by default so the table matches the
     # logged-in account without the manual step.
@@ -8018,6 +8033,7 @@ def _nomo_start_market_rejoin_original(cfg):
                 if health.get("clean_fresh"):
                     clear_manual_login_block(rt_tab)
                     clear_captcha_ui_runtime(rt_tab)
+                    rt_tab["hatcher_startup_observe_until"] = 0
 
             # -----------------------------------------------------
             # SHARED REJOIN ENGINE
@@ -10447,6 +10463,29 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
     hcfg = load_hatcher_config()
     rt = load_runtime()
 
+    # V4.43 one-time startup-grace repair. Clear queue/open artifacts from the
+    # previous immediate-startup hard-recovery behavior; the current process will
+    # rebuild its in-memory queue using the new observation grace.
+    if int(cfg.get("_nomo_startup_loading_grace_migration", 0) or 0) < 443:
+        for profile in hatcher_profiles(hcfg, enabled_only=False):
+            pkg = str((profile or {}).get("package", "") or "")
+            if not pkg:
+                continue
+            rt_tab = get_runtime_tab(rt, pkg)
+            note_l = str(rt_tab.get("note", "") or "").lower()
+            if (
+                "startup stale" in note_l
+                or "solver running" in note_l
+                or "already queued" in note_l
+            ):
+                rt_tab["note"] = "startup grace reset by V4.43"
+            rt_tab["hatcher_startup_observe_until"] = 0
+        rt["_open_lock_pkg"] = ""
+        rt["_open_lock_at"] = 0
+        cfg["_nomo_startup_loading_grace_migration"] = 443
+        save_runtime(rt)
+        save_config(cfg)
+
     # V4.42 one-time repair: clear only temporary queue/open state left by the
     # old 20-second "died while loading" rule. Persistent config and holds stay.
     if int(cfg.get("_nomo_loading_wait_migration", 0) or 0) < 442:
@@ -10560,13 +10599,20 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                 continue
 
             if raw_alive and state is not None and old_enabled and old_sec <= state_age <= old_max:
-                added, _ = queue_open(
-                    open_queue, tab, "hatcher",
-                    f"hatcher startup old state {state_age}s",
-                    force=True, mode="hard_force", front=False,
-                    metadata={"bypass_recheck": True, "pid_only_recovery": True},
+                # NOMO may have been started while this clone was already in the
+                # Roblox loading screen. Its previous state file remains old until
+                # AutoExec reaches the game, so observe first instead of killing it.
+                startup_stale_grace = max(
+                    120,
+                    int(cfg.get("hatcher_startup_stale_grace_seconds", 240) or 240),
                 )
-                rt_tab["note"] = "startup stale PID queued" if added else "startup stale already queued"
+                rt_tab["hatcher_startup_observe_until"] = now() + startup_stale_grace
+                rt_tab["last_open"] = now()
+                rt_tab["note"] = f"startup loading grace {startup_stale_grace}s"
+                log_activity(
+                    f"alive with old state; startup grace {format_age(startup_stale_grace)} (no stop)",
+                    pkg, CYAN,
+                )
                 continue
 
             if raw_alive:
@@ -10700,8 +10746,21 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                 old_open_age = (now() - last_open_for_old) if last_open_for_old > 0 else 999999
                 in_old_open_grace = old_open_age < old_after_open_grace
 
+                startup_observe_until = int(
+                    rt_tab.get("hatcher_startup_observe_until", 0) or 0
+                )
+                in_startup_observe = bool(
+                    alive and startup_observe_until > now()
+                )
+
                 if problem_code:
                     pass
+                elif in_startup_observe and recovery_age >= old_sec:
+                    status = "Loading"
+                    note = (
+                        "startup loading grace "
+                        + format_age(max(1, startup_observe_until - now()))
+                    )
                 elif alive and old_enabled and recovery_age > old_max:
                     status = "Online"
                     note = f"invalid old state ignored {age}s"
@@ -10798,6 +10857,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                         note = f"ingame,no {expected_state_name(tab)}? chk Lua"
                 else:
                     rt_tab["hatcher_no_state_since"] = 0
+                    rt_tab["hatcher_startup_observe_until"] = 0
                     status = "Offline"
 
             # Clear a previous incident as soon as the counter reports a clean
@@ -11605,7 +11665,7 @@ def compute_age(created_str):
 
 PET_COUNTER_FALLBACK_TEMPLATE = r'''--========================================================--
 --                    NOMO PET COUNTER
---       v4.1 CONFIRMED BOOSTER SCHEMA
+--       v3.9 RELEASE DATA COUNTS
 --========================================================--
 -- Writes per-account state to:
 --   nomo_rejoiner/<username>_state.json
@@ -11683,7 +11743,7 @@ local Config = getgenv().NOMO_PET_COUNTER
 
 Config.Enabled = true
 Config.Stop = false
-Config.Version = "v4.1-confirmed-booster-schema"
+Config.Version = "v3.9-release-data-counts"
 
 Config.WriteFolder = Config.WriteFolder or "nomo_rejoiner"
 
@@ -11703,12 +11763,6 @@ Config.WriteFile = Config.WriteFile or (Config.WriteFolder .. "/" .. _safeUser .
 -- Scan fast, write light.
 Config.ScanEvery = tonumber(Config.ScanEvery or 2) or 2
 Config.WriteEvery = tonumber(Config.WriteEvery or 5) or 5
-
--- Booster match defaults. The counter only exports matching pet details, never
--- the full pet inventory, keeping state files compact.
-Config.BoosterMinBaseWeightKg = tonumber(Config.BoosterMinBaseWeightKg or 6) or 6
-Config.BoosterMinAge = tonumber(Config.BoosterMinAge or 500) or 500
-Config.BoosterMaxMatches = math.max(1, math.floor(tonumber(Config.BoosterMaxMatches or 100) or 100))
 
 Config.Debug = Config.Debug == true
 Config.Verbose = Config.Verbose == true
@@ -12338,178 +12392,19 @@ local function firstTable(...)
     return nil
 end
 
-local PET_NAME_FIELDS = {
-    "PetType", "PetName", "pet_type", "pet_name", "Name", "name",
-    "ItemName", "item_name", "Type", "type"
-}
-local PET_AGE_FIELDS = {"Age", "age", "PetAge", "pet_age"}
-local PET_WEIGHT_FIELDS = {
-    "WeightKg", "WeightKG", "weight_kg", "Weight", "weight",
-    "CurrentWeight", "current_weight", "FinalWeight", "final_weight"
-}
-local PET_BASE_WEIGHT_FIELDS = {
-    "BaseWeightKg", "BaseWeightKG", "base_weight_kg", "BaseWeight",
-    "base_weight", "OriginalWeight", "original_weight", "BaseKG", "base_kg"
-}
-local PET_MUTATION_FIELDS = {
-    "Mutation", "mutation", "MutationType", "mutation_type",
-    "Mutations", "mutations"
-}
-local PET_UUID_FIELDS = {
-    "PET_UUID", "PetUUID", "pet_uuid", "UUID", "uuid", "Id", "id"
-}
-
-local function entryTables(entry)
-    local out = {}
-    local seen = {}
-    local function add(value)
-        if type(value) == "table" and not seen[value] then
-            seen[value] = true
-            table.insert(out, value)
-        end
-    end
-    add(entry)
-    if type(entry) == "table" then
-        add(entry.Data)
-        add(entry.data)
-        add(entry.PetData)
-        add(entry.petData)
-        add(entry.Pet)
-        add(entry.pet)
-        add(entry.Info)
-        add(entry.info)
-    end
-    return out
-end
-
-local function firstEntryField(entry, fields)
-    for _, container in ipairs(entryTables(entry)) do
-        for _, field in ipairs(fields) do
-            local value = container[field]
-            if value ~= nil then
-                return value
-            end
-        end
-    end
-    return nil
-end
-
-local function numericEntryField(entry, fields)
-    local value = firstEntryField(entry, fields)
-    if type(value) == "table" then
-        value = value.Value or value.value or value.Amount or value.amount
-    end
-    return tonumber(value)
-end
-
-local function stringEntryField(entry, fields)
-    local value = firstEntryField(entry, fields)
-    if value == nil then
-        return ""
-    end
-    if type(value) == "table" then
-        local parts = {}
-        for key, enabled in pairs(value) do
-            if enabled ~= false and enabled ~= nil then
-                table.insert(parts, tostring(key))
-            end
-        end
-        table.sort(parts)
-        return table.concat(parts, ",")
-    end
-    return tostring(value)
-end
-
-local function boosterPetDetail(key, entry)
-    if type(entry) ~= "table" then
-        return nil
-    end
-
-    -- Confirmed DataService PetInventory schema:
-    -- table key     = pet UUID
-    -- PetType       = species
-    -- Name          = nickname
-    -- Level         = age
-    -- BaseWeight    = age-0 base weight
-    -- MutationType  = mutation
-    local uuid = tostring(key or "")
-    local petType = tostring(entry.PetType or "Unknown Pet")
-    local nickname = tostring(entry.Name or "")
-    local age = tonumber(entry.Level) or 0
-    local age0BaseWeight = tonumber(entry.BaseWeight) or 0
-
-    -- NOMO convention: filter/report base weight as the pet's age-1 weight.
-    -- Keep only 2 decimals by truncating; never round.
-    local age1BaseWeight = math.floor((age0BaseWeight * 1.1) * 100) / 100
-
-    local mutation = tostring(entry.MutationType or "")
-    local hatchedFrom = tostring(entry.HatchedFrom or "")
-    local isFavorite = entry.IsFavorite == true
-
-    local boosts = {}
-    if type(entry.Boosts) == "table" then
-        for _, value in pairs(entry.Boosts) do
-            table.insert(boosts, tostring(value))
-        end
-        table.sort(boosts)
-    end
-
-    local ageMatch = age >= Config.BoosterMinAge
-    local weightMatch = age1BaseWeight >= Config.BoosterMinBaseWeightKg
-    if not ageMatch and not weightMatch then
-        return nil
-    end
-
-    return {
-        uuid = uuid,
-        name = petType,
-        nickname = nickname,
-        age = age,
-        base_weight_kg = age1BaseWeight,
-        mutation = mutation,
-        hatched_from = hatchedFrom,
-        is_favorite = isFavorite,
-        boosts = boosts,
-        match_age = ageMatch,
-        match_base_weight = weightMatch,
-    }
-end
-
-local function analyzePetsFromData(data)
+local function countPetsFromData(data)
     local petInv = data and data.PetsData and data.PetsData.PetInventory
     local petData = petInv and firstTable(petInv.Data, petInv.PetData, petInv.Inventory)
     if type(petData) ~= "table" then
-        return nil, {}
+        return nil
     end
 
     local count = 0
-    local matches = {}
-    for key, entry in pairs(petData) do
+    for _, entry in pairs(petData) do
         if entry ~= nil and entry ~= false then
             count += 1
-            if #matches < Config.BoosterMaxMatches then
-                local detail = boosterPetDetail(key, entry)
-                if detail then
-                    table.insert(matches, detail)
-                end
-            end
         end
     end
-
-    table.sort(matches, function(a, b)
-        local aw = tonumber(a.base_weight_kg) or -1
-        local bw = tonumber(b.base_weight_kg) or -1
-        if aw ~= bw then
-            return aw > bw
-        end
-        return (tonumber(a.age) or 0) > (tonumber(b.age) or 0)
-    end)
-
-    return count, matches
-end
-
-local function countPetsFromData(data)
-    local count = analyzePetsFromData(data)
     return count
 end
 
@@ -12659,7 +12554,7 @@ local function countPetsAndEggs()
     end
 
     local data = getLiveData()
-    local petCount, boostingMatches = analyzePetsFromData(data)
+    local petCount = countPetsFromData(data)
     local dataEggsOk = countEggsFromData(data, eggs)
 
     if petCount == nil or not dataEggsOk then
@@ -12674,7 +12569,7 @@ local function countPetsAndEggs()
         eggTotal += tonumber(amount) or 0
     end
 
-    return tonumber(petCount) or 0, eggTotal, eggs, boostingMatches or {}
+    return tonumber(petCount) or 0, eggTotal, eggs
 end
 
 --========================================================--
@@ -13145,7 +13040,6 @@ end
 local lastGoodPetCount = 0
 local lastGoodEggTotal = 0
 local lastGoodEggs = {}
-local lastGoodBoostingMatches = {}
 
 -- Heartbeat: increments every successful state build. Lets the harness tell
 -- "script running but game stuck" (seq advancing, pets frozen) from
@@ -13154,9 +13048,9 @@ local WRITE_SEQ = 0
 local SCRIPT_START = os.time()
 
 local function buildState()
-    local petCount, eggTotal, eggs, boostingMatches = 0, 0, {}, {}
+    local petCount, eggTotal, eggs = 0, 0, {}
 
-    local okCount, a, b, c, d = pcall(function()
+    local okCount, a, b, c = pcall(function()
         return countPetsAndEggs()
     end)
 
@@ -13164,16 +13058,13 @@ local function buildState()
         petCount = tonumber(a) or 0
         eggTotal = tonumber(b) or 0
         eggs = type(c) == "table" and c or {}
-        boostingMatches = type(d) == "table" and d or {}
         lastGoodPetCount = petCount
         lastGoodEggTotal = eggTotal
         lastGoodEggs = eggs
-        lastGoodBoostingMatches = boostingMatches
     else
         petCount = lastGoodPetCount
         eggTotal = lastGoodEggTotal
         eggs = lastGoodEggs
-        boostingMatches = lastGoodBoostingMatches
         if Config.Debug then
             warn("[NOMO PET COUNTER] countPetsAndEggs error:", tostring(a))
         end
@@ -13226,11 +13117,6 @@ local function buildState()
         egg_catalog_count = countTable(EGG_CATALOG),
         egg_catalog_source = EGG_CATALOG_SOURCE,
         egg_counts_include_zero = Config.IncludeZeroCountEggs == true,
-
-        boosting_match_count = #boostingMatches,
-        boosting_matches = boostingMatches,
-        boosting_min_base_weight_kg = Config.BoosterMinBaseWeightKg,
-        boosting_min_age = Config.BoosterMinAge,
 
         ts = now(),
         write_seq = WRITE_SEQ,
@@ -13473,7 +13359,7 @@ def pet_counter_autoexec_source():
     embedded = _lua_long_string(PET_COUNTER_FALLBACK_TEMPLATE)
 
     return f'''-- NOMO Pet Counter updater/loader
--- Priority: GitHub latest -> local cache -> embedded v4.1 fallback
+-- Priority: GitHub latest -> local cache -> embedded stable v3.9 fallback
 
 local COUNTER_URL = {remote_url}
 local CACHE_FOLDER = "nomo_rejoiner"
@@ -14510,7 +14396,7 @@ def autoexec_menu(cfg):
         ]
         draw_boxed_menu(rows, cfg)
         print("")
-        print(col("Pet Counter source: GitHub latest -> cache -> embedded v4.1 fallback", DIM))
+        print(col("Pet Counter source: GitHub latest -> cache -> embedded stable v3.9 fallback", DIM))
         choice = read_menu_choice("\nOption: ", valid={"0", "1", "2", "3", "4", "5", "6", "7"})
         if choice is None:
             print(col("Invalid option. Use one of the numbers shown.", RED))

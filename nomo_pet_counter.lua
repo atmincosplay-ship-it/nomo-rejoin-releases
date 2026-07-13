@@ -1,6 +1,6 @@
 --========================================================--
 --                    NOMO PET COUNTER
---       v4.1 CONFIRMED BOOSTER SCHEMA
+--       v3.9 RELEASE DATA COUNTS
 --========================================================--
 -- Writes per-account state to:
 --   nomo_rejoiner/<username>_state.json
@@ -78,7 +78,7 @@ local Config = getgenv().NOMO_PET_COUNTER
 
 Config.Enabled = true
 Config.Stop = false
-Config.Version = "v4.1-confirmed-booster-schema"
+Config.Version = "v3.9-release-data-counts"
 
 Config.WriteFolder = Config.WriteFolder or "nomo_rejoiner"
 
@@ -98,12 +98,6 @@ Config.WriteFile = Config.WriteFile or (Config.WriteFolder .. "/" .. _safeUser .
 -- Scan fast, write light.
 Config.ScanEvery = tonumber(Config.ScanEvery or 2) or 2
 Config.WriteEvery = tonumber(Config.WriteEvery or 5) or 5
-
--- Booster match defaults. The counter only exports matching pet details, never
--- the full pet inventory, keeping state files compact.
-Config.BoosterMinBaseWeightKg = tonumber(Config.BoosterMinBaseWeightKg or 6) or 6
-Config.BoosterMinAge = tonumber(Config.BoosterMinAge or 500) or 500
-Config.BoosterMaxMatches = math.max(1, math.floor(tonumber(Config.BoosterMaxMatches or 100) or 100))
 
 Config.Debug = Config.Debug == true
 Config.Verbose = Config.Verbose == true
@@ -733,178 +727,19 @@ local function firstTable(...)
     return nil
 end
 
-local PET_NAME_FIELDS = {
-    "PetType", "PetName", "pet_type", "pet_name", "Name", "name",
-    "ItemName", "item_name", "Type", "type"
-}
-local PET_AGE_FIELDS = {"Age", "age", "PetAge", "pet_age"}
-local PET_WEIGHT_FIELDS = {
-    "WeightKg", "WeightKG", "weight_kg", "Weight", "weight",
-    "CurrentWeight", "current_weight", "FinalWeight", "final_weight"
-}
-local PET_BASE_WEIGHT_FIELDS = {
-    "BaseWeightKg", "BaseWeightKG", "base_weight_kg", "BaseWeight",
-    "base_weight", "OriginalWeight", "original_weight", "BaseKG", "base_kg"
-}
-local PET_MUTATION_FIELDS = {
-    "Mutation", "mutation", "MutationType", "mutation_type",
-    "Mutations", "mutations"
-}
-local PET_UUID_FIELDS = {
-    "PET_UUID", "PetUUID", "pet_uuid", "UUID", "uuid", "Id", "id"
-}
-
-local function entryTables(entry)
-    local out = {}
-    local seen = {}
-    local function add(value)
-        if type(value) == "table" and not seen[value] then
-            seen[value] = true
-            table.insert(out, value)
-        end
-    end
-    add(entry)
-    if type(entry) == "table" then
-        add(entry.Data)
-        add(entry.data)
-        add(entry.PetData)
-        add(entry.petData)
-        add(entry.Pet)
-        add(entry.pet)
-        add(entry.Info)
-        add(entry.info)
-    end
-    return out
-end
-
-local function firstEntryField(entry, fields)
-    for _, container in ipairs(entryTables(entry)) do
-        for _, field in ipairs(fields) do
-            local value = container[field]
-            if value ~= nil then
-                return value
-            end
-        end
-    end
-    return nil
-end
-
-local function numericEntryField(entry, fields)
-    local value = firstEntryField(entry, fields)
-    if type(value) == "table" then
-        value = value.Value or value.value or value.Amount or value.amount
-    end
-    return tonumber(value)
-end
-
-local function stringEntryField(entry, fields)
-    local value = firstEntryField(entry, fields)
-    if value == nil then
-        return ""
-    end
-    if type(value) == "table" then
-        local parts = {}
-        for key, enabled in pairs(value) do
-            if enabled ~= false and enabled ~= nil then
-                table.insert(parts, tostring(key))
-            end
-        end
-        table.sort(parts)
-        return table.concat(parts, ",")
-    end
-    return tostring(value)
-end
-
-local function boosterPetDetail(key, entry)
-    if type(entry) ~= "table" then
-        return nil
-    end
-
-    -- Confirmed DataService PetInventory schema:
-    -- table key     = pet UUID
-    -- PetType       = species
-    -- Name          = nickname
-    -- Level         = age
-    -- BaseWeight    = age-0 base weight
-    -- MutationType  = mutation
-    local uuid = tostring(key or "")
-    local petType = tostring(entry.PetType or "Unknown Pet")
-    local nickname = tostring(entry.Name or "")
-    local age = tonumber(entry.Level) or 0
-    local age0BaseWeight = tonumber(entry.BaseWeight) or 0
-
-    -- NOMO convention: filter/report base weight as the pet's age-1 weight.
-    -- Keep only 2 decimals by truncating; never round.
-    local age1BaseWeight = math.floor((age0BaseWeight * 1.1) * 100) / 100
-
-    local mutation = tostring(entry.MutationType or "")
-    local hatchedFrom = tostring(entry.HatchedFrom or "")
-    local isFavorite = entry.IsFavorite == true
-
-    local boosts = {}
-    if type(entry.Boosts) == "table" then
-        for _, value in pairs(entry.Boosts) do
-            table.insert(boosts, tostring(value))
-        end
-        table.sort(boosts)
-    end
-
-    local ageMatch = age >= Config.BoosterMinAge
-    local weightMatch = age1BaseWeight >= Config.BoosterMinBaseWeightKg
-    if not ageMatch and not weightMatch then
-        return nil
-    end
-
-    return {
-        uuid = uuid,
-        name = petType,
-        nickname = nickname,
-        age = age,
-        base_weight_kg = age1BaseWeight,
-        mutation = mutation,
-        hatched_from = hatchedFrom,
-        is_favorite = isFavorite,
-        boosts = boosts,
-        match_age = ageMatch,
-        match_base_weight = weightMatch,
-    }
-end
-
-local function analyzePetsFromData(data)
+local function countPetsFromData(data)
     local petInv = data and data.PetsData and data.PetsData.PetInventory
     local petData = petInv and firstTable(petInv.Data, petInv.PetData, petInv.Inventory)
     if type(petData) ~= "table" then
-        return nil, {}
+        return nil
     end
 
     local count = 0
-    local matches = {}
-    for key, entry in pairs(petData) do
+    for _, entry in pairs(petData) do
         if entry ~= nil and entry ~= false then
             count += 1
-            if #matches < Config.BoosterMaxMatches then
-                local detail = boosterPetDetail(key, entry)
-                if detail then
-                    table.insert(matches, detail)
-                end
-            end
         end
     end
-
-    table.sort(matches, function(a, b)
-        local aw = tonumber(a.base_weight_kg) or -1
-        local bw = tonumber(b.base_weight_kg) or -1
-        if aw ~= bw then
-            return aw > bw
-        end
-        return (tonumber(a.age) or 0) > (tonumber(b.age) or 0)
-    end)
-
-    return count, matches
-end
-
-local function countPetsFromData(data)
-    local count = analyzePetsFromData(data)
     return count
 end
 
@@ -1054,7 +889,7 @@ local function countPetsAndEggs()
     end
 
     local data = getLiveData()
-    local petCount, boostingMatches = analyzePetsFromData(data)
+    local petCount = countPetsFromData(data)
     local dataEggsOk = countEggsFromData(data, eggs)
 
     if petCount == nil or not dataEggsOk then
@@ -1069,7 +904,7 @@ local function countPetsAndEggs()
         eggTotal += tonumber(amount) or 0
     end
 
-    return tonumber(petCount) or 0, eggTotal, eggs, boostingMatches or {}
+    return tonumber(petCount) or 0, eggTotal, eggs
 end
 
 --========================================================--
@@ -1540,7 +1375,6 @@ end
 local lastGoodPetCount = 0
 local lastGoodEggTotal = 0
 local lastGoodEggs = {}
-local lastGoodBoostingMatches = {}
 
 -- Heartbeat: increments every successful state build. Lets the harness tell
 -- "script running but game stuck" (seq advancing, pets frozen) from
@@ -1549,9 +1383,9 @@ local WRITE_SEQ = 0
 local SCRIPT_START = os.time()
 
 local function buildState()
-    local petCount, eggTotal, eggs, boostingMatches = 0, 0, {}, {}
+    local petCount, eggTotal, eggs = 0, 0, {}
 
-    local okCount, a, b, c, d = pcall(function()
+    local okCount, a, b, c = pcall(function()
         return countPetsAndEggs()
     end)
 
@@ -1559,16 +1393,13 @@ local function buildState()
         petCount = tonumber(a) or 0
         eggTotal = tonumber(b) or 0
         eggs = type(c) == "table" and c or {}
-        boostingMatches = type(d) == "table" and d or {}
         lastGoodPetCount = petCount
         lastGoodEggTotal = eggTotal
         lastGoodEggs = eggs
-        lastGoodBoostingMatches = boostingMatches
     else
         petCount = lastGoodPetCount
         eggTotal = lastGoodEggTotal
         eggs = lastGoodEggs
-        boostingMatches = lastGoodBoostingMatches
         if Config.Debug then
             warn("[NOMO PET COUNTER] countPetsAndEggs error:", tostring(a))
         end
@@ -1621,11 +1452,6 @@ local function buildState()
         egg_catalog_count = countTable(EGG_CATALOG),
         egg_catalog_source = EGG_CATALOG_SOURCE,
         egg_counts_include_zero = Config.IncludeZeroCountEggs == true,
-
-        boosting_match_count = #boostingMatches,
-        boosting_matches = boostingMatches,
-        boosting_min_base_weight_kg = Config.BoosterMinBaseWeightKg,
-        boosting_min_age = Config.BoosterMinAge,
 
         ts = now(),
         write_seq = WRITE_SEQ,
