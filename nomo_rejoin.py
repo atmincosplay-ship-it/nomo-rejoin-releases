@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-# V4.34 — COMPLETE REJOIN ONLY + HATCHER WINDOW SAFETY
-# - ADD: complete third REJOIN ONLY mode inside the full NOMO script.
-# - KEEP: Market, Hatcher, setup, diagnostics, updater, solver, and layouts.
-# - COOKIE: one local cookies/cookies.txt export; local TXT picker for import.
-# - FIX: fresh clones open once before cookie injection when WebView DB is missing.
-# - FIX: automatic Hatcher recovery never force-stops an alive clone.
-# - FIX: one kick incident cannot queue old-state recovery and popup recovery together.
-# - FIX: restore sane Hatcher recovery cooldown instead of the old 15-second loop.
+# V4.36 — PID-ONLY HATCHER QUEUE + READABLE AUTO LAYOUT
+# - FIX: Hatcher old-state, kick, timeout, challenge, and hard recovery use the
+#        selected package's verified exact PID only; no am force-stop/killall/pkill.
+# - FIX: Hatcher startup immediately queues PID-only recovery for alive packages
+#        whose state is already old, so B/C/D cannot sit forever without opening.
+# - FIX: clear stale V4.34 recovery cooldown/lock fields once after updating.
+# - FIX: Auto 3x2 keeps Termux at its readable saved bottom-right 540x280 box
+#        whenever that box does not overlap an active clone; detector crops follow it.
+# - KEEP: full Market, Hatcher, Rejoin Only, cookie TXT, solver, Cloudflare,
+#         setup, diagnostics, layouts, and GitHub updater.
 #
 # V4.33 — REJOIN ONLY MODE
 # - ADD: third mode for generic per-package link keep-alive.
@@ -20,7 +22,7 @@
 # - CHANGE: bulk cookie login chooses a TXT from the same local cookies folder.
 # - FIX: a fresh clone is opened once automatically when its WebView cookie DB does not exist.
 #
-# NOMO REJOIN V4.34
+# NOMO REJOIN V4.36
 #
 # V4.31 — OPTION 13 AUTOMATIC LAYOUT
 # - NEW: New Redfinger Setup automatically selects Auto layout for the packages
@@ -65,7 +67,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.34"
+__version__ = "V4.36"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -519,9 +521,9 @@ DEFAULT_CONFIG = {
     # Soft intent often cannot recover from PandoraHub session-expired popups.
     "hatcher_disconnect_ui_hard_force": True,
     "hatcher_disconnect_ui_retry_seconds": 15,
-    # V4.34: automatic Hatcher recovery never force-stops an alive clone.
-    # App Cloner can collapse all floating tasks when one live package is killed.
-    "hatcher_never_force_stop_alive_automatic": True,
+    # Compatibility key from V4.34. Exact-PID hard recovery is enabled again;
+    # broad Android package-stop commands remain forbidden.
+    "hatcher_never_force_stop_alive_automatic": False,
     "hatcher_safe_disconnect_hold_seconds": 300,
     # One continuous popup incident gets one soft attempt + one hard fallback.
     # If both fail, isolate only that package before allowing a new generation.
@@ -4944,52 +4946,20 @@ def open_target(tab, rt_tab, cfg, target, reason, force=False, rt=None, mode="ha
     mode_s = str(mode or "hard").lower()
     soft = (mode_s == "soft")
     hard_force = mode_s in ["hard_force", "force", "force_stop", "force-stop"]
-    pkg = str(tab.get("package") or "")
-    pkg_alive = package_alive(pkg, cfg, fresh=True)
+    pkg_alive = package_alive(tab["package"], cfg, fresh=True)
 
-    # V4.34: never automatically force-stop an ALIVE Hatcher clone. On the
-    # App Cloner floating-task build used by Redfinger, stopping one live target
-    # can visually collapse every clone window. Automatic Hatcher recoveries now
-    # send only the saved private-server deep link. Explicit manual force actions
-    # remain available from Option 6.
-    low_reason = str(reason or "").lower()
-    explicit_manual_force = any(token in low_reason for token in (
-        "manual force", "force restart", "manual restart", "option 6",
-    ))
-    safe_hatcher_alive = (
-        target == "hatcher"
-        and pkg_alive
-        and bool(cfg.get("hatcher_never_force_stop_alive_automatic", True))
-        and not explicit_manual_force
-    )
-    if safe_hatcher_alive:
-        ok, note = open_roblox(
-            pkg, link, cfg,
-            soft=True,
-            rt_tab=rt_tab,
-            reason=reason,
-            require_stop=False,
-            skip_force_stop=True,
-        )
-        rt_tab["target"] = target
-        rt_tab["last_open"] = now()
-        rt_tab["last_open_mode"] = "soft"
-        rt_tab["note"] = reason
-        return ok, ("safe alive soft rejoin" if ok else note)
-
-    # `disable_soft_rejoin` still disables ordinary/scheduled soft hops, but it
-    # must not convert the safe Hatcher branch above into a hard stop.
+    # V4.15: `disable_soft_rejoin` still disables ordinary/scheduled soft hops,
+    # but it must not turn every ALIVE recovery into an immediate PID kill. On
+    # Redfinger/App Cloner that target-only kill can collapse all floating task
+    # windows even though sibling processes remain alive. First send the deep
+    # link to the target without stopping it; _do_open_cycle() owns one hard
+    # fallback if the target still cannot produce fresh state.
     alive_soft_recovery = _alive_recovery_soft_allowed(reason, pkg_alive, cfg)
     if cfg.get("disable_soft_rejoin", True) and not alive_soft_recovery:
         soft = False
         hard_force = True
-        ok, note = open_roblox(
-            pkg, link, cfg,
-            soft=False,
-            rt_tab=rt_tab,
-            reason=reason,
-            require_stop=True,
-        )
+        require_stop = True
+        ok, note = open_roblox(tab["package"], link, cfg, soft=False, rt_tab=rt_tab, reason=reason, require_stop=True)
         rt_tab["target"] = target
         rt_tab["last_open"] = now()
         rt_tab["last_open_mode"] = "hard"
@@ -5017,15 +4987,9 @@ def open_target(tab, rt_tab, cfg, target, reason, force=False, rt=None, mode="ha
         elif alive_mode != "hard":
             rt_tab["note"] = "alive skip hard"
             return False, "alive skip hard"
-
     require_stop = not soft
-    ok, note = open_roblox(
-        pkg, link, cfg,
-        soft=soft,
-        rt_tab=rt_tab,
-        reason=reason,
-        require_stop=require_stop,
-    )
+
+    ok, note = open_roblox(tab["package"], link, cfg, soft=soft, rt_tab=rt_tab, reason=reason, require_stop=require_stop)
 
     rt_tab["target"] = target
     rt_tab["last_open"] = now()
@@ -5480,16 +5444,13 @@ def hatcher_alive_old_state_hard_settings(hcfg, cfg):
 
 
 def queue_hatcher_alive_old_state_hard(open_queue, tab, rt_tab, hcfg, cfg, age_or_seconds, reason):
-    """Queue one Hatcher old/no-state recovery without killing an alive clone.
-
-    Kept under the old function name so existing call sites remain compatible.
-    """
+    """Queue one affected Hatcher package for verified exact-PID restart."""
     enabled, age_seconds, max_valid_seconds, cooldown_seconds = hatcher_alive_old_state_hard_settings(hcfg, cfg)
     pkg = str((tab or {}).get("package", "") or "")
     if pkg and solver_job_running(pkg):
         return False, "solver running", False
     if not enabled:
-        return False, "old-state recovery disabled", False
+        return False, "old-state hard disabled", False
     try:
         age_i = int(age_or_seconds)
     except Exception:
@@ -5503,20 +5464,15 @@ def queue_hatcher_alive_old_state_hard(open_queue, tab, rt_tab, hcfg, cfg, age_o
     last = int(rt_tab.get("hatcher_alive_old_state_hard_last", 0) or 0)
     if last > 0 and (t - last) < cooldown_seconds:
         left = max(1, cooldown_seconds - (t - last))
-        return False, f"old-state recovery cooldown {left}s", False
-
-    alive_now = bool(pkg and package_alive(pkg, cfg, fresh=True))
-    safe_alive = bool(cfg.get("hatcher_never_force_stop_alive_automatic", True)) and alive_now
-    open_mode = "soft" if safe_alive else "hard"
-    action_name = "safe soft rejoin" if safe_alive else "dead-package open"
+        return False, f"old-state hard cooldown {left}s", False
 
     added, _ = queue_open(
         open_queue, tab, "hatcher",
-        str(reason or "hatcher alive old state recovery"),
-        force=True, mode=open_mode, front=False,
+        str(reason or "hatcher alive old state hard"),
+        force=True, mode="hard_force", front=False,
         metadata={
-            "hatcher_safe_alive_recovery": bool(safe_alive),
-            "bypass_recheck": False,
+            "bypass_recheck": True,
+            "pid_only_recovery": True,
         },
     )
     if not added:
@@ -5525,7 +5481,7 @@ def queue_hatcher_alive_old_state_hard(open_queue, tab, rt_tab, hcfg, cfg, age_o
     rt_tab["hatcher_alive_old_state_hard_last"] = t
     rt_tab["hatcher_alive_old_state_hard_age"] = age_i
     rt_tab["hatcher_alive_old_state_hard_reason"] = str(reason or "alive old state")
-    return True, f"old-state {action_name} queued", True
+    return True, "old-state PID hard queued", True
 
 
 
@@ -5558,35 +5514,29 @@ def queue_disconnect_ui_rejoin(open_queue, tab, target, rt_tab, cfg):
     if hold_until > t:
         return False, f"kick recovery hold {max(1, hold_until - t)}s"
 
+    # While one recovery sequence owns this popup, the dashboard must not create
+    # another generation. The flag is persisted in runtime, though, so an update,
+    # Termux stop, or process restart can leave it True after the in-memory queue
+    # and solver job are gone. Detect that orphaned lock and repair it immediately.
     if rt_tab.get("disconnect_ui_recovery_active"):
         pkg = str((tab or {}).get("package", "") or "")
         live_owner = bool(queue_has(open_queue, pkg) or solver_job_running(pkg))
         if live_owner:
             return False, "kick recovery active"
+
         rt_tab["disconnect_ui_recovery_active"] = False
         rt_tab["disconnect_ui_recovery_stage"] = ""
         rt_tab["last_disconnect_ui_open"] = 0
         log_activity("stale kick recovery lock cleared", pkg, YELLOW)
 
     retry = int(cfg.get("disconnect_ui_retry_seconds", 60) or 60)
-    safe_hatcher = (
-        target == "hatcher"
-        and bool(cfg.get("hatcher_never_force_stop_alive_automatic", True))
-    )
     if target == "hatcher":
         retry = int(cfg.get("hatcher_disconnect_ui_retry_seconds", retry) or retry)
-        if safe_hatcher:
-            retry = max(60, retry)
-
     last = int(rt_tab.get("last_disconnect_ui_open", 0) or 0)
     if last and t - last < retry:
         return False, f"kick wait {max(0, retry - (t - last))}s"
 
-    # App Cloner can collapse every floating task when one live clone is
-    # force-stopped. Hatcher therefore sends only a deep-link rejoin while the
-    # target process is alive. A dead target still becomes a normal hard open in
-    # open_target().
-    mode = "soft" if safe_hatcher else "hard_force"
+    mode = "hard_force"
 
     soft_first = int(cfg.get("disconnect_ui_soft_first_seconds", 0) or 0)
     if soft_first > 0:
@@ -5594,29 +5544,25 @@ def queue_disconnect_ui_rejoin(open_queue, tab, target, rt_tab, cfg):
         if t - since < soft_first:
             mode = "soft"
 
+    # V3.88: FIFO, not front insertion. A later D popup must not jump ahead of
+    # an already-waiting B popup. Single-flight still recovers only one package.
     added, anote = queue_open(
         open_queue, tab, target, "kick/disconnect popup",
         force=True, mode=mode, front=False, bypass_manual=True,
         metadata={
             "disconnect_recovery": True,
             "disconnect_recovery_stage": "initial",
+            # A kicked client may keep writing a fresh state behind the popup.
+            # Never let the generic fresh-state recheck cancel this target-only
+            # exact-PID restart, or the dashboard will queue it forever.
             "bypass_recheck": True,
-            "hatcher_safe_alive_recovery": bool(safe_hatcher),
         },
     )
     if added:
         rt_tab["last_disconnect_ui_open"] = t
         rt_tab["disconnect_ui_recovery_active"] = True
         rt_tab["disconnect_ui_recovery_stage"] = "initial"
-        if safe_hatcher:
-            # One attempt per incident. A clean heartbeat clears this immediately;
-            # otherwise only this package may retry after the hold.
-            hold_s = max(
-                120,
-                int(cfg.get("hatcher_safe_disconnect_hold_seconds", 300) or 300),
-            )
-            rt_tab["disconnect_ui_hold_until"] = t + hold_s
-        return True, ("kick safe-soft queued" if safe_hatcher else f"kick {mode} queued")
+        return True, (f"kick {mode} queued" if mode != "soft" else "kick soft queued")
     if anote == "already queued":
         return False, "already queued"
     return False, f"kick not-queued ({anote})"
@@ -9867,15 +9813,38 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
     # open into a hard kill+open, so hatcher would force-stop alive clones it was
     # only meant to soft-rejoin. Hatcher mode must keep soft opens soft.
     cfg["disable_soft_rejoin"] = False
-    # V4.34: automatic Hatcher recovery must never kill an already-running
-    # clone because App Cloner can collapse every floating task window.
-    cfg["hatcher_never_force_stop_alive_automatic"] = True
-    cfg["alive_recovery_soft_first"] = True
-    cfg["alive_recovery_hard_fallback"] = False
+    # V4.36: hard recovery is safe because force_stop_package() resolves and
+    # re-validates only the selected clone's exact Linux PID(s). Never downgrade
+    # old-state/kick recovery to a duplicate deep-link soft open.
+    cfg["hatcher_never_force_stop_alive_automatic"] = False
+    cfg["alive_recovery_soft_first"] = False
+    cfg["alive_recovery_hard_fallback"] = True
     cfg["soft_hop_fallback_hard"] = False
 
     hcfg = load_hatcher_config()
     rt = load_runtime()
+
+    # V4.36 one-time repair: V4.34 could stamp long cooldowns even though an
+    # alive clone only received a soft intent and never actually restarted.
+    # Clear those stale per-package locks once so every affected clone gets a
+    # real FIFO exact-PID recovery immediately after updating.
+    if int(cfg.get("_nomo_pid_hatcher_recovery_migration", 0) or 0) < 436:
+        for profile in hatcher_profiles(hcfg, enabled_only=False):
+            pkg = str((profile or {}).get("package", "") or "")
+            if not pkg:
+                continue
+            rt_tab = get_runtime_tab(rt, pkg)
+            rt_tab["hatcher_alive_old_state_hard_last"] = 0
+            rt_tab["last_disconnect_ui_open"] = 0
+            rt_tab["disconnect_ui_hold_until"] = 0
+            rt_tab["disconnect_ui_recovery_active"] = False
+            rt_tab["disconnect_ui_recovery_stage"] = ""
+        rt["_open_lock_pkg"] = ""
+        rt["_open_lock_at"] = 0
+        cfg["_nomo_pid_hatcher_recovery_migration"] = 436
+        save_runtime(rt)
+        save_config(cfg)
+
     session_start = now()
     loops = 0
     open_queue = []
@@ -9904,33 +9873,54 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
     except Exception as exc:
         log_activity(f"allowlist startup check failed: {cut(exc, 80)}", "", YELLOW)
 
-    # Startup: only open GENUINELY CLOSED hatcher packages. An alive clone may be
-    # mid Lua-startup writing its first state.json — reopening it (soft opens can
-    # still become a hard kill+open) would kill the counter the user just
-    # launched. So alive clones are left alone with a grace anchor, and the queue
-    # is NOT drained here: the main loop drains it so the status table appears
-    # immediately instead of hanging on the debug line until every clone opens.
+    # Startup: queue every package that truly needs an open, in profile order.
+    # Fresh packages are untouched. A running PID with a state already older than
+    # the configured hard threshold is not treated as healthy: it is queued for
+    # one exact-PID restart immediately. Closed packages are queued normally.
     if cfg.get("open_all_on_start", True):
+        old_enabled, old_sec, old_max, _old_cd = hatcher_alive_old_state_hard_settings(hcfg, cfg)
         for tab in tabs:
-            raw_alive = package_alive(tab["package"], cfg)
-            fresh_state = state_recent_enough_for_alive(tab, cfg, seconds=int(cfg.get("state_stale_seconds", 180) or 180))
-            rt_tab = get_runtime_tab(rt, tab["package"])
+            pkg = tab["package"]
+            raw_alive = package_alive(pkg, cfg, fresh=True)
+            state, _state_err = read_state(tab)
+            state_age = int((state or {}).get("age", 999999) or 999999) if state else None
+            fresh_state = bool(
+                state is not None
+                and state_is_clean(state)
+                and state_age <= int(cfg.get("state_stale_seconds", 180) or 180)
+            )
+            rt_tab = get_runtime_tab(rt, pkg)
             rt_tab["target"] = "hatcher"
+
             if fresh_state:
                 rt_tab["note"] = "start fresh state"
-            elif raw_alive:
-                # Alive but no fresh state yet: give the Lua a SHORT window to
-                # write it (not the full 6-min post-open grace, which looked
-                # stuck). Anchor last_open back so only startup_grace remains.
-                # We never force-stop a clone that is already up at startup.
+                continue
+
+            if raw_alive and state is not None and old_enabled and old_sec <= state_age <= old_max:
+                added, _ = queue_open(
+                    open_queue, tab, "hatcher",
+                    f"hatcher startup old state {state_age}s",
+                    force=True, mode="hard_force", front=False,
+                    metadata={"bypass_recheck": True, "pid_only_recovery": True},
+                )
+                rt_tab["note"] = "startup stale PID queued" if added else "startup stale already queued"
+                continue
+
+            if raw_alive:
+                # Alive with no usable state yet: allow only the short startup
+                # grace. The normal loop then queues exact-PID no-state recovery.
                 startup_grace = int(cfg.get("hatcher_startup_grace_seconds", 75) or 75)
                 post_grace = int(cfg.get("post_open_grace_seconds", 360) or 360)
                 rt_tab["last_open"] = now() - max(0, post_grace - startup_grace)
                 rt_tab["hatcher_no_state_since"] = now()
                 rt_tab["note"] = f"start alive -> grace {startup_grace}s"
-            else:
-                # Genuinely closed -> queue a normal open. Drained by main loop.
-                queue_open(open_queue, tab, "hatcher", "hatcher start", force=True, skip_if_alive=True, mode="hard")
+                continue
+
+            queue_open(
+                open_queue, tab, "hatcher", "hatcher start",
+                force=True, skip_if_alive=True, mode="hard",
+                metadata={"pid_only_recovery": True},
+            )
         save_runtime(rt)
 
     while True:
@@ -10097,9 +10087,13 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                             if (recovery_age >= int(cfg.get("hatcher_alive_old_state_hard_force_seconds", 180) or 180)
                                     and recovery_age <= int(cfg.get("hatcher_alive_old_state_max_valid_seconds", 86400) or 86400)
                                     and cfg.get("rejoin_if_crash", True)):
-                                added, _ = queue_open(open_queue, tab, "hatcher",
-                                                      f"alive old state {recovery_age}s", force=True, mode="soft")
-                                note = f"old {recovery_age}s safe rejoin" if added else "already queued"
+                                added, _ = queue_open(
+                                    open_queue, tab, "hatcher",
+                                    f"alive old state {recovery_age}s",
+                                    force=True, mode="hard_force",
+                                    metadata={"bypass_recheck": True, "pid_only_recovery": True},
+                                )
+                                note = f"old {recovery_age}s PID kill+open" if added else "already queued"
                                 status = "Queued" if added else "Stale"
                             else:
                                 status = "Online"
@@ -10235,7 +10229,11 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
             tag = "OK" if ok else "ERR"
             last_msg = f"[{date_time_text()}] {tag}: {msg}"
         hatcher_rejoin_status_screen(rows, hcfg, cfg, session_start, loops, last_msg)
-        print(col("  Hatcher: alive old state 5m..24h => safe soft-rejoin only; alive clones are never force-stopped.", GREEN))
+        _old_on, _old_sec, _old_max, _old_cd = hatcher_alive_old_state_hard_settings(hcfg, cfg)
+        print(col(
+            f"  Hatcher: old state {format_age(_old_sec)}..{format_age(_old_max)} => exact-PID restart affected tab only; above max ignored.",
+            GREEN,
+        ))
 
         if open_queue and cfg.get("smart_open_queue", True):
             if not wait_seconds(2, rt):
@@ -16693,22 +16691,33 @@ def _compute_captcha_safe_layout(cfg, packages=None):
     for index, pkg in enumerate(packages):
         cells[pkg] = list(all_cells[index])
 
-    # A spare grid cell is the safest Termux location. Explicit full grids such
-    # as 2x2 with four clones still work, but retain the user's custom Termux box
-    # and clearly warn when it overlaps a detector crop.
+    # Keep Termux readable. The old Auto 3x2 code stretched Termux to one full
+    # narrow cell (~397x322), making the terminal text ugly. Prefer the user's
+    # saved bottom-right box (default 670,420,540,280) whenever it fits and does
+    # not overlap any active clone. Detector crops still use the exact clone cells.
     spare = all_cells[-1] if len(all_cells) > len(packages) else None
-    if spare:
+    tw = max(240, int(cfg.get("layout_termux_width", 540) or 540))
+    th = max(180, int(cfg.get("layout_termux_height", 280) or 280))
+    max_tx = max(0, width - right_safe - tw)
+    max_ty = max(0, height - gap - th)
+    tx = min(max(0, int(cfg.get("layout_termux_x", 670) or 670)), max_tx)
+    ty = min(max(top, int(cfg.get("layout_termux_y", 420) or 420)), max_ty)
+    custom_rect = [tx, ty, tx + tw, ty + th]
+    custom_fits = custom_rect[2] <= width and custom_rect[3] <= height
+    custom_overlaps = any(_rects_overlap(rect, custom_rect) for rect in cells.values())
+
+    if custom_fits and not custom_overlaps:
+        termux = [tx, ty, tw, th]
+        termux_rect = custom_rect
+        termux_source = "readable saved bottom-right box"
+    elif spare:
         termux = [spare[0], spare[1], spare[2] - spare[0], spare[3] - spare[1]]
         termux_rect = list(spare)
-        termux_source = "spare grid cell"
+        termux_source = "spare grid cell fallback"
     else:
-        tx = int(cfg.get("layout_termux_x", 670) or 670)
-        ty = int(cfg.get("layout_termux_y", 420) or 420)
-        tw = int(cfg.get("layout_termux_width", 540) or 540)
-        th = int(cfg.get("layout_termux_height", 280) or 280)
         termux = [tx, ty, tw, th]
-        termux_rect = [tx, ty, tx + tw, ty + th]
-        termux_source = "custom saved position"
+        termux_rect = custom_rect
+        termux_source = "custom saved position (overlap warning)"
     overlaps = [pkg for pkg, rect in cells.items() if _rects_overlap(rect, termux_rect)]
     return {
         "screen": [width, height], "template": template,
