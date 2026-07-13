@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+# V4.42 — SLOW-LOAD PROCESS WAIT FIX
+# - FIX: A newly opened clone is no longer declared dead after only 20 seconds.
+# - NEW: Wait up to 120 seconds for the selected package PID to first appear.
+# - NEW: After the PID has appeared, require 45 continuous seconds missing
+#        before treating that package as having died during loading.
+# - SAFE: Continue waiting for the normal fresh state for up to the existing
+#         open/homepage timeout; do not restart merely because Roblox is slow.
+# - KEEP: Exact-PID-only recovery, V4.41 queue fixes, and Booster pet schema.
+#
 # V4.41 — RECOVERY QUEUE HOTFIX + CONFIRMED BOOSTER PET SCHEMA
 # - FIX: Hatcher old-state cooldown is stamped only after a real open succeeds,
 #        never when a restart is merely queued.
@@ -101,7 +110,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.41"
+__version__ = "V4.42"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -440,6 +449,12 @@ DEFAULT_CONFIG = {
     "wait_fresh_after_open": True,
     "open_wait_fresh_seconds": 300,
     "open_wait_check_seconds": 5,
+    # Redfinger/App Cloner can take well over 20 seconds before the new Roblox
+    # process becomes visible in ps. Never hard-retry during this startup window.
+    "open_process_start_grace_seconds": 120,
+    # Once the PID has been observed, require a sustained disappearance before
+    # declaring that package dead. Brief process transitions are ignored.
+    "open_process_dead_confirm_seconds": 45,
     "post_open_grace_seconds": 360,
 
     # Homepage / cold-start recovery:
@@ -1343,6 +1358,10 @@ def apply_update_migrations(cfg):
     # stuck and cause unnecessary rejoin loops. Raise only known-aggressive values.
     if _int_cfg(cfg.get("open_wait_fresh_seconds"), 0) <= 120:
         set_cfg("open_wait_fresh_seconds", 300)
+    if _int_cfg(cfg.get("open_process_start_grace_seconds"), 0) < 60:
+        set_cfg("open_process_start_grace_seconds", 120)
+    if _int_cfg(cfg.get("open_process_dead_confirm_seconds"), 0) < 20:
+        set_cfg("open_process_dead_confirm_seconds", 45)
     if _int_cfg(cfg.get("soft_hop_wait_fresh_seconds"), 0) <= 90:
         set_cfg("soft_hop_wait_fresh_seconds", 240)
     if _int_cfg(cfg.get("post_open_grace_seconds"), 0) <= 180:
@@ -4656,6 +4675,8 @@ def config_settings(cfg):
                 ("smart_open_queue", "smart_open_queue"),
                 ("wait_fresh_after_open", "wait_fresh_after_open"),
                 ("open_wait_fresh_seconds", "wait_fresh_timeout"),
+                ("open_process_start_grace_seconds", "process_start_grace"),
+                ("open_process_dead_confirm_seconds", "process_dead_confirm"),
                 ("open_wait_check_seconds", "wait_check_seconds"),
                 ("homepage_stuck_hard_fallback_enabled", "homepage_hard_fallback"),
                 ("homepage_stuck_fallback_seconds", "homepage_fallback_after"),
@@ -7246,6 +7267,15 @@ def wait_until_fresh_after_open(tab, cfg, rt, opened_at, timeout_override=None, 
     pkg = tab.get("package")
     rt_tab = get_runtime_tab(rt, pkg)
 
+    process_start_grace = max(
+        30, int(cfg.get("open_process_start_grace_seconds", 120) or 120)
+    )
+    process_dead_confirm = max(
+        15, int(cfg.get("open_process_dead_confirm_seconds", 45) or 45)
+    )
+    seen_alive_after_open = False
+    process_missing_since = 0
+
     # V3.81: never call the solver blindly here. A job is started below only
     # when the Lua state explicitly reports a join/login challenge.
 
@@ -7258,6 +7288,12 @@ def wait_until_fresh_after_open(tab, cfg, rt, opened_at, timeout_override=None, 
 
         alive = package_alive(tab["package"], cfg)
         fresh, state, err = state_fresh_after_open(tab, cfg, opened_at)
+
+        if alive:
+            seen_alive_after_open = True
+            process_missing_since = 0
+        elif process_missing_since <= 0:
+            process_missing_since = now()
 
         # V3.84: one provider check per actual open/rejoin. An old state file may
         # still exist, so use `not fresh` rather than only `not state`.
@@ -7324,7 +7360,15 @@ def wait_until_fresh_after_open(tab, cfg, rt, opened_at, timeout_override=None, 
         elif solver_job_running(pkg):
             status_note = solver_job_note(pkg)
         elif not alive:
-            status_note = "loading (not alive yet)"
+            missing_for = max(0, now() - int(process_missing_since or now()))
+            if seen_alive_after_open:
+                status_note = (
+                    f"process missing {missing_for}/{process_dead_confirm}s"
+                )
+            else:
+                status_note = (
+                    f"waiting process {elapsed}/{process_start_grace}s"
+                )
         else:
             status_note = "waiting fresh state"
 
@@ -7349,8 +7393,18 @@ def wait_until_fresh_after_open(tab, cfg, rt, opened_at, timeout_override=None, 
             log_activity("fresh clean state - rejoin complete", pkg, GREEN)
             return True, "fresh"
     
-        if not alive and elapsed >= 20:
-            return False, "died while loading"
+        if not alive:
+            missing_for = max(0, now() - int(process_missing_since or now()))
+
+            # The clone may need a long time before ps exposes its new process.
+            # Do not stop/reopen it during that initial Redfinger startup window.
+            if not seen_alive_after_open and elapsed >= process_start_grace:
+                return False, "process never appeared"
+
+            # Only treat it as dead when it was previously confirmed alive and
+            # then remained continuously absent for the configured confirmation.
+            if seen_alive_after_open and missing_for >= process_dead_confirm:
+                return False, "died while loading"
 
         for _ in range(check_every):
             if stop_requested():
@@ -10392,6 +10446,25 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
 
     hcfg = load_hatcher_config()
     rt = load_runtime()
+
+    # V4.42 one-time repair: clear only temporary queue/open state left by the
+    # old 20-second "died while loading" rule. Persistent config and holds stay.
+    if int(cfg.get("_nomo_loading_wait_migration", 0) or 0) < 442:
+        for profile in hatcher_profiles(hcfg, enabled_only=False):
+            pkg = str((profile or {}).get("package", "") or "")
+            if not pkg:
+                continue
+            rt_tab = get_runtime_tab(rt, pkg)
+            note_l = str(rt_tab.get("note", "") or "").lower()
+            if "died while loading" in note_l or "homepage/no-state hard retry" in note_l:
+                rt_tab["note"] = "loading wait reset by V4.42"
+                rt_tab["last_open"] = 0
+                rt_tab["last_open_mode"] = ""
+        rt["_open_lock_pkg"] = ""
+        rt["_open_lock_at"] = 0
+        cfg["_nomo_loading_wait_migration"] = 442
+        save_runtime(rt)
+        save_config(cfg)
 
     # V4.41 one-time repair: older builds stamped the old-state cooldown when
     # an item was queued, even if it never reached PID stop/open. Clear that bad
