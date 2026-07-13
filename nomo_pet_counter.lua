@@ -1,6 +1,6 @@
 --========================================================--
 --                    NOMO PET COUNTER
---       v3.4 STABLE ZERO-FILLED EGG CATALOG
+--       v3.5 DATA-SERVICE PET / EGG COUNTS
 --========================================================--
 -- Writes per-account state to:
 --   nomo_rejoiner/<username>_state.json
@@ -34,6 +34,23 @@ pcall(function()
     VirtualInputManager = game:GetService("VirtualInputManager")
 end)
 
+local DataService = nil
+local function getDataService()
+    if DataService then
+        return DataService
+    end
+
+    pcall(function()
+        local modules = ReplicatedStorage:WaitForChild("Modules", 20)
+        local dataServiceModule = modules and modules:WaitForChild("DataService", 10)
+        if dataServiceModule then
+            DataService = require(dataServiceModule)
+        end
+    end)
+
+    return DataService
+end
+
 local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
 
 --========================================================--
@@ -60,7 +77,7 @@ local Config = getgenv().NOMO_PET_COUNTER
 
 Config.Enabled = true
 Config.Stop = false
-Config.Version = "v3.4-stable-egg-catalog"
+Config.Version = "v3.5-data-service-counts"
 
 Config.WriteFolder = Config.WriteFolder or "nomo_rejoiner"
 
@@ -680,17 +697,164 @@ local function sortedEggCatalog()
     return names
 end
 
-local function countPetsAndEggs()
-    discoverEggCatalog(false)
+local function getLiveData()
+    local service = getDataService()
+    if not service then
+        return nil
+    end
 
-    local petsSeen = {}
-    local eggs = {}
+    local ok, data = pcall(function()
+        return service:GetData()
+    end)
 
-    if Config.IncludeZeroCountEggs then
-        for name in pairs(EGG_CATALOG) do
-            eggs[name] = 0
+    if ok and type(data) == "table" then
+        return data
+    end
+
+    if Config.Debug then
+        warn("[NOMO PET COUNTER] DataService:GetData failed:", tostring(data))
+    end
+    return nil
+end
+
+local function firstTable(...)
+    for _, value in ipairs({...}) do
+        if type(value) == "table" then
+            return value
         end
     end
+    return nil
+end
+
+local function countPetsFromData(data)
+    local petInv = data and data.PetsData and data.PetsData.PetInventory
+    local petData = petInv and firstTable(petInv.Data, petInv.PetData, petInv.Inventory)
+    if type(petData) ~= "table" then
+        return nil
+    end
+
+    local count = 0
+    for _, entry in pairs(petData) do
+        if entry ~= nil and entry ~= false then
+            count += 1
+        end
+    end
+    return count
+end
+
+local function cleanInventoryEggName(value)
+    local name = normalizeEggCatalogName(value)
+    if name then
+        return name
+    end
+
+    value = tostring(value or "")
+    value = string.gsub(value, "%s*%[x%d+%]%s*", "")
+    value = string.gsub(value, "%s*%b[]%s*", "")
+    value = string.gsub(value, "^%s+", "")
+    value = string.gsub(value, "%s+$", "")
+    value = string.gsub(value, "%s+", " ")
+    if value ~= "" and string.find(lower(value), "egg", 1, true) then
+        return value
+    end
+    return nil
+end
+
+local function getStackAmount(value)
+    if type(value) == "number" then
+        return math.max(0, math.floor(value))
+    end
+    if type(value) ~= "table" then
+        return 1
+    end
+
+    local amount = value.Quantity or value.quantity or value.Amount or value.amount
+        or value.Count or value.count or value.Stack or value.stack
+        or value.Uses or value.uses or value.Value or value.value
+    amount = tonumber(amount)
+    if amount and amount > 0 then
+        return math.floor(amount)
+    end
+    return 1
+end
+
+local function addEggCount(eggs, name, amount)
+    name = cleanInventoryEggName(name)
+    amount = tonumber(amount) or 0
+    if not name or amount <= 0 then
+        return false
+    end
+
+    addEggCatalogName(name)
+    eggs[name] = (eggs[name] or 0) + math.floor(amount)
+    return true
+end
+
+local function scanEggInventoryTable(container, eggs, depth, visited)
+    if type(container) ~= "table" or depth > 4 then
+        return 0
+    end
+    if visited[container] then
+        return 0
+    end
+    visited[container] = true
+
+    local found = 0
+    for key, value in pairs(container) do
+        local keyName = type(key) == "string" and cleanInventoryEggName(key) or nil
+        if keyName then
+            if addEggCount(eggs, keyName, getStackAmount(value)) then
+                found += 1
+            end
+        elseif type(value) == "table" then
+            local itemName = value.EggName or value.EggType or value.eggName or value.eggType
+                or value.ItemName or value.itemName or value.Name or value.name
+                or value.Type or value.type or value.PetEggName or value.petEggName
+            if addEggCount(eggs, itemName, getStackAmount(value)) then
+                found += 1
+            else
+                found += scanEggInventoryTable(value, eggs, depth + 1, visited)
+            end
+        end
+    end
+
+    return found
+end
+
+local function countEggsFromData(data, eggs)
+    if type(data) ~= "table" then
+        return false
+    end
+
+    local petsData = data.PetsData or {}
+    local candidates = {
+        petsData.PetEggInventory and petsData.PetEggInventory.Data,
+        petsData.PetEggInventory,
+        petsData.EggInventory and petsData.EggInventory.Data,
+        petsData.EggInventory,
+        petsData.PetEggs,
+        petsData.Eggs,
+        data.PetEggInventory and data.PetEggInventory.Data,
+        data.PetEggInventory,
+        data.EggInventory and data.EggInventory.Data,
+        data.EggInventory,
+        data.PetEggs,
+        data.Eggs,
+        data.EggsData,
+        data.EggData,
+    }
+
+    local found = 0
+    local visited = {}
+    for _, candidate in ipairs(candidates) do
+        found += scanEggInventoryTable(candidate, eggs, 0, visited)
+    end
+
+    return found > 0
+end
+
+local function countPetsAndEggsFromTools(eggs)
+    local petsSeen = {}
 
     for _, container in ipairs(getContainers()) do
         local children = {}
@@ -710,14 +874,36 @@ local function countPetsAndEggs()
         end
     end
 
-    local petCount = countTable(petsSeen)
+    return countTable(petsSeen)
+end
+
+local function countPetsAndEggs()
+    discoverEggCatalog(false)
+
+    local eggs = {}
+    if Config.IncludeZeroCountEggs then
+        for name in pairs(EGG_CATALOG) do
+            eggs[name] = 0
+        end
+    end
+
+    local data = getLiveData()
+    local petCount = countPetsFromData(data)
+    local dataEggsOk = countEggsFromData(data, eggs)
+
+    if petCount == nil or not dataEggsOk then
+        local toolPetCount = countPetsAndEggsFromTools(eggs)
+        if petCount == nil then
+            petCount = toolPetCount
+        end
+    end
 
     local eggTotal = 0
     for _, amount in pairs(eggs) do
-        eggTotal += amount
+        eggTotal += tonumber(amount) or 0
     end
 
-    return petCount, eggTotal, eggs
+    return tonumber(petCount) or 0, eggTotal, eggs
 end
 
 --========================================================--
