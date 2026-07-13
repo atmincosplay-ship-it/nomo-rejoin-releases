@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
-# V4.39 — GITHUB PET COUNTER UPDATES WITH CACHE + EMBEDDED FALLBACK
+# V4.41 — RECOVERY QUEUE HOTFIX + CONFIRMED BOOSTER PET SCHEMA
+# - FIX: Hatcher old-state cooldown is stamped only after a real open succeeds,
+#        never when a restart is merely queued.
+# - FIX: Dead/crashed Hatcher and Booster packages can perform one recovery open
+#        even when stale manual-login/cookie flags would otherwise discard it.
+# - FIX: One-time migration clears the bad queued-only cooldown and stale open lock.
+# - FIX: Hatcher shows Stale instead of misleading Online while cooldown-blocked.
+# - BOOSTER: Uses confirmed PetInventory fields and age-1 base weight,
+#            truncated to 2 decimals with no rounding.
+#
+# V4.40 — BOOSTER STAY-SERVER MODE
 # - NEW: AutoExec installs a loader that fetches the latest
 #        nomo_pet_counter.lua from GitHub on Roblox startup.
 # - SAFE: Successful downloads are cached locally in the executor workspace.
 # - FALLBACK: If GitHub is unavailable, the last cache is used; if no cache
 #             exists yet, the complete tested v3.9 counter embedded here runs.
-# - UPDATE: The embedded fallback is v3.9-release-data-counts.
+# - UPDATE: The embedded fallback is v4.1-confirmed-booster-schema.
 # - KEEP: V4.38 no-PID-stop Market/Restock routing and exact-PID hard recovery.
 #
 # V4.38 — EMBEDDED DATA-SERVICE COUNTER + SAFE MARKET ROUTING
@@ -91,7 +101,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.39"
+__version__ = "V4.41"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -139,6 +149,8 @@ CONFIG_TEMPLATE_FILE = BASE_DIR / "global_config_template.json"
 RUNTIME_FILE = BASE_DIR / "runtime.json"
 HATCHER_CONFIG_FILE = BASE_DIR / "hatcher_reporter_config.json"
 HATCHER_RUNTIME_FILE = BASE_DIR / "hatcher_reporter_runtime.json"
+BOOSTER_CONFIG_FILE = BASE_DIR / "booster_reporter_config.json"
+BOOSTER_RUNTIME_FILE = BASE_DIR / "booster_reporter_runtime.json"
 
 # --------------------------------------------------------------------------
 # UNIFIED CONFIG FILE
@@ -156,6 +168,8 @@ _MERGED_SECTIONS = {
     str(HATCHER_CONFIG_FILE): "hatcher",
     str(RUNTIME_FILE): "runtime_market",
     str(HATCHER_RUNTIME_FILE): "runtime_hatcher",
+    str(BOOSTER_CONFIG_FILE): "booster",
+    str(BOOSTER_RUNTIME_FILE): "runtime_booster",
 }
 
 _NOMO_CACHE = {"data": None}
@@ -377,6 +391,7 @@ DEFAULT_CONFIG = {
     "active_rejoin_mode": "market",
     "market_mode_enabled": True,
     "hatcher_mode_enabled": False,
+    "booster_mode_enabled": False,
     # Setup-role marker. LOCAL uses the Hatcher keep-alive/server-link engine
     # while disabling all backend registration and reporting.
     "local_rejoin_only": False,
@@ -731,6 +746,51 @@ DEFAULT_HATCHER_CONFIG = {
 
     # per package / per hatcher server config
     "hatchers": DEFAULT_HATCHER_PROFILES
+}
+
+
+DEFAULT_BOOSTER_PROFILE = {
+    "enabled": True,
+    "package": "premium.nokaA",
+    "booster_name": "nomoboost1",
+    "server_link": "YOUR_BOOSTER_PRIVATE_SERVER_LINK",
+    "state_file": "/storage/emulated/0/RobloxClone001/Arceus X/Workspace/nomo_rejoiner/state.json",
+}
+
+DEFAULT_BOOSTER_PROFILES = [
+    {**DEFAULT_BOOSTER_PROFILE, "package": f"premium.noka{chr(65+i)}",
+     "booster_name": f"nomoboost{i+1}",
+     "state_file": f"/storage/emulated/0/RobloxClone{i+1:03d}/Arceus X/Workspace/nomo_rejoiner/state.json"}
+    for i in range(4)
+]
+
+DEFAULT_BOOSTER_CONFIG = {
+    "enabled": True,
+    "update_only_on_status_change": True,
+    "force_update_every_seconds": 3600,
+    "heartbeat_interval": 60,
+    "hatcher_rejoin_alive_stale": False,
+    "hatcher_dead_confirm_seconds": 30,
+    "hatcher_alive_old_state_hard_force_enabled": True,
+    "hatcher_alive_old_state_hard_force_seconds": 300,
+    "hatcher_alive_old_state_max_valid_seconds": 86400,
+    "hatcher_alive_old_state_after_open_grace_seconds": 180,
+    "hatcher_alive_old_state_hard_force_cooldown_seconds": 900,
+    "detect_public_server": False,
+    "detect_wrong_place": True,
+    "rejoin_public_server": True,
+    "public_server_rejoin_after_seconds": 20,
+    "expected_place_id": "126884695634066",
+    "backend_provider": "cloudflare",
+    "jsonbin_hatchers_enabled": True,
+    "jsonbin_bin_id": "",
+    "jsonbin_api_key": "",
+    "jsonbin_key_header": "X-Master-Key",
+    "jsonbin_timeout_seconds": 10,
+    "cloudflare_worker_url": DEFAULT_CLOUDFLARE_WORKER_URL,
+    "cloudflare_secret": "",
+    "cloudflare_timeout_seconds": 8,
+    "boosters": DEFAULT_BOOSTER_PROFILES,
 }
 
 # ============================================================
@@ -2621,31 +2681,31 @@ def _ensure_rejoin_only_defaults(cfg):
     return changed
 
 def normalize_active_mode_flags(cfg):
-    """Keep Market, Hatcher, and Rejoin Only mutually exclusive."""
+    """Keep Market, Hatcher, Booster, and Rejoin Only mutually exclusive."""
     changed = _ensure_rejoin_only_defaults(cfg)
-    allowed = ("market", "hatcher", "rejoin_only")
+    allowed = ("market", "hatcher", "booster", "rejoin_only")
     active = str(cfg.get("active_rejoin_mode", "market") or "market").lower().strip()
     if active not in allowed:
         active = "market"
         changed = True
 
-    market_on = bool(cfg.get("market_mode_enabled", active == "market"))
-    hatcher_on = bool(cfg.get("hatcher_mode_enabled", active == "hatcher"))
-    rejoin_on = bool(cfg.get("rejoin_only_mode_enabled", active == "rejoin_only"))
-
-    enabled = [market_on, hatcher_on, rejoin_on]
-    if sum(1 for value in enabled if value) != 1:
-        market_on = active == "market"
-        hatcher_on = active == "hatcher"
-        rejoin_on = active == "rejoin_only"
+    flags = {
+        "market": bool(cfg.get("market_mode_enabled", active == "market")),
+        "hatcher": bool(cfg.get("hatcher_mode_enabled", active == "hatcher")),
+        "booster": bool(cfg.get("booster_mode_enabled", active == "booster")),
+        "rejoin_only": bool(cfg.get("rejoin_only_mode_enabled", active == "rejoin_only")),
+    }
+    if sum(1 for value in flags.values() if value) != 1:
+        flags = {name: name == active for name in flags}
         changed = True
 
-    active2 = "rejoin_only" if rejoin_on else ("hatcher" if hatcher_on else "market")
+    active2 = next((name for name, value in flags.items() if value), "market")
     desired = {
         "active_rejoin_mode": active2,
-        "market_mode_enabled": market_on,
-        "hatcher_mode_enabled": hatcher_on,
-        "rejoin_only_mode_enabled": rejoin_on,
+        "market_mode_enabled": flags["market"],
+        "hatcher_mode_enabled": flags["hatcher"],
+        "booster_mode_enabled": flags["booster"],
+        "rejoin_only_mode_enabled": flags["rejoin_only"],
     }
     for key, value in desired.items():
         if cfg.get(key) != value:
@@ -2654,11 +2714,9 @@ def normalize_active_mode_flags(cfg):
     return changed
 
 
-
 def active_rejoin_mode(cfg):
     normalize_active_mode_flags(cfg)
     return str(cfg.get("active_rejoin_mode", "market") or "market")
-
 
 
 def set_active_rejoin_mode(mode, cfg=None):
@@ -2666,15 +2724,16 @@ def set_active_rejoin_mode(mode, cfg=None):
         cfg = load_config()
     _ensure_rejoin_only_defaults(cfg)
     mode = str(mode or "market").lower().strip()
-    if mode not in ("market", "hatcher", "rejoin_only"):
+    if mode not in ("market", "hatcher", "booster", "rejoin_only"):
         mode = "market"
 
     cfg["active_rejoin_mode"] = mode
     cfg["market_mode_enabled"] = mode == "market"
     cfg["hatcher_mode_enabled"] = mode == "hatcher"
+    cfg["booster_mode_enabled"] = mode == "booster"
     cfg["rejoin_only_mode_enabled"] = mode == "rejoin_only"
 
-    if mode == "hatcher":
+    if mode in ("hatcher", "booster"):
         if cfg.get("hatcher_disable_scheduled_hop_on_enable", True):
             cfg["scheduled_hop_enabled"] = False
         if cfg.get("hatcher_disable_soft_hop_fallback_on_enable", True):
@@ -2688,11 +2747,12 @@ def set_active_rejoin_mode(mode, cfg=None):
     return cfg
 
 
-
 def active_mode_label(cfg):
     mode = active_rejoin_mode(cfg)
     if mode == "hatcher":
         return "HATCHER"
+    if mode == "booster":
+        return "BOOSTER"
     if mode == "rejoin_only":
         return "REJOIN ONLY"
     return "MARKET"
@@ -2715,7 +2775,7 @@ def banner(title, cfg=None, code=CYAN):
 
 MAIN_MENU_ITEMS = [
     ("1",  "Start rejoin"),
-    ("2",  "Mode (Market/Hatcher/Rejoin Only)"),
+    ("2",  "Mode (Market/Hatcher/Booster/Rejoin Only)"),
     ("3",  "Package manager"),
     ("4",  "Refresh usernames"),
     ("5",  "Set private server"),
@@ -4841,6 +4901,10 @@ def pick_jsonbin_hatcher(cfg, rt):
         if not h.get("enabled", True):
             continue
 
+        pool_mode = str(h.get("mode") or h.get("role") or "hatcher").strip().lower()
+        if pool_mode not in ("", "hatcher"):
+            continue
+
         status = str(h.get("status", "ready")).lower()
         if status not in ["ready", "idle", "available", "ok", "online", "ingame"]:
             continue
@@ -5510,12 +5574,17 @@ def queue_hatcher_alive_old_state_hard(open_queue, tab, rt_tab, hcfg, cfg, age_o
         metadata={
             "bypass_recheck": True,
             "pid_only_recovery": True,
+            "recovery_must_open_once": True,
+            "hatcher_old_state_recovery": True,
+            "hatcher_old_state_age": age_i,
+            "hatcher_old_state_reason": str(reason or "alive old state"),
         },
     )
     if not added:
         return False, "already queued", True
 
-    rt_tab["hatcher_alive_old_state_hard_last"] = t
+    # Cooldown starts only after _do_open_cycle confirms that Android accepted
+    # the real target open. A queued item may be blocked, cancelled, or held.
     rt_tab["hatcher_alive_old_state_hard_age"] = age_i
     rt_tab["hatcher_alive_old_state_hard_reason"] = str(reason or "alive old state")
     return True, "old-state PID hard queued", True
@@ -6228,9 +6297,16 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
 
         # old past trigger -> kill + open THIS one clone
         if age >= trigger:
-            added, _ = queue_open(open_queue, tab, target,
-                                  f"{mode} alive old state {format_age(age)}",
-                                  force=True, mode="hard", skip_if_alive=False)
+            added, _ = queue_open(
+                open_queue, tab, target,
+                f"{mode} alive old state {format_age(age)}",
+                force=True, mode="hard_force", skip_if_alive=False, bypass_manual=True,
+                metadata={
+                    "pid_only_recovery": True,
+                    "recovery_must_open_once": True,
+                    "bypass_recheck": True,
+                },
+            )
             return ("Queued" if added else "Stale"), \
                    (f"old {format_age(age)} kill+open" if added else "already queued"), True
 
@@ -6241,14 +6317,28 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
     if alive:
         if in_grace:
             return "Loading", "no state grace", True
-        added, _ = queue_open(open_queue, tab, target, f"{mode} alive no-state hard",
-                              force=True, mode="hard", skip_if_alive=False)
+        added, _ = queue_open(
+            open_queue, tab, target, f"{mode} alive no-state hard",
+            force=True, mode="hard_force", skip_if_alive=False, bypass_manual=True,
+            metadata={
+                "pid_only_recovery": True,
+                "recovery_must_open_once": True,
+                "bypass_recheck": True,
+            },
+        )
         return ("Queued" if added else "No state"), \
                ("no-state kill+open" if added else "already queued"), True
 
     # dead -> kill + open
-    added, _ = queue_open(open_queue, tab, target, f"{mode} crash/dead",
-                          force=True, mode="hard", skip_if_alive=True)
+    added, _ = queue_open(
+        open_queue, tab, target, f"{mode} crash/dead",
+        force=True, mode="hard_force", skip_if_alive=True, bypass_manual=True,
+        metadata={
+            "pid_only_recovery": True,
+            "recovery_must_open_once": True,
+            "bypass_recheck": True,
+        },
+    )
     return ("Queued" if added else "Offline"), \
            ("crash kill+open" if added else "already queued"), True
 
@@ -7337,13 +7427,13 @@ def solver_preflight_before_open(open_queue, item, tab, rt_tab, pkg, target, cfg
         # the restart must not disappear merely because cookie extraction failed.
         # Skip the provider for this one generation and still restart only the
         # affected PID. A genuine logged-out client will surface after reopening.
-        if item.get("disconnect_recovery"):
+        if item.get("disconnect_recovery") or item.get("recovery_must_open_once"):
             item["solver_preflight_done"] = True
             item["solver_result"] = "SOLVER_SKIPPED_COOKIE"
             item["skip_solver_once"] = True
             item["skip_solver_probe"] = True
-            rt_tab["note"] = f"solver cookie unavailable; restarting kicked package once"
-            log_activity("solver cookie unavailable; kick PID recovery continues once", pkg, YELLOW)
+            rt_tab["note"] = "solver cookie unavailable; recovery open continues once"
+            log_activity("solver cookie unavailable; exact-PID recovery continues once", pkg, YELLOW)
             save_runtime(rt)
             return "ready", item
 
@@ -7391,10 +7481,16 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0):
     # A confirmed kick/disconnect is an in-session failure, not a reason to let
     # an older persisted manual-login hold discard the recovery item. Kick items
     # are allowed to perform one target-only restart even when that stale flag exists.
-    if manual_login_blocked(rt_tab, cfg) and not item.get("bypass_manual") and not item.get("disconnect_recovery"):
+    if (
+        manual_login_blocked(rt_tab, cfg)
+        and not item.get("bypass_manual")
+        and not item.get("disconnect_recovery")
+        and not item.get("recovery_must_open_once")
+    ):
         recovered, detail = maybe_clear_manual_login_prejoin(tab, cfg, rt, rt_tab)
         if not recovered:
             rt_tab["note"] = rt_tab.get("note") or "needs manual login"
+            log_activity(f"queued open held by manual-login flag: {cut(detail, 70)}", pkg, YELLOW)
             save_runtime(rt)
             return True
 
@@ -7499,6 +7595,13 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
     log_activity(f"opening -> {target} ({display_mode})", pkg)
     ok, msg = open_target(tab, rt_tab, cfg, target, reason, force=item.get("force", False), rt=rt, mode=mode)
     opened_at = int(rt_tab.get("last_open", now()))
+
+    if ok and item.get("hatcher_old_state_recovery"):
+        rt_tab["hatcher_alive_old_state_hard_last"] = now()
+        rt_tab["hatcher_alive_old_state_hard_age"] = int(item.get("hatcher_old_state_age", 0) or 0)
+        rt_tab["hatcher_alive_old_state_hard_reason"] = str(
+            item.get("hatcher_old_state_reason", reason) or reason
+        )
     # Record pool-wide hard-open time for the stagger gate.
     if is_hard and ok:
         rt["_last_pool_hard_open"] = now()
@@ -7991,6 +8094,405 @@ def _nomo_start_market_rejoin_original(cfg):
             return
 
 
+
+
+# ============================================================
+# BOOSTER MODE — stay in private server and report valuable pets
+# ============================================================
+
+def normalize_booster_profile(prof, idx=0):
+    base = dict(DEFAULT_BOOSTER_PROFILE)
+    if idx < len(DEFAULT_BOOSTER_PROFILES):
+        base.update(DEFAULT_BOOSTER_PROFILES[idx])
+    if isinstance(prof, dict):
+        base.update(prof)
+    base["enabled"] = bool(base.get("enabled", True))
+    base["package"] = str(base.get("package") or f"premium.noka{chr(65+idx)}")
+    base["booster_name"] = str(base.get("booster_name") or f"nomoboost{idx+1}")
+    base["server_link"] = str(base.get("server_link") or "")
+    base["state_file"] = str(base.get("state_file") or "")
+    return base
+
+
+def load_booster_config():
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+    if not _merged_section_exists(BOOSTER_CONFIG_FILE):
+        save_json(BOOSTER_CONFIG_FILE, DEFAULT_BOOSTER_CONFIG)
+    cfg = load_json(BOOSTER_CONFIG_FILE, DEFAULT_BOOSTER_CONFIG)
+    changed = False
+    for key, value in DEFAULT_BOOSTER_CONFIG.items():
+        if key == "boosters":
+            continue
+        if key not in cfg:
+            cfg[key] = value
+            changed = True
+    raw = cfg.get("boosters")
+    if not isinstance(raw, list):
+        raw = []
+    profiles = [normalize_booster_profile(p, i) for i, p in enumerate(raw)]
+    if not profiles:
+        profiles = [dict(p) for p in DEFAULT_BOOSTER_PROFILES]
+    if profiles != raw:
+        cfg["boosters"] = profiles
+        changed = True
+    if hatcher_backend_missing(cfg):
+        main_cfg = load_config()
+        for key in ("backend_provider", "jsonbin_bin_id", "jsonbin_api_key", "jsonbin_key_header",
+                    "jsonbin_timeout_seconds", "cloudflare_worker_url", "cloudflare_secret",
+                    "cloudflare_timeout_seconds", "jsonbin_hatchers_enabled"):
+            if key in main_cfg:
+                cfg[key] = main_cfg.get(key)
+                changed = True
+    if changed:
+        save_json(BOOSTER_CONFIG_FILE, cfg)
+    return cfg
+
+
+def save_booster_config(cfg):
+    save_json(BOOSTER_CONFIG_FILE, cfg)
+
+
+def booster_profiles(cfg, enabled_only=False):
+    raw = cfg.setdefault("boosters", [])
+    out = []
+    for i, prof in enumerate(raw):
+        normalized = normalize_booster_profile(prof, i)
+        if isinstance(prof, dict):
+            prof.clear(); prof.update(normalized); item = prof
+        else:
+            raw[i] = normalized; item = normalized
+        if enabled_only and not item.get("enabled", True):
+            continue
+        out.append(item)
+    return out
+
+
+def sync_booster_profiles_with_tabs(main_cfg, bcfg, create_missing=True):
+    existing = {str(p.get("package") or ""): p for p in booster_profiles(bcfg)}
+    new_profiles = []
+    for idx, tab in enumerate(main_cfg.get("tabs", [])):
+        pkg = str(tab.get("package") or "")
+        if not pkg:
+            continue
+        prof = existing.pop(pkg, None)
+        if prof is None and create_missing:
+            prof = normalize_booster_profile({
+                "enabled": tab.get("enabled", True),
+                "package": pkg,
+                "booster_name": tab.get("user_name") or f"nomoboost{idx+1}",
+                "server_link": tab.get("server_link") or "YOUR_BOOSTER_PRIVATE_SERVER_LINK",
+                "state_file": tab.get("stat_file") or "",
+            }, idx)
+        if prof is not None:
+            prof["enabled"] = bool(tab.get("enabled", True))
+            if tab.get("stat_file"):
+                prof["state_file"] = tab.get("stat_file")
+            current_name = str(prof.get("booster_name") or "")
+            defaultish = (not current_name or current_name == pkg or current_name.startswith("nomoboost"))
+            if defaultish and str(tab.get("user_name") or "").strip():
+                prof["booster_name"] = str(tab.get("user_name")).strip()
+            new_profiles.append(prof)
+    bcfg["boosters"] = new_profiles
+    save_booster_config(bcfg)
+    return True
+
+
+def booster_profile_to_tab(prof):
+    return {
+        "enabled": bool(prof.get("enabled", True)),
+        "package": str(prof.get("package") or ""),
+        "user_name": str(prof.get("booster_name") or prof.get("package") or "booster"),
+        "server_link": str(prof.get("server_link") or ""),
+        "stat_file": str(prof.get("state_file") or ""),
+    }
+
+
+def booster_read_state(prof):
+    return read_state({"user_name": prof.get("booster_name", "booster"), "stat_file": prof.get("state_file", "")})
+
+
+def load_booster_runtime():
+    rt = load_json(BOOSTER_RUNTIME_FILE, {})
+    for key in ("last_update_ts", "last_signature", "last_status"):
+        if not isinstance(rt.get(key), dict):
+            rt[key] = {}
+    return rt
+
+
+def save_booster_runtime(rt):
+    save_json(BOOSTER_RUNTIME_FILE, rt)
+
+
+def booster_entry(prof, state, err):
+    link = str(prof.get("server_link") or "").strip()
+    matches = state.get("boosting_matches", []) if isinstance(state, dict) else []
+    if not isinstance(matches, list):
+        matches = []
+    if not prof.get("enabled", True):
+        status = "disabled"
+    elif not link or link.startswith(("YOUR_", "PUT_")):
+        status = "no_server"
+    elif state:
+        status = "available" if matches else "online"
+    else:
+        status = "no_state"
+    entry = {
+        "enabled": bool(prof.get("enabled", True)),
+        "package": prof.get("package", ""),
+        "name": prof.get("booster_name", ""),
+        "booster_name": prof.get("booster_name", ""),
+        "mode": "booster",
+        "role": "booster",
+        "status": status,
+        "server_link": link,
+        "pet_count": int((state or {}).get("pet_count", 0) or 0),
+        "egg_total": int((state or {}).get("egg_total", 0) or 0),
+        "boosting_match_count": len(matches),
+        "boosting_matches": matches,
+        "boosting_min_base_weight_kg": (state or {}).get("boosting_min_base_weight_kg", 6),
+        "boosting_min_age": (state or {}).get("boosting_min_age", 500),
+        "updated_at": now(),
+        "updated_text": date_time_text(),
+        "source": "nomo_rejoin_booster",
+    }
+    if state:
+        for key in ("username", "place_id", "job_id", "state_ts"):
+            if key in state:
+                entry[key] = state.get(key)
+        entry["state_age"] = state.get("age")
+    else:
+        entry["error"] = str(err or "no state")
+    return entry
+
+
+def booster_signature(entry):
+    compact_matches = []
+    for item in entry.get("boosting_matches", []) if isinstance(entry.get("boosting_matches"), list) else []:
+        if isinstance(item, dict):
+            compact_matches.append({
+                "uuid": item.get("uuid"), "name": item.get("name"), "age": item.get("age"),
+                "base_weight_kg": item.get("base_weight_kg"), "mutation": item.get("mutation"),
+            })
+    return json.dumps({
+        "enabled": entry.get("enabled"), "status": entry.get("status"),
+        "server_link": entry.get("server_link"), "matches": compact_matches,
+    }, sort_keys=True, separators=(",", ":"))
+
+
+def booster_should_update(bcfg, name, entry, force=False):
+    if force:
+        return True, "forced"
+    rt = load_booster_runtime()
+    sig = booster_signature(entry)
+    last = str(rt["last_signature"].get(name, ""))
+    last_ts = int(rt["last_update_ts"].get(name, 0) or 0)
+    force_every = int(bcfg.get("force_update_every_seconds", 3600) or 3600)
+    if not bcfg.get("update_only_on_status_change", True) or sig != last:
+        return True, "changed"
+    if now() - last_ts >= force_every:
+        return True, "heartbeat"
+    return False, "unchanged"
+
+
+def booster_report_once(bcfg=None, force=False, state_cache=None):
+    bcfg = load_booster_config() if bcfg is None else bcfg
+    if not bcfg.get("enabled", True):
+        return False, "booster mode disabled"
+    if hatcher_backend_missing(bcfg):
+        return False, "backend missing"
+    updates = []
+    removes = []
+    for prof in booster_profiles(bcfg, enabled_only=False):
+        name = str(prof.get("booster_name") or "booster")
+        pkg = str(prof.get("package") or "")
+        cached = state_cache.get(pkg) if isinstance(state_cache, dict) else None
+        if isinstance(cached, tuple) and len(cached) == 2:
+            state, err = cached
+        else:
+            state, err = booster_read_state(prof)
+        entry = booster_entry(prof, state, err)
+        if entry["status"] in ("disabled", "no_server", "no_state"):
+            removes.append((name, entry["status"]))
+            continue
+        should, _ = booster_should_update(bcfg, name, entry, force=force)
+        if should:
+            updates.append((name, entry))
+    if not updates and not removes:
+        return True, "no update; unchanged"
+    if backend_provider(bcfg) == "cloudflare":
+        for name, entry in updates:
+            ok, msg = cloudflare_update_one_hatcher(bcfg, name, entry)
+            if not ok:
+                return False, f"{name}: {msg}"
+        for name, status in removes:
+            removed_entry = {"mode": "booster", "role": "booster", "enabled": False,
+                             "status": status, "server_link": "", "boosting_matches": [],
+                             "boosting_match_count": 0, "updated_at": now()}
+            ok, msg = cloudflare_update_one_hatcher(bcfg, name, removed_entry)
+            if not ok:
+                return False, f"remove {name}: {msg}"
+    else:
+        record, err = jsonbin_read_bin(bcfg)
+        if err:
+            return False, err
+        record = record if isinstance(record, dict) else {}
+        pool = record.setdefault("hatchers", {})
+        for name, status in removes:
+            pool.pop(name, None)
+        for name, entry in updates:
+            pool[name] = entry
+        ok, msg = jsonbin_update_bin(bcfg, record)
+        if not ok:
+            return False, msg
+    rt = load_booster_runtime()
+    for name, entry in updates:
+        rt["last_update_ts"][name] = now()
+        rt["last_signature"][name] = booster_signature(entry)
+        rt["last_status"][name] = entry.get("status")
+    save_booster_runtime(rt)
+    return True, f"updated {len(updates)} removed {len(removes)}"
+
+
+def booster_status_screen(rows, bcfg, cfg, session_start, loops, last_msg=""):
+    clear(); print_banner(cfg)
+    print(col("BOOSTER MODE — stay in server; Market joins Booster", MAGENTA))
+    print(col(f"Backend: {last_msg}", DIM))
+    table_rows = []
+    for row in rows:
+        table_rows.append([
+            (row.get("user", ""), WHITE), (short_pkg(row.get("pkg", "")), CYAN),
+            (str(row.get("pets", "-")), WHITE, True), (str(row.get("matches", "-")), MAGENTA, True),
+            (row.get("status", ""), status_color(row.get("status", ""))),
+            (str(row.get("age", "-")), DIM), (row.get("session", ""), DIM),
+            (row.get("note", ""), note_color(row.get("note", ""))),
+        ])
+    draw_table(["User", "Pkg", "Pets", "Boost", "Status", "Age", "Session", "Note"],
+               table_rows, [14, 8, 5, 5, 10, 6, 9, 28], cfg)
+    print(col(f"Uptime {format_uptime(now()-session_start)} | checks {loops} | Q+ENTER stops", DIM))
+    render_activity_log(cfg, int(cfg.get("activity_log_lines", 6) or 6))
+
+
+def start_booster_safe_rejoiner(main_cfg=None):
+    global _STOP_REQUESTED
+    _STOP_REQUESTED = False
+    cfg = dict(load_config())
+    if isinstance(main_cfg, dict):
+        cfg.update(main_cfg)
+    cfg["disable_soft_rejoin"] = False
+    cfg["scheduled_hop_enabled"] = False
+    cfg["smart_open_queue"] = True
+    cfg["wait_fresh_after_open"] = True
+    cfg["alive_recovery_soft_first"] = False
+    cfg["alive_recovery_hard_fallback"] = True
+    bcfg = load_booster_config()
+    rt = load_runtime()
+    session_start = now(); loops = 0; open_queue = []; last_report_at = 0
+    last_msg = "not uploaded yet"
+
+    while True:
+        if stop_requested():
+            save_runtime(rt); return
+        loops += 1
+        bcfg = load_booster_config()
+        tabs = [booster_profile_to_tab(p) for p in booster_profiles(bcfg, enabled_only=True)]
+        profiles = {str(p.get("package") or ""): p for p in booster_profiles(bcfg, enabled_only=True)}
+        rows = []; state_cache = {}
+        capture_android_ui_snapshot(cfg, force=False)
+        for tab in tabs:
+            pkg = tab["package"]
+            rt_tab = get_runtime_tab(rt, pkg)
+            rt_tab["target"] = "hatcher"
+            state, err = read_state(tab)
+            state_cache[pkg] = (state, err)
+            alive = package_alive(pkg, cfg)
+            health = evaluate_package_health(tab, cfg, rt_tab, mode="hatcher", hcfg=bcfg,
+                                             prof=profiles.get(pkg), raw_alive=alive, state=state, err=err)
+            if not str(tab.get("server_link") or "").strip() or str(tab.get("server_link") or "").startswith(("YOUR_", "PUT_")):
+                status, note, handled = "No server", "server_link missing", True
+                cancel_queued_package(open_queue, pkg)
+            else:
+                status, note, handled = apply_rejoin_action(open_queue, tab, "hatcher", rt_tab,
+                                                            cfg, rt, health, hcfg=bcfg, mode="booster")
+            if not handled:
+                status = health.get("status") or status
+                note = health.get("note") or note
+            pets = int((state or {}).get("pet_count", 0) or 0) if state else "-"
+            matches = int((state or {}).get("boosting_match_count", 0) or 0) if state else "-"
+            age = int((state or {}).get("age", 999999) or 999999) if state else "-"
+            update_clone_session(rt_tab, status, cfg)
+            rows.append({"user": tab.get("user_name", pkg), "pkg": pkg, "pets": pets,
+                         "matches": matches, "status": status, "age": age,
+                         "session": format_session(rt_tab), "note": note})
+        save_runtime(rt)
+        interval = max(10, int(bcfg.get("heartbeat_interval", 60) or 60))
+        if last_report_at <= 0 or now() - last_report_at >= interval:
+            ok, msg = booster_report_once(bcfg, force=False, state_cache=state_cache)
+            last_report_at = now(); last_msg = ("OK: " if ok else "ERR: ") + msg
+        booster_status_screen(rows, bcfg, cfg, session_start, loops, last_msg)
+        if open_queue:
+            if not wait_seconds(2, rt): return
+            process_open_queue(open_queue, cfg, rt, session_start, loops)
+            continue
+        if not wait_seconds(int(cfg.get("check_interval", 10)), rt): return
+
+
+def booster_server_link_menu(cfg):
+    bcfg = load_booster_config()
+    profiles = booster_profiles(bcfg, enabled_only=False)
+    clear(); banner("BOOSTER PRIVATE SERVERS", cfg)
+    for i, p in enumerate(profiles, 1):
+        print(f"{i}. {short_pkg(p.get('package','')):<10} {p.get('booster_name',''):<16} {short_link(p.get('server_link',''))}")
+    print("0. Back")
+    ch = input("Choose profile: ").strip()
+    if not ch.isdigit() or ch == "0": return
+    idx = int(ch)-1
+    if not 0 <= idx < len(profiles): return
+    value = input("Private server link: ").strip()
+    if value:
+        profiles[idx]["server_link"] = value
+        save_booster_config(bcfg)
+        print(col("Saved Booster server link.", GREEN)); pause()
+
+
+def booster_config_menu(cfg):
+    while True:
+        bcfg = load_booster_config()
+        clear(); banner("BOOSTER MODE CONFIG", cfg)
+        print(col("Booster stays in its private server; Market bots come to it.", DIM))
+        for i, p in enumerate(booster_profiles(bcfg), 1):
+            print(f"{i}. {'ON' if p.get('enabled',True) else 'OFF'} {short_pkg(p.get('package','')):<10} "
+                  f"{p.get('booster_name',''):<16} {short_link(p.get('server_link',''))}")
+        print("\n1. Enable BOOSTER mode")
+        print("2. Set private server link")
+        print("3. Force backend report now")
+        print("4. Toggle a Booster profile")
+        print("0. Back")
+        ch = input("Choose: ").strip()
+        if ch == "0": return
+        if ch == "1":
+            set_active_rejoin_mode("booster", cfg); print(col("BOOSTER mode enabled.", GREEN)); pause()
+        elif ch == "2": booster_server_link_menu(cfg)
+        elif ch == "3":
+            ok, msg = booster_report_once(bcfg, force=True)
+            print(col(("OK: " if ok else "ERROR: ") + msg, GREEN if ok else RED)); pause()
+        elif ch == "4":
+            pick = input("Profile number: ").strip()
+            if pick.isdigit() and 1 <= int(pick) <= len(bcfg.get("boosters", [])):
+                p = bcfg["boosters"][int(pick)-1]; p["enabled"] = not p.get("enabled", True)
+                save_booster_config(bcfg)
+
+
+def open_all_booster_tabs_once(main_cfg=None):
+    cfg = dict(load_config())
+    if isinstance(main_cfg, dict): cfg.update(main_cfg)
+    rt = load_runtime(); tabs = [booster_profile_to_tab(p) for p in booster_profiles(load_booster_config(), True)]
+    for idx, tab in enumerate(tabs, 1):
+        rt_tab = get_runtime_tab(rt, tab["package"])
+        opening_screen(tab, "hatcher", cfg, idx, len(tabs), mode="hard")
+        manual_force_restart_tab(tab, rt_tab, cfg, "hatcher", "manual booster force restart", rt=rt)
+        save_runtime(rt)
+        if idx < len(tabs) and not wait_seconds(int(cfg.get("delay_between_open", 45)), rt): break
+    pause()
 
 # ============================================================
 # HATCHING MODE / JSONBIN REPORTER
@@ -8631,10 +9133,16 @@ def cloudflare_update_one_hatcher(cfg, name, entry):
 
     roblox_username = str(payload.get("username", "") or "").strip()
 
+    entry_mode = str(payload.get("mode") or payload.get("role") or "hatcher").strip().lower()
+    if entry_mode not in ("hatcher", "booster"):
+        entry_mode = "hatcher"
     payload["username"] = name
     payload["hatcher_name"] = name
     payload["name"] = name
-    payload["mode"] = "hatcher"
+    payload["mode"] = entry_mode
+    payload["role"] = entry_mode
+    if entry_mode == "booster":
+        payload["booster_name"] = name
 
     if roblox_username and roblox_username != name:
         payload["roblox_username"] = roblox_username
@@ -9418,7 +9926,7 @@ def start_hatcher_reporter(main_cfg=None):
                         status = "Online"
                     else:
                         note = hard_note
-                        status = "Online"
+                        status = "Stale"
                 elif loading_grace:
                     note = "loading grace"
                     status = "Loading"
@@ -9885,6 +10393,27 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
     hcfg = load_hatcher_config()
     rt = load_runtime()
 
+    # V4.41 one-time repair: older builds stamped the old-state cooldown when
+    # an item was queued, even if it never reached PID stop/open. Clear that bad
+    # lock once. Also clear only the stale missing-cookie manual flag that used
+    # to discard crash/dead recovery before the package could open.
+    if int(cfg.get("_nomo_recovery_queue_migration", 0) or 0) < 441:
+        for profile in hatcher_profiles(hcfg, enabled_only=False):
+            pkg = str((profile or {}).get("package", "") or "")
+            if not pkg:
+                continue
+            rt_tab = get_runtime_tab(rt, pkg)
+            rt_tab["hatcher_alive_old_state_hard_last"] = 0
+            reason = str(rt_tab.get("manual_login_reason", "") or "").lower()
+            if reason == "invalid or missing package cookie":
+                clear_manual_login_block(rt_tab)
+                clear_hold(pkg)
+        rt["_open_lock_pkg"] = ""
+        rt["_open_lock_at"] = 0
+        cfg["_nomo_recovery_queue_migration"] = 441
+        save_runtime(rt)
+        save_config(cfg)
+
     # V4.36 one-time repair: V4.34 could stamp long cooldowns even though an
     # alive clone only received a soft intent and never actually restarted.
     # Clear those stale per-package locks once so every affected clone gets a
@@ -9979,8 +10508,12 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
 
             queue_open(
                 open_queue, tab, "hatcher", "hatcher start",
-                force=True, skip_if_alive=True, mode="hard",
-                metadata={"pid_only_recovery": True},
+                force=True, skip_if_alive=True, mode="hard_force", bypass_manual=True,
+                metadata={
+                    "pid_only_recovery": True,
+                    "recovery_must_open_once": True,
+                    "bypass_recheck": True,
+                },
             )
         save_runtime(rt)
 
@@ -10216,7 +10749,15 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                 and cfg.get("rejoin_if_crash", True)
             ):
                 if cfg.get("smart_open_queue", True):
-                    added, _ = queue_open(open_queue, tab, "hatcher", "crash/dead", skip_if_alive=True)
+                    added, _ = queue_open(
+                        open_queue, tab, "hatcher", "crash/dead",
+                        force=True, skip_if_alive=True, mode="hard_force", bypass_manual=True,
+                        metadata={
+                            "pid_only_recovery": True,
+                            "recovery_must_open_once": True,
+                            "bypass_recheck": True,
+                        },
+                    )
                     note = "crash queued" if added else "already queued"
                     status = "Queued" if added else "Offline"
                 else:
@@ -10991,7 +11532,7 @@ def compute_age(created_str):
 
 PET_COUNTER_FALLBACK_TEMPLATE = r'''--========================================================--
 --                    NOMO PET COUNTER
---       v3.9 RELEASE DATA COUNTS
+--       v4.1 CONFIRMED BOOSTER SCHEMA
 --========================================================--
 -- Writes per-account state to:
 --   nomo_rejoiner/<username>_state.json
@@ -11069,7 +11610,7 @@ local Config = getgenv().NOMO_PET_COUNTER
 
 Config.Enabled = true
 Config.Stop = false
-Config.Version = "v3.9-release-data-counts"
+Config.Version = "v4.1-confirmed-booster-schema"
 
 Config.WriteFolder = Config.WriteFolder or "nomo_rejoiner"
 
@@ -11089,6 +11630,12 @@ Config.WriteFile = Config.WriteFile or (Config.WriteFolder .. "/" .. _safeUser .
 -- Scan fast, write light.
 Config.ScanEvery = tonumber(Config.ScanEvery or 2) or 2
 Config.WriteEvery = tonumber(Config.WriteEvery or 5) or 5
+
+-- Booster match defaults. The counter only exports matching pet details, never
+-- the full pet inventory, keeping state files compact.
+Config.BoosterMinBaseWeightKg = tonumber(Config.BoosterMinBaseWeightKg or 6) or 6
+Config.BoosterMinAge = tonumber(Config.BoosterMinAge or 500) or 500
+Config.BoosterMaxMatches = math.max(1, math.floor(tonumber(Config.BoosterMaxMatches or 100) or 100))
 
 Config.Debug = Config.Debug == true
 Config.Verbose = Config.Verbose == true
@@ -11718,19 +12265,178 @@ local function firstTable(...)
     return nil
 end
 
-local function countPetsFromData(data)
-    local petInv = data and data.PetsData and data.PetsData.PetInventory
-    local petData = petInv and firstTable(petInv.Data, petInv.PetData, petInv.Inventory)
-    if type(petData) ~= "table" then
+local PET_NAME_FIELDS = {
+    "PetType", "PetName", "pet_type", "pet_name", "Name", "name",
+    "ItemName", "item_name", "Type", "type"
+}
+local PET_AGE_FIELDS = {"Age", "age", "PetAge", "pet_age"}
+local PET_WEIGHT_FIELDS = {
+    "WeightKg", "WeightKG", "weight_kg", "Weight", "weight",
+    "CurrentWeight", "current_weight", "FinalWeight", "final_weight"
+}
+local PET_BASE_WEIGHT_FIELDS = {
+    "BaseWeightKg", "BaseWeightKG", "base_weight_kg", "BaseWeight",
+    "base_weight", "OriginalWeight", "original_weight", "BaseKG", "base_kg"
+}
+local PET_MUTATION_FIELDS = {
+    "Mutation", "mutation", "MutationType", "mutation_type",
+    "Mutations", "mutations"
+}
+local PET_UUID_FIELDS = {
+    "PET_UUID", "PetUUID", "pet_uuid", "UUID", "uuid", "Id", "id"
+}
+
+local function entryTables(entry)
+    local out = {}
+    local seen = {}
+    local function add(value)
+        if type(value) == "table" and not seen[value] then
+            seen[value] = true
+            table.insert(out, value)
+        end
+    end
+    add(entry)
+    if type(entry) == "table" then
+        add(entry.Data)
+        add(entry.data)
+        add(entry.PetData)
+        add(entry.petData)
+        add(entry.Pet)
+        add(entry.pet)
+        add(entry.Info)
+        add(entry.info)
+    end
+    return out
+end
+
+local function firstEntryField(entry, fields)
+    for _, container in ipairs(entryTables(entry)) do
+        for _, field in ipairs(fields) do
+            local value = container[field]
+            if value ~= nil then
+                return value
+            end
+        end
+    end
+    return nil
+end
+
+local function numericEntryField(entry, fields)
+    local value = firstEntryField(entry, fields)
+    if type(value) == "table" then
+        value = value.Value or value.value or value.Amount or value.amount
+    end
+    return tonumber(value)
+end
+
+local function stringEntryField(entry, fields)
+    local value = firstEntryField(entry, fields)
+    if value == nil then
+        return ""
+    end
+    if type(value) == "table" then
+        local parts = {}
+        for key, enabled in pairs(value) do
+            if enabled ~= false and enabled ~= nil then
+                table.insert(parts, tostring(key))
+            end
+        end
+        table.sort(parts)
+        return table.concat(parts, ",")
+    end
+    return tostring(value)
+end
+
+local function boosterPetDetail(key, entry)
+    if type(entry) ~= "table" then
         return nil
     end
 
+    -- Confirmed DataService PetInventory schema:
+    -- table key     = pet UUID
+    -- PetType       = species
+    -- Name          = nickname
+    -- Level         = age
+    -- BaseWeight    = age-0 base weight
+    -- MutationType  = mutation
+    local uuid = tostring(key or "")
+    local petType = tostring(entry.PetType or "Unknown Pet")
+    local nickname = tostring(entry.Name or "")
+    local age = tonumber(entry.Level) or 0
+    local age0BaseWeight = tonumber(entry.BaseWeight) or 0
+
+    -- NOMO convention: filter/report base weight as the pet's age-1 weight.
+    -- Keep only 2 decimals by truncating; never round.
+    local age1BaseWeight = math.floor((age0BaseWeight * 1.1) * 100) / 100
+
+    local mutation = tostring(entry.MutationType or "")
+    local hatchedFrom = tostring(entry.HatchedFrom or "")
+    local isFavorite = entry.IsFavorite == true
+
+    local boosts = {}
+    if type(entry.Boosts) == "table" then
+        for _, value in pairs(entry.Boosts) do
+            table.insert(boosts, tostring(value))
+        end
+        table.sort(boosts)
+    end
+
+    local ageMatch = age >= Config.BoosterMinAge
+    local weightMatch = age1BaseWeight >= Config.BoosterMinBaseWeightKg
+    if not ageMatch and not weightMatch then
+        return nil
+    end
+
+    return {
+        uuid = uuid,
+        name = petType,
+        nickname = nickname,
+        age = age,
+        base_weight_kg = age1BaseWeight,
+        mutation = mutation,
+        hatched_from = hatchedFrom,
+        is_favorite = isFavorite,
+        boosts = boosts,
+        match_age = ageMatch,
+        match_base_weight = weightMatch,
+    }
+end
+
+local function analyzePetsFromData(data)
+    local petInv = data and data.PetsData and data.PetsData.PetInventory
+    local petData = petInv and firstTable(petInv.Data, petInv.PetData, petInv.Inventory)
+    if type(petData) ~= "table" then
+        return nil, {}
+    end
+
     local count = 0
-    for _, entry in pairs(petData) do
+    local matches = {}
+    for key, entry in pairs(petData) do
         if entry ~= nil and entry ~= false then
             count += 1
+            if #matches < Config.BoosterMaxMatches then
+                local detail = boosterPetDetail(key, entry)
+                if detail then
+                    table.insert(matches, detail)
+                end
+            end
         end
     end
+
+    table.sort(matches, function(a, b)
+        local aw = tonumber(a.base_weight_kg) or -1
+        local bw = tonumber(b.base_weight_kg) or -1
+        if aw ~= bw then
+            return aw > bw
+        end
+        return (tonumber(a.age) or 0) > (tonumber(b.age) or 0)
+    end)
+
+    return count, matches
+end
+
+local function countPetsFromData(data)
+    local count = analyzePetsFromData(data)
     return count
 end
 
@@ -11880,7 +12586,7 @@ local function countPetsAndEggs()
     end
 
     local data = getLiveData()
-    local petCount = countPetsFromData(data)
+    local petCount, boostingMatches = analyzePetsFromData(data)
     local dataEggsOk = countEggsFromData(data, eggs)
 
     if petCount == nil or not dataEggsOk then
@@ -11895,7 +12601,7 @@ local function countPetsAndEggs()
         eggTotal += tonumber(amount) or 0
     end
 
-    return tonumber(petCount) or 0, eggTotal, eggs
+    return tonumber(petCount) or 0, eggTotal, eggs, boostingMatches or {}
 end
 
 --========================================================--
@@ -12366,6 +13072,7 @@ end
 local lastGoodPetCount = 0
 local lastGoodEggTotal = 0
 local lastGoodEggs = {}
+local lastGoodBoostingMatches = {}
 
 -- Heartbeat: increments every successful state build. Lets the harness tell
 -- "script running but game stuck" (seq advancing, pets frozen) from
@@ -12374,9 +13081,9 @@ local WRITE_SEQ = 0
 local SCRIPT_START = os.time()
 
 local function buildState()
-    local petCount, eggTotal, eggs = 0, 0, {}
+    local petCount, eggTotal, eggs, boostingMatches = 0, 0, {}, {}
 
-    local okCount, a, b, c = pcall(function()
+    local okCount, a, b, c, d = pcall(function()
         return countPetsAndEggs()
     end)
 
@@ -12384,13 +13091,16 @@ local function buildState()
         petCount = tonumber(a) or 0
         eggTotal = tonumber(b) or 0
         eggs = type(c) == "table" and c or {}
+        boostingMatches = type(d) == "table" and d or {}
         lastGoodPetCount = petCount
         lastGoodEggTotal = eggTotal
         lastGoodEggs = eggs
+        lastGoodBoostingMatches = boostingMatches
     else
         petCount = lastGoodPetCount
         eggTotal = lastGoodEggTotal
         eggs = lastGoodEggs
+        boostingMatches = lastGoodBoostingMatches
         if Config.Debug then
             warn("[NOMO PET COUNTER] countPetsAndEggs error:", tostring(a))
         end
@@ -12443,6 +13153,11 @@ local function buildState()
         egg_catalog_count = countTable(EGG_CATALOG),
         egg_catalog_source = EGG_CATALOG_SOURCE,
         egg_counts_include_zero = Config.IncludeZeroCountEggs == true,
+
+        boosting_match_count = #boostingMatches,
+        boosting_matches = boostingMatches,
+        boosting_min_base_weight_kg = Config.BoosterMinBaseWeightKg,
+        boosting_min_age = Config.BoosterMinAge,
 
         ts = now(),
         write_seq = WRITE_SEQ,
@@ -12680,12 +13395,12 @@ def _lua_long_string(text):
 
 
 def pet_counter_autoexec_source():
-    """Build GitHub-latest -> cache -> embedded-v3.9 AutoExec loader."""
+    """Build GitHub-latest -> cache -> embedded-v4.0 AutoExec loader."""
     remote_url = json.dumps(NOMO_PET_COUNTER_URL)
     embedded = _lua_long_string(PET_COUNTER_FALLBACK_TEMPLATE)
 
     return f'''-- NOMO Pet Counter updater/loader
--- Priority: GitHub latest -> local cache -> embedded v3.9 fallback
+-- Priority: GitHub latest -> local cache -> embedded v4.1 fallback
 
 local COUNTER_URL = {remote_url}
 local CACHE_FOLDER = "nomo_rejoiner"
@@ -12767,15 +13482,15 @@ end
 
 if not selectedSource then
     selectedSource = EMBEDDED_FALLBACK
-    selectedName = "embedded-v3.9"
+    selectedName = "embedded-v4.0"
 end
 
 local chunk, compileError = loadstring(selectedSource)
-if not chunk and selectedName ~= "embedded-v3.9" then
+if not chunk and selectedName ~= "embedded-v4.0" then
     warn("[NOMO COUNTER LOADER] " .. selectedName
-        .. " compile failed; using embedded v3.9:", tostring(compileError))
+        .. " compile failed; using embedded v4.0:", tostring(compileError))
     selectedSource = EMBEDDED_FALLBACK
-    selectedName = "embedded-v3.9"
+    selectedName = "embedded-v4.0"
     chunk, compileError = loadstring(selectedSource)
 end
 
@@ -13722,7 +14437,7 @@ def autoexec_menu(cfg):
         ]
         draw_boxed_menu(rows, cfg)
         print("")
-        print(col("Pet Counter source: GitHub latest -> cache -> embedded v3.9 fallback", DIM))
+        print(col("Pet Counter source: GitHub latest -> cache -> embedded v4.1 fallback", DIM))
         choice = read_menu_choice("\nOption: ", valid={"0", "1", "2", "3", "4", "5", "6", "7"})
         if choice is None:
             print(col("Invalid option. Use one of the numbers shown.", RED))
@@ -17165,10 +17880,10 @@ def _setup_prompt_private_server_place_id(cfg, role):
     """
     default_place = "126884695634066"
     clear()
-    title = "SETUP: PRIVATE SERVER PLACE" if role in {"hatcher", "local"} else "SETUP: DEFAULT PLACE"
+    title = "SETUP: PRIVATE SERVER PLACE" if role in {"hatcher", "booster", "local"} else "SETUP: DEFAULT PLACE"
     banner(title, cfg)
     print(col("Press Enter to use Grow a Garden.", DIM))
-    if role in {"hatcher", "local"}:
+    if role in {"hatcher", "booster", "local"}:
         print(col("Only the Place ID is requested; create/reuse stays automatic.", DIM))
     else:
         print(col("Market registration stays automatic; this saves the default solver Place ID.", DIM))
@@ -17187,6 +17902,9 @@ def _setup_prompt_private_server_place_id(cfg, role):
     hcfg = load_hatcher_config()
     hcfg["expected_place_id"] = place_id
     save_hatcher_config(hcfg)
+    bcfg = load_booster_config()
+    bcfg["expected_place_id"] = place_id
+    save_booster_config(bcfg)
     print(col(f"Using Place ID: {place_id}", GREEN))
     return place_id
 
@@ -17205,14 +17923,15 @@ def new_redfinger_setup_wizard(cfg=None):
     print("")
     print("1. MARKET Redfinger")
     print("2. HATCHER Redfinger")
-    print("3. LOCAL REJOIN ONLY (no backend / no allowlist)")
+    print("3. BOOSTER Redfinger")
+    print("4. LOCAL REJOIN ONLY (no backend / no allowlist)")
     print("0. Cancel")
-    mode_choice = read_menu_choice("Select role: ", {"0", "1", "2", "3"})
+    mode_choice = read_menu_choice("Select role: ", {"0", "1", "2", "3", "4"})
     if mode_choice in {None, "0"}:
         return
 
-    role = {"1": "market", "2": "hatcher", "3": "local"}[mode_choice]
-    runtime_mode = "market" if role == "market" else "hatcher"
+    role = {"1": "market", "2": "hatcher", "3": "booster", "4": "local"}[mode_choice]
+    runtime_mode = role if role in ("market", "hatcher", "booster") else "hatcher"
     role_label = "LOCAL REJOIN ONLY" if role == "local" else role.upper()
 
     clear()
@@ -17246,6 +17965,8 @@ def new_redfinger_setup_wizard(cfg=None):
     hcfg = load_hatcher_config()
     sync_hatcher_profiles_with_tabs(cfg, hcfg)
     save_hatcher_config(hcfg)
+    bcfg = load_booster_config()
+    sync_booster_profiles_with_tabs(cfg, bcfg)
 
     clear()
     banner("SETUP: USERNAMES", cfg)
@@ -17260,6 +17981,8 @@ def new_redfinger_setup_wizard(cfg=None):
     hcfg = load_hatcher_config()
     sync_hatcher_profiles_with_tabs(cfg, hcfg)
     save_hatcher_config(hcfg)
+    bcfg = load_booster_config()
+    sync_booster_profiles_with_tabs(cfg, bcfg)
 
     # Backend roles ask only for NOMO_SECRET. LOCAL intentionally disables all
     # registration/reporting while preserving any previously saved credentials.
@@ -17277,6 +18000,13 @@ def new_redfinger_setup_wizard(cfg=None):
         cfg["local_rejoin_only"] = False
         save_config(cfg)
         cfg, hcfg, backend_ok = _setup_configure_cloudflare(cfg, automatic=True)
+        bcfg = load_booster_config()
+        for key in ("backend_provider", "jsonbin_hatchers_enabled", "cloudflare_worker_url",
+                    "cloudflare_secret", "cloudflare_timeout_seconds", "jsonbin_bin_id",
+                    "jsonbin_api_key", "jsonbin_key_header", "jsonbin_timeout_seconds"):
+            if key in cfg:
+                bcfg[key] = cfg.get(key)
+        save_booster_config(bcfg)
 
     # Automatic YES on every role: always install/update the counter.
     clear()
@@ -17332,6 +18062,30 @@ def new_redfinger_setup_wizard(cfg=None):
             hcfg["enabled"] = True
             save_hatcher_config(hcfg)
             first_upload = hatcher_report_once(hcfg, force=True)
+
+    elif role == "booster":
+        print(col("Create/reuse Booster private servers: YES (automatic)", GREEN))
+        print(col("Sync registered Market access: YES (automatic)", GREEN))
+        server_result = auto_fetch_private_servers(
+            cfg, selected_packages=selected, pause_at_end=False,
+            sync_market_access=True, automatic=True,
+            place_id_override=setup_place_id
+        )
+        hcfg = load_hatcher_config()
+        bcfg = load_booster_config()
+        by_pkg = {str(p.get("package") or ""): p for p in hatcher_profiles(hcfg)}
+        for prof in booster_profiles(bcfg):
+            source_prof = by_pkg.get(str(prof.get("package") or ""))
+            if source_prof:
+                prof["server_link"] = source_prof.get("server_link", prof.get("server_link", ""))
+                prof["state_file"] = source_prof.get("state_file", prof.get("state_file", ""))
+        bcfg["enabled"] = True
+        save_booster_config(bcfg)
+        mode_ok = bool((server_result or {}).get("changed"))
+        mode_msg = "booster private-server setup completed" if mode_ok else "booster server setup made no changes"
+        if backend_ok:
+            print(col("Force first Booster D1 report: YES (automatic)", GREEN))
+            first_upload = booster_report_once(bcfg, force=True)
 
     else:  # local
         print(col("Create/reuse local private servers: YES (automatic)", GREEN))
@@ -17443,10 +18197,12 @@ def mode_menu(cfg):
         print("")
         print("1. Enable MARKET mode")
         print("2. Enable HATCHER mode")
-        print("3. Enable REJOIN ONLY mode")
-        print("4. Market config (pet routing / restock settings)")
-        print("5. Hatcher config (reporting / backend settings)")
-        print("6. Rejoin Only config (per-package links / safety)")
+        print("3. Enable BOOSTER mode")
+        print("4. Enable REJOIN ONLY mode")
+        print("5. Market config (pet routing / restock settings)")
+        print("6. Hatcher config (reporting / backend settings)")
+        print("7. Booster config (servers / reporting)")
+        print("8. Rejoin Only config (per-package links / safety)")
         print("0. Back")
         drain_stdin()
         ch = input("\nChoose: ").strip()
@@ -17463,19 +18219,20 @@ def mode_menu(cfg):
             print(col("HATCHER mode enabled.", GREEN))
             pause()
         elif ch == "3":
+            cfg = set_active_rejoin_mode("booster", cfg)
+            print(col("BOOSTER mode enabled.", GREEN)); pause()
+        elif ch == "4":
             cfg = set_active_rejoin_mode("rejoin_only", cfg)
             print(col("REJOIN ONLY mode enabled.", GREEN))
-            print(col("This mode ignores pet routing and Cloudflare reporting.", DIM))
-            pause()
-        elif ch == "4":
-            market_only_settings(cfg)
-            cfg = load_config()
+            print(col("This mode ignores pet routing and Cloudflare reporting.", DIM)); pause()
         elif ch == "5":
-            hatcher_global_settings(cfg)
-            cfg = load_config()
+            market_only_settings(cfg); cfg = load_config()
         elif ch == "6":
-            rejoin_only_menu(cfg)
-            cfg = load_config()
+            hatcher_global_settings(cfg); cfg = load_config()
+        elif ch == "7":
+            booster_config_menu(cfg); cfg = load_config()
+        elif ch == "8":
+            rejoin_only_menu(cfg); cfg = load_config()
         else:
             print("Invalid choice.")
             time.sleep(1)
@@ -19459,6 +20216,8 @@ def start_rejoin(cfg):
 def set_global_private_server_menu(cfg):
     if active_rejoin_mode(cfg) == "rejoin_only":
         return rejoin_only_link_menu(cfg)
+    if active_rejoin_mode(cfg) == "booster":
+        return booster_server_link_menu(cfg)
     return _nomo_set_global_private_server_menu_original(cfg)
 
 
@@ -19466,6 +20225,8 @@ def set_global_private_server_menu(cfg):
 def force_restart_active_tabs_once(cfg):
     if active_rejoin_mode(cfg) == "rejoin_only":
         return rejoin_only_force_restart_all(cfg)
+    if active_rejoin_mode(cfg) == "booster":
+        return open_all_booster_tabs_once(cfg)
     return _nomo_force_restart_active_tabs_once_original(cfg)
 
 def main():
@@ -19490,6 +20251,8 @@ def main():
             try:
                 if mode == "hatcher":
                     start_hatcher_safe_rejoiner(cfg)
+                elif mode == "booster":
+                    start_booster_safe_rejoiner(cfg)
                 else:
                     start_rejoin(cfg)
             finally:
