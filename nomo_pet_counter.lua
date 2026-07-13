@@ -1,6 +1,6 @@
 --========================================================--
 --                    NOMO PET COUNTER
---       v3.5 DATA-SERVICE PET / EGG COUNTS
+--       v3.9 RELEASE DATA COUNTS
 --========================================================--
 -- Writes per-account state to:
 --   nomo_rejoiner/<username>_state.json
@@ -27,6 +27,7 @@
 local Players = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TeleportService = game:GetService("TeleportService")
 local CoreGui = game:GetService("CoreGui")
 local GuiService = game:GetService("GuiService")
 local VirtualInputManager = nil
@@ -77,7 +78,7 @@ local Config = getgenv().NOMO_PET_COUNTER
 
 Config.Enabled = true
 Config.Stop = false
-Config.Version = "v3.5-data-service-counts"
+Config.Version = "v3.9-release-data-counts"
 
 Config.WriteFolder = Config.WriteFolder or "nomo_rejoiner"
 
@@ -95,7 +96,7 @@ local _safeUser = sanitizeName(LocalPlayer.Name)
 Config.WriteFile = Config.WriteFile or (Config.WriteFolder .. "/" .. _safeUser .. "_state.json")
 
 -- Scan fast, write light.
-Config.ScanEvery = tonumber(Config.ScanEvery or 1) or 1
+Config.ScanEvery = tonumber(Config.ScanEvery or 2) or 2
 Config.WriteEvery = tonumber(Config.WriteEvery or 5) or 5
 
 Config.Debug = Config.Debug == true
@@ -1517,17 +1518,6 @@ local function writeState()
     return ok, err, state
 end
 
---========================================================--
--- Debug commands
---========================================================--
-
-getgenv().NOMO_WRITE_STATE_NOW = function()
-    local ok, err, state = writeState()
-    print("[NOMO PET COUNTER] write now:", ok, err or "")
-    print(HttpService:JSONEncode(state))
-    return state
-end
-
 getgenv().NOMO_COUNTER_STOP = function()
     Config.Enabled = false
     Config.Stop = true
@@ -1559,6 +1549,26 @@ local lastPetCount = nil
 local lastEggTotal = nil
 local lastLoadingSignature = nil
 
+local function rejoinServer()
+    pcall(writeState)
+
+    task.spawn(function()
+        local ok, err = pcall(function()
+            if tostring(game.JobId or "") ~= "" then
+                TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+            else
+                TeleportService:Teleport(game.PlaceId, LocalPlayer)
+            end
+        end)
+
+        if not ok then
+            warn("[NOMO PET COUNTER] rejoin failed:", tostring(err))
+        end
+    end)
+end
+
+getgenv().NOMO_COUNTER_REJOIN = rejoinServer
+
 print("========================================")
 print("[NOMO PET COUNTER] " .. tostring(Config.Version) .. "  (for NOMO REJOIN V4.04+)")
 print("[NOMO PET COUNTER] account = " .. tostring(LocalPlayer.Name))
@@ -1570,6 +1580,7 @@ print("[NOMO PET COUNTER] loading edge clicks = " .. tostring(Config.AutoSkipLoa
     .. ", interval=" .. tostring(Config.LoadingClickInterval) .. "s"
     .. ", start-side=" .. tostring(Config.LoadingClickSide))
 print("========================================")
+
 
 -- Send fixed delayed edge clicks independently so state writing never waits for them.
 task.spawn(runLoadingEdgeClicks)
