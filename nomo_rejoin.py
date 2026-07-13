@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+# V4.37 — DEFAULT MARKET/GAG LOADER IN NEW REDFINGER SETUP
+# - CHANGE: Built-in Market/GAG AutoExec loader now waits for game load and uses
+#           the requested Grow a Garden and GitHub NOMO Market URLs.
+# - NEW: New Redfinger Setup -> MARKET automatically installs/updates
+#        nomo_market_loader.lua for every selected package beside the Pet Counter.
+# - KEEP: V4.36 exact-PID recovery and readable Termux Auto layout.
+#
 # V4.36 — PID-ONLY HATCHER QUEUE + READABLE AUTO LAYOUT
 # - FIX: Hatcher old-state, kick, timeout, challenge, and hard recovery use the
 #        selected package's verified exact PID only; no am force-stop/killall/pkill.
@@ -22,7 +29,7 @@
 # - CHANGE: bulk cookie login chooses a TXT from the same local cookies folder.
 # - FIX: a fresh clone is opened once automatically when its WebView cookie DB does not exist.
 #
-# NOMO REJOIN V4.36
+# NOMO REJOIN V4.37
 #
 # V4.31 — OPTION 13 AUTOMATIC LAYOUT
 # - NEW: New Redfinger Setup automatically selects Auto layout for the packages
@@ -67,7 +74,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.36"
+__version__ = "V4.37"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -10944,16 +10951,23 @@ end
 fn()
 '''
 
-MARKET_LOADER_AUTOEXEC_TEMPLATE = r'''-- NOMO Market / GAG loader template
+MARKET_LOADER_AUTOEXEC_TEMPLATE = r'''-- NOMO Market / GAG loader
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
+
 if game.PlaceId == 126884695634066 then
     -- Grow a Garden
     print("grow a garden")
-    loadstring(game:HttpGet("https://pastebin.com/raw/PJYuhuuk"))()
+    loadstring(game:HttpGet("https://pastebin.com/raw/PJYuhuuk", true))()
+
 elseif game.PlaceId == 129954712878723 then
-    -- Trade World
+    -- Trade World / Market
     print("trade world")
-    loadstring(game:HttpGet("https://pastebin.com/raw/DNeJi4nC"))()
+    loadstring(game:HttpGet("https://raw.githubusercontent.com/atmincosplay-ship-it/nomo-market/main/nomo_obsidian.lua", true))()
+
 else
+    print("unsupported place:", game.PlaceId)
     return
 end
 '''
@@ -15252,6 +15266,58 @@ def _setup_install_counter_for_packages(cfg, packages, path_mode):
     return results
 
 
+
+def _setup_install_market_loader_for_packages(cfg, packages, path_mode):
+    """Install/update the built-in Market/GAG loader during MARKET setup."""
+    tabs_by_pkg = {str(t.get("package") or ""): t for t in autoexec_tabs(cfg)}
+    selected_tabs = [tabs_by_pkg[p] for p in packages if p in tabs_by_pkg]
+    results = []
+    for tab in selected_tabs:
+        pkg = str(tab.get("package") or "")
+        paths = autoexec_paths_for_tab(
+            tab,
+            path_mode,
+            filename=AUTOEXEC_MARKET_LOADER_FILE,
+        )
+        if not paths:
+            results.append((pkg, False, "no AutoExec path"))
+            continue
+
+        ok_count = 0
+        errors = []
+        unchanged = 0
+        for path in paths:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                old = None
+                try:
+                    if path.exists():
+                        old = path.read_text(encoding="utf-8")
+                except Exception:
+                    old = None
+
+                if old == MARKET_LOADER_AUTOEXEC_TEMPLATE:
+                    unchanged += 1
+                    ok_count += 1
+                    continue
+
+                tmp = path.with_suffix(path.suffix + ".tmp")
+                tmp.write_text(MARKET_LOADER_AUTOEXEC_TEMPLATE, encoding="utf-8")
+                os.replace(str(tmp), str(path))
+                ok_count += 1
+            except Exception as exc:
+                errors.append(str(exc))
+
+        if errors:
+            note = "; ".join(errors)
+        elif unchanged == len(paths):
+            note = f"unchanged {unchanged}"
+        else:
+            note = f"saved {ok_count}"
+        results.append((pkg, ok_count == len(paths), note))
+    return results
+
+
 def _setup_register_market_accounts(cfg, packages):
     cache = load_cookie_cache()
     tabs_by_pkg = {str(t.get("package") or ""): t for t in cfg.get("tabs", [])}
@@ -15416,6 +15482,15 @@ def new_redfinger_setup_wizard(cfg=None):
     _print_autoexec_full_paths(selected_tabs, cfg, "Pet Counter destination path(s)")
     counter_results = _setup_install_counter_for_packages(cfg, selected, "1")
 
+    market_loader_results = []
+    if role == "market":
+        clear()
+        banner("SETUP: MARKET / GAG LOADER", cfg)
+        print(col("Install/update NOMO Market/GAG loader: YES (automatic)", GREEN))
+        print(col("The loader waits for game load and selects Grow a Garden or Trade World by PlaceId.", DIM))
+        _print_autoexec_full_paths(selected_tabs, cfg, "Market/GAG loader destination path(s)")
+        market_loader_results = _setup_install_market_loader_for_packages(cfg, selected, "1")
+
     mode_ok = False
     mode_msg = "skipped"
     server_result = None
@@ -15520,6 +15595,12 @@ def new_redfinger_setup_wizard(cfg=None):
 
     if role == "market":
         print("")
+        print(col("Market / GAG loader:", BOLD))
+        for pkg, ok, note in market_loader_results:
+            print(f"  {short_pkg(pkg):<10} {col('OK' if ok else 'FAILED', GREEN if ok else RED)}  {note}")
+
+    if role == "market":
+        print("")
         print(f"D1 Market registration: {col(mode_msg, GREEN if mode_ok else YELLOW)}")
         for pkg, ok, note in reg_results:
             print(f"  {short_pkg(pkg):<10} {col('OK' if ok else 'SKIP', GREEN if ok else YELLOW)}  {note}")
@@ -15544,7 +15625,7 @@ def new_redfinger_setup_wizard(cfg=None):
         print(f"  {col('NOT RUN', YELLOW)}")
 
     print("")
-    print(col("Next: restart/re-execute the executor if the Pet Counter was newly installed, reopen Termux Float for its saved cell, then use Option 1.", DIM))
+    print(col("Next: restart/re-execute the executor if AutoExec files were newly installed, reopen Termux Float for its saved box, then use Option 1.", DIM))
     pause()
 
 
