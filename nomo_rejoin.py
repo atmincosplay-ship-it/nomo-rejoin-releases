@@ -1,4 +1,23 @@
 #!/usr/bin/env python3
+# V4.45 — COOKIE FIRST-LAUNCH OK HANDLER
+# - FIX: A fresh clone with no WebView Cookies DB is initialized automatically.
+# - NEW: After first launch, NOMO waits 3 seconds and taps the Delta/clone OK
+#        position twice (default 868,403) before waiting for cookie storage.
+# - NEW: Cookie DB readiness is polled for up to 35 seconds instead of sleeping
+#        blindly for only 12 seconds.
+# - SAFE: The OK taps run only after injection reports a missing cookie database.
+# - SAFE: Exact-package PID stop remains required before database injection.
+#
+# V4.44 — DELTA GLOBAL AUTO SETUP
+# - NEW: Option 13 asks for executor storage: Delta Global or Arceus X per-clone.
+# - DELTA: Uses /storage/emulated/0/Delta/Autoexecute and
+#          /storage/emulated/0/Delta/Workspace globally for all selected clones.
+# - DELTA: Per-account state stays separated as
+#          Delta/Workspace/nomo_rejoiner/<username>_state.json.
+# - DELTA: Shared AutoExec files are written once, not once per package.
+# - KEEP: Exact-PID recovery, startup loading grace, saved detector rectangles,
+#         and readable Termux Float bounds.
+#
 # V4.43 — HATCHER STARTUP LOADING GRACE
 # - FIX: An already-alive clone with an old state file is no longer PID-stopped
 #        immediately when NOMO starts.
@@ -119,11 +138,16 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.43"
+__version__ = "V4.45"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 NOMO_APP_FILE = BASE_DIR / "nomo_rejoin.py"
+
+DELTA_GLOBAL_ROOT = Path("/storage/emulated/0/Delta")
+DELTA_GLOBAL_AUTOEXEC_DIR = DELTA_GLOBAL_ROOT / "Autoexecute"
+DELTA_GLOBAL_WORKSPACE_DIR = DELTA_GLOBAL_ROOT / "Workspace"
+DELTA_GLOBAL_STATE_DIR = DELTA_GLOBAL_WORKSPACE_DIR / "nomo_rejoiner"
 NOMO_BACKUP_DIR = BASE_DIR / "backups"
 NOMO_UPDATE_URL = (
     "https://raw.githubusercontent.com/atmincosplay-ship-it/"
@@ -305,7 +329,22 @@ DEFAULT_CONFIG = {
     "update_source_url": NOMO_UPDATE_URL,
     "update_timeout_seconds": 45,
 
+    # Selected by Option 13. Existing devices remain auto/per-clone until setup
+    # explicitly chooses Delta Global.
+    "executor_storage_mode": "auto",
+
     "cookie_webhook_url": "",   # stored locally, never hardcoded
+
+    # Fresh Delta/App-Cloner packages show a one-time OK dialog before WebView
+    # creates the Cookies database. These taps run only in the missing-DB path.
+    "cookie_first_launch_ok_enabled": True,
+    "cookie_first_launch_ok_x": 868,
+    "cookie_first_launch_ok_y": 403,
+    "cookie_first_launch_ok_delay_seconds": 3.0,
+    "cookie_first_launch_ok_repeats": 2,
+    "cookie_first_launch_ok_interval_seconds": 0.25,
+    "cookie_first_launch_db_wait_seconds": 35,
+
     "login_challenge_detection_enabled": True,
     "login_challenge_api_detection_enabled": True,
     "login_challenge_ui_detection_enabled": True,
@@ -11458,6 +11497,131 @@ def auto_map_packages_to_clone_workspaces(
     return results
 
 
+
+def _delta_state_path_for_username(username):
+    safe = _sanitize_state_name(username or "unknown")
+    return DELTA_GLOBAL_STATE_DIR / f"{safe}_state.json"
+
+
+def _setup_choose_executor_storage(cfg):
+    """Choose the executor storage model used by Option 13."""
+    saved = str(cfg.get("executor_storage_mode", "auto") or "auto").strip().lower()
+    delta_exists = DELTA_GLOBAL_ROOT.exists() or DELTA_GLOBAL_AUTOEXEC_DIR.exists()
+
+    default_choice = "1" if saved == "delta_global" or (saved == "auto" and delta_exists) else "2"
+
+    clear()
+    banner("SETUP: EXECUTOR STORAGE", cfg)
+    print("1. Delta GLOBAL")
+    print(f"   AutoExec : {DELTA_GLOBAL_AUTOEXEC_DIR}")
+    print(f"   Workspace: {DELTA_GLOBAL_WORKSPACE_DIR}")
+    print("")
+    print("2. Arceus X PER-CLONE")
+    print("   AutoExec : RobloxClone###/Arceus X/Autoexec")
+    print("   Workspace: RobloxClone###/Arceus X/Workspace")
+    print("")
+    print(f"ENTER = {'Delta Global' if default_choice == '1' else 'Arceus X per-clone'}")
+    print("0. Cancel")
+
+    drain_stdin()
+    raw = clean_terminal_input(input("\nExecutor storage: "))
+    if raw == "":
+        raw = default_choice
+    if raw == "0":
+        return None
+    if raw == "1":
+        return "delta_global"
+    if raw == "2":
+        return "arceus_per_clone"
+
+    print(col("Invalid choice.", RED))
+    pause()
+    return None
+
+
+def _configure_delta_global_storage(cfg, packages):
+    """Map selected packages to Delta's shared AutoExec and Workspace."""
+    DELTA_GLOBAL_AUTOEXEC_DIR.mkdir(parents=True, exist_ok=True)
+    DELTA_GLOBAL_STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+    wanted = set(packages or [])
+    results = []
+    for tab in cfg.get("tabs", []):
+        pkg = str(tab.get("package") or "")
+        if pkg not in wanted:
+            continue
+
+        username = str(tab.get("user_name") or pkg).strip()
+        state_path = _delta_state_path_for_username(username)
+
+        tab["stat_file"] = str(state_path)
+        tab["autoexec_path"] = str(DELTA_GLOBAL_AUTOEXEC_DIR)
+        tab["executor_storage"] = "delta_global"
+
+        results.append({
+            "package": pkg,
+            "clone_no": 0,
+            "username": username,
+            "state_file": str(state_path),
+            "autoexec_path": str(DELTA_GLOBAL_AUTOEXEC_DIR),
+            "reason": "Delta global",
+            "storage": "delta_global",
+        })
+
+    cfg["executor_storage_mode"] = "delta_global"
+    save_config(cfg)
+
+    hcfg = load_hatcher_config()
+    sync_hatcher_profiles_with_tabs(cfg, hcfg)
+    hmap = {str(p.get("package") or ""): p for p in hcfg.get("hatchers", [])}
+    hchanged = False
+    for result in results:
+        prof = hmap.get(result["package"])
+        if not prof:
+            continue
+        if str(prof.get("state_file") or "") != result["state_file"]:
+            prof["state_file"] = result["state_file"]
+            hchanged = True
+        if result["username"] and prof.get("hatcher_name") != result["username"]:
+            prof["hatcher_name"] = result["username"]
+            hchanged = True
+    if hchanged:
+        save_hatcher_config(hcfg)
+
+    bcfg = load_booster_config()
+    sync_booster_profiles_with_tabs(cfg, bcfg)
+    bmap = {str(p.get("package") or ""): p for p in booster_profiles(bcfg)}
+    bchanged = False
+    for result in results:
+        prof = bmap.get(result["package"])
+        if not prof:
+            continue
+        if str(prof.get("state_file") or "") != result["state_file"]:
+            prof["state_file"] = result["state_file"]
+            bchanged = True
+        if result["username"] and prof.get("booster_name") != result["username"]:
+            prof["booster_name"] = result["username"]
+            bchanged = True
+    if bchanged:
+        save_booster_config(bcfg)
+
+    return results
+
+
+def _prepare_arceus_per_clone_storage(cfg, packages):
+    """Clear Delta overrides before running the existing per-clone mapper."""
+    wanted = set(packages or [])
+    for tab in cfg.get("tabs", []):
+        pkg = str(tab.get("package") or "")
+        if pkg not in wanted:
+            continue
+        tab.pop("autoexec_path", None)
+        tab["executor_storage"] = "arceus_per_clone"
+
+    cfg["executor_storage_mode"] = "arceus_per_clone"
+    save_config(cfg)
+
+
 def _new_tab_for_package(pkg, position=0):
     hint = _package_clone_number_hint(pkg)
     idx = max(0, int(hint - 1 if hint else (position or 0)))
@@ -17079,11 +17243,95 @@ def import_cookie_menu(cfg):
         except Exception as exc:
             return False, f"first launch failed: {exc}"
 
-        # Give WebView time to create app_webview/.../Cookies on a fresh clone.
-        time.sleep(12)
+        tapped_ok = False
+        if bool(cfg.get("cookie_first_launch_ok_enabled", True)):
+            delay = max(
+                0.5,
+                float(cfg.get("cookie_first_launch_ok_delay_seconds", 3.0) or 3.0),
+            )
+            x = int(cfg.get("cookie_first_launch_ok_x", 868) or 868)
+            y = int(cfg.get("cookie_first_launch_ok_y", 403) or 403)
+            repeats = max(
+                1,
+                int(cfg.get("cookie_first_launch_ok_repeats", 2) or 2),
+            )
+            interval = max(
+                0.05,
+                float(cfg.get("cookie_first_launch_ok_interval_seconds", 0.25) or 0.25),
+            )
+
+            print(col(
+                f"[{pkg}] Waiting {delay:g}s, then tapping first-launch OK "
+                f"{repeats}x at {x},{y}...",
+                CYAN,
+            ))
+            time.sleep(delay)
+
+            tap_parts = []
+            for index in range(repeats):
+                tap_parts.append(f"input tap {x} {y}")
+                if index + 1 < repeats:
+                    tap_parts.append(f"sleep {interval:g}")
+            tap_cmd = "; ".join(tap_parts)
+
+            try:
+                tap_result = subprocess.run(
+                    ["su", "-c", tap_cmd],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=max(8, int(repeats * interval + 6)),
+                )
+                tapped_ok = tap_result.returncode == 0
+            except Exception:
+                tapped_ok = False
+
+        # Wait until Delta/Roblox creates a non-empty WebView Cookies database.
+        wait_seconds = max(
+            10,
+            int(cfg.get("cookie_first_launch_db_wait_seconds", 35) or 35),
+        )
+        cookie_candidates = [
+            f"/data/data/{pkg}/app_webview/Default/Cookies",
+            f"/data/user/0/{pkg}/app_webview/Default/Cookies",
+            f"/data/data/{pkg}/app_webview/Cookies",
+            f"/data/user/0/{pkg}/app_webview/Cookies",
+        ]
+        quoted_candidates = " ".join(shlex.quote(path) for path in cookie_candidates)
+        ready = False
+        started_wait = time.time()
+
+        while time.time() - started_wait < wait_seconds:
+            check_cmd = (
+                "for f in " + quoted_candidates
+                + '; do [ -s "$f" ] && exit 0; done; exit 1'
+            )
+            try:
+                check = subprocess.run(
+                    ["su", "-c", check_cmd],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                )
+                if check.returncode == 0:
+                    ready = True
+                    break
+            except Exception:
+                pass
+            time.sleep(1)
+
+        # Release the DB before NOMO copies/edits it. This remains exact-PID only.
         force_stop_package(pkg, cfg)
         time.sleep(1)
-        return True, "clone initialized"
+
+        tap_note = "OK tapped" if tapped_ok else "OK tap skipped/failed"
+        if ready:
+            return True, f"clone initialized; {tap_note}; cookie DB ready"
+        return True, (
+            f"clone initialized; {tap_note}; DB not visible after "
+            f"{wait_seconds}s (injection will retry discovery)"
+        )
 
     def inject_with_first_launch(pkg, cookie):
         ok, msg = inject_and_restart(pkg, cookie, cfg)
@@ -17724,24 +17972,39 @@ def _setup_install_counter_for_packages(cfg, packages, path_mode):
     tabs_by_pkg = {str(t.get("package") or ""): t for t in autoexec_tabs(cfg)}
     selected_tabs = [tabs_by_pkg[p] for p in packages if p in tabs_by_pkg]
     results = []
+    written = {}
+
     for tab in selected_tabs:
         pkg = str(tab.get("package") or "")
         paths = autoexec_paths_for_tab(tab, path_mode, filename=AUTOEXEC_PET_COUNTER_FILE)
         if not paths:
             results.append((pkg, False, "no AutoExec path"))
             continue
+
         ok_count = 0
-        errors = []
+        notes = []
         for path in paths:
+            key = str(path)
+            if key in written:
+                ok, note = written[key]
+                ok_count += 1 if ok else 0
+                notes.append(f"shared global file: {path}" if ok else note)
+                continue
+
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 tmp = path.with_suffix(path.suffix + ".tmp")
                 tmp.write_text(pet_counter_autoexec_source(), encoding="utf-8")
                 os.replace(str(tmp), str(path))
+                written[key] = (True, f"saved: {path}")
                 ok_count += 1
+                notes.append(f"saved: {path}")
             except Exception as exc:
-                errors.append(str(exc))
-        results.append((pkg, ok_count == len(paths), "; ".join(errors) if errors else f"saved {ok_count}"))
+                note = str(exc)
+                written[key] = (False, note)
+                notes.append(note)
+
+        results.append((pkg, ok_count == len(paths), "; ".join(notes)))
     return results
 
 
@@ -17751,6 +18014,8 @@ def _setup_install_market_loader_for_packages(cfg, packages, path_mode):
     tabs_by_pkg = {str(t.get("package") or ""): t for t in autoexec_tabs(cfg)}
     selected_tabs = [tabs_by_pkg[p] for p in packages if p in tabs_by_pkg]
     results = []
+    written = {}
+
     for tab in selected_tabs:
         pkg = str(tab.get("package") or "")
         paths = autoexec_paths_for_tab(
@@ -17763,37 +18028,36 @@ def _setup_install_market_loader_for_packages(cfg, packages, path_mode):
             continue
 
         ok_count = 0
-        errors = []
-        unchanged = 0
+        notes = []
         for path in paths:
+            key = str(path)
+            if key in written:
+                ok, note = written[key]
+                ok_count += 1 if ok else 0
+                notes.append(f"shared global file: {path}" if ok else note)
+                continue
+
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
-                old = None
-                try:
-                    if path.exists():
-                        old = path.read_text(encoding="utf-8")
-                except Exception:
-                    old = None
-
+                old = path.read_text(encoding="utf-8") if path.exists() else None
                 if old == MARKET_LOADER_AUTOEXEC_TEMPLATE:
-                    unchanged += 1
+                    written[key] = (True, f"unchanged: {path}")
                     ok_count += 1
+                    notes.append(f"unchanged: {path}")
                     continue
 
                 tmp = path.with_suffix(path.suffix + ".tmp")
                 tmp.write_text(MARKET_LOADER_AUTOEXEC_TEMPLATE, encoding="utf-8")
                 os.replace(str(tmp), str(path))
+                written[key] = (True, f"saved: {path}")
                 ok_count += 1
+                notes.append(f"saved: {path}")
             except Exception as exc:
-                errors.append(str(exc))
+                note = str(exc)
+                written[key] = (False, note)
+                notes.append(note)
 
-        if errors:
-            note = "; ".join(errors)
-        elif unchanged == len(paths):
-            note = f"unchanged {unchanged}"
-        else:
-            note = f"saved {ok_count}"
-        results.append((pkg, ok_count == len(paths), note))
+        results.append((pkg, ok_count == len(paths), "; ".join(notes)))
     return results
 
 
@@ -17869,7 +18133,7 @@ def _setup_prompt_private_server_place_id(cfg, role):
 
 
 def new_redfinger_setup_wizard(cfg=None):
-    """Full-auto one-time setup for MARKET, HATCHER, or LOCAL roles.
+    """Full-auto one-time setup with Delta-global or Arceus per-clone storage.
 
     The user still selects the role/packages and enters NOMO_SECRET for backend
     roles. All safe recommended actions then run automatically. Paid private
@@ -17932,10 +18196,28 @@ def new_redfinger_setup_wizard(cfg=None):
     refresh_usernames_for_packages(cfg, selected)
     cfg = load_config()
 
+    executor_storage = _setup_choose_executor_storage(cfg)
+    if executor_storage is None:
+        print(col("Setup cancelled.", YELLOW))
+        pause()
+        return
+
     clear()
     banner("SETUP: PACKAGE / WORKSPACE MAPPING", cfg)
-    print(col("Mapping packages from real state usernames first; package suffix is fallback.", DIM))
-    mapping_results = auto_map_packages_to_clone_workspaces(cfg, selected, resolve_api=True, persist=True, verbose=True)
+    if executor_storage == "delta_global":
+        print(col("Using Delta GLOBAL storage for every selected package.", GREEN))
+        print(f"AutoExec : {DELTA_GLOBAL_AUTOEXEC_DIR}")
+        print(f"Workspace: {DELTA_GLOBAL_WORKSPACE_DIR}")
+        mapping_results = _configure_delta_global_storage(cfg, selected)
+    else:
+        print(col("Using Arceus X per-clone storage.", GREEN))
+        print(col("Mapping packages from real state usernames first; package suffix is fallback.", DIM))
+        _prepare_arceus_per_clone_storage(cfg, selected)
+        cfg = load_config()
+        mapping_results = auto_map_packages_to_clone_workspaces(
+            cfg, selected, resolve_api=True, persist=True, verbose=True
+        )
+
     cfg = load_config()
     hcfg = load_hatcher_config()
     sync_hatcher_profiles_with_tabs(cfg, hcfg)
@@ -18099,12 +18381,27 @@ def new_redfinger_setup_wizard(cfg=None):
         print(f"  {short_pkg(pkg):<10} {tabs.get(pkg, {}).get('user_name', '-')}")
 
     print("")
+    print(col("Executor storage:", BOLD))
+    if executor_storage == "delta_global":
+        print(f"  Mode       : {col('Delta GLOBAL', GREEN)}")
+        print(f"  AutoExec   : {DELTA_GLOBAL_AUTOEXEC_DIR}")
+        print(f"  Workspace  : {DELTA_GLOBAL_WORKSPACE_DIR}")
+    else:
+        print(f"  Mode       : {col('Arceus X per-clone', GREEN)}")
+
+    print("")
     print(col("Workspace mapping:", BOLD))
     for item in sorted(mapping_results, key=lambda value: natural_package_key(value["package"])):
-        print(
-            f"  {short_pkg(item['package']):<10} RobloxClone{item['clone_no']:03d}  "
-            f"{item['username']}"
-        )
+        if item.get("storage") == "delta_global":
+            print(
+                f"  {short_pkg(item['package']):<10} Delta global  "
+                f"{item['username']} -> {item['state_file']}"
+            )
+        else:
+            print(
+                f"  {short_pkg(item['package']):<10} RobloxClone{item['clone_no']:03d}  "
+                f"{item['username']}"
+            )
 
     print("")
     print(col("Pet Counter:", BOLD))
