@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.58.11 — MARKET BOOSTER POOL + MANUAL SAFE JOIN
+# - Market reads Booster records from the existing shared backend.
+# - Pool shows only fresh, enabled, link-ready, probe-ready Boosters with pets.
+# - Manual selector routes one installed Market clone with task reuse (0x24000000).
+# - Normal route never stops an alive PID; one exact-PID hard fallback remains.
+# - Manual Booster hold prevents Market pet routing/scheduled hops until released.
+# - Return-to-Market action clears the hold and safely reuses the same clone task.
+# - No automatic Booster selection/reservation yet; this build is manual testing.
+# - Booster reporting/health, Hatcher, Package Manager, Option 4, and Lua unchanged.
+#
 # V4.58.10 — BOOSTER SCHEMA COMPATIBILITY
 # - Validates Booster probe contents before enforcing its schema number.
 # - A complete ready probe with parsed==inventory and no missing age/weight is
@@ -306,7 +316,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.58.10"
+__version__ = "V4.58.11"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -1055,6 +1065,15 @@ DEFAULT_CONFIG = {
     "jsonbin_min_hatcher_pets": 100,
     "jsonbin_no_hatcher_action": "stay_market",  # stay_market / fallback_restock
     "jsonbin_fallback_restock": False,  # old compatibility key
+
+    # Market-side Booster pool. Manual only in V4.58.11.
+    "market_booster_pool_enabled": True,
+    "market_booster_stale_seconds": 7200,
+    "market_booster_require_matches": True,
+    "market_booster_top_pets": 3,
+    # 0 = stay in the selected Booster until manually returned to Market.
+    "market_booster_manual_hold_seconds": 0,
+    "market_booster_expected_place_id": "126884695634066",
 
     "prefer_experience_start_links": True,
     "prefer_https_game_links": False,
@@ -5269,6 +5288,7 @@ def market_only_settings(cfg):
         print("")
         print("1. Pet routing / restock")
         print("2. JSONBin hatcher picker")
+        print("3. Booster pool / manual safe join")
         print("0. Save/back")
         print(col("Tip: on true/false settings, choose it and press ENTER to toggle.", DIM))
 
@@ -5279,6 +5299,11 @@ def market_only_settings(cfg):
             save_config(cfg)
             set_color_enabled(cfg)
             return
+
+        if ch == "3":
+            market_booster_pool_menu(cfg)
+            cfg = load_config()
+            continue
 
         group = groups.get(ch)
         if group:
@@ -6135,6 +6160,471 @@ def pick_jsonbin_hatcher(cfg, rt):
     return best["link"], best, None
 
 
+
+def market_booster_pool_entries(cfg, rt=None, force=False):
+    """Return usable Booster backend records, never ordinary Hatchers."""
+    if not cfg.get("market_booster_pool_enabled", True):
+        return [], "Booster pool disabled"
+    if not cfg.get("jsonbin_hatchers_enabled", False):
+        return [], "shared backend disabled"
+
+    rt = load_runtime() if rt is None else rt
+    data, err = read_hatchers_cached(cfg, rt, force=force)
+    if err or not isinstance(data, dict):
+        return [], str(err or "bad backend response")
+
+    raw = data.get("hatchers", {})
+    if not isinstance(raw, dict):
+        return [], "bad backend pool format"
+
+    stale_seconds = max(
+        60,
+        int(cfg.get("market_booster_stale_seconds", 7200) or 7200),
+    )
+    require_matches = bool(
+        cfg.get("market_booster_require_matches", True)
+    )
+    choices = []
+
+    for key, item in raw.items():
+        if not isinstance(item, dict):
+            continue
+
+        mode = str(
+            item.get("mode") or item.get("role") or ""
+        ).strip().lower()
+        if mode != "booster":
+            continue
+        if not item.get("enabled", True):
+            continue
+
+        status = str(item.get("status") or "").strip().lower()
+        if status not in {
+            "available", "online", "ingame", "ready", "ok",
+        }:
+            continue
+
+        link = str(item.get("server_link") or "").strip()
+        if not link or link.startswith(("YOUR_", "PUT_")):
+            continue
+
+        updated_at = _cloudflare_item_updated_seconds(item)
+        if not updated_at:
+            try:
+                updated_at = int(item.get("updated_at", 0) or 0)
+            except Exception:
+                updated_at = 0
+        age = now() - updated_at if updated_at else 999999
+        if age > stale_seconds:
+            continue
+
+        probe_status = str(
+            item.get("booster_probe_status") or ""
+        ).strip().lower()
+        if probe_status and probe_status != "ready":
+            continue
+        if item.get("booster_probe_reportable") is False:
+            continue
+
+        matches = item.get("boosting_matches", [])
+        if not isinstance(matches, list):
+            matches = []
+        matches = [m for m in matches if isinstance(m, dict)]
+
+        try:
+            match_count = int(
+                item.get("boosting_match_count", len(matches))
+                or len(matches)
+            )
+        except Exception:
+            match_count = len(matches)
+        match_count = max(match_count, len(matches))
+        if require_matches and match_count <= 0:
+            continue
+
+        try:
+            pet_count = int(item.get("pet_count", 0) or 0)
+        except Exception:
+            pet_count = 0
+
+        name = str(
+            item.get("booster_name")
+            or item.get("name")
+            or item.get("hatcher_name")
+            or key
+        ).strip() or str(key)
+
+        choices.append({
+            "name": name,
+            "link": link,
+            "age": max(0, age),
+            "updated_at": updated_at,
+            "pet_count": pet_count,
+            "match_count": match_count,
+            "matches": matches,
+            "status": status,
+            "probe_status": probe_status or "ready",
+            "raw": dict(item),
+        })
+
+    choices.sort(
+        key=lambda item: (
+            -int(item.get("match_count", 0) or 0),
+            int(item.get("age", 999999) or 999999),
+            str(item.get("name") or "").lower(),
+        )
+    )
+    return choices, None
+
+
+def market_booster_pet_label(item):
+    if not isinstance(item, dict):
+        return "?"
+    name = str(item.get("name") or "?")
+    age = item.get("age")
+    weight = item.get("base_weight_age1_kg")
+    if weight is None:
+        weight = item.get("base_weight_kg")
+    mutation = str(item.get("mutation") or "Normal")
+
+    parts = [name]
+    if isinstance(age, (int, float)):
+        parts.append(f"a{int(age)}")
+    if isinstance(weight, (int, float)):
+        parts.append(f"{float(weight):.2f}kg")
+    if mutation and mutation.lower() not in {"normal", "none"}:
+        parts.append(mutation)
+    return " ".join(parts)
+
+
+def market_booster_top_summary(entry, cfg):
+    limit = max(
+        1,
+        int(cfg.get("market_booster_top_pets", 3) or 3),
+    )
+    matches = entry.get("matches", []) if isinstance(entry, dict) else []
+    labels = [
+        market_booster_pet_label(item)
+        for item in matches[:limit]
+    ]
+    return cut(", ".join(labels) or "-", 44)
+
+
+def market_booster_hold_info(rt_tab):
+    if str(rt_tab.get("target") or "") != "booster":
+        return False, False, 0
+    if not rt_tab.get("manual_booster_hold_active", False):
+        return False, True, 0
+
+    until = int(rt_tab.get("manual_booster_hold_until", 0) or 0)
+    if until <= 0:
+        return True, False, 0
+    left = until - now()
+    if left > 0:
+        return True, False, left
+    return False, True, 0
+
+
+def market_prepare_booster_route(rt_tab, booster, cfg):
+    hold_seconds = max(
+        0,
+        int(cfg.get("market_booster_manual_hold_seconds", 0) or 0),
+    )
+    rt_tab["booster_route_link"] = str(booster.get("link") or "")
+    rt_tab["booster_route_name"] = str(booster.get("name") or "booster")
+    rt_tab["booster_route_record_ts"] = int(
+        booster.get("updated_at", 0) or 0
+    )
+    rt_tab["manual_booster_hold_active"] = True
+    rt_tab["manual_booster_hold_until"] = (
+        now() + hold_seconds if hold_seconds > 0 else 0
+    )
+    rt_tab["target"] = "booster"
+
+
+def market_clear_booster_route(rt_tab):
+    rt_tab["manual_booster_hold_active"] = False
+    rt_tab["manual_booster_hold_until"] = 0
+    rt_tab["booster_route_link"] = ""
+    rt_tab["booster_route_name"] = ""
+    rt_tab["booster_route_record_ts"] = 0
+
+
+def market_run_route_queue(cfg, tabs, target, reason):
+    """Use the normal route queue: task reuse first, one exact-PID fallback."""
+    rt = load_runtime()
+    open_queue = []
+    queued = []
+
+    for tab in tabs:
+        package = str(tab.get("package") or "")
+        if not package:
+            continue
+        added, note = queue_open(
+            open_queue,
+            tab,
+            target,
+            reason,
+            force=True,
+            skip_if_alive=False,
+            mode="route",
+            bypass_manual=True,
+            metadata={
+                "skip_solver_once": True,
+                "skip_solver_probe": True,
+                "manual_booster_route": target == "booster",
+            },
+        )
+        if added:
+            queued.append(package)
+        else:
+            log_activity(
+                f"manual route queue skipped: {note}",
+                package,
+                YELLOW,
+            )
+
+    while open_queue:
+        if stop_requested():
+            save_runtime(rt)
+            return False, "stopped"
+        process_open_queue(open_queue, cfg, rt)
+        if open_queue and not wait_seconds(1, rt):
+            return False, "stopped"
+
+    save_runtime(rt)
+    if not queued:
+        return False, "nothing queued"
+    return True, f"routed {len(queued)} package(s)"
+
+
+def market_manual_join_booster(cfg, booster, package):
+    tab = next(
+        (
+            tab for tab in cfg.get("tabs", [])
+            if str(tab.get("package") or "") == str(package or "")
+        ),
+        None,
+    )
+    if not isinstance(tab, dict):
+        return False, "package not configured"
+
+    link = str(booster.get("link") or "").strip()
+    if not link:
+        return False, "Booster has no link"
+
+    rt = load_runtime()
+    rt_tab = get_runtime_tab(rt, package)
+    market_prepare_booster_route(rt_tab, booster, cfg)
+    save_runtime(rt)
+
+    ok, note = market_run_route_queue(
+        cfg,
+        [tab],
+        "booster",
+        f"manual Booster join: {booster.get('name', 'booster')}",
+    )
+    if not ok:
+        return False, note
+
+    latest_rt = load_runtime()
+    latest_tab = get_runtime_tab(latest_rt, package)
+    active, expired, left = market_booster_hold_info(latest_tab)
+    hold_note = (
+        "manual return"
+        if active and left <= 0
+        else (f"hold {format_age(left)}" if active else "hold ended")
+    )
+    return True, f"joined {booster.get('name', 'booster')}; {hold_note}"
+
+
+def market_return_packages_from_booster(cfg, packages):
+    wanted = set(packages or [])
+    tabs = [
+        tab for tab in cfg.get("tabs", [])
+        if str(tab.get("package") or "") in wanted
+    ]
+    if not tabs:
+        return False, "no packages selected"
+
+    rt = load_runtime()
+    for tab in tabs:
+        rt_tab = get_runtime_tab(rt, tab.get("package"))
+        rt_tab["manual_booster_hold_active"] = False
+        rt_tab["manual_booster_hold_until"] = 0
+    save_runtime(rt)
+
+    ok, note = market_run_route_queue(
+        cfg,
+        tabs,
+        "market",
+        "manual return from Booster",
+    )
+
+    rt = load_runtime()
+    for tab in tabs:
+        rt_tab = get_runtime_tab(rt, tab.get("package"))
+        market_clear_booster_route(rt_tab)
+        rt_tab["target"] = "market"
+    save_runtime(rt)
+    return ok, note
+
+
+def market_booster_pool_settings(cfg):
+    edit_config_group(
+        cfg,
+        "MARKET BOOSTER POOL SETTINGS",
+        [
+            ("market_booster_pool_enabled", "pool_enabled"),
+            ("market_booster_stale_seconds", "max_backend_record_age_seconds"),
+            ("market_booster_require_matches", "require_valuable_pets"),
+            ("market_booster_top_pets", "top_pets_to_show"),
+            ("market_booster_manual_hold_seconds", "hold_seconds_0_manual_return"),
+            ("market_booster_expected_place_id", "expected_booster_place_id"),
+        ],
+    )
+
+
+def market_booster_pool_menu(cfg):
+    force_refresh = True
+    while True:
+        rt = load_runtime()
+        entries, err = market_booster_pool_entries(
+            cfg,
+            rt=rt,
+            force=force_refresh,
+        )
+        force_refresh = False
+
+        clear()
+        banner("MARKET BOOSTER POOL — MANUAL TEST", cfg)
+        print(col(
+            "Manual only: no auto-selection or reservation in this build.",
+            DIM,
+        ))
+        print(col(
+            "Join uses task reuse first; only the selected package can hard-fallback.",
+            DIM,
+        ))
+        print("")
+
+        if entries:
+            rows = []
+            for index, entry in enumerate(entries, 1):
+                rows.append([
+                    (str(index), CYAN),
+                    (cut(entry.get("name"), 14), WHITE),
+                    (format_age(entry.get("age")), GREEN),
+                    (str(entry.get("pet_count", 0)), WHITE),
+                    (str(entry.get("match_count", 0)), MAGENTA),
+                    (cut(entry.get("status"), 9), GREEN),
+                    (market_booster_top_summary(entry, cfg), WHITE),
+                ])
+            draw_table(
+                ["No", "Booster", "Age", "Pets", "Boost", "Status", "Top pets"],
+                rows,
+                [3, 14, 6, 5, 5, 9, 44],
+                cfg,
+            )
+        else:
+            print(col(f"No usable Booster records: {err or 'none ready'}", YELLOW))
+
+        print("")
+        print("1. Refresh pool")
+        print("2. Manual safe join")
+        print("3. Return package(s) to Market")
+        print("4. Pool settings")
+        print("0. Back")
+        drain_stdin()
+        choice = input("\nChoose: ").strip().lower()
+
+        if choice in {"0", "b", "back", "q"}:
+            return
+        if choice == "1":
+            force_refresh = True
+            continue
+        if choice == "2":
+            if not entries:
+                print(col("No usable Booster to join.", RED))
+                pause()
+                force_refresh = True
+                continue
+            raw = input("Booster number: ").strip()
+            try:
+                index = int(raw) - 1
+            except Exception:
+                index = -1
+            if not (0 <= index < len(entries)):
+                print(col("Invalid Booster number.", RED))
+                pause()
+                continue
+
+            selected = choose_packages_common(
+                cfg,
+                "SELECT ONE MARKET PACKAGE FOR BOOSTER JOIN",
+                multi=False,
+                enabled_only=True,
+                installed_only=True,
+                include_discovered=False,
+                configured_only=True,
+                allow_all=False,
+            )
+            if not selected:
+                continue
+
+            booster = entries[index]
+            package = selected[0]
+            print("")
+            print(f"Package : {package}")
+            print(f"Booster : {booster.get('name')}")
+            print(f"Pets    : {booster.get('pet_count')}")
+            print(f"Valuable: {booster.get('match_count')}")
+            print(f"Top     : {market_booster_top_summary(booster, cfg)}")
+            confirm = input("Safe-route this package now? [y/N]: ").strip().lower()
+            if confirm != "y":
+                continue
+
+            ok, note = market_manual_join_booster(
+                cfg,
+                booster,
+                package,
+            )
+            print(col(note, GREEN if ok else RED))
+            pause()
+            force_refresh = True
+            cfg = load_config()
+            continue
+
+        if choice == "3":
+            selected = choose_packages_common(
+                cfg,
+                "RETURN PACKAGE(S) FROM BOOSTER TO MARKET",
+                multi=True,
+                enabled_only=True,
+                installed_only=True,
+                include_discovered=False,
+                configured_only=True,
+            )
+            if selected:
+                ok, note = market_return_packages_from_booster(
+                    cfg,
+                    selected,
+                )
+                print(col(note, GREEN if ok else RED))
+                pause()
+            cfg = load_config()
+            continue
+
+        if choice == "4":
+            market_booster_pool_settings(cfg)
+            cfg = load_config()
+            force_refresh = True
+            continue
+
+        print(col("Invalid choice.", RED))
+        time.sleep(1)
+
+
 def resolve_restock_link(tab, rt_tab, cfg, rt=None):
     fallback = tab.get("restock_link") or cfg.get("restock_link")
 
@@ -6178,6 +6668,15 @@ def can_open(rt_tab, cfg):
 
 
 def target_link(tab, cfg, target, rt_tab=None, rt=None):
+    if target == "booster":
+        if rt_tab is not None:
+            return (
+                rt_tab.get("booster_route_link")
+                or tab.get("booster_route_link")
+                or ""
+            )
+        return tab.get("booster_route_link") or ""
+
     if target == "hatcher":
         return tab.get("server_link") or tab.get("restock_link") or cfg.get("market_link")
 
@@ -9212,57 +9711,86 @@ def _nomo_start_market_rejoin_original(cfg):
                 status = "Ingame"
                 note = note or "ok"
 
-                last_pet = int(rt_tab.get("last_pet_count", -1))
-                if last_pet >= 0 and pets < last_pet:
-                    rt_tab["last_pet_drop_ts"] = now()
-                if pets > last_pet:
-                    rt_tab["last_gain_ts"] = now()
-                rt_tab["last_pet_count"] = pets
-                idle_no_gain = now() - int(rt_tab.get("last_gain_ts", now()))
+                hold_active, hold_expired, hold_left = market_booster_hold_info(rt_tab)
+                if target == "booster" and hold_active:
+                    booster_name = str(
+                        rt_tab.get("booster_route_name") or "Booster"
+                    )
+                    status = "Booster"
+                    hold_text = (
+                        "manual return"
+                        if hold_left <= 0
+                        else f"{format_age(hold_left)} left"
+                    )
+                    note = f"{booster_name}; hold {hold_text}"
+                elif target == "booster" and hold_expired:
+                    added, _ = queue_open(
+                        open_queue,
+                        tab,
+                        "market",
+                        "manual Booster hold ended",
+                        force=True,
+                        mode="route",
+                        bypass_manual=True,
+                        metadata={
+                            "skip_solver_once": True,
+                            "skip_solver_probe": True,
+                        },
+                    )
+                    note = "market return queued" if added else "market return already queued"
+                    status = "Queued" if added else status
+                else:
+                    last_pet = int(rt_tab.get("last_pet_count", -1))
+                    if last_pet >= 0 and pets < last_pet:
+                        rt_tab["last_pet_drop_ts"] = now()
+                    if pets > last_pet:
+                        rt_tab["last_gain_ts"] = now()
+                    rt_tab["last_pet_count"] = pets
+                    idle_no_gain = now() - int(rt_tab.get("last_gain_ts", now()))
 
-                if pets < int(cfg["restock_below"]) and target != "restock":
-                    added, _ = queue_open(
-                        open_queue, tab, "restock", f"pets<{cfg['restock_below']}",
-                        mode="route",
-                        metadata={"skip_solver_once": True, "skip_solver_probe": True},
-                    )
-                    note = "restock queued" if added else "already queued"
-                    status = "Queued" if added else status
-                elif pets >= int(cfg["ready_market_at"]) and target != "market":
-                    added, _ = queue_open(
-                        open_queue, tab, "market", f"pets>={cfg['ready_market_at']}",
-                        mode="route",
-                        metadata={"skip_solver_once": True, "skip_solver_probe": True},
-                    )
-                    note = "market queued" if added else "already queued"
-                    status = "Queued" if added else status
-                elif (target == "restock" and pets >= int(cfg["idle_min_pet_to_market"])
-                      and idle_no_gain >= int(cfg["idle_no_gain_seconds"])):
-                    added, _ = queue_open(
-                        open_queue, tab, "market", "idle no gain",
-                        mode="route",
-                        metadata={"skip_solver_once": True, "skip_solver_probe": True},
-                    )
-                    note = "idle queued" if added else "already queued"
-                    status = "Queued" if added else status
+                    if pets < int(cfg["restock_below"]) and target != "restock":
+                        added, _ = queue_open(
+                            open_queue, tab, "restock", f"pets<{cfg['restock_below']}",
+                            mode="route",
+                            metadata={"skip_solver_once": True, "skip_solver_probe": True},
+                        )
+                        note = "restock queued" if added else "already queued"
+                        status = "Queued" if added else status
+                    elif pets >= int(cfg["ready_market_at"]) and target != "market":
+                        added, _ = queue_open(
+                            open_queue, tab, "market", f"pets>={cfg['ready_market_at']}",
+                            mode="route",
+                            metadata={"skip_solver_once": True, "skip_solver_probe": True},
+                        )
+                        note = "market queued" if added else "already queued"
+                        status = "Queued" if added else status
+                    elif (target == "restock" and pets >= int(cfg["idle_min_pet_to_market"])
+                          and idle_no_gain >= int(cfg["idle_no_gain_seconds"])):
+                        added, _ = queue_open(
+                            open_queue, tab, "market", "idle no gain",
+                            mode="route",
+                            metadata={"skip_solver_once": True, "skip_solver_probe": True},
+                        )
+                        note = "idle queued" if added else "already queued"
+                        status = "Queued" if added else status
 
-                # Scheduled server hop
-                if (
-                    cfg.get("scheduled_hop_enabled", False)
-                    and cfg.get("soft_hop_enabled", True)
-                    and not queue_has(open_queue, pkg)
-                    and scheduled_hop_due(rt_tab, cfg)
-                ):
-                    delay_needed, delay_left = should_delay_hop_for_selling(rt_tab, cfg)
-                    if delay_needed:
-                        schedule_next_soft_hop(rt_tab, cfg, delay_left)
-                        if note in ["ok", ""]:
-                            note = f"hop delay {delay_left}s"
-                    else:
-                        added, _ = queue_open(open_queue, tab, target, "scheduled soft hop", mode="soft")
-                        schedule_next_soft_hop(rt_tab, cfg)
-                        if added and note in ["ok", ""]:
-                            note = "hop queued"
+                    # Scheduled server hop never runs during a manual Booster hold.
+                    if (
+                        cfg.get("scheduled_hop_enabled", False)
+                        and cfg.get("soft_hop_enabled", True)
+                        and not queue_has(open_queue, pkg)
+                        and scheduled_hop_due(rt_tab, cfg)
+                    ):
+                        delay_needed, delay_left = should_delay_hop_for_selling(rt_tab, cfg)
+                        if delay_needed:
+                            schedule_next_soft_hop(rt_tab, cfg, delay_left)
+                            if note in ["ok", ""]:
+                                note = f"hop delay {delay_left}s"
+                        else:
+                            added, _ = queue_open(open_queue, tab, target, "scheduled soft hop", mode="soft")
+                            schedule_next_soft_hop(rt_tab, cfg)
+                            if added and note in ["ok", ""]:
+                                note = "hop queued"
 
             due_refresh, refresh_left = periodic_hard_refresh_due(rt_tab, cfg)
             if due_refresh and not rj_handled and not open_queue and not queue_has(open_queue, pkg) and not solver_job_running(pkg):
