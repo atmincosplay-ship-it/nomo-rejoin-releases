@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# V4.51 — DELTA GLOBAL PACKAGE MAPPING LOCK
+# Built from V4.49. Rejoin/recovery behavior is unchanged.
+# - Each Delta package reads only its configured username state file.
+# - Shared-folder "freshest JSON" fallback is disabled for Delta.
+# - Delta usernames update only from that package's cookie/API or manual map.
+# - Duplicate package->username mappings are blocked as CONFLICT.
+# - Option 4 adds a manual Delta mapping editor.
+#
 # V4.49 — APK FOLDER + PACKAGE SELECTION
 # - NEW: Local APK installer defaults to /storage/emulated/0/Download.
 # - NEW: Select one APK, multiple APKs, or all APKs before install.
@@ -174,7 +182,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.49"
+__version__ = "V4.51"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -375,6 +383,7 @@ DEFAULT_CONFIG = {
     # Selected by Option 13. Existing devices remain auto/per-clone until setup
     # explicitly chooses Delta Global.
     "executor_storage_mode": "auto",
+    "delta_global_lock_package_mapping": True,
 
     # Optional token for private GitHub release assets. Public release assets do
     # not need this. GoFile tokens are requested interactively and not saved.
@@ -1895,6 +1904,12 @@ def load_config():
             tab["enabled"] = True
             changed = True
 
+    if normalize_delta_global_mappings(cfg):
+        changed = True
+    if int(cfg.get("_nomo_delta_mapping_migration", 0) or 0) < 451:
+        cfg["_nomo_delta_mapping_migration"] = 451
+        changed = True
+
     if normalize_active_mode_flags(cfg):
         changed = True
 
@@ -2573,41 +2588,231 @@ def _state_file_freshness(path):
             return -1
 
 
+
+def _path_is_under(path_value, root_value):
+    try:
+        path = Path(str(path_value or "")).resolve(strict=False)
+        root = Path(str(root_value or "")).resolve(strict=False)
+        return path == root or root in path.parents
+    except Exception:
+        path = str(path_value or "").replace("\\", "/").rstrip("/")
+        root = str(root_value or "").replace("\\", "/").rstrip("/")
+        return bool(path and root and (path == root or path.startswith(root + "/")))
+
+
+def is_delta_global_tab(tab):
+    if not isinstance(tab, dict):
+        return False
+    if str(tab.get("executor_storage", "") or "").lower() == "delta_global":
+        return True
+    state_path = str(tab.get("stat_file") or tab.get("state_file") or "")
+    autoexec_path = str(tab.get("autoexec_path") or "")
+    return (
+        _path_is_under(state_path, DELTA_GLOBAL_STATE_DIR)
+        or _path_is_under(state_path, DELTA_GLOBAL_WORKSPACE_DIR)
+        or _path_is_under(autoexec_path, DELTA_GLOBAL_AUTOEXEC_DIR)
+    )
+
+
+def _delta_username_key(value):
+    value = _usable_detected_username(value)
+    return _sanitize_state_name(value).lower() if value else ""
+
+
+def delta_global_state_path(username):
+    username = _usable_detected_username(username)
+    if not username:
+        return None
+    return DELTA_GLOBAL_STATE_DIR / (
+        f"{_sanitize_state_name(username)}_state.json"
+    )
+
+
+def normalize_delta_global_mappings(cfg):
+    """Lock Delta tabs to exact username files and flag duplicates."""
+    if not isinstance(cfg, dict):
+        return False
+
+    tabs = [
+        tab for tab in cfg.get("tabs", [])
+        if isinstance(tab, dict) and is_delta_global_tab(tab)
+    ]
+    changed = False
+    groups = {}
+
+    for tab in tabs:
+        username = _usable_detected_username(tab.get("user_name"))
+        if username:
+            exact = delta_global_state_path(username)
+            if exact and str(tab.get("stat_file") or "") != str(exact):
+                tab["stat_file"] = str(exact)
+                changed = True
+            groups.setdefault(_delta_username_key(username), []).append(tab)
+        if tab.get("executor_storage") != "delta_global":
+            tab["executor_storage"] = "delta_global"
+            changed = True
+        if tab.get("delta_mapping_locked") is not True:
+            tab["delta_mapping_locked"] = True
+            changed = True
+
+    for tab in tabs:
+        key = _delta_username_key(tab.get("user_name"))
+        conflict = bool(key and len(groups.get(key, [])) > 1)
+        if bool(tab.get("delta_mapping_conflict", False)) != conflict:
+            tab["delta_mapping_conflict"] = conflict
+            changed = True
+
+    return changed
+
+
+def delta_mapping_conflict_for_tab(tab):
+    if not is_delta_global_tab(tab):
+        return False
+    if bool(tab.get("delta_mapping_conflict", False)):
+        return True
+
+    package = str(tab.get("package") or "")
+    key = _delta_username_key(
+        tab.get("user_name") or tab.get("username")
+    )
+    if not key:
+        return False
+
+    try:
+        raw_cfg = load_json(CONFIG_FILE, DEFAULT_CONFIG)
+    except Exception:
+        return False
+
+    packages = set()
+    for other in raw_cfg.get("tabs", []):
+        if not isinstance(other, dict) or not is_delta_global_tab(other):
+            continue
+        if _delta_username_key(other.get("user_name")) == key:
+            packages.add(str(other.get("package") or ""))
+
+    return len(packages) > 1 and (not package or package in packages)
+
+
+def delta_state_username_candidates():
+    found = {}
+    if not DELTA_GLOBAL_STATE_DIR.exists():
+        return []
+
+    for path in DELTA_GLOBAL_STATE_DIR.glob("*_state.json"):
+        username = ""
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            username = _usable_detected_username(payload.get("username")) or ""
+        except Exception:
+            pass
+        if not username:
+            username = _usable_detected_username(
+                path.name[:-len("_state.json")]
+            ) or ""
+        key = _delta_username_key(username)
+        if key:
+            found[key] = username
+
+    return sorted(found.values(), key=str.lower)
+
+
+def apply_delta_package_mapping(cfg, package, username, source_name):
+    package = str(package or "").strip()
+    username = _usable_detected_username(username)
+    if not package or not username:
+        return False
+
+    exact_path = delta_global_state_path(username)
+    changed = False
+
+    for tab in cfg.get("tabs", []):
+        if str(tab.get("package") or "") != package:
+            continue
+        desired = {
+            "user_name": username,
+            "stat_file": str(exact_path),
+            "autoexec_path": str(DELTA_GLOBAL_AUTOEXEC_DIR),
+            "executor_storage": "delta_global",
+            "delta_mapping_locked": True,
+            "delta_mapping_source": source_name,
+        }
+        for key, value in desired.items():
+            if tab.get(key) != value:
+                tab[key] = value
+                changed = True
+        break
+
+    hcfg = load_hatcher_config()
+    for profile in hatcher_profiles(hcfg, enabled_only=False):
+        if str(profile.get("package") or "") == package:
+            profile["hatcher_name"] = username
+            profile["state_file"] = str(exact_path)
+            profile["executor_storage"] = "delta_global"
+            profile["delta_mapping_locked"] = True
+            profile["delta_mapping_source"] = source_name
+            break
+
+    bcfg = load_booster_config()
+    for profile in booster_profiles(bcfg):
+        if str(profile.get("package") or "") == package:
+            profile["booster_name"] = username
+            profile["state_file"] = str(exact_path)
+            profile["executor_storage"] = "delta_global"
+            profile["delta_mapping_locked"] = True
+            profile["delta_mapping_source"] = source_name
+            break
+
+    normalize_delta_global_mappings(cfg)
+    save_hatcher_config(hcfg)
+    save_booster_config(bcfg)
+    return changed
+
+
 def resolve_state_path(tab):
-    """Return the freshest matching state across nomo_rejoiner and legacy gag_rejoiner."""
+    """Return exact Delta state; preserve legacy fallback elsewhere."""
     raw = str(tab.get("stat_file", "") or "")
     if not raw:
         return None
+
     configured = Path(raw)
-    folders = _state_folder_candidates(configured.parent)
     user = tab.get("user_name") or tab.get("username") or ""
 
+    if is_delta_global_tab(tab):
+        exact = delta_global_state_path(user)
+        return exact if exact is not None else configured
+
+    folders = _state_folder_candidates(configured.parent)
     per_user_candidates = []
     if user:
         safe = _sanitize_state_name(user)
-        per_user_candidates = [folder / f"{safe}_state.json" for folder in folders]
+        per_user_candidates = [
+            folder / f"{safe}_state.json" for folder in folders
+        ]
 
     freshest = _freshest_state_file(configured.parent)
     existing_per_user = [p for p in per_user_candidates if p.exists()]
     if existing_per_user:
         per_user = max(existing_per_user, key=_state_file_freshness)
-        if freshest is None or _state_file_freshness(per_user) >= _state_file_freshness(freshest):
+        if (
+            freshest is None
+            or _state_file_freshness(per_user)
+            >= _state_file_freshness(freshest)
+        ):
             return per_user
 
     if freshest is not None:
         return freshest
 
-    # Legacy state.json fallback in either folder.
     for folder in folders:
         legacy = folder / configured.name
         if legacy.exists():
             return legacy
 
-    # Stable missing target always points at the new canonical folder.
     canonical = folders[0] if folders else configured.parent
     if user:
         return canonical / f"{_sanitize_state_name(user)}_state.json"
     return canonical / configured.name
+
 
 def cleanup_orphan_state_files(tab, cfg):
     """Delete ONLY proven-orphan state files in this clone's NOMO state folder."""
@@ -2679,6 +2884,9 @@ def format_session(rt_tab):
 
 
 def read_state(tab):
+    if delta_mapping_conflict_for_tab(tab):
+        return None, "Delta mapping conflict"
+
     path = resolve_state_path(tab)
 
     if path is None or not path.exists():
@@ -2686,6 +2894,22 @@ def read_state(tab):
 
     try:
         data = json.loads(path.read_text())
+
+        if is_delta_global_tab(tab):
+            expected = _usable_detected_username(
+                tab.get("user_name") or tab.get("username")
+            )
+            actual = _usable_detected_username(data.get("username"))
+            if (
+                expected
+                and actual
+                and _delta_username_key(expected)
+                != _delta_username_key(actual)
+            ):
+                return None, (
+                    f"Delta username mismatch: expected {expected}, "
+                    f"found {actual}"
+                )
 
         pet_count = int(data.get("pet_count", 0))
         state_ts = int(data.get("ts", 0))
@@ -3605,7 +3829,14 @@ def _persist_market_usernames_only(cfg):
 
 
 def sync_detected_username_for_package(hcfg, package, username, tab=None, source="state"):
-    """Apply one detected account name to the package and persist it safely."""
+    """Apply identity, except shared Delta state-derived identity."""
+    if (
+        source == "state"
+        and isinstance(tab, dict)
+        and is_delta_global_tab(tab)
+    ):
+        return tab.get("user_name") or package, False
+
     username = _usable_detected_username(username)
     package = str(package or "").strip()
     if not package or not username:
@@ -3644,22 +3875,201 @@ def sync_detected_username_for_package(hcfg, package, username, tab=None, source
     return username, (changed_market or changed_hatcher)
 
 
-def get_all_usernames_via_api(cfg=None):
-    """Manual username refresh for selected configured packages."""
-    if cfg is None:
-        cfg = load_config()
-    selected = choose_packages_common(
-        cfg, "REFRESH USERNAMES", multi=True,
-        include_discovered=False, configured_only=True
-    )
-    if not selected:
-        return
+
+def show_delta_mapping(cfg):
     clear()
-    banner("REFRESH USERNAMES", cfg)
-    print(col("Cookie -> Roblox API, with freshest state fallback.", DIM))
+    banner("DELTA PACKAGE MAPPING", cfg)
+    tabs = [
+        tab for tab in cfg.get("tabs", [])
+        if isinstance(tab, dict) and is_delta_global_tab(tab)
+    ]
+    if not tabs:
+        print(col("No Delta Global packages configured.", YELLOW))
+        pause()
+        return
+
+    rows = []
+    for tab in sorted(
+        tabs,
+        key=lambda item: natural_package_key(
+            str(item.get("package") or "")
+        ),
+    ):
+        conflict = delta_mapping_conflict_for_tab(tab)
+        rows.append([
+            (short_pkg(tab.get("package", "")), CYAN),
+            (str(tab.get("user_name") or "-"), RED if conflict else GREEN),
+            ("CONFLICT" if conflict else "LOCKED", RED if conflict else GREEN),
+            (Path(str(tab.get("stat_file") or "-")).name, DIM),
+        ])
+
+    draw_table(
+        ["Package", "Username", "Mapping", "Exact file"],
+        rows,
+        [10, 18, 10, 30],
+        cfg,
+    )
     print("")
-    refresh_usernames_for_packages(cfg, selected)
+    print(col(
+        "Delta reads only this exact file; newest/random fallback is OFF.",
+        DIM,
+    ))
     pause()
+
+
+def manual_delta_mapping(cfg):
+    packages = [
+        str(tab.get("package") or "")
+        for tab in cfg.get("tabs", [])
+        if isinstance(tab, dict) and is_delta_global_tab(tab)
+    ]
+    if not packages:
+        print(col("No Delta Global packages configured.", RED))
+        pause()
+        return
+
+    candidates = delta_state_username_candidates()
+
+    for pkg in sorted(packages, key=natural_package_key):
+        cfg = load_config()
+        tab = next(
+            (
+                item for item in cfg.get("tabs", [])
+                if str(item.get("package") or "") == pkg
+            ),
+            None,
+        )
+        if not tab:
+            continue
+
+        while True:
+            clear()
+            banner(f"MAP {short_pkg(pkg)}", cfg)
+            print(f"Current: {tab.get('user_name') or '-'}")
+            print("")
+            for index, username in enumerate(candidates, 1):
+                used = [
+                    short_pkg(other.get("package", ""))
+                    for other in cfg.get("tabs", [])
+                    if (
+                        str(other.get("package") or "") != pkg
+                        and is_delta_global_tab(other)
+                        and _delta_username_key(other.get("user_name"))
+                        == _delta_username_key(username)
+                    )
+                ]
+                suffix = f" [used by {', '.join(used)}]" if used else ""
+                print(f"{index}. {username}{suffix}")
+            print("M. Type username manually")
+            print("S. Skip")
+            print("0. Finish")
+
+            drain_stdin()
+            choice = clean_terminal_input(input("\\nChoose: "))
+            if choice == "0":
+                show_delta_mapping(cfg)
+                return
+            if choice.lower() == "s":
+                break
+            if choice.lower() == "m":
+                username = _usable_detected_username(
+                    clean_terminal_input(input("Exact Roblox username: "))
+                )
+            elif choice.isdigit() and 1 <= int(choice) <= len(candidates):
+                username = candidates[int(choice) - 1]
+            else:
+                print(col("Invalid choice.", RED))
+                time.sleep(1)
+                continue
+
+            if not username:
+                print(col("Invalid username.", RED))
+                time.sleep(1)
+                continue
+
+            duplicate = next(
+                (
+                    str(other.get("package") or "")
+                    for other in cfg.get("tabs", [])
+                    if (
+                        str(other.get("package") or "") != pkg
+                        and is_delta_global_tab(other)
+                        and _delta_username_key(other.get("user_name"))
+                        == _delta_username_key(username)
+                    )
+                ),
+                "",
+            )
+            if duplicate:
+                print(col(
+                    f"{username} is already mapped to "
+                    f"{short_pkg(duplicate)}.",
+                    RED,
+                ))
+                pause()
+                continue
+
+            apply_delta_package_mapping(
+                cfg, pkg, username, "manual"
+            )
+            normalize_delta_global_mappings(cfg)
+            save_config(cfg)
+            print(col(
+                f"Locked {short_pkg(pkg)} -> {username}",
+                GREEN,
+            ))
+            time.sleep(1)
+            break
+
+    show_delta_mapping(load_config())
+
+
+def get_all_usernames_via_api(cfg=None):
+    cfg = load_config() if cfg is None else cfg
+
+    while True:
+        clear()
+        banner("USERNAME / DELTA MAPPING", cfg)
+        print("1. Auto refresh via each package cookie/API")
+        print("2. Manual Delta Global package mapping")
+        print("3. Show Delta Global mapping")
+        print("0. Back")
+        drain_stdin()
+        choice = clean_terminal_input(input("\nChoose: "))
+
+        if choice == "0":
+            return
+        if choice == "1":
+            selected = choose_packages_common(
+                cfg,
+                "REFRESH USERNAMES",
+                multi=True,
+                include_discovered=False,
+                configured_only=True,
+            )
+            if selected:
+                clear()
+                banner("REFRESH USERNAMES", cfg)
+                print(col(
+                    "Delta: package API only; shared-state fallback disabled.",
+                    DIM,
+                ))
+                refresh_usernames_for_packages(cfg, selected)
+                cfg = load_config()
+                pause()
+            continue
+        if choice == "2":
+            manual_delta_mapping(cfg)
+            cfg = load_config()
+            continue
+        if choice == "3":
+            show_delta_mapping(cfg)
+            cfg = load_config()
+            continue
+
+        print(col("Invalid choice.", RED))
+        time.sleep(1)
+
 
 def resolve_usernames_auto(cfg, hcfg=None, rt=None, force=False, quiet=True):
     """AUTOMATIC version of option 4. Resolves each package's real username from
@@ -3711,9 +4121,13 @@ def resolve_usernames_auto(cfg, hcfg=None, rt=None, force=False, quiet=True):
         except Exception:
             username = None
 
-        if not username and state_tab is not None:
+        if (
+            not username
+            and state_tab is not None
+            and not is_delta_global_tab(state_tab)
+        ):
             try:
-                state, _err = read_state(state_tab)  # uses freshest-file fallback
+                state, _err = read_state(state_tab)
                 if state and state.get("username"):
                     username = state.get("username")
             except Exception:
@@ -3722,12 +4136,19 @@ def resolve_usernames_auto(cfg, hcfg=None, rt=None, force=False, quiet=True):
         if not username:
             continue
 
-        if tab is not None and tab.get("user_name") != username:
-            tab["user_name"] = username
-            changed_market = True
-        if prof is not None and prof.get("hatcher_name") != username:
-            prof["hatcher_name"] = username
-            changed_hatcher = True
+        if tab is not None and is_delta_global_tab(tab):
+            if apply_delta_package_mapping(
+                cfg, pkg, username, "cookie/API"
+            ):
+                changed_market = True
+                changed_hatcher = True
+        else:
+            if tab is not None and tab.get("user_name") != username:
+                tab["user_name"] = username
+                changed_market = True
+            if prof is not None and prof.get("hatcher_name") != username:
+                prof["hatcher_name"] = username
+                changed_hatcher = True
         if not quiet:
             print(f"{pad(short_pkg(pkg), 6, CYAN)} -> {col(username, GREEN)}")
 
@@ -8371,7 +8792,16 @@ def booster_profile_to_tab(prof):
 
 
 def booster_read_state(prof):
-    return read_state({"user_name": prof.get("booster_name", "booster"), "stat_file": prof.get("state_file", "")})
+    return read_state({
+        "package": prof.get("package", ""),
+        "user_name": prof.get("booster_name", "booster"),
+        "stat_file": prof.get("state_file", ""),
+        "executor_storage": prof.get("executor_storage", ""),
+        "delta_mapping_conflict": bool(
+            prof.get("delta_mapping_conflict", False)
+        ),
+    })
+
 
 
 def load_booster_runtime():
@@ -8981,9 +9411,15 @@ def hatcher_effective(hcfg, prof):
 
 def hatcher_state_tab(hcfg_or_prof):
     return {
+        "package": hcfg_or_prof.get("package", ""),
         "user_name": hcfg_or_prof.get("hatcher_name", "hatcher"),
-        "stat_file": hcfg_or_prof.get("state_file", "")
+        "stat_file": hcfg_or_prof.get("state_file", ""),
+        "executor_storage": hcfg_or_prof.get("executor_storage", ""),
+        "delta_mapping_conflict": bool(
+            hcfg_or_prof.get("delta_mapping_conflict", False)
+        ),
     }
+
 
 
 def hatcher_read_state(hcfg_or_prof):
@@ -12773,72 +13209,50 @@ def _setup_choose_executor_storage(cfg):
 
 
 def _configure_delta_global_storage(cfg, packages):
-    """Map selected packages to Delta's shared AutoExec and Workspace."""
+    """Configure shared Delta storage with a locked identity per package."""
     DELTA_GLOBAL_AUTOEXEC_DIR.mkdir(parents=True, exist_ok=True)
     DELTA_GLOBAL_STATE_DIR.mkdir(parents=True, exist_ok=True)
 
     wanted = set(packages or [])
     results = []
+
     for tab in cfg.get("tabs", []):
         pkg = str(tab.get("package") or "")
         if pkg not in wanted:
             continue
 
-        username = str(tab.get("user_name") or pkg).strip()
-        state_path = _delta_state_path_for_username(username)
+        api_username = ""
+        try:
+            api_username, _ = get_username_from_package_api(pkg)
+        except Exception:
+            api_username = ""
 
-        tab["stat_file"] = str(state_path)
-        tab["autoexec_path"] = str(DELTA_GLOBAL_AUTOEXEC_DIR)
-        tab["executor_storage"] = "delta_global"
+        username = (
+            _usable_detected_username(api_username)
+            or _usable_detected_username(tab.get("user_name"))
+            or pkg
+        )
+        source_name = "cookie/API" if api_username else "existing config"
+        apply_delta_package_mapping(
+            cfg, pkg, username, source_name
+        )
 
+        exact = delta_global_state_path(username)
         results.append({
             "package": pkg,
             "clone_no": 0,
             "username": username,
-            "state_file": str(state_path),
+            "state_file": str(exact),
             "autoexec_path": str(DELTA_GLOBAL_AUTOEXEC_DIR),
-            "reason": "Delta global",
+            "reason": f"Delta locked ({source_name})",
             "storage": "delta_global",
         })
 
     cfg["executor_storage_mode"] = "delta_global"
+    normalize_delta_global_mappings(cfg)
     save_config(cfg)
-
-    hcfg = load_hatcher_config()
-    sync_hatcher_profiles_with_tabs(cfg, hcfg)
-    hmap = {str(p.get("package") or ""): p for p in hcfg.get("hatchers", [])}
-    hchanged = False
-    for result in results:
-        prof = hmap.get(result["package"])
-        if not prof:
-            continue
-        if str(prof.get("state_file") or "") != result["state_file"]:
-            prof["state_file"] = result["state_file"]
-            hchanged = True
-        if result["username"] and prof.get("hatcher_name") != result["username"]:
-            prof["hatcher_name"] = result["username"]
-            hchanged = True
-    if hchanged:
-        save_hatcher_config(hcfg)
-
-    bcfg = load_booster_config()
-    sync_booster_profiles_with_tabs(cfg, bcfg)
-    bmap = {str(p.get("package") or ""): p for p in booster_profiles(bcfg)}
-    bchanged = False
-    for result in results:
-        prof = bmap.get(result["package"])
-        if not prof:
-            continue
-        if str(prof.get("state_file") or "") != result["state_file"]:
-            prof["state_file"] = result["state_file"]
-            bchanged = True
-        if result["username"] and prof.get("booster_name") != result["username"]:
-            prof["booster_name"] = result["username"]
-            bchanged = True
-    if bchanged:
-        save_booster_config(bcfg)
-
     return results
+
 
 
 def _prepare_arceus_per_clone_storage(cfg, packages):
@@ -13022,31 +13436,72 @@ def set_enabled_package_set(cfg, selected):
 
 def refresh_usernames_for_packages(cfg, packages):
     hcfg = load_hatcher_config()
-    profile_map = {p.get("package"): p for p in hatcher_profiles(hcfg, enabled_only=False)}
+    profile_map = {
+        p.get("package"): p
+        for p in hatcher_profiles(hcfg, enabled_only=False)
+    }
     changed = False
+
     for pkg in packages:
-        tab = next((t for t in cfg.get("tabs", []) if t.get("package") == pkg), None)
+        tab = next(
+            (
+                item for item in cfg.get("tabs", [])
+                if item.get("package") == pkg
+            ),
+            None,
+        )
         if tab is None:
             continue
+
         username, uid = get_username_from_package_api(pkg)
-        source = "cookie/API"
-        if not username:
+        username = _usable_detected_username(username)
+        source_name = "cookie/API"
+
+        if not username and not is_delta_global_tab(tab):
             state, _ = read_state(tab)
-            username = _usable_detected_username((state or {}).get("username"))
-            source = "state"
+            username = _usable_detected_username(
+                (state or {}).get("username")
+            )
+            source_name = "state"
+
         if username:
-            tab["user_name"] = username
-            prof = profile_map.get(pkg)
-            if prof is not None:
-                prof["hatcher_name"] = username
-            print(col(f"{short_pkg(pkg)} -> {username} [{source}]", GREEN if source == "cookie/API" else YELLOW))
-            changed = True
+            if is_delta_global_tab(tab):
+                changed |= apply_delta_package_mapping(
+                    cfg, pkg, username, source_name
+                )
+            else:
+                if tab.get("user_name") != username:
+                    tab["user_name"] = username
+                    changed = True
+                profile = profile_map.get(pkg)
+                if (
+                    profile is not None
+                    and profile.get("hatcher_name") != username
+                ):
+                    profile["hatcher_name"] = username
+                    changed = True
+            print(col(
+                f"{short_pkg(pkg)} -> {username} [{source_name}]",
+                GREEN if source_name == "cookie/API" else YELLOW,
+            ))
         else:
-            print(col(f"{short_pkg(pkg)} -> unresolved", RED))
+            current = _usable_detected_username(tab.get("user_name"))
+            if is_delta_global_tab(tab):
+                print(col(
+                    f"{short_pkg(pkg)} -> {current or 'unresolved'} "
+                    "[locked; package API unavailable]",
+                    YELLOW if current else RED,
+                ))
+            else:
+                print(col(f"{short_pkg(pkg)} -> unresolved", RED))
+
+    if normalize_delta_global_mappings(cfg):
+        changed = True
     if changed:
         save_config(cfg)
         save_hatcher_config(hcfg)
     return changed
+
 
 def compute_age(created_str):
     """Return days since account creation, or 'N/A' if invalid."""
@@ -19424,16 +19879,26 @@ def new_redfinger_setup_wizard(cfg=None):
     bcfg = load_booster_config()
     sync_booster_profiles_with_tabs(cfg, bcfg)
 
-    clear()
-    banner("SETUP: USERNAMES", cfg)
-    refresh_usernames_for_packages(cfg, selected)
-    cfg = load_config()
-
     executor_storage = _setup_choose_executor_storage(cfg)
     if executor_storage is None:
         print(col("Setup cancelled.", YELLOW))
         pause()
         return
+
+    if executor_storage == "delta_global":
+        cfg["executor_storage_mode"] = "delta_global"
+        selected_set = set(selected)
+        for tab in cfg.get("tabs", []):
+            if str(tab.get("package") or "") in selected_set:
+                tab["executor_storage"] = "delta_global"
+                tab["autoexec_path"] = str(DELTA_GLOBAL_AUTOEXEC_DIR)
+        save_config(cfg)
+        cfg = load_config()
+
+    clear()
+    banner("SETUP: USERNAMES", cfg)
+    refresh_usernames_for_packages(cfg, selected)
+    cfg = load_config()
 
     clear()
     banner("SETUP: PACKAGE / WORKSPACE MAPPING", cfg)
