@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# V4.52 — DELTA FULL-SYSTEM IDENTITY SYNC
+# Built from V4.51/V4.49 recovery baseline. Rejoin behavior is unchanged.
+# - One package->username edit synchronizes Main, Hatcher, Booster, and paths.
+# - Runtime username/signature caches are invalidated immediately.
+# - Old backend identity keys are queued for removal after a rename.
+# - New identity is forced into the next Hatcher/Booster backend report.
+# - Auto Refresh no longer overwrites fresh mappings with stale config objects.
+#
 # V4.51 — DELTA GLOBAL PACKAGE MAPPING LOCK
 # Built from V4.49. Rejoin/recovery behavior is unchanged.
 # - Each Delta package reads only its configured username state file.
@@ -182,7 +190,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.51"
+__version__ = "V4.52"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -2716,18 +2724,128 @@ def delta_state_username_candidates():
     return sorted(found.values(), key=str.lower)
 
 
+
+def _unique_identity_names(values):
+    result = []
+    seen = set()
+    for value in values:
+        name = _usable_detected_username(value)
+        key = _delta_username_key(name)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(name)
+    return result
+
+
+def _queue_identity_backend_sync(package, old_names, new_name):
+    """Invalidate report caches and queue removal of old backend identity keys."""
+    package = str(package or "").strip()
+    new_name = _usable_detected_username(new_name)
+    old_names = [
+        name
+        for name in _unique_identity_names(old_names)
+        if _delta_username_key(name) != _delta_username_key(new_name)
+    ]
+
+    hrt = load_hatcher_runtime()
+    pending_h = set(
+        _unique_identity_names(hrt.get("pending_remove_names", []))
+    )
+    pending_h.update(old_names)
+    hrt["pending_remove_names"] = sorted(pending_h, key=str.lower)
+    hrt["mapping_force_report"] = True
+    for name in _unique_identity_names(old_names + [new_name]):
+        for key in (
+            "last_update_ts",
+            "last_signature",
+            "last_status",
+            "last_reason",
+        ):
+            bucket = hrt.get(key)
+            if isinstance(bucket, dict):
+                bucket.pop(name, None)
+    save_hatcher_runtime(hrt)
+
+    brt = load_booster_runtime()
+    pending_b = set(
+        _unique_identity_names(brt.get("pending_remove_names", []))
+    )
+    pending_b.update(old_names)
+    brt["pending_remove_names"] = sorted(pending_b, key=str.lower)
+    brt["mapping_force_report"] = True
+    for name in _unique_identity_names(old_names + [new_name]):
+        for key in ("last_update_ts", "last_signature", "last_status"):
+            bucket = brt.get(key)
+            if isinstance(bucket, dict):
+                bucket.pop(name, None)
+    save_booster_runtime(brt)
+
+    rt = load_runtime()
+    rt["_last_username_resolve"] = 0
+    if package:
+        rt_tab = get_runtime_tab(rt, package)
+        rt_tab["note"] = f"identity synced -> {new_name}"
+        rt_tab["delta_mapping_synced_at"] = now()
+    save_runtime(rt)
+
+
+def _clear_hatcher_pending_identity_removes(names):
+    names = {_delta_username_key(name) for name in names if name}
+    if not names:
+        return
+    rt = load_hatcher_runtime()
+    pending = [
+        name
+        for name in _unique_identity_names(rt.get("pending_remove_names", []))
+        if _delta_username_key(name) not in names
+    ]
+    rt["pending_remove_names"] = pending
+    if not pending:
+        rt["mapping_force_report"] = False
+    save_hatcher_runtime(rt)
+
+
+def _clear_booster_pending_identity_removes(names):
+    names = {_delta_username_key(name) for name in names if name}
+    if not names:
+        return
+    rt = load_booster_runtime()
+    pending = [
+        name
+        for name in _unique_identity_names(rt.get("pending_remove_names", []))
+        if _delta_username_key(name) not in names
+    ]
+    rt["pending_remove_names"] = pending
+    if not pending:
+        rt["mapping_force_report"] = False
+    save_booster_runtime(rt)
+
+
 def apply_delta_package_mapping(cfg, package, username, source_name):
+    """Synchronize one Delta package identity across every NOMO subsystem."""
     package = str(package or "").strip()
     username = _usable_detected_username(username)
     if not package or not username:
         return False
 
+    # Use the caller's current object for immediate flow, but load fresh profile
+    # configs so an older in-memory Hatcher/Booster object cannot overwrite us.
+    hcfg = load_hatcher_config()
+    bcfg = load_booster_config()
     exact_path = delta_global_state_path(username)
     changed = False
+    old_names = []
 
-    for tab in cfg.get("tabs", []):
-        if str(tab.get("package") or "") != package:
-            continue
+    tab = next(
+        (
+            item for item in cfg.get("tabs", [])
+            if str(item.get("package") or "") == package
+        ),
+        None,
+    )
+    if tab is not None:
+        old_names.append(tab.get("user_name"))
         desired = {
             "user_name": username,
             "stat_file": str(exact_path),
@@ -2735,37 +2853,94 @@ def apply_delta_package_mapping(cfg, package, username, source_name):
             "executor_storage": "delta_global",
             "delta_mapping_locked": True,
             "delta_mapping_source": source_name,
+            "delta_mapping_conflict": False,
         }
         for key, value in desired.items():
             if tab.get(key) != value:
                 tab[key] = value
                 changed = True
-        break
 
-    hcfg = load_hatcher_config()
+    h_profile = next(
+        (
+            profile
+            for profile in hatcher_profiles(hcfg, enabled_only=False)
+            if str(profile.get("package") or "") == package
+        ),
+        None,
+    )
+    if h_profile is not None:
+        old_names.append(h_profile.get("hatcher_name"))
+        desired = {
+            "hatcher_name": username,
+            "state_file": str(exact_path),
+            "executor_storage": "delta_global",
+            "delta_mapping_locked": True,
+            "delta_mapping_source": source_name,
+            "delta_mapping_conflict": False,
+        }
+        for key, value in desired.items():
+            if h_profile.get(key) != value:
+                h_profile[key] = value
+                changed = True
+
+    b_profile = next(
+        (
+            profile
+            for profile in booster_profiles(bcfg)
+            if str(profile.get("package") or "") == package
+        ),
+        None,
+    )
+    if b_profile is not None:
+        old_names.append(b_profile.get("booster_name"))
+        desired = {
+            "booster_name": username,
+            "state_file": str(exact_path),
+            "executor_storage": "delta_global",
+            "delta_mapping_locked": True,
+            "delta_mapping_source": source_name,
+            "delta_mapping_conflict": False,
+        }
+        for key, value in desired.items():
+            if b_profile.get(key) != value:
+                b_profile[key] = value
+                changed = True
+
+    if normalize_delta_global_mappings(cfg):
+        changed = True
+
+    # Re-apply conflict flags to the role configs after main normalization.
+    main_by_package = {
+        str(item.get("package") or ""): item
+        for item in cfg.get("tabs", [])
+        if isinstance(item, dict)
+    }
     for profile in hatcher_profiles(hcfg, enabled_only=False):
-        if str(profile.get("package") or "") == package:
-            profile["hatcher_name"] = username
-            profile["state_file"] = str(exact_path)
-            profile["executor_storage"] = "delta_global"
-            profile["delta_mapping_locked"] = True
-            profile["delta_mapping_source"] = source_name
-            break
-
-    bcfg = load_booster_config()
+        main_tab = main_by_package.get(str(profile.get("package") or ""))
+        if main_tab and is_delta_global_tab(main_tab):
+            profile["delta_mapping_conflict"] = bool(
+                main_tab.get("delta_mapping_conflict", False)
+            )
     for profile in booster_profiles(bcfg):
-        if str(profile.get("package") or "") == package:
-            profile["booster_name"] = username
-            profile["state_file"] = str(exact_path)
-            profile["executor_storage"] = "delta_global"
-            profile["delta_mapping_locked"] = True
-            profile["delta_mapping_source"] = source_name
-            break
+        main_tab = main_by_package.get(str(profile.get("package") or ""))
+        if main_tab and is_delta_global_tab(main_tab):
+            profile["delta_mapping_conflict"] = bool(
+                main_tab.get("delta_mapping_conflict", False)
+            )
 
-    normalize_delta_global_mappings(cfg)
+    save_config(cfg)
     save_hatcher_config(hcfg)
     save_booster_config(bcfg)
+
+    if changed:
+        _queue_identity_backend_sync(package, old_names, username)
+        log_activity(
+            f"identity synced everywhere -> {username} [{source_name}]",
+            package,
+            GREEN,
+        )
     return changed
+
 
 
 def resolve_state_path(tab):
@@ -4030,8 +4205,8 @@ def get_all_usernames_via_api(cfg=None):
     while True:
         clear()
         banner("USERNAME / DELTA MAPPING", cfg)
-        print("1. Auto refresh via each package cookie/API")
-        print("2. Manual Delta Global package mapping")
+        print("1. Auto refresh + sync every system")
+        print("2. Manual Delta mapping + sync every system")
         print("3. Show Delta Global mapping")
         print("0. Back")
         drain_stdin()
@@ -4072,13 +4247,7 @@ def get_all_usernames_via_api(cfg=None):
 
 
 def resolve_usernames_auto(cfg, hcfg=None, rt=None, force=False, quiet=True):
-    """AUTOMATIC version of option 4. Resolves each package's real username from
-    its cookie (Roblox API), falling back to the freshest state file, and writes
-    it into tab['user_name'] / profile['hatcher_name'] so state matching lines up
-    without the user ever running the manual step. Cached + rate-limited via rt.
-
-    Fully guarded: any network/root failure just leaves names as-is.
-    """
+    """Resolve package identities without shared-Delta state-file guessing."""
     if not cfg.get("auto_resolve_usernames_enabled", True):
         return False
     if hcfg is None:
@@ -4093,33 +4262,38 @@ def resolve_usernames_auto(cfg, hcfg=None, rt=None, force=False, quiet=True):
         if last > 0 and (now() - last) < interval:
             return False
 
-    tabs = cfg.get("tabs", [])
     profiles = hatcher_profiles(hcfg, enabled_only=False)
-    profile_map = {p.get("package"): p for p in profiles if p.get("package")}
+    profile_map = {
+        profile.get("package"): profile
+        for profile in profiles
+        if profile.get("package")
+    }
 
-    # Resolve across BOTH market tabs and hatcher profiles by package.
     packages = {}
-    for tab in tabs:
+    for tab in cfg.get("tabs", []):
         pkg = tab.get("package")
         if pkg:
             packages.setdefault(pkg, {})["tab"] = tab
-    for pkg, prof in profile_map.items():
-        packages.setdefault(pkg, {})["prof"] = prof
+    for pkg, profile in profile_map.items():
+        packages.setdefault(pkg, {})["prof"] = profile
 
-    changed_market = False
-    changed_hatcher = False
+    changed_main = False
+    changed_non_delta_hatcher = False
+    changed_delta = False
 
     for pkg, refs in packages.items():
         tab = refs.get("tab")
-        prof = refs.get("prof")
-        # Build a tab-like object for state fallback if only a profile exists.
-        state_tab = tab or (hatcher_profile_to_tab(prof) if prof else None)
+        profile = refs.get("prof")
+        state_tab = tab or (
+            hatcher_profile_to_tab(profile) if profile else None
+        )
 
         username = None
         try:
-            username, _uid = get_username_from_package_api(pkg)
+            username, uid = get_username_from_package_api(pkg)
         except Exception:
             username = None
+        username = _usable_detected_username(username)
 
         if (
             not username
@@ -4127,9 +4301,10 @@ def resolve_usernames_auto(cfg, hcfg=None, rt=None, force=False, quiet=True):
             and not is_delta_global_tab(state_tab)
         ):
             try:
-                state, _err = read_state(state_tab)
-                if state and state.get("username"):
-                    username = state.get("username")
+                state, error = read_state(state_tab)
+                username = _usable_detected_username(
+                    (state or {}).get("username")
+                )
             except Exception:
                 username = None
 
@@ -4140,59 +4315,51 @@ def resolve_usernames_auto(cfg, hcfg=None, rt=None, force=False, quiet=True):
             if apply_delta_package_mapping(
                 cfg, pkg, username, "cookie/API"
             ):
-                changed_market = True
-                changed_hatcher = True
+                changed_delta = True
+                changed_main = True
+                fresh_cfg = load_config()
+                cfg.clear()
+                cfg.update(fresh_cfg)
         else:
             if tab is not None and tab.get("user_name") != username:
                 tab["user_name"] = username
-                changed_market = True
-            if prof is not None and prof.get("hatcher_name") != username:
-                prof["hatcher_name"] = username
-                changed_hatcher = True
-        if not quiet:
-            print(f"{pad(short_pkg(pkg), 6, CYAN)} -> {col(username, GREEN)}")
+                changed_main = True
+            if (
+                profile is not None
+                and profile.get("hatcher_name") != username
+            ):
+                profile["hatcher_name"] = username
+                changed_non_delta_hatcher = True
 
-    if changed_market:
+        if not quiet:
+            print(
+                f"{pad(short_pkg(pkg), 6, CYAN)} -> "
+                f"{col(username, GREEN)}"
+            )
+
+    if changed_main and not changed_delta:
         try:
             _persist_market_usernames_only(cfg)
         except Exception:
             pass
-    if changed_hatcher:
+    elif changed_main:
+        save_config(cfg)
+
+    if changed_non_delta_hatcher:
         try:
             save_hatcher_config(hcfg)
         except Exception:
             pass
+
     if isinstance(rt, dict):
         rt["_last_username_resolve"] = now()
 
-    return changed_market or changed_hatcher
+    return bool(
+        changed_main
+        or changed_non_delta_hatcher
+        or changed_delta
+    )
 
-
-
-    banner("GET USERNAME", cfg)
-
-    print("")
-    for t in cfg["tabs"]:
-        state, err = read_state(t)
-
-        if state:
-            t["user_name"] = state.get("username", t.get("user_name", ""))
-            print(f"{pad(short_pkg(t['package']), 6, CYAN)} -> {col(t['user_name'], GREEN)} | pets={state.get('pet_count')}")
-        else:
-            print(f"{pad(short_pkg(t['package']), 6, CYAN)} -> {col('no state: ' + str(err), RED)}")
-
-    save_config(cfg)
-
-    print("\nJSON files found:")
-    found = auto_find_state_files()
-
-    if not found:
-        print(col("none", DIM))
-
-    for p in found[:20]:
-        print(col(p, DIM))
-
-    pause()
 
 
 
@@ -8752,33 +8919,75 @@ def booster_profiles(cfg, enabled_only=False):
 
 
 def sync_booster_profiles_with_tabs(main_cfg, bcfg, create_missing=True):
-    existing = {str(p.get("package") or ""): p for p in booster_profiles(bcfg)}
+    """Ensure Booster profiles follow the main Delta identity mapping."""
+    existing = {
+        str(profile.get("package") or ""): profile
+        for profile in booster_profiles(bcfg)
+    }
     new_profiles = []
-    for idx, tab in enumerate(main_cfg.get("tabs", [])):
+
+    for index, tab in enumerate(main_cfg.get("tabs", [])):
         pkg = str(tab.get("package") or "")
         if not pkg:
             continue
-        prof = existing.pop(pkg, None)
-        if prof is None and create_missing:
-            prof = normalize_booster_profile({
+
+        profile = existing.pop(pkg, None)
+        if profile is None and create_missing:
+            profile = normalize_booster_profile({
                 "enabled": tab.get("enabled", True),
                 "package": pkg,
-                "booster_name": tab.get("user_name") or f"nomoboost{idx+1}",
-                "server_link": tab.get("server_link") or "YOUR_BOOSTER_PRIVATE_SERVER_LINK",
+                "booster_name": (
+                    tab.get("user_name")
+                    or f"nomoboost{index + 1}"
+                ),
+                "server_link": (
+                    tab.get("server_link")
+                    or "YOUR_BOOSTER_PRIVATE_SERVER_LINK"
+                ),
                 "state_file": tab.get("stat_file") or "",
-            }, idx)
-        if prof is not None:
-            prof["enabled"] = bool(tab.get("enabled", True))
+            }, index)
+
+        if profile is None:
+            continue
+
+        profile["enabled"] = bool(tab.get("enabled", True))
+        if is_delta_global_tab(tab):
+            profile["booster_name"] = str(
+                tab.get("user_name") or pkg
+            )
+            profile["state_file"] = str(tab.get("stat_file") or "")
+            profile["executor_storage"] = "delta_global"
+            profile["delta_mapping_locked"] = True
+            profile["delta_mapping_conflict"] = bool(
+                tab.get("delta_mapping_conflict", False)
+            )
+            profile["delta_mapping_source"] = tab.get(
+                "delta_mapping_source",
+                "main sync",
+            )
+        else:
             if tab.get("stat_file"):
-                prof["state_file"] = tab.get("stat_file")
-            current_name = str(prof.get("booster_name") or "")
-            defaultish = (not current_name or current_name == pkg or current_name.startswith("nomoboost"))
-            if defaultish and str(tab.get("user_name") or "").strip():
-                prof["booster_name"] = str(tab.get("user_name")).strip()
-            new_profiles.append(prof)
+                profile["state_file"] = tab.get("stat_file")
+            current_name = str(profile.get("booster_name") or "")
+            defaultish = (
+                not current_name
+                or current_name == pkg
+                or current_name.startswith("nomoboost")
+            )
+            if (
+                defaultish
+                and str(tab.get("user_name") or "").strip()
+            ):
+                profile["booster_name"] = str(
+                    tab.get("user_name")
+                ).strip()
+
+        new_profiles.append(profile)
+
     bcfg["boosters"] = new_profiles
     save_booster_config(bcfg)
     return True
+
 
 
 def booster_profile_to_tab(prof):
@@ -8895,7 +9104,28 @@ def booster_report_once(bcfg=None, force=False, state_cache=None):
         return False, "backend missing"
     updates = []
     removes = []
-    for prof in booster_profiles(bcfg, enabled_only=False):
+
+    brt = load_booster_runtime()
+    profiles = booster_profiles(bcfg, enabled_only=False)
+    current_profile_names = {
+        str(profile.get("booster_name") or "booster")
+        for profile in profiles
+    }
+    pending_identity_removes = [
+        name
+        for name in _unique_identity_names(
+            brt.get("pending_remove_names", [])
+        )
+        if name not in current_profile_names
+    ]
+    removes.extend(
+        (name, "renamed")
+        for name in pending_identity_removes
+    )
+    if brt.get("mapping_force_report"):
+        force = True
+
+    for prof in profiles:
         name = str(prof.get("booster_name") or "booster")
         pkg = str(prof.get("package") or "")
         cached = state_cache.get(pkg) if isinstance(state_cache, dict) else None
@@ -8943,6 +9173,9 @@ def booster_report_once(bcfg=None, force=False, state_cache=None):
         rt["last_signature"][name] = booster_signature(entry)
         rt["last_status"][name] = entry.get("status")
     save_booster_runtime(rt)
+    _clear_booster_pending_identity_removes(
+        pending_identity_removes
+    )
     return True, f"updated {len(updates)} removed {len(removes)}"
 
 
@@ -9200,29 +9433,22 @@ def hatcher_backend_missing(hcfg):
     return is_placeholder_value(hcfg.get("jsonbin_bin_id")) or is_placeholder_value(hcfg.get("jsonbin_api_key"))
 
 def sync_hatcher_profiles_with_tabs(cfg, hcfg, create_missing=True):
-    """Ensure every tab has a matching hatcher profile."""
+    """Ensure every main tab has a synchronized Hatcher profile."""
     changed = False
-    tabs = cfg.get("tabs", [])
     profiles = hcfg.get("hatchers", [])
-
-    profile_map = {}
-    for prof in profiles:
-        pkg = prof.get("package")
-        if pkg:
-            profile_map[pkg] = prof
+    profile_map = {
+        profile.get("package"): profile
+        for profile in profiles
+        if profile.get("package")
+    }
 
     new_profiles = []
-    for tab in tabs:
+    for tab in cfg.get("tabs", []):
         pkg = tab.get("package")
-        if pkg in profile_map:
-            prof = profile_map[pkg]
-            if prof.get("enabled") != tab.get("enabled", True):
-                prof["enabled"] = tab.get("enabled", True)
-                changed = True
-            new_profiles.append(prof)
-            del profile_map[pkg]
-        elif create_missing:
-            new_prof = {
+        profile = profile_map.pop(pkg, None)
+
+        if profile is None and create_missing:
+            profile = {
                 "enabled": tab.get("enabled", True),
                 "package": pkg,
                 "hatcher_name": tab.get("user_name", pkg),
@@ -9232,10 +9458,36 @@ def sync_hatcher_profiles_with_tabs(cfg, hcfg, create_missing=True):
                 "ready_pet_count": 200,
                 "enable_egg_ready": False,
                 "required_eggs": {},
-                "status_when_not_ready": "busy"
+                "status_when_not_ready": "busy",
             }
-            new_profiles.append(new_prof)
             changed = True
+
+        if profile is None:
+            continue
+
+        desired = {
+            "enabled": tab.get("enabled", True),
+        }
+        if is_delta_global_tab(tab):
+            desired.update({
+                "hatcher_name": tab.get("user_name", pkg),
+                "state_file": tab.get("stat_file", ""),
+                "executor_storage": "delta_global",
+                "delta_mapping_locked": True,
+                "delta_mapping_conflict": bool(
+                    tab.get("delta_mapping_conflict", False)
+                ),
+                "delta_mapping_source": tab.get(
+                    "delta_mapping_source",
+                    "main sync",
+                ),
+            })
+
+        for key, value in desired.items():
+            if profile.get(key) != value:
+                profile[key] = value
+                changed = True
+        new_profiles.append(profile)
 
     if profile_map or len(new_profiles) != len(profiles):
         changed = True
@@ -9243,8 +9495,8 @@ def sync_hatcher_profiles_with_tabs(cfg, hcfg, create_missing=True):
     if changed:
         hcfg["hatchers"] = new_profiles
         save_hatcher_config(hcfg)
-
     return changed
+
 
 
 def hatcher_apply_main_backend_if_missing(hcfg, main_cfg=None, save=True):
@@ -10042,6 +10294,30 @@ def hatcher_report_once(hcfg, force=True, state_cache=None):
     removes = []
     skips = []
 
+    hrt = load_hatcher_runtime()
+    current_profile_names = {
+        str(
+            hatcher_effective(hcfg, profile).get(
+                "hatcher_name",
+                "hatcher",
+            )
+        ).strip()
+        for profile in profiles
+    }
+    pending_identity_removes = [
+        name
+        for name in _unique_identity_names(
+            hrt.get("pending_remove_names", [])
+        )
+        if name not in current_profile_names
+    ]
+    removes.extend(
+        (name, "renamed")
+        for name in pending_identity_removes
+    )
+    if hrt.get("mapping_force_report"):
+        force = True
+
     for prof in profiles:
         eff = hatcher_effective(hcfg, prof)
         name = str(eff.get("hatcher_name", "hatcher")).strip() or "hatcher"
@@ -10090,6 +10366,9 @@ def hatcher_report_once(hcfg, force=True, state_cache=None):
             parts.append(f"+{len(updates)-4}")
         if remove_names:
             parts.append("removed " + ",".join(remove_names[:4]))
+        _clear_hatcher_pending_identity_removes(
+            pending_identity_removes
+        )
         return True, f"cloudflare updated {len(updates)} removed {len(remove_names)} ({', '.join(parts)})"
 
     # JSONBin fallback/path: read-modify-write full record.
@@ -10133,6 +10412,9 @@ def hatcher_report_once(hcfg, force=True, state_cache=None):
     if removed_names:
         parts.append("removed " + ",".join(removed_names[:4]))
 
+    _clear_hatcher_pending_identity_removes(
+        pending_identity_removes
+    )
     return True, f"jsonbin updated {len(updates)} removed {len(removed_names)} ({', '.join(parts)})"
 
 def hatcher_test_upload_screen(main_cfg=None):
@@ -13435,12 +13717,9 @@ def set_enabled_package_set(cfg, selected):
 
 
 def refresh_usernames_for_packages(cfg, packages):
-    hcfg = load_hatcher_config()
-    profile_map = {
-        p.get("package"): p
-        for p in hatcher_profiles(hcfg, enabled_only=False)
-    }
     changed = False
+    non_delta_hcfg = load_hatcher_config()
+    non_delta_changed = False
 
     for pkg in packages:
         tab = next(
@@ -13469,17 +13748,34 @@ def refresh_usernames_for_packages(cfg, packages):
                 changed |= apply_delta_package_mapping(
                     cfg, pkg, username, source_name
                 )
+                # Reload the just-saved main config into the caller object so
+                # subsequent packages see the newest conflict/path state.
+                fresh_cfg = load_config()
+                cfg.clear()
+                cfg.update(fresh_cfg)
             else:
                 if tab.get("user_name") != username:
                     tab["user_name"] = username
                     changed = True
-                profile = profile_map.get(pkg)
+                profile = next(
+                    (
+                        profile
+                        for profile in hatcher_profiles(
+                            non_delta_hcfg,
+                            enabled_only=False,
+                        )
+                        if profile.get("package") == pkg
+                    ),
+                    None,
+                )
                 if (
                     profile is not None
                     and profile.get("hatcher_name") != username
                 ):
                     profile["hatcher_name"] = username
+                    non_delta_changed = True
                     changed = True
+
             print(col(
                 f"{short_pkg(pkg)} -> {username} [{source_name}]",
                 GREEN if source_name == "cookie/API" else YELLOW,
@@ -13497,10 +13793,13 @@ def refresh_usernames_for_packages(cfg, packages):
 
     if normalize_delta_global_mappings(cfg):
         changed = True
+
     if changed:
         save_config(cfg)
-        save_hatcher_config(hcfg)
+    if non_delta_changed:
+        save_hatcher_config(non_delta_hcfg)
     return changed
+
 
 
 def compute_age(created_str):
