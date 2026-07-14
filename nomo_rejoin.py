@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.58.3 — INSTALLED PACKAGE LOCK
+# - Option 13 re-locks the exact selected installed package set at completion.
+# - Configured but uninstalled packages are forced OFF in Market/Hatcher/Booster.
+# - Option 6 shows only packages that are both enabled and actually installed.
+# - Keeps V4.58.2 legacy AutoExec cleanup, setup mode lock, and solver every-open.
+#
 # V4.58.2 — AUTOSETUP LEGACY AUTOEXEC CLEANUP
 # - Option 13 disables obsolete AutoExec Lua files before installing current files.
 # - Stops old gag/gap pet-counter loaders and Hatching.lua from running beside NOMO.
@@ -247,7 +253,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.58.2"
+__version__ = "V4.58.3"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -4889,9 +4895,15 @@ def _nomo_force_restart_active_tabs_once_original(cfg=None):
     _STOP_REQUESTED = False
     if cfg is None:
         cfg = load_config()
-    selected = choose_packages_common(cfg, "PID-RESTART ENABLED PACKAGES", multi=True,
-                                      enabled_only=True, include_discovered=False,
-                                      configured_only=True)
+    selected = choose_packages_common(
+        cfg,
+        "PID-RESTART ENABLED INSTALLED PACKAGES",
+        multi=True,
+        enabled_only=True,
+        installed_only=True,
+        include_discovered=False,
+        configured_only=True,
+    )
     if not selected:
         return
     if active_rejoin_mode(cfg) == "hatcher":
@@ -20895,6 +20907,86 @@ def lock_setup_selected_mode(role, cfg=None):
     )
 
 
+
+def lock_setup_selected_packages(selected, cfg=None):
+    """Persist exactly the installed packages selected in Option 13."""
+    selected = {
+        str(package or "").strip()
+        for package in (selected or [])
+        if str(package or "").strip()
+    }
+    installed = set(get_installed_packages())
+    wanted = selected & installed
+
+    fresh = load_config() if cfg is None else cfg
+    configured = {
+        str(tab.get("package") or "")
+        for tab in fresh.get("tabs", [])
+        if isinstance(tab, dict)
+    }
+
+    for package in sorted(wanted, key=natural_package_key):
+        if package not in configured:
+            fresh.setdefault("tabs", []).append(
+                _new_tab_for_package(
+                    package,
+                    len(fresh.get("tabs", [])),
+                )
+            )
+            configured.add(package)
+
+    for tab in fresh.get("tabs", []):
+        if not isinstance(tab, dict):
+            continue
+        package = str(tab.get("package") or "")
+        tab["enabled"] = bool(
+            package
+            and package in wanted
+            and package in installed
+        )
+
+    save_config(fresh)
+
+    hcfg = load_hatcher_config()
+    sync_hatcher_profiles_with_tabs(fresh, hcfg)
+    save_hatcher_config(hcfg)
+
+    bcfg = load_booster_config()
+    sync_booster_profiles_with_tabs(fresh, bcfg)
+    save_booster_config(bcfg)
+
+    verified = load_config()
+    enabled = {
+        str(tab.get("package") or "")
+        for tab in verified.get("tabs", [])
+        if isinstance(tab, dict)
+        and tab.get("enabled", True)
+        and str(tab.get("package") or "")
+    }
+    enabled_uninstalled = enabled - installed
+
+    return verified, {
+        "ok": enabled == wanted and not enabled_uninstalled,
+        "wanted": sorted(wanted, key=natural_package_key),
+        "enabled": sorted(enabled, key=natural_package_key),
+        "disabled_uninstalled": sorted(
+            {
+                str(tab.get("package") or "")
+                for tab in verified.get("tabs", [])
+                if isinstance(tab, dict)
+                and str(tab.get("package") or "")
+                and str(tab.get("package") or "") not in installed
+                and not tab.get("enabled", True)
+            },
+            key=natural_package_key,
+        ),
+        "selected_missing": sorted(
+            selected - installed,
+            key=natural_package_key,
+        ),
+    }
+
+
 def new_redfinger_setup_wizard(cfg=None):
     """Full-auto one-time setup with Delta-global or Arceus per-clone storage.
 
@@ -20943,8 +21035,10 @@ def new_redfinger_setup_wizard(cfg=None):
         if pkg not in configured:
             cfg.setdefault("tabs", []).append(_new_tab_for_package(pkg, len(cfg.get("tabs", []))))
             configured.add(pkg)
-    set_enabled_package_set(cfg, selected)
-    cfg = load_config()
+    cfg, initial_package_lock = lock_setup_selected_packages(
+        selected,
+        cfg,
+    )
     cfg["local_rejoin_only"] = role == "local"
     save_config(cfg)
     cfg, initial_mode_ok = lock_setup_selected_mode(role, load_config())
@@ -21152,6 +21246,10 @@ def new_redfinger_setup_wizard(cfg=None):
     # V4.58: setup helpers may save stale mode flags. The user's selected role
     # is authoritative and is reapplied after every setup operation completes.
     cfg, final_mode_ok = lock_setup_selected_mode(role, cfg)
+    cfg, final_package_lock = lock_setup_selected_packages(
+        selected,
+        cfg,
+    )
     final_active_mode = active_rejoin_mode(cfg)
 
     clear()
@@ -21172,7 +21270,26 @@ def new_redfinger_setup_wizard(cfg=None):
         f"Solver     : "
         f"{col('READY - one submit per actual open' if solver_ready else 'DISABLED / credentials missing', GREEN if solver_ready else YELLOW)}"
     )
-    print(f"Packages   : {', '.join(short_pkg(p) for p in selected)}")
+    package_lock_ok = bool(final_package_lock.get("ok"))
+    print(
+        f"Packages   : "
+        f"{', '.join(short_pkg(p) for p in final_package_lock.get('enabled', [])) or '-'} "
+        f"({'VERIFIED' if package_lock_ok else 'FAILED'})"
+    )
+    if final_package_lock.get("disabled_uninstalled"):
+        print(
+            f"Disabled   : "
+            f"{', '.join(short_pkg(p) for p in final_package_lock['disabled_uninstalled'])} "
+            f"{col('(not installed)', DIM)}"
+        )
+    if final_package_lock.get("selected_missing"):
+        print(
+            col(
+                "Missing selected packages: "
+                + ", ".join(final_package_lock["selected_missing"]),
+                RED,
+            )
+        )
     if setup_place_id:
         print(f"Place ID   : {setup_place_id}")
     if role == "local":
