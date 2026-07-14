@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# V4.56 — LEGACY STATE CLEANUP + AUDIT FIXES
+# - Automatically migrates/quarantines Delta/Workspace/gag_rejoiner once.
+# - Patches legacy state-folder references in unified config and template.
+# - Adds a 15-minute maximum active Event hold for fresh wrong-place heartbeats.
+# - Keeps V4.55's 5-minute stale override and exact-package PID recovery.
+# - Removes dead old_inject_cookie_unused code.
+# - Clarifies dashboard columns: StateAge and RunTime.
+#
 # V4.55 — EVENT HOLD 5-MINUTE STALE OVERRIDE
 # - Built directly from corrected V4.54.
 # - Event hold protects intentional hopping only below the existing old-state
@@ -214,7 +222,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.55"
+__version__ = "V4.56"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -354,6 +362,199 @@ COOKIE_CACHE = BASE_DIR / "cookie_cache.json"
 
 STATE_FOLDER_NAME = "nomo_rejoiner"
 LEGACY_STATE_FOLDER_NAME = "gag_rejoiner"
+LEGACY_DELTA_STATE_MIGRATION_VERSION = 456
+
+
+def _legacy_state_payload_timestamp(path):
+    """Prefer payload ts; fall back to mtime for non-state/invalid files."""
+    path = Path(path)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        ts = int(payload.get("ts", 0) or 0)
+        if ts > 0:
+            return ts
+    except Exception:
+        pass
+    try:
+        return int(path.stat().st_mtime)
+    except Exception:
+        return 0
+
+
+def _replace_legacy_state_folder_strings(value):
+    """Recursively patch exact /gag_rejoiner/ path components."""
+    changed = False
+
+    if isinstance(value, dict):
+        for key in list(value.keys()):
+            new_value, item_changed = _replace_legacy_state_folder_strings(
+                value[key]
+            )
+            if item_changed:
+                value[key] = new_value
+                changed = True
+        return value, changed
+
+    if isinstance(value, list):
+        for index, item in enumerate(list(value)):
+            new_value, item_changed = _replace_legacy_state_folder_strings(item)
+            if item_changed:
+                value[index] = new_value
+                changed = True
+        return value, changed
+
+    if isinstance(value, str):
+        old_component = f"/{LEGACY_STATE_FOLDER_NAME}/"
+        if old_component in value:
+            return (
+                value.replace(
+                    old_component,
+                    f"/{STATE_FOLDER_NAME}/",
+                ),
+                True,
+            )
+
+    return value, False
+
+
+def _unique_legacy_quarantine_path(parent):
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    candidate = parent / (
+        f"{LEGACY_STATE_FOLDER_NAME}_legacy_v456_{stamp}"
+    )
+    suffix = 1
+    while candidate.exists():
+        candidate = parent / (
+            f"{LEGACY_STATE_FOLDER_NAME}_legacy_v456_{stamp}_{suffix}"
+        )
+        suffix += 1
+    return candidate
+
+
+def migrate_legacy_delta_state_folder_once(cfg=None, force=False):
+    """Move/quarantine the obsolete Delta gag_rejoiner state folder safely.
+
+    The canonical folder always wins unless the legacy file has a newer payload
+    timestamp. The old directory is renamed after migration so state discovery
+    can no longer select it, while preserving rollback data.
+    """
+    cfg = cfg if isinstance(cfg, dict) else {}
+    marker = int(
+        cfg.get("_nomo_legacy_delta_state_cleanup_migration", 0) or 0
+    )
+    if marker >= LEGACY_DELTA_STATE_MIGRATION_VERSION and not force:
+        return {
+            "ran": False,
+            "moved": 0,
+            "replaced": 0,
+            "quarantined": "",
+            "paths_patched": False,
+        }
+
+    workspace = DELTA_GLOBAL_WORKSPACE_DIR
+    canonical = workspace / STATE_FOLDER_NAME
+    legacy = workspace / LEGACY_STATE_FOLDER_NAME
+    backup_root = BASE_DIR / "legacy_state_backups"
+    moved = 0
+    replaced = 0
+    quarantined = ""
+    paths_patched = False
+
+    try:
+        canonical.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    if legacy.exists() and legacy.is_dir():
+        try:
+            backup_root.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        try:
+            legacy_items = list(legacy.iterdir())
+        except Exception:
+            legacy_items = []
+
+        for old_path in legacy_items:
+            if not old_path.is_file():
+                continue
+
+            new_path = canonical / old_path.name
+            try:
+                if not new_path.exists():
+                    shutil.copy2(old_path, new_path)
+                    moved += 1
+                    continue
+
+                old_ts = _legacy_state_payload_timestamp(old_path)
+                new_ts = _legacy_state_payload_timestamp(new_path)
+
+                if old_ts > new_ts:
+                    backup_name = (
+                        f"{new_path.name}.pre_v456."
+                        f"{int(time.time())}.bak"
+                    )
+                    backup_path = backup_root / backup_name
+                    shutil.copy2(new_path, backup_path)
+                    shutil.copy2(old_path, new_path)
+                    replaced += 1
+            except Exception:
+                continue
+
+        try:
+            quarantine_path = _unique_legacy_quarantine_path(workspace)
+            legacy.rename(quarantine_path)
+            quarantined = str(quarantine_path)
+        except Exception:
+            quarantined = ""
+
+    # Patch all sections in nomo.json in one pass.
+    try:
+        all_data = _nomo_read_all()
+        _, paths_patched = _replace_legacy_state_folder_strings(all_data)
+        if paths_patched:
+            _nomo_write_all(all_data)
+    except Exception:
+        paths_patched = False
+
+    # Also patch the optional template so it cannot recreate legacy paths.
+    try:
+        if CONFIG_TEMPLATE_FILE.exists():
+            template = json.loads(
+                CONFIG_TEMPLATE_FILE.read_text(encoding="utf-8")
+            )
+            _, template_changed = _replace_legacy_state_folder_strings(
+                template
+            )
+            if template_changed:
+                CONFIG_TEMPLATE_FILE.write_text(
+                    json.dumps(template, indent=2),
+                    encoding="utf-8",
+                )
+                paths_patched = True
+    except Exception:
+        pass
+
+    cfg["_nomo_legacy_delta_state_cleanup_migration"] = (
+        LEGACY_DELTA_STATE_MIGRATION_VERSION
+    )
+    cfg["_nomo_legacy_delta_state_cleanup_summary"] = {
+        "moved": moved,
+        "replaced": replaced,
+        "quarantined": quarantined,
+        "paths_patched": bool(paths_patched),
+        "completed_at": int(time.time()),
+    }
+
+    return {
+        "ran": True,
+        "moved": moved,
+        "replaced": replaced,
+        "quarantined": quarantined,
+        "paths_patched": bool(paths_patched),
+    }
+
 
 _STOP_REQUESTED = False
 
@@ -903,6 +1104,7 @@ DEFAULT_HATCHER_CONFIG = {
     "transition_guard_place_id": "129954712878723",
     "transition_guard_return_place_id": "126884695634066",
     "transition_guard_return_stable_seconds": 300,
+    "transition_guard_max_active_seconds": 900,
     "transition_guard_pause_rejoin": True,
     "transition_guard_pause_backend": True,
     "transition_guard_publish_unavailable_once": True,
@@ -1857,6 +2059,12 @@ def load_config():
 
     cfg = load_json(CONFIG_FILE, DEFAULT_CONFIG)
     changed = False
+
+    if int(
+        cfg.get("_nomo_legacy_delta_state_cleanup_migration", 0) or 0
+    ) < LEGACY_DELTA_STATE_MIGRATION_VERSION:
+        migrate_legacy_delta_state_folder_once(cfg)
+        changed = True
 
     # If config was just created, make sure template values are saved after any load fallback.
     if created_new and apply_global_template_to_config(cfg, force=True):
@@ -3585,7 +3793,7 @@ def status_screen(rows, cfg, session_start, loops):
         ])
 
     draw_table(
-        ["No", "Username", "Package", "Pet", "Egg", "Status", "Age", "Session", "Note"],
+        ["No", "Username", "Package", "Pet", "Egg", "Status", "StateAge", "RunTime", "Note"],
         table_rows,
         widths,
         cfg,
@@ -8568,7 +8776,7 @@ def api_check_package(package, cache=None, cfg=None):
             print(col(f"[SOLVER] Attempting to solve challenge for {package}...", CYAN))
             ok, msg = solve_captcha(cookie, cfg)
             if ok:
-                print(col(f"[SOLVER] Solved! Re-checking API...", GREEN))
+                print(col("[SOLVER] Solved! Re-checking API...", GREEN))
                 status2 = check_cookie_challenge(cookie)
                 if status2 == "valid":
                     clear_hold(package)
@@ -8898,6 +9106,11 @@ def normalize_booster_profile(prof, idx=0):
     base["booster_name"] = str(base.get("booster_name") or f"nomoboost{idx+1}")
     base["server_link"] = str(base.get("server_link") or "")
     base["state_file"] = str(base.get("state_file") or "")
+    if f"/{LEGACY_STATE_FOLDER_NAME}/" in base["state_file"]:
+        base["state_file"] = base["state_file"].replace(
+            f"/{LEGACY_STATE_FOLDER_NAME}/",
+            f"/{STATE_FOLDER_NAME}/",
+        )
     return base
 
 
@@ -9921,7 +10134,7 @@ def cloudflare_admin_hatchers(cfg, stale_after_seconds=7200):
 
 def cloudflare_admin_accounts(cfg, role=""):
     role_q = urllib.parse.quote(str(role or ""), safe="")
-    path = f"/accounts?limit=1000" + (f"&role={role_q}" if role_q else "")
+    path = "/accounts?limit=1000" + (f"&role={role_q}" if role_q else "")
     data, err = cloudflare_request(cfg, "GET", path)
     if err:
         return None, err
@@ -10458,6 +10671,20 @@ def hatcher_transition_guard_update(
     except Exception:
         stable_seconds = 300
 
+    try:
+        max_active_seconds = max(
+            0,
+            int(
+                hcfg.get(
+                    "transition_guard_max_active_seconds",
+                    900,
+                )
+                or 0
+            ),
+        )
+    except Exception:
+        max_active_seconds = 900
+
     phase = _hatcher_transition_phase(rt_tab)
     previous_phase = phase
     current_place = _hatcher_transition_place(
@@ -10664,7 +10891,42 @@ def hatcher_transition_guard_update(
         )
 
     elif phase == HATCHER_TRANSITION_ACTIVE:
-        if clean_fresh and return_place and current_place == return_place:
+        entered_at = int(
+            rt_tab.get("hatcher_transition_entered_at", 0) or 0
+        )
+        active_elapsed = (
+            max(0, t - entered_at)
+            if entered_at > 0
+            else 0
+        )
+
+        if (
+            max_active_seconds > 0
+            and entered_at > 0
+            and active_elapsed >= max_active_seconds
+        ):
+            phase = HATCHER_TRANSITION_NORMAL
+            released = True
+            rt_tab["hatcher_transition_phase"] = phase
+            rt_tab["hatcher_transition_entered_at"] = 0
+            rt_tab["hatcher_transition_return_started_at"] = 0
+            rt_tab["hatcher_transition_notice_pending"] = False
+            rt_tab["hatcher_transition_resume_report_pending"] = True
+            rt_tab["hatcher_transition_resumed_at"] = t
+            rt_tab["hatcher_transition_note"] = (
+                "transition max-hold exceeded; normal recovery resumed"
+            )
+            _reset_hatcher_transition_return_timers(rt_tab)
+            log_activity(
+                (
+                    "event transition max-hold "
+                    f"{format_age(max_active_seconds)} exceeded; "
+                    "hold released"
+                ),
+                package,
+                YELLOW,
+            )
+        elif clean_fresh and return_place and current_place == return_place:
             phase = HATCHER_TRANSITION_RETURNING
             rt_tab["hatcher_transition_phase"] = phase
             rt_tab["hatcher_transition_return_started_at"] = t
@@ -10741,7 +11003,10 @@ def hatcher_transition_guard_update(
     elif phase == HATCHER_TRANSITION_ACTIVE:
         note = "Trade World/event hop hold"
     elif released:
-        note = "Main Garden stable; resumed"
+        note = str(
+            rt_tab.get("hatcher_transition_note")
+            or "transition hold released"
+        )
     else:
         note = "normal"
 
@@ -11267,7 +11532,7 @@ def hatcher_rejoin_status_screen(rows, hcfg, cfg, session_start, loops, last_msg
             (cut(r.get("note", ""), widths[-1]), note_color(r.get("note", ""))),
         ])
 
-    draw_table(["No", "Username", "Package", "Pet", "Egg", "Status", "Age", "Session", "Note"],
+    draw_table(["No", "Username", "Package", "Pet", "Egg", "Status", "StateAge", "RunTime", "Note"],
                table_rows, widths, cfg)
 
     render_activity_log(cfg, lines=int(cfg.get("activity_log_lines", 6) or 6))
@@ -19869,125 +20134,6 @@ def inject_cookie(package, cookie):
         return True, f"cookie injected into {len(ok_paths)} DB(s): {detail}{extra}"
 
     return False, "; ".join(errors[:3]) or "cookie injection failed"
-
-def old_inject_cookie_unused(package, cookie):
-    # ---- Copy DB with retry ----
-    success = False
-    owner = ""
-    ret, out, err = run_su_cmd(f"stat -c %u:%g {shlex.quote(db_src)}", timeout=5)
-    if ret == 0:
-        owner = out.strip()
-
-    for attempt in range(3):
-        ret, out, err = run_su_cmd(f"cp {shlex.quote(db_src)} {shlex.quote(db_dst)}", timeout=5)
-        if ret == 0 and os.path.exists(db_dst) and os.path.getsize(db_dst) > 0:
-            success = True
-            break
-        time.sleep(1)
-    if not success:
-        return False, "failed to copy database (may not exist or locked)"
-
-    try:
-        conn = sqlite3.connect(db_dst, timeout=2)
-        c = conn.cursor()
-
-        c.execute("PRAGMA table_info(cookies)")
-        columns_info = c.fetchall()
-        columns = [row[1] for row in columns_info]
-        col_types = {row[1]: row[2] for row in columns_info}
-        col_notnull = {row[1]: row[3] for row in columns_info}
-
-        row_data = {}
-        for col in columns:
-            col_type = col_types.get(col, "TEXT").upper()
-            if col_notnull.get(col, 0) == 1:
-                if "INT" in col_type or "REAL" in col_type:
-                    row_data[col] = 0
-                else:
-                    row_data[col] = ""
-            else:
-                row_data[col] = None
-
-        row_data["host_key"] = ".roblox.com"
-        row_data["name"] = ".ROBLOSECURITY"
-        row_data["value"] = cookie
-        row_data["path"] = "/"
-
-        chrome_now = int((time.time() + 11644473600) * 1000000)
-        chrome_expires = chrome_now + int(10 * 365 * 24 * 60 * 60 * 1000000)
-
-        for ts_col in ["expires_utc", "creation_utc", "creation_act", "last_access_utc", "last_access_act"]:
-            if ts_col in columns:
-                row_data[ts_col] = chrome_expires if ts_col == "expires_utc" else chrome_now
-
-        optional_values = {
-            "secure": 1,
-            "httponly": 1,
-            "is_secure": 1,
-            "is_httponly": 1,
-            "has_expires": 1,
-            "is_persistent": 1,
-            "priority": 1,
-            "samesite": -1,
-            "source_scheme": 2,
-            "source_port": 443,
-            "is_same_party": 0,
-            "same_party": 0,
-        }
-        for opt_col, opt_val in optional_values.items():
-            if opt_col in columns:
-                row_data[opt_col] = opt_val
-
-        c.execute("DELETE FROM cookies WHERE host_key LIKE ? AND name = ?", ("%.roblox.com", ".ROBLOSECURITY"))
-
-        placeholders = ",".join(["?" for _ in columns])
-        col_names = ",".join(columns)
-        c.execute(f"INSERT OR REPLACE INTO cookies ({col_names}) VALUES ({placeholders})", [row_data.get(col) for col in columns])
-
-        conn.commit()
-        conn.close()
-
-        success = False
-        for attempt in range(3):
-            ret, out, err = run_su_cmd(f"cp {shlex.quote(db_dst)} {shlex.quote(db_src)}", timeout=5)
-            if ret == 0:
-                success = True
-                break
-            time.sleep(1)
-        if not success:
-            return False, "failed to copy back database"
-
-        if owner:
-            run_su_cmd(f"chown {shlex.quote(owner)} {shlex.quote(db_src)}", timeout=5)
-
-        try:
-            ret, out, err = run_su_cmd(f"cp {shlex.quote(db_src)} {shlex.quote(db_dst)}", timeout=5)
-            if ret == 0 and os.path.exists(db_dst):
-                conn2 = sqlite3.connect(db_dst, timeout=2)
-                c2 = conn2.cursor()
-                c2.execute("SELECT value FROM cookies WHERE host_key LIKE '%.roblox.com' AND name='.ROBLOSECURITY' ORDER BY rowid DESC LIMIT 1")
-                row2 = c2.fetchone()
-                conn2.close()
-                if row2 and row2[0] == cookie:
-                    return True, "cookie injected and verified"
-                else:
-                    return False, "verification failed: cookie mismatch"
-        except Exception as e:
-            pass
-        finally:
-            if os.path.exists(db_dst):
-                try: os.remove(db_dst)
-                except: pass
-
-        return True, "cookie injected (verification skipped)"
-
-    except Exception as e:
-        return False, f"DB error: {e}"
-    finally:
-        if os.path.exists(db_dst):
-            try: os.remove(db_dst)
-            except: pass
-
 
 def import_cookie_menu(cfg):
     """Login via one pasted cookie or a local TXT chosen from BASE_DIR/cookies."""
