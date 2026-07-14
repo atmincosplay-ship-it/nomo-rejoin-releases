@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# V4.49 — APK FOLDER + PACKAGE SELECTION
+# - NEW: Local APK installer defaults to /storage/emulated/0/Download.
+# - NEW: Select one APK, multiple APKs, or all APKs before install.
+# - NEW: APK list shows detected Android package names when available.
+# - NEW: Recursive APK scan includes APKs inside Download subfolders.
+# - SAFE: Existing install-only / uninstall-first / ask-each behavior remains.
+# - KEEP: Exact-package uninstall, cookie setup, Delta tools, and exact-PID rules.
+#
 # V4.48 — APK INSTALL / UNINSTALL MODES
 # - NEW: APK install behavior: install-only, uninstall-first, or ask per APK.
 # - NEW: Default ask-per-APK mode asks Y/N before removing the matching package.
@@ -166,7 +174,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.48"
+__version__ = "V4.49"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -181,6 +189,7 @@ DELTA_WORKSPACE_EXPORT_DIR = BASE_DIR / "workspace_exports"
 DELTA_WORKSPACE_BACKUP_DIR = BASE_DIR / "workspace_backups"
 
 APK_DOWNLOAD_DIR = Path("/storage/emulated/0/Download/NOMO_APK")
+APK_LOCAL_DEFAULT_DIR = Path("/storage/emulated/0/Download")
 APK_EXTRACT_DIR = APK_DOWNLOAD_DIR / "_extracted"
 NOMO_BACKUP_DIR = BASE_DIR / "backups"
 NOMO_UPDATE_URL = (
@@ -11901,6 +11910,133 @@ def choose_apk_install_mode(cfg):
         time.sleep(1)
 
 
+
+def _scan_apks_in_folder(folder, recursive=True):
+    folder = Path(folder)
+    if not folder.exists() or not folder.is_dir():
+        return []
+
+    iterator = folder.rglob("*.apk") if recursive else folder.glob("*.apk")
+    found = []
+    seen = set()
+    for path in iterator:
+        try:
+            if not path.is_file():
+                continue
+            key = str(path.resolve())
+        except Exception:
+            key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(path)
+
+    return sorted(found, key=lambda path: natural_package_key(str(path)))
+
+
+def _parse_number_selection(raw, total):
+    """Parse 1,3-5,all into zero-based indices."""
+    text = str(raw or "").strip().lower()
+    if not text:
+        return []
+    if text in {"a", "all", "*"}:
+        return list(range(total))
+
+    selected = set()
+    for token in re.split(r"[\s,]+", text):
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            left, right = token.split("-", 1)
+            if not left.isdigit() or not right.isdigit():
+                raise ValueError(f"invalid range: {token}")
+            start = int(left)
+            end = int(right)
+            if start > end:
+                start, end = end, start
+            for number in range(start, end + 1):
+                if not 1 <= number <= total:
+                    raise ValueError(f"out of range: {number}")
+                selected.add(number - 1)
+        else:
+            if not token.isdigit():
+                raise ValueError(f"invalid number: {token}")
+            number = int(token)
+            if not 1 <= number <= total:
+                raise ValueError(f"out of range: {number}")
+            selected.add(number - 1)
+
+    return sorted(selected)
+
+
+def choose_apk_files(apks, base_folder=None):
+    apks = list(apks or [])
+    if not apks:
+        return []
+
+    package_cache = {}
+    while True:
+        clear()
+        print(col("SELECT APK FILES", BOLD))
+        if base_folder:
+            print(f"Folder: {base_folder}")
+        print("")
+        print("Enter one number, multiple numbers, a range, or A for all.")
+        print("Examples: 1   |   1,3,5   |   2-6   |   A")
+        print("0. Cancel")
+        print("")
+
+        for index, path in enumerate(apks, 1):
+            key = str(path)
+            if key not in package_cache:
+                package_cache[key] = apk_package_name(path)
+            package, detected_by = package_cache[key]
+
+            try:
+                relative = path.relative_to(base_folder) if base_folder else path
+            except Exception:
+                relative = path
+
+            package_note = package if package else "package unknown"
+            print(f"{index:>3}. {relative}")
+            print(col(f"     -> {package_note}", DIM))
+
+        drain_stdin()
+        raw = clean_terminal_input(input("\nSelect APKs: "))
+        if raw == "0":
+            return []
+
+        try:
+            indices = _parse_number_selection(raw, len(apks))
+        except ValueError as exc:
+            print(col(f"Invalid selection: {exc}", RED))
+            time.sleep(1.5)
+            continue
+
+        if not indices:
+            print(col("Nothing selected.", YELLOW))
+            time.sleep(1)
+            continue
+
+        selected = [apks[index] for index in indices]
+
+        clear()
+        print(col("SELECTED APK FILES", BOLD))
+        print("")
+        for path in selected:
+            package, _ = package_cache[str(path)]
+            print(f"  - {path.name}")
+            print(col(f"    {package or 'package unknown'}", DIM))
+        print("")
+
+        if _setup_yes_no(
+            f"Use these {len(selected)} APK file(s)?",
+            default=True,
+        ):
+            return selected
+
+
 def install_apk_batch(paths, cfg=None):
     cfg = cfg or load_config()
     mode = _normalized_apk_install_mode(cfg)
@@ -12201,7 +12337,7 @@ def apk_download_install_menu(cfg):
         print("1. Direct APK/ZIP URL -> download + install")
         print("2. GitHub latest release -> download + install all APK/ZIP assets")
         print("3. GoFile share -> API token lookup + download + install")
-        print("4. Install APKs from a local folder")
+        print("4. Select APKs from local folder -> install")
         print("5. Uninstall installed packages only")
         print("6. Change install/uninstall behavior")
         print("7. Show download folder")
@@ -12295,28 +12431,43 @@ def apk_download_install_menu(cfg):
 
         if choice == "4":
             raw = clean_terminal_input(input(
-                f"APK folder [ENTER={APK_DOWNLOAD_DIR}]: "
+                f"APK folder [ENTER={APK_LOCAL_DEFAULT_DIR}]: "
             ))
-            folder = Path(raw) if raw else APK_DOWNLOAD_DIR
+            folder = Path(raw) if raw else APK_LOCAL_DEFAULT_DIR
             if not folder.exists() or not folder.is_dir():
                 print(col(f"Folder not found: {folder}", RED))
                 pause()
                 continue
-            apks = sorted(
-                folder.glob("*.apk"),
-                key=lambda p: natural_package_key(p.name),
-            )
+
+            apks = _scan_apks_in_folder(folder, recursive=True)
             if not apks:
-                print(col("No APK files found in that folder.", RED))
+                print(col(
+                    f"No APK files found under: {folder}",
+                    RED,
+                ))
                 pause()
                 continue
-            print(f"Found {len(apks)} APK files.")
-            if _setup_yes_no("Install all now?", default=True):
-                installed, failed, _ = install_apk_batch(apks, cfg=cfg)
-                print(col(
-                    f"Finished: {installed} installed, {failed} failed.",
-                    GREEN if failed == 0 else YELLOW,
-                ))
+
+            print(col(
+                f"Found {len(apks)} APK files. Opening selector...",
+                GREEN,
+            ))
+            time.sleep(0.7)
+
+            selected_apks = choose_apk_files(apks, base_folder=folder)
+            if not selected_apks:
+                print(col("No APK files selected.", YELLOW))
+                pause()
+                continue
+
+            installed, failed, _ = install_apk_batch(
+                selected_apks,
+                cfg=cfg,
+            )
+            print(col(
+                f"Finished: {installed} installed, {failed} failed.",
+                GREEN if failed == 0 else YELLOW,
+            ))
             pause()
             continue
 
