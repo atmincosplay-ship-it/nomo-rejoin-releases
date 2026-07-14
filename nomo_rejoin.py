@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.58.9 — BOOSTER FRESH-PROBE HEALTH FALLBACK
+# - Stable v3.9 state remains the primary Booster health heartbeat.
+# - A fresh verified Booster probe is a safe secondary in-game heartbeat.
+# - Fresh probe cancels stale/no-state restart queues while the exact package lives.
+# - Probe fallback never overrides a dead package or confirmed Android disconnect.
+# - Stale Lua CAPTCHA/disconnect text is ignored only in an in-memory health copy.
+# - Booster start verifies both stable counter and Booster scanner AutoExec loaders.
+# - Backend can report a ready probe even when normal state is temporarily missing.
+# - Market, Hatcher, Package Manager, Option 4, PID policy, and Lua files unchanged.
+#
 # V4.58.8 — BOOSTER PHASE 2
 # - Booster health/rejoin continues to use the stable v3.9 normal state file.
 # - Valuable pets are read only from <username>_booster_probe.json.
@@ -287,7 +297,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.58.8"
+__version__ = "V4.58.9"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -1218,6 +1228,7 @@ DEFAULT_BOOSTER_CONFIG = {
     "force_update_every_seconds": 3600,
     "heartbeat_interval": 60,
     "probe_enabled": True,
+    "probe_health_fallback_enabled": True,
     "probe_required_for_report": True,
     "probe_stale_seconds": 90,
     "probe_expected_schema_version": 2,
@@ -9666,6 +9677,119 @@ def booster_probe_quality(probe, err, bcfg):
     return "ready", True, f"{parsed} pets parsed"
 
 
+
+def booster_health_state_from_probe(
+    state,
+    probe,
+    probe_status,
+    probe_reportable,
+    package_alive_now,
+    bcfg,
+):
+    """Create an in-memory clean heartbeat from a verified fresh probe.
+
+    This never writes over the normal state file. It only prevents a stale or
+    missing v3.9 file from restarting a package whose verified Booster scanner
+    is actively executing in the expected game.
+    """
+    enabled = bool(
+        bcfg.get(
+            "probe_health_fallback_enabled",
+            True,
+        )
+    )
+    ready = bool(
+        enabled
+        and package_alive_now
+        and probe_status == "ready"
+        and probe_reportable
+        and isinstance(probe, dict)
+    )
+    if not ready:
+        return state, False, ""
+
+    merged = dict(state or {})
+
+    # A currently executing scanner in Main Garden proves old Lua popup flags
+    # are stale. Clear them only in this temporary health copy. Android's
+    # package-scoped disconnect detector still runs first and can override it.
+    for key in (
+        "disconnected",
+        "_android_disconnect_confirmed",
+        "disconnect_title",
+        "disconnect_text",
+        "disconnect_code",
+        "disconnect_reason",
+        "disconnect_observed_ts",
+        "login_challenge",
+        "login_challenge_text",
+        "login_challenge_reason",
+        "ui_title",
+        "ui_text",
+        "popup_title",
+        "popup_text",
+        "screen_text",
+        "text",
+        "note",
+    ):
+        merged.pop(key, None)
+
+    probe_age = max(
+        0,
+        int(probe.get("age", 0) or 0),
+    )
+    probe_ts = int(
+        probe.get("ts", now()) or now()
+    )
+    inventory = int(
+        probe.get(
+            "parsed_pet_count",
+            probe.get("inventory_entry_count", 0),
+        )
+        or 0
+    )
+
+    merged["age"] = probe_age
+    merged["ts"] = probe_ts
+    merged["state_ts"] = probe_ts
+    merged["updated_at"] = probe_ts
+    merged["place_id"] = str(
+        probe.get("place_id")
+        or merged.get("place_id")
+        or ""
+    )
+    merged["username"] = str(
+        probe.get("username")
+        or merged.get("username")
+        or ""
+    )
+    merged["pet_count"] = inventory
+    merged["_booster_probe_health"] = True
+    merged["_booster_probe_revision"] = str(
+        probe.get("probe_revision") or ""
+    )
+
+    if state:
+        normal_age = state_age_seconds(state)
+        if normal_age >= 999999:
+            note = (
+                f"fresh probe {probe_age}s; "
+                "normal state invalid/missing timestamp"
+            )
+        else:
+            note = (
+                f"fresh probe {probe_age}s; "
+                f"normal state old {format_age(normal_age)}"
+            )
+    else:
+        note = (
+            f"fresh probe {probe_age}s; "
+            "normal state missing"
+        )
+
+    return merged, True, note
+
+
 def booster_probe_matches(probe, bcfg):
     """Return compact verified valuable-pet records for D1."""
     if not isinstance(probe, dict):
@@ -9748,10 +9872,10 @@ def booster_entry(prof, state, err, probe=None, probe_err=None, bcfg=None):
         status = "disabled"
     elif not link or link.startswith(("YOUR_", "PUT_")):
         status = "no_server"
-    elif not state:
-        status = "no_state"
     elif probe_reportable:
         status = "available" if matches else "online"
+    elif not state:
+        status = "no_state"
     else:
         status = "probe_wait"
 
@@ -9764,7 +9888,16 @@ def booster_entry(prof, state, err, probe=None, probe_err=None, bcfg=None):
         "role": "booster",
         "status": status,
         "server_link": link,
-        "pet_count": int((state or {}).get("pet_count", 0) or 0),
+        "pet_count": int(
+            (state or {}).get(
+                "pet_count",
+                (probe or {}).get(
+                    "parsed_pet_count",
+                    (probe or {}).get("inventory_entry_count", 0),
+                ),
+            )
+            or 0
+        ),
         "egg_total": int((state or {}).get("egg_total", 0) or 0),
         "boosting_match_count": len(matches),
         "boosting_matches": matches,
@@ -9995,10 +10128,27 @@ def start_booster_safe_rejoiner(main_cfg=None):
         for profile in enabled_profiles
         if str(profile.get("package") or "")
     ]
+    counter_install_results = []
     probe_install_results = []
+
+    try:
+        counter_install_results = _setup_install_counter_for_packages(
+            cfg,
+            enabled_packages,
+            "1",
+        )
+    except Exception as exc:
+        log_activity(
+            f"Booster stable counter install warning: {cut(exc, 80)}",
+            "",
+            YELLOW,
+        )
+
     try:
         probe_install_results = _setup_install_booster_probe_for_packages(
-            cfg, enabled_packages, "1"
+            cfg,
+            enabled_packages,
+            "1",
         )
     except Exception as exc:
         log_activity(
@@ -10012,11 +10162,22 @@ def start_booster_safe_rejoiner(main_cfg=None):
     loops = 0
     open_queue = []
     last_report_at = 0
-    installed_ok = any(ok for _pkg, ok, _note in probe_install_results)
+    counter_ok = any(
+        ok
+        for _pkg, ok, _note in counter_install_results
+    )
+    probe_ok = any(
+        ok
+        for _pkg, ok, _note in probe_install_results
+    )
     last_msg = (
-        "probe loader ready; waiting for scanner JSON"
-        if installed_ok
-        else "waiting for scanner JSON"
+        "stable counter + probe loaders ready"
+        if counter_ok and probe_ok
+        else (
+            "probe ready; stable counter loader warning"
+            if probe_ok
+            else "waiting for scanner JSON"
+        )
     )
 
     while True:
@@ -10042,9 +10203,26 @@ def start_booster_safe_rejoiner(main_cfg=None):
             rt_tab["target"] = "hatcher"
 
             state, err = read_state(tab)
-            probe, probe_err = booster_read_probe(prof, state=state, bcfg=bcfg)
-            probe_status, probe_ready, probe_note = booster_probe_quality(probe, probe_err, bcfg)
-            probe_matches = booster_probe_matches(probe, bcfg) if probe_ready else []
+            probe, probe_err = booster_read_probe(
+                prof,
+                state=state,
+                bcfg=bcfg,
+            )
+            (
+                probe_status,
+                probe_reportable,
+                probe_note,
+            ) = booster_probe_quality(
+                probe,
+                probe_err,
+                bcfg,
+            )
+            probe_matches = (
+                booster_probe_matches(probe, bcfg)
+                if probe_reportable
+                else []
+            )
+
             state_cache[pkg] = {
                 "state": state,
                 "state_err": err,
@@ -10053,14 +10231,35 @@ def start_booster_safe_rejoiner(main_cfg=None):
             }
 
             alive = package_alive(pkg, cfg)
+            (
+                health_state,
+                probe_health_active,
+                probe_health_note,
+            ) = booster_health_state_from_probe(
+                state,
+                probe,
+                probe_status,
+                probe_reportable,
+                alive,
+                bcfg,
+            )
+
+            if probe_health_active:
+                # A previously queued old-state recovery is obsolete now.
+                cancel_queued_package(open_queue, pkg)
+                clear_manual_login_block(rt_tab)
+                clear_hold(pkg)
+
             health = evaluate_package_health(
-                tab, cfg, rt_tab,
+                tab,
+                cfg,
+                rt_tab,
                 mode="hatcher",
                 hcfg=bcfg,
                 prof=prof,
                 raw_alive=alive,
-                state=state,
-                err=err,
+                state=health_state,
+                err=None if probe_health_active else err,
             )
             server_link = str(tab.get("server_link") or "").strip()
             if not server_link or server_link.startswith(("YOUR_", "PUT_")):
@@ -10079,17 +10278,50 @@ def start_booster_safe_rejoiner(main_cfg=None):
 
             probe_ui_note = (
                 f"probe ready; {len(probe_matches)} valuable"
-                if probe_ready
+                if probe_status == "ready" and probe_reportable
                 else f"probe {probe_status}: {probe_note}"
             )
+
+            if probe_health_active:
+                note = probe_health_note
+
             note = "; ".join(
                 value
-                for value in (str(note or "").strip(), probe_ui_note)
+                for value in (
+                    str(note or "").strip(),
+                    probe_ui_note,
+                )
                 if value
             )
-            pets = int((state or {}).get("pet_count", 0) or 0) if state else "-"
-            matches = len(probe_matches) if probe_ready else "-"
-            age = int((state or {}).get("age", 999999) or 999999) if state else "-"
+
+            pets = (
+                int(
+                    health_state.get(
+                        "pet_count",
+                        0,
+                    )
+                    or 0
+                )
+                if health_state
+                else "-"
+            )
+            matches = (
+                len(probe_matches)
+                if probe_status == "ready"
+                and probe_reportable
+                else "-"
+            )
+            age = (
+                int(
+                    health_state.get(
+                        "age",
+                        999999,
+                    )
+                    or 999999
+                )
+                if health_state
+                else "-"
+            )
             update_clone_session(rt_tab, status, cfg)
             rows.append({
                 "user": tab.get("user_name", pkg),
