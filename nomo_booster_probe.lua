@@ -1,6 +1,6 @@
 --========================================================--
 --                  NOMO BOOSTER PROBE
---                 v0.1 PHASE 1 SAFE
+--             v0.1.1 PETDATA CONTAINER FIX
 --========================================================--
 -- PURPOSE:
 --   Validate the real Grow a Garden pet schema before Booster mode is merged
@@ -49,6 +49,7 @@ local Config = getgenv().NOMO_BOOSTER_PROBE
 Config.Enabled = true
 Config.Stop = false
 Config.Version = "v0.1-phase1-safe"
+Config.Revision = "v0.1.1-petdata-container-fix"
 
 Config.WriteFolder = Config.WriteFolder or "nomo_rejoiner"
 Config.ScanEvery = math.max(5, tonumber(Config.ScanEvery or 10) or 10)
@@ -226,12 +227,24 @@ local function truncateTwo(value)
 end
 
 local function firstValue(containers, names)
-    for _, container in ipairs(containers) do
+    for _, item in ipairs(containers) do
+        local container = item
+        local path = ""
+
+        if type(item) == "table" and item.Value ~= nil then
+            container = item.Value
+            path = tostring(item.Path or "")
+        end
+
         if type(container) == "table" then
             for _, name in ipairs(names) do
                 local value = container[name]
                 if value ~= nil then
-                    return value, name
+                    local field = tostring(name)
+                    if path ~= "" then
+                        field = path .. "." .. field
+                    end
+                    return value, field
                 end
             end
         end
@@ -244,19 +257,33 @@ local function entryContainers(entry)
         return {}
     end
 
-    return {
-        entry,
-        entry.Data,
-        entry.PetData,
-        entry.Properties,
-        entry.Info,
-    }
+    -- Never create a sparse array here. ipairs() stops at the first nil.
+    local containers = {}
+
+    local function add(value, path)
+        if type(value) == "table" then
+            table.insert(containers, {
+                Value = value,
+                Path = tostring(path or ""),
+            })
+        end
+    end
+
+    add(entry, "")
+    add(entry.PetData, "PetData")
+    add(entry.Data, "Data")
+    add(entry.Properties, "Properties")
+    add(entry.Info, "Info")
+
+    return containers
 end
 
-local function scalarKeyList(entry, output)
+local function scalarKeyList(entry, output, prefix)
     if type(entry) ~= "table" then
         return
     end
+
+    prefix = tostring(prefix or "")
 
     for key, value in pairs(entry) do
         if type(key) == "string" then
@@ -264,7 +291,11 @@ local function scalarKeyList(entry, output)
             if valueType ~= "function"
                 and valueType ~= "thread"
                 and valueType ~= "userdata" then
-                output[key] = true
+                local observed = key
+                if prefix ~= "" then
+                    observed = prefix .. "." .. key
+                end
+                output[observed] = true
             end
         end
     end
@@ -287,14 +318,107 @@ local function cleanString(value)
     return tostring(value)
 end
 
+local function collectTextValues(value, output, depth)
+    output = output or {}
+    depth = depth or 0
+
+    if depth > 3 then
+        return output
+    end
+
+    if type(value) == "string" then
+        local text = tostring(value)
+        text = string.gsub(text, "^%s+", "")
+        text = string.gsub(text, "%s+$", "")
+
+        if text ~= ""
+            and text ~= "Normal"
+            and text ~= "None"
+            and text ~= "Unknown" then
+            output[text] = true
+        end
+    elseif type(value) == "table" then
+        for key, item in pairs(value) do
+            if type(item) == "string" then
+                collectTextValues(item, output, depth + 1)
+            elseif item == true and tostring(key or "") ~= "" then
+                collectTextValues(tostring(key), output, depth + 1)
+            elseif type(item) == "table" then
+                collectTextValues(item, output, depth + 1)
+            end
+        end
+    end
+
+    return output
+end
+
+local function mutationInfo(entry)
+    local pd = type(entry.PetData) == "table"
+        and entry.PetData
+        or {}
+
+    local mutationMap = {}
+    local sources = {
+        {"MutationType", entry.MutationType},
+        {"Mutation", entry.Mutation},
+        {"Mutations", entry.Mutations},
+        {"MutationData", entry.MutationData},
+        {"AppliedMutations", entry.AppliedMutations},
+        {"ActiveMutations", entry.ActiveMutations},
+        {"PetData.MutationType", pd.MutationType},
+        {"PetData.Mutation", pd.Mutation},
+        {"PetData.Mutations", pd.Mutations},
+        {"PetData.MutationData", pd.MutationData},
+        {"PetData.AppliedMutations", pd.AppliedMutations},
+        {"PetData.ActiveMutations", pd.ActiveMutations},
+    }
+
+    local sourceField = ""
+    for _, item in ipairs(sources) do
+        if item[2] ~= nil and sourceField == "" then
+            sourceField = item[1]
+        end
+        collectTextValues(item[2], mutationMap, 0)
+    end
+
+    for _, key in ipairs({"Rainbow", "Gold", "Golden", "Shiny"}) do
+        if entry[key] == true or pd[key] == true then
+            mutationMap[key] = true
+            if sourceField == "" then
+                sourceField = entry[key] == true
+                    and key
+                    or ("PetData." .. key)
+            end
+        end
+    end
+
+    local names = {}
+    for name in pairs(mutationMap) do
+        table.insert(names, tostring(name))
+    end
+    table.sort(names)
+
+    if #names == 0 then
+        return "Normal", {}, (
+            sourceField ~= ""
+            and sourceField
+            or "default:Normal"
+        )
+    end
+
+    return table.concat(names, ", "), names, sourceField
+end
+
 local function parsePet(uuidKey, entry, observedKeys)
     if type(entry) ~= "table" then
         return nil, "entry_not_table"
     end
 
-    scalarKeyList(entry, observedKeys)
-    scalarKeyList(entry.Data, observedKeys)
-    scalarKeyList(entry.PetData, observedKeys)
+    scalarKeyList(entry, observedKeys, "")
+    scalarKeyList(entry.PetData, observedKeys, "PetData")
+    scalarKeyList(entry.Data, observedKeys, "Data")
+    scalarKeyList(entry.Properties, observedKeys, "Properties")
+    scalarKeyList(entry.Info, observedKeys, "Info")
 
     local containers = entryContainers(entry)
 
@@ -320,10 +444,6 @@ local function parsePet(uuidKey, entry, observedKeys)
             "BaseWeightInKg",
         }
     )
-    local mutationValue, mutationField = firstValue(
-        containers,
-        {"MutationType", "Mutation", "mutation"}
-    )
     local hatchedFromValue = firstValue(
         containers,
         {"HatchedFrom", "EggType", "SourceEgg"}
@@ -337,6 +457,8 @@ local function parsePet(uuidKey, entry, observedKeys)
         {"Boosts", "PetBoosts"}
     )
 
+    local mutationText, mutationList, mutationField = mutationInfo(entry)
+
     local uuid = cleanString(uuidValue)
     if uuid == "" then
         uuid = cleanString(uuidKey)
@@ -344,12 +466,14 @@ local function parsePet(uuidKey, entry, observedKeys)
 
     local name = cleanString(nameValue)
     local age = toNumber(ageValue)
-    local baseWeightAge0 = toNumber(baseWeightValue)
+    local rawBaseWeightAge0 = toNumber(baseWeightValue)
+
+    local baseWeightAge0 = nil
     local baseWeightAge1 = nil
 
-    if baseWeightAge0 then
-        baseWeightAge0 = truncateTwo(baseWeightAge0)
-        baseWeightAge1 = truncateTwo(baseWeightAge0 * 1.1)
+    if rawBaseWeightAge0 then
+        baseWeightAge0 = truncateTwo(rawBaseWeightAge0)
+        baseWeightAge1 = truncateTwo(rawBaseWeightAge0 * 1.1)
     end
 
     local reasons = {}
@@ -367,7 +491,8 @@ local function parsePet(uuidKey, entry, observedKeys)
         age = age,
         base_weight_age0_kg = baseWeightAge0,
         base_weight_age1_kg = baseWeightAge1,
-        mutation = cleanString(mutationValue),
+        mutation = mutationText,
+        mutations = mutationList,
         hatched_from = cleanString(hatchedFromValue),
         is_favorite = favoriteValue == true,
         boost_count = countTable(boostsValue),
@@ -460,7 +585,8 @@ local function buildProbeState()
 
     local state = {
         probe_version = Config.Version,
-        schema_version = 1,
+        probe_revision = Config.Revision,
+        schema_version = 2,
 
         username = LocalPlayer.Name,
         display_name = LocalPlayer.DisplayName,
