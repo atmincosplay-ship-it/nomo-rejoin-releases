@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.58.6 — SIMPLE INSTALLED PACKAGE MANAGER
+# - Main Package Manager table shows Android-installed packages only.
+# - Saved/template packages that are not installed are completely hidden.
+# - Adds one cleanup action to remove every uninstalled/invalid NOMO entry.
+# - Add/toggle/username/map selectors operate on installed packages only.
+# - Remove-from-config remains available for exact manual cleanup.
+# - No package-ID conversion, aliasing, or automatic migration.
+#
 # V4.58.5 — INSTALLED PACKAGE TABLE ONLY
 # - Built directly from V4.58.3; the package-ID conversion experiment is discarded.
 # - Package Manager's main table is sourced only from Android-installed packages.
@@ -261,7 +269,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.58.5"
+__version__ = "V4.58.6"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -22382,81 +22390,366 @@ def handle_nomo_cli_command():
         return True
 
 
+
+def _drop_package_records(value, packages):
+    """Remove exact package keys/list records recursively."""
+    packages = set(packages or [])
+
+    if isinstance(value, dict):
+        for key in list(value.keys()):
+            if isinstance(key, str) and key in packages:
+                value.pop(key, None)
+                continue
+
+            item = value.get(key)
+            if (
+                isinstance(item, dict)
+                and str(item.get("package") or "") in packages
+            ):
+                value.pop(key, None)
+                continue
+
+            _drop_package_records(item, packages)
+        return value
+
+    if isinstance(value, list):
+        kept = []
+        for item in value:
+            if (
+                isinstance(item, dict)
+                and str(item.get("package") or "") in packages
+            ):
+                continue
+            _drop_package_records(item, packages)
+            kept.append(item)
+        value[:] = kept
+        return value
+
+    return value
+
+
+def remove_packages_from_nomo_config(cfg, packages):
+    """Remove exact package IDs from main/Hatcher/Booster/runtime config."""
+    packages = {
+        str(package or "").strip()
+        for package in (packages or [])
+        if str(package or "").strip()
+    }
+    if not packages:
+        return {
+            "removed": [],
+            "runtime_files_changed": 0,
+        }
+
+    before = {
+        str(tab.get("package") or "")
+        for tab in cfg.get("tabs", [])
+        if isinstance(tab, dict)
+    }
+
+    cfg["tabs"] = [
+        tab
+        for tab in cfg.get("tabs", [])
+        if not (
+            isinstance(tab, dict)
+            and str(tab.get("package") or "") in packages
+        )
+    ]
+    save_config(cfg)
+
+    hcfg = load_hatcher_config()
+    hcfg["hatchers"] = [
+        profile
+        for profile in hcfg.get("hatchers", [])
+        if not (
+            isinstance(profile, dict)
+            and str(profile.get("package") or "") in packages
+        )
+    ]
+    save_hatcher_config(hcfg)
+
+    bcfg = load_booster_config()
+    bcfg["boosters"] = [
+        profile
+        for profile in bcfg.get("boosters", [])
+        if not (
+            isinstance(profile, dict)
+            and str(profile.get("package") or "") in packages
+        )
+    ]
+    save_booster_config(bcfg)
+
+    runtime_files_changed = 0
+    runtime_paths = [
+        RUNTIME_FILE,
+        HATCHER_RUNTIME_FILE,
+        BOOSTER_RUNTIME_FILE,
+        BASE_DIR / "captcha_hold.json",
+    ]
+    optional_rejoin_runtime = globals().get(
+        "REJOIN_ONLY_RUNTIME_FILE"
+    )
+    if optional_rejoin_runtime:
+        runtime_paths.append(optional_rejoin_runtime)
+
+    for runtime_path in runtime_paths:
+        path = Path(runtime_path)
+        if not path.exists():
+            continue
+
+        try:
+            payload = json.loads(
+                path.read_text(
+                    encoding="utf-8"
+                )
+            )
+        except Exception:
+            continue
+
+        before_json = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        _drop_package_records(
+            payload,
+            packages,
+        )
+        after_json = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+        if before_json != after_json:
+            save_json(path, payload)
+            runtime_files_changed += 1
+
+    removed = sorted(
+        before & packages,
+        key=natural_package_key,
+    )
+    return {
+        "removed": removed,
+        "runtime_files_changed": runtime_files_changed,
+    }
+
+
+def uninstalled_or_invalid_config_packages(cfg):
+    """Return configured entries that Android does not currently have."""
+    installed = set(get_installed_packages())
+    output = []
+
+    for tab in cfg.get("tabs", []):
+        if not isinstance(tab, dict):
+            continue
+
+        package = str(tab.get("package") or "").strip()
+        invalid = (
+            not package
+            or "." not in package
+            or package == "0"
+        )
+
+        if invalid or package not in installed:
+            if package not in output:
+                output.append(package or "<blank>")
+
+    return sorted(
+        output,
+        key=natural_package_key,
+    )
+
+
+
 def select_package_menu(cfg):
     while True:
         cfg = load_config()
         clear()
-        banner("PACKAGE MANAGER — INSTALLED PACKAGES", cfg)
-        entries = installed_package_table_entries(cfg)
-        hidden_configured = configured_uninstalled_packages(cfg)
-        rows = []
-        for i, e in enumerate(entries, 1):
-            rows.append([
-                (str(i), CYAN),
-                ("ON" if e.get("enabled") else ("NEW" if not e.get("configured") else "OFF"),
-                 GREEN if e.get("enabled") else (YELLOW if not e.get("configured") else RED)),
-                ("YES" if e.get("installed") else "NO", GREEN if e.get("installed") else YELLOW),
-                (short_pkg(e.get("package", "")), WHITE),
-                (e.get("username", ""), WHITE),
-            ])
-        if rows:
-            draw_table(["No", "Use", "Inst", "Package", "Username"], rows,
-                       [3, 4, 4, 12, 18], cfg)
-        else:
-            print(col("No Android Roblox/Noka packages are installed.", YELLOW))
+        banner("PACKAGE MANAGER — INSTALLED ONLY", cfg)
 
-        if hidden_configured:
-            print("")
-            print(
-                col(
-                    f"Hidden configured entries not installed: "
-                    f"{len(hidden_configured)}",
-                    DIM,
-                )
-            )
-            print(
-                col(
-                    "  "
-                    + ", ".join(
-                        short_pkg(package)
-                        for package in hidden_configured
+        entries = installed_package_table_entries(cfg)
+        rows = []
+
+        for index, entry in enumerate(entries, 1):
+            rows.append([
+                (str(index), CYAN),
+                (
+                    "ON"
+                    if entry.get("enabled")
+                    else (
+                        "NEW"
+                        if not entry.get("configured")
+                        else "OFF"
                     ),
-                    DIM,
+                    GREEN
+                    if entry.get("enabled")
+                    else (
+                        YELLOW
+                        if not entry.get("configured")
+                        else RED
+                    ),
+                ),
+                ("YES", GREEN),
+                (
+                    short_pkg(
+                        entry.get("package", "")
+                    ),
+                    WHITE,
+                ),
+                (
+                    entry.get("username", ""),
+                    WHITE,
+                ),
+            ])
+
+        if rows:
+            draw_table(
+                [
+                    "No",
+                    "Use",
+                    "Inst",
+                    "Package",
+                    "Username",
+                ],
+                rows,
+                [3, 4, 4, 14, 18],
+                cfg,
+            )
+        else:
+            print(
+                col(
+                    "No Android Roblox/Noka packages are installed.",
+                    YELLOW,
                 )
             )
 
         print("")
         print(
             col(
-                "Detection is read-only; exact package IDs are never converted.",
+                "Only packages reported by Android are shown here.",
+                DIM,
+            )
+        )
+        print(
+            col(
+                "Opening this screen never edits or converts package IDs.",
                 DIM,
             )
         )
         print("")
-        print("1. Add detected installed packages to NOMO config")
-        print("2. Set exact active package set")
-        print("3. Toggle enable/disable package(s)")
-        print("4. Add custom package name(s)")
-        print("5. Remove package(s) from NOMO config")
-        print("6. Refresh selected usernames (cookie -> state)")
-        print("7. Auto-map packages to RobloxClone folders")
+        print("1. Add installed package(s) to NOMO")
+        print("2. Set exact active installed package set")
+        print("3. Toggle installed package(s)")
+        print("4. Remove saved package(s) from NOMO")
+        print("5. Clean all saved entries not installed")
+        print("6. Refresh installed usernames")
+        print("7. Auto-map installed packages to RobloxClone folders")
         print("0. Back")
+
         drain_stdin()
-        ch = read_menu_choice("\nChoose: ", {"0", "1", "2", "3", "4", "5", "6", "7", "q", "b", "back"})
-        if ch in {"0", "q", "b", "back"}:
+        choice = read_menu_choice(
+            "\nChoose: ",
+            {
+                "0",
+                "1",
+                "2",
+                "3",
+                "4",
+                "5",
+                "6",
+                "7",
+                "q",
+                "b",
+                "back",
+            },
+        )
+
+        if choice in {"0", "q", "b", "back"}:
             return
-        if ch is None:
-            print(col("Invalid choice. Use 0-7.", RED))
+
+        if choice is None:
+            print(
+                col(
+                    "Invalid choice. Use 0-7.",
+                    RED,
+                )
+            )
             time.sleep(1)
             continue
-        if ch == "1":
-            added = sync_installed_packages_into_config(cfg)
-            if added:
-                print(col("Added: " + ", ".join(added), GREEN))
-            else:
-                print(col("No new installed packages found.", YELLOW))
-            pause()
-        elif ch == "2":
+
+        if choice == "1":
+            selected = choose_packages_common(
+                cfg,
+                "ADD INSTALLED PACKAGES",
+                multi=True,
+                include_discovered=True,
+                installed_only=True,
+            )
+            if selected:
+                existing = {
+                    str(tab.get("package") or "")
+                    for tab in cfg.get("tabs", [])
+                    if isinstance(tab, dict)
+                }
+                added = []
+                for package in selected:
+                    if package in existing:
+                        continue
+                    cfg.setdefault(
+                        "tabs",
+                        [],
+                    ).append(
+                        _new_tab_for_package(
+                            package,
+                            len(
+                                cfg.get(
+                                    "tabs",
+                                    [],
+                                )
+                            ),
+                        )
+                    )
+                    existing.add(package)
+                    added.append(package)
+
+                if added:
+                    save_config(cfg)
+
+                    hcfg = load_hatcher_config()
+                    sync_hatcher_profiles_with_tabs(
+                        cfg,
+                        hcfg,
+                    )
+                    save_hatcher_config(hcfg)
+
+                    bcfg = load_booster_config()
+                    sync_booster_profiles_with_tabs(
+                        cfg,
+                        bcfg,
+                    )
+                    save_booster_config(bcfg)
+
+                    print(
+                        col(
+                            "Added: "
+                            + ", ".join(
+                                short_pkg(package)
+                                for package in added
+                            ),
+                            GREEN,
+                        )
+                    )
+                else:
+                    print(
+                        col(
+                            "Selected packages are already saved.",
+                            YELLOW,
+                        )
+                    )
+                pause()
+
+        elif choice == "2":
             selected = choose_packages_common(
                 cfg,
                 "SET ACTIVE INSTALLED PACKAGES",
@@ -22465,80 +22758,274 @@ def select_package_menu(cfg):
                 installed_only=True,
             )
             if selected:
-                # Add any selected discovered package before enabling it.
-                configured = {t.get("package") for t in cfg.get("tabs", [])}
-                for pkg in selected:
-                    if pkg not in configured:
-                        cfg.setdefault("tabs", []).append(_new_tab_for_package(pkg, len(cfg.get("tabs", []))))
-                set_enabled_package_set(cfg, selected)
-                print(col(f"Active package set saved ({len(selected)}).", GREEN))
+                configured = {
+                    str(tab.get("package") or "")
+                    for tab in cfg.get("tabs", [])
+                    if isinstance(tab, dict)
+                }
+
+                for package in selected:
+                    if package in configured:
+                        continue
+                    cfg.setdefault(
+                        "tabs",
+                        [],
+                    ).append(
+                        _new_tab_for_package(
+                            package,
+                            len(
+                                cfg.get(
+                                    "tabs",
+                                    [],
+                                )
+                            ),
+                        )
+                    )
+                    configured.add(package)
+
+                set_enabled_package_set(
+                    cfg,
+                    selected,
+                )
+                print(
+                    col(
+                        f"Active installed set saved ({len(selected)}).",
+                        GREEN,
+                    )
+                )
                 pause()
-        elif ch == "3":
-            selected = choose_packages_common(cfg, "TOGGLE PACKAGES", multi=True,
-                                              include_discovered=False, configured_only=True)
+
+        elif choice == "3":
+            selected = choose_packages_common(
+                cfg,
+                "TOGGLE INSTALLED PACKAGES",
+                multi=True,
+                include_discovered=True,
+                installed_only=True,
+            )
             if selected:
-                wanted = set(selected)
-                for tab in cfg.get("tabs", []):
-                    if tab.get("package") in wanted:
-                        tab["enabled"] = not tab.get("enabled", True)
+                configured = {
+                    str(tab.get("package") or ""): tab
+                    for tab in cfg.get("tabs", [])
+                    if isinstance(tab, dict)
+                }
+
+                for package in selected:
+                    tab = configured.get(package)
+                    if tab is None:
+                        tab = _new_tab_for_package(
+                            package,
+                            len(
+                                cfg.get(
+                                    "tabs",
+                                    [],
+                                )
+                            ),
+                        )
+                        cfg.setdefault(
+                            "tabs",
+                            [],
+                        ).append(tab)
+                        configured[package] = tab
+
+                    tab["enabled"] = not bool(
+                        tab.get(
+                            "enabled",
+                            False,
+                        )
+                    )
+
                 save_config(cfg)
+
                 hcfg = load_hatcher_config()
-                sync_hatcher_profiles_with_tabs(cfg, hcfg)
-                print(col("Package enable states updated.", GREEN))
+                sync_hatcher_profiles_with_tabs(
+                    cfg,
+                    hcfg,
+                )
+                save_hatcher_config(hcfg)
+
+                bcfg = load_booster_config()
+                sync_booster_profiles_with_tabs(
+                    cfg,
+                    bcfg,
+                )
+                save_booster_config(bcfg)
+
+                print(
+                    col(
+                        "Installed package states updated.",
+                        GREEN,
+                    )
+                )
                 pause()
-        elif ch == "4":
-            tmpl = add_custom_package_names(cfg)
-            if tmpl:
-                existing = {t.get("package") for t in cfg.get("tabs", [])}
-                added = []
-                for pkg in tmpl.get("packages", []):
-                    if pkg not in existing:
-                        cfg.setdefault("tabs", []).append(_new_tab_for_package(pkg, len(cfg.get("tabs", []))))
-                        existing.add(pkg)
-                        added.append(pkg)
-                save_config(cfg)
-                hcfg = load_hatcher_config()
-                sync_hatcher_profiles_with_tabs(cfg, hcfg)
-                print(col("Added: " + (", ".join(added) if added else "none (already configured)"), GREEN if added else YELLOW))
-                pause()
-        elif ch == "5":
-            selected = choose_packages_common(cfg, "REMOVE FROM NOMO CONFIG", multi=True,
-                                              include_discovered=False, configured_only=True)
+
+        elif choice == "4":
+            selected = choose_packages_common(
+                cfg,
+                "REMOVE SAVED PACKAGES",
+                multi=True,
+                include_discovered=False,
+                configured_only=True,
+            )
             if selected:
-                print(col("This does not uninstall Android apps.", YELLOW))
-                confirm = input(f"Remove {len(selected)} package(s) from NOMO config? [y/N]: ").strip().lower()
+                print(
+                    col(
+                        "This removes NOMO configuration only. "
+                        "Android apps are not uninstalled.",
+                        YELLOW,
+                    )
+                )
+                confirm = input(
+                    f"Remove {len(selected)} saved package(s)? [y/N]: "
+                ).strip().lower()
+
                 if confirm == "y":
-                    wanted = set(selected)
-                    cfg["tabs"] = [t for t in cfg.get("tabs", []) if t.get("package") not in wanted]
-                    save_config(cfg)
-                    hcfg = load_hatcher_config()
-                    sync_hatcher_profiles_with_tabs(cfg, hcfg)
-                    print(col("Removed from NOMO config.", GREEN))
+                    result = remove_packages_from_nomo_config(
+                        cfg,
+                        selected,
+                    )
+                    print(
+                        col(
+                            "Removed: "
+                            + (
+                                ", ".join(
+                                    short_pkg(package)
+                                    for package in result["removed"]
+                                )
+                                or "none"
+                            ),
+                            GREEN,
+                        )
+                    )
                     pause()
-        elif ch == "6":
-            selected = choose_packages_common(cfg, "REFRESH USERNAMES", multi=True,
-                                              include_discovered=False, configured_only=True)
-            if selected:
-                refresh_usernames_for_packages(cfg, selected)
+
+        elif choice == "5":
+            targets = uninstalled_or_invalid_config_packages(
+                cfg
+            )
+
+            if not targets:
+                print(
+                    col(
+                        "No uninstalled or invalid saved entries found.",
+                        GREEN,
+                    )
+                )
                 pause()
-        elif ch == "7":
-            selected = choose_packages_common(cfg, "AUTO-MAP ROBLOXCLONE FOLDERS", multi=True,
-                                              include_discovered=False, configured_only=True)
+                continue
+
+            clear()
+            banner(
+                "CLEAN UNINSTALLED NOMO ENTRIES",
+                cfg,
+            )
+            print(
+                col(
+                    "These entries are not installed on Android:",
+                    YELLOW,
+                )
+            )
+            print("")
+            for package in targets:
+                print(
+                    f"  - {package}"
+                )
+            print("")
+            print(
+                col(
+                    "Their Hatcher/Booster/runtime rows will also be removed.",
+                    DIM,
+                )
+            )
+            print(
+                col(
+                    "Android applications are not uninstalled.",
+                    DIM,
+                )
+            )
+            print("")
+
+            confirm = input(
+                f"Remove all {len(targets)} entries from NOMO? [y/N]: "
+            ).strip().lower()
+
+            if confirm == "y":
+                result = remove_packages_from_nomo_config(
+                    cfg,
+                    targets,
+                )
+                print(
+                    col(
+                        f"Removed {len(result['removed'])} saved entries.",
+                        GREEN,
+                    )
+                )
+                pause()
+
+        elif choice == "6":
+            selected = choose_packages_common(
+                cfg,
+                "REFRESH INSTALLED USERNAMES",
+                multi=True,
+                include_discovered=False,
+                configured_only=True,
+                installed_only=True,
+            )
+            if selected:
+                refresh_usernames_for_packages(
+                    cfg,
+                    selected,
+                )
+                pause()
+
+        elif choice == "7":
+            selected = choose_packages_common(
+                cfg,
+                "AUTO-MAP INSTALLED PACKAGES",
+                multi=True,
+                include_discovered=False,
+                configured_only=True,
+                installed_only=True,
+            )
             if selected:
                 clear()
-                banner("PACKAGE / ROBLOXCLONE MAPPING", cfg)
-                print(col("No apps will be stopped or opened.", DIM))
-                print("")
-                results = auto_map_packages_to_clone_workspaces(
-                    cfg, selected, resolve_api=True, persist=True, verbose=True
+                banner(
+                    "PACKAGE / ROBLOXCLONE MAPPING",
+                    cfg,
                 )
+                print(
+                    col(
+                        "No apps will be stopped or opened.",
+                        DIM,
+                    )
+                )
+                print("")
+
+                results = (
+                    auto_map_packages_to_clone_workspaces(
+                        cfg,
+                        selected,
+                        resolve_api=True,
+                        persist=True,
+                        verbose=True,
+                    )
+                )
+
                 if results:
-                    print(col(f"\nMapped {len(results)} package(s).", GREEN))
-                    print(col("AutoExec and state paths now follow the real RobloxClone folders.", DIM))
+                    print(
+                        col(
+                            f"\nMapped {len(results)} package(s).",
+                            GREEN,
+                        )
+                    )
+                    print(
+                        col(
+                            "AutoExec and state paths now follow "
+                            "the real RobloxClone folders.",
+                            DIM,
+                        )
+                    )
                 pause()
-        else:
-            print(col("Invalid choice.", RED))
-            time.sleep(1)
 
 
 # ============================================================
