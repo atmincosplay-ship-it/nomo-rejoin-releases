@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.58.7 — OPTION 4 ALL INSTALLED USERNAMES
+# - Restores Option 4 as one direct action instead of a submenu.
+# - Detects every actually installed Roblox/Noka package.
+# - Adds the exact installed package ID to NOMO only when missing.
+# - Refreshes username via each package cookie/API with no package selection.
+# - Syncs Main, Hatcher, Booster, Delta state path, and runtime identity.
+# - Never converts package IDs and never uses uninstalled template entries.
+#
 # V4.58.6 — SIMPLE INSTALLED PACKAGE MANAGER
 # - Main Package Manager table shows Android-installed packages only.
 # - Saved/template packages that are not installed are completely hidden.
@@ -269,7 +277,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.58.6"
+__version__ = "V4.58.7"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -4496,51 +4504,115 @@ def manual_delta_mapping(cfg):
     show_delta_mapping(load_config())
 
 
+
+def ensure_installed_packages_for_username_refresh(cfg, installed_packages):
+    """Add exact installed package IDs that are missing from NOMO config."""
+    installed = [
+        str(package or "").strip()
+        for package in (installed_packages or [])
+        if str(package or "").strip()
+    ]
+    existing = {
+        str(tab.get("package") or ""): tab
+        for tab in cfg.get("tabs", [])
+        if isinstance(tab, dict)
+        and str(tab.get("package") or "")
+    }
+
+    added = []
+    for package in installed:
+        if package in existing:
+            continue
+
+        tab = _new_tab_for_package(
+            package,
+            len(cfg.get("tabs", [])),
+        )
+        tab["enabled"] = True
+        cfg.setdefault("tabs", []).append(tab)
+        existing[package] = tab
+        added.append(package)
+
+    if added:
+        save_config(cfg)
+
+        hcfg = load_hatcher_config()
+        sync_hatcher_profiles_with_tabs(cfg, hcfg)
+        save_hatcher_config(hcfg)
+
+        bcfg = load_booster_config()
+        sync_booster_profiles_with_tabs(cfg, bcfg)
+        save_booster_config(bcfg)
+
+    return added
+
+
 def get_all_usernames_via_api(cfg=None):
+    """Option 4: refresh every actually installed package in one action."""
     cfg = load_config() if cfg is None else cfg
+    installed = get_installed_packages()
 
-    while True:
-        clear()
-        banner("USERNAME / DELTA MAPPING", cfg)
-        print("1. Auto refresh + sync every system")
-        print("2. Manual Delta mapping + sync every system")
-        print("3. Show Delta Global mapping")
-        print("0. Back")
-        drain_stdin()
-        choice = clean_terminal_input(input("\nChoose: "))
+    clear()
+    banner("GET USERNAME — ALL INSTALLED", cfg)
 
-        if choice == "0":
-            return
-        if choice == "1":
-            selected = choose_packages_common(
-                cfg,
-                "REFRESH USERNAMES",
-                multi=True,
-                include_discovered=False,
-                configured_only=True,
+    if not installed:
+        print(col("No installed Roblox/Noka packages detected.", RED))
+        pause()
+        return False
+
+    print(
+        col(
+            f"Detected {len(installed)} installed package(s).",
+            GREEN,
+        )
+    )
+    print(
+        col(
+            "Exact Android package IDs only; no template entries or ID conversion.",
+            DIM,
+        )
+    )
+    print("")
+
+    added = ensure_installed_packages_for_username_refresh(
+        cfg,
+        installed,
+    )
+
+    if added:
+        print(
+            col(
+                "Added to NOMO: "
+                + ", ".join(
+                    short_pkg(package)
+                    for package in added
+                ),
+                CYAN,
             )
-            if selected:
-                clear()
-                banner("REFRESH USERNAMES", cfg)
-                print(col(
-                    "Delta: package API only; shared-state fallback disabled.",
-                    DIM,
-                ))
-                refresh_usernames_for_packages(cfg, selected)
-                cfg = load_config()
-                pause()
-            continue
-        if choice == "2":
-            manual_delta_mapping(cfg)
-            cfg = load_config()
-            continue
-        if choice == "3":
-            show_delta_mapping(cfg)
-            cfg = load_config()
-            continue
+        )
+        print("")
+        cfg = load_config()
 
-        print(col("Invalid choice.", RED))
-        time.sleep(1)
+    changed = refresh_usernames_for_packages(
+        cfg,
+        installed,
+    )
+
+    print("")
+    print(
+        col(
+            f"Finished all {len(installed)} installed package(s).",
+            GREEN,
+        )
+    )
+    print(
+        col(
+            "Main / Hatcher / Booster / Delta identity sync completed.",
+            DIM,
+        )
+    )
+    pause()
+    return changed or bool(added)
 
 
 def resolve_usernames_auto(cfg, hcfg=None, rt=None, force=False, quiet=True):
