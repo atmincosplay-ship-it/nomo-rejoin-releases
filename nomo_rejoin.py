@@ -1,4 +1,32 @@
 #!/usr/bin/env python3
+# V4.48 — APK INSTALL / UNINSTALL MODES
+# - NEW: APK install behavior: install-only, uninstall-first, or ask per APK.
+# - NEW: Default ask-per-APK mode asks Y/N before removing the matching package.
+# - NEW: Uninstall-only tool selects exact installed Roblox/Noka packages.
+# - SAFE: Uninstall is always exact-package and requires explicit confirmation.
+# - SAFE: Choosing N keeps app data and continues with pm install -r.
+# - WARNING: Choosing Y removes that package's app data/cookies before install.
+# - KEEP: Direct/GitHub/GoFile downloads, Delta tools, and exact-PID recovery.
+#
+# V4.47 — APK DOWNLOAD / INSTALL TOOLS
+# - NEW: Main menu Option 18 downloads and installs APKs from direct URLs.
+# - NEW: Supports direct APK/ZIP links from any HTTPS host with redirects.
+# - NEW: Supports all APK/ZIP assets from a public GitHub latest release.
+# - NEW: Supports GoFile folder/share lookup through an official API token.
+# - NEW: Installs all APKs from a local folder, sequentially with pm install -r.
+# - SAFE: ZIP extraction accepts APK files only and rejects traversal entries.
+# - SAFE: APKs are ZIP-signature checked before installation.
+# - KEEP: Delta workspace tools, cookie setup, exact-PID rules, and stable v3.9.
+#
+# V4.46 — DELTA WORKSPACE ZIP TOOLS
+# - NEW: Main menu Option 17 imports config/workspace ZIPs into Delta Workspace.
+# - NEW: Recognizes Arceus X/Workspace/, Delta/Workspace/, Workspace/, or
+#        already-flat workspace archive layouts.
+# - NEW: Existing destination files that will be overwritten are backed up first.
+# - NEW: Manual export creates a timestamped Delta Workspace ZIP.
+# - SAFE: ZIP paths are normalized and traversal/symlink entries are rejected.
+# - KEEP: Delta global setup, cookie first-launch OK handler, and exact-PID rules.
+#
 # V4.45 — COOKIE FIRST-LAUNCH OK HANDLER
 # - FIX: A fresh clone with no WebView Cookies DB is initialized automatically.
 # - NEW: After first launch, NOMO waits 3 seconds and taps the Delta/clone OK
@@ -138,7 +166,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.45"
+__version__ = "V4.48"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -148,6 +176,12 @@ DELTA_GLOBAL_ROOT = Path("/storage/emulated/0/Delta")
 DELTA_GLOBAL_AUTOEXEC_DIR = DELTA_GLOBAL_ROOT / "Autoexecute"
 DELTA_GLOBAL_WORKSPACE_DIR = DELTA_GLOBAL_ROOT / "Workspace"
 DELTA_GLOBAL_STATE_DIR = DELTA_GLOBAL_WORKSPACE_DIR / "nomo_rejoiner"
+DELTA_WORKSPACE_DEFAULT_IMPORT_ZIP = Path("/storage/emulated/0/Download/config.zip")
+DELTA_WORKSPACE_EXPORT_DIR = BASE_DIR / "workspace_exports"
+DELTA_WORKSPACE_BACKUP_DIR = BASE_DIR / "workspace_backups"
+
+APK_DOWNLOAD_DIR = Path("/storage/emulated/0/Download/NOMO_APK")
+APK_EXTRACT_DIR = APK_DOWNLOAD_DIR / "_extracted"
 NOMO_BACKUP_DIR = BASE_DIR / "backups"
 NOMO_UPDATE_URL = (
     "https://raw.githubusercontent.com/atmincosplay-ship-it/"
@@ -332,6 +366,15 @@ DEFAULT_CONFIG = {
     # Selected by Option 13. Existing devices remain auto/per-clone until setup
     # explicitly chooses Delta Global.
     "executor_storage_mode": "auto",
+
+    # Optional token for private GitHub release assets. Public release assets do
+    # not need this. GoFile tokens are requested interactively and not saved.
+    "github_download_token": "",
+
+    # install_only    = always pm install -r
+    # uninstall_first = remove detected exact package first, then install
+    # ask_each        = ask Y/N before uninstalling each detected package
+    "apk_install_mode": "ask_each",
 
     "cookie_webhook_url": "",   # stored locally, never hardcoded
 
@@ -2863,6 +2906,8 @@ MAIN_MENU_ITEMS = [
     ("14", "Export diagnostics ZIP"),
     ("15", "NOMO update manager"),
     ("16", "Layout / visual CAPTCHA"),
+    ("17", "Workspace ZIP tools"),
+    ("18", "APK download / install"),
     ("0",  "Exit"),
 ]
 
@@ -11496,6 +11541,1043 @@ def auto_map_packages_to_clone_workspaces(
             print(col(f"  {result['state_file']}", DIM))
     return results
 
+
+
+
+
+def _safe_download_filename(value, fallback="download.bin"):
+    name = str(value or "").replace("\\", "/").split("/")[-1].strip()
+    name = urllib.parse.unquote(name)
+    name = re.sub(r"[\x00-\x1f<>:\"/\\|?*]+", "_", name).strip(" .")
+    return name[:180] or fallback
+
+
+def _filename_from_response(response, url, fallback="download.bin"):
+    disposition = str(response.headers.get("Content-Disposition", "") or "")
+    match = re.search(r"filename\*=UTF-8''([^;]+)", disposition, re.I)
+    if match:
+        return _safe_download_filename(match.group(1), fallback)
+    match = re.search(r'filename="?([^";]+)"?', disposition, re.I)
+    if match:
+        return _safe_download_filename(match.group(1), fallback)
+
+    final_url = str(getattr(response, "url", "") or url)
+    parsed_name = Path(urllib.parse.urlparse(final_url).path).name
+    return _safe_download_filename(parsed_name, fallback)
+
+
+def download_url_to_apk_dir(url, filename=None, headers=None):
+    """Download a redirecting HTTP(S) URL into NOMO_APK using a .part file."""
+    url = str(url or "").strip()
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return False, "Only http/https URLs are supported.", None
+
+    APK_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    request_headers = {
+        "User-Agent": "NOMO-Rejoin/4.47 Android-Termux",
+        "Accept": "application/octet-stream,*/*",
+    }
+    request_headers.update(headers or {})
+
+    request = urllib.request.Request(url, headers=request_headers)
+    try:
+        response = urllib.request.urlopen(request, timeout=60)
+    except urllib.error.HTTPError as exc:
+        return False, f"HTTP {exc.code}: {exc.reason}", None
+    except Exception as exc:
+        return False, f"Download connection failed: {exc}", None
+
+    try:
+        resolved_name = _safe_download_filename(
+            filename or _filename_from_response(response, url),
+            "download.bin",
+        )
+        destination = APK_DOWNLOAD_DIR / resolved_name
+        temporary = destination.with_name(destination.name + ".part")
+
+        total = int(response.headers.get("Content-Length", 0) or 0)
+        downloaded = 0
+        last_report = 0
+        with open(temporary, "wb") as handle:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                handle.write(chunk)
+                downloaded += len(chunk)
+                if downloaded - last_report >= 5 * 1024 * 1024:
+                    if total > 0:
+                        pct = min(100, int(downloaded * 100 / total))
+                        print(
+                            f"  Downloaded {downloaded // 1048576} MB / "
+                            f"{total // 1048576} MB ({pct}%)"
+                        )
+                    else:
+                        print(f"  Downloaded {downloaded // 1048576} MB")
+                    last_report = downloaded
+
+        if downloaded <= 0:
+            try:
+                temporary.unlink()
+            except Exception:
+                pass
+            return False, "Downloaded file was empty.", None
+
+        os.replace(str(temporary), str(destination))
+        return True, f"Downloaded {downloaded} bytes", destination
+    except Exception as exc:
+        return False, f"Download write failed: {exc}", None
+    finally:
+        try:
+            response.close()
+        except Exception:
+            pass
+
+
+def _safe_extract_apks_from_zip(zip_path):
+    """Extract APK members only, with safe flattened names."""
+    zip_path = Path(zip_path)
+    APK_EXTRACT_DIR.mkdir(parents=True, exist_ok=True)
+    extract_root = APK_EXTRACT_DIR / re.sub(
+        r"[^A-Za-z0-9._-]+", "_", zip_path.stem
+    )
+    if extract_root.exists():
+        shutil.rmtree(extract_root, ignore_errors=True)
+    extract_root.mkdir(parents=True, exist_ok=True)
+
+    extracted = []
+    try:
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            for info in archive.infolist():
+                if info.is_dir() or _workspace_zip_is_symlink(info):
+                    continue
+                raw = str(info.filename or "").replace("\\", "/")
+                parts = [part for part in raw.split("/") if part not in ("", ".")]
+                if ".." in parts:
+                    continue
+                if not parts or not parts[-1].lower().endswith(".apk"):
+                    continue
+
+                base_name = _safe_download_filename(parts[-1], "package.apk")
+                target = extract_root / base_name
+                counter = 2
+                while target.exists():
+                    target = extract_root / (
+                        f"{Path(base_name).stem}_{counter}{Path(base_name).suffix}"
+                    )
+                    counter += 1
+
+                with archive.open(info, "r") as src, open(target, "wb") as dst:
+                    shutil.copyfileobj(src, dst, length=1024 * 1024)
+                extracted.append(target)
+    except zipfile.BadZipFile:
+        return False, "Invalid ZIP archive.", []
+    except Exception as exc:
+        return False, f"ZIP extraction failed: {exc}", []
+
+    if not extracted:
+        return False, "No APK files were found inside the ZIP.", []
+    return True, f"Extracted {len(extracted)} APK files.", extracted
+
+
+def _collect_installable_apks(downloaded_path):
+    path = Path(downloaded_path)
+    lower = path.name.lower()
+    if lower.endswith(".apk"):
+        return True, "APK ready.", [path]
+    if lower.endswith(".zip"):
+        return _safe_extract_apks_from_zip(path)
+
+    if zipfile.is_zipfile(path):
+        try:
+            with zipfile.ZipFile(path, "r") as archive:
+                names = set(archive.namelist())
+            if "AndroidManifest.xml" in names:
+                renamed = path.with_suffix(".apk")
+                if renamed != path:
+                    os.replace(str(path), str(renamed))
+                return True, "APK detected by signature.", [renamed]
+        except Exception:
+            pass
+
+    return False, f"Unsupported download type: {path.name}", []
+
+
+def _apk_signature_valid(path):
+    path = Path(path)
+    if not path.is_file() or path.stat().st_size <= 0:
+        return False
+    try:
+        with zipfile.ZipFile(path, "r") as archive:
+            return "AndroidManifest.xml" in set(archive.namelist())
+    except Exception:
+        return False
+
+
+def _valid_android_package_name(value):
+    return bool(re.fullmatch(r"[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+", str(value or "")))
+
+
+def apk_package_name(path):
+    """Best-effort package-name detection without installing the APK."""
+    path = Path(path)
+    quoted = shlex.quote(str(path))
+
+    commands = (
+        (
+            f"aapt dump badging {quoted} 2>/dev/null | "
+            r"""sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -n 1"""
+        ),
+        (
+            f"aapt2 dump badging {quoted} 2>/dev/null | "
+            r"""sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -n 1"""
+        ),
+        f"apkanalyzer manifest application-id {quoted} 2>/dev/null | head -n 1",
+    )
+
+    for command in commands:
+        try:
+            result = subprocess.run(
+                command,
+                shell=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=20,
+            )
+            candidate = str(result.stdout or "").strip().splitlines()
+            candidate = candidate[0].strip() if candidate else ""
+            if _valid_android_package_name(candidate):
+                return candidate, "manifest tool"
+        except Exception:
+            pass
+
+    # Known NOMO clone filename fallback:
+    # Noka Delta Lite [Nomozo] 1.apk -> premium.nokaA ... 8.apk -> premium.nokaH
+    name = path.name
+    number_match = re.search(
+        r"noka.*?(?:nomozo.*?)?\s([1-8])(?:\D|$)",
+        name,
+        re.I,
+    )
+    if number_match:
+        suffix = chr(ord("A") + int(number_match.group(1)) - 1)
+        return f"premium.noka{suffix}", "NOMO filename mapping"
+
+    suffix_match = re.search(r"(?:premium[._-]?noka|noka)\s*([A-H])(?:\D|$)", name, re.I)
+    if suffix_match:
+        return f"premium.noka{suffix_match.group(1).upper()}", "filename suffix"
+
+    return "", "package name unavailable"
+
+
+def exact_package_installed(package):
+    if not _valid_android_package_name(package):
+        return False
+    command = f"pm path {shlex.quote(package)}"
+    try:
+        result = subprocess.run(
+            ["su", "-c", command],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=15,
+        )
+        return result.returncode == 0 and "package:" in str(result.stdout or "")
+    except Exception:
+        return False
+
+
+def uninstall_exact_package(package):
+    """Uninstall one exact package. This removes its Android app data."""
+    package = str(package or "").strip()
+    if not _valid_android_package_name(package):
+        return False, f"Invalid package name: {package!r}"
+
+    if not exact_package_installed(package):
+        return True, f"Not installed: {package}"
+
+    command = f"pm uninstall {shlex.quote(package)}"
+    try:
+        result = subprocess.run(
+            ["su", "-c", command],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=180,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"Uninstall timed out: {package}"
+    except Exception as exc:
+        return False, f"Uninstall failed: {package}: {exc}"
+
+    output = str(result.stdout or "").strip()
+    if result.returncode == 0 and "success" in output.lower():
+        return True, f"Uninstalled: {package}"
+    return False, f"{package}: {output or 'pm uninstall failed'}"
+
+
+def install_apk_file(path):
+    path = Path(path)
+    if not _apk_signature_valid(path):
+        return False, f"Not a valid APK: {path.name}"
+
+    command = f"pm install -r {shlex.quote(str(path))}"
+    try:
+        result = subprocess.run(
+            ["su", "-c", command],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=300,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"Install timed out: {path.name}"
+    except Exception as exc:
+        return False, f"Install failed: {path.name}: {exc}"
+
+    output = str(result.stdout or "").strip()
+    if result.returncode == 0 and "success" in output.lower():
+        return True, f"Installed: {path.name}"
+    return False, f"{path.name}: {output or 'pm install failed'}"
+
+
+def _normalized_apk_install_mode(cfg):
+    mode = str((cfg or {}).get("apk_install_mode", "ask_each") or "ask_each").strip().lower()
+    if mode not in {"install_only", "uninstall_first", "ask_each"}:
+        mode = "ask_each"
+    return mode
+
+
+def _apk_install_mode_label(mode):
+    return {
+        "install_only": "Install only",
+        "uninstall_first": "Always uninstall matching package first",
+        "ask_each": "Ask Y/N before uninstalling each APK",
+    }.get(mode, "Ask Y/N before uninstalling each APK")
+
+
+def choose_apk_install_mode(cfg):
+    current = _normalized_apk_install_mode(cfg)
+    while True:
+        clear()
+        banner("APK INSTALL BEHAVIOR", cfg)
+        print(f"Current: {_apk_install_mode_label(current)}")
+        print("")
+        print("1. Install only")
+        print("   Keeps existing app data and runs: pm install -r")
+        print("")
+        print("2. Uninstall matching package first, then install")
+        print("   WARNING: deletes that package's app data and cookies.")
+        print("")
+        print("3. Ask Y/N before uninstalling each APK")
+        print("   Y = uninstall exact matching package, then install")
+        print("   N = keep data and use pm install -r")
+        print("")
+        print("0. Back")
+        drain_stdin()
+        choice = clean_terminal_input(input("\nChoose: "))
+
+        mapping = {
+            "1": "install_only",
+            "2": "uninstall_first",
+            "3": "ask_each",
+        }
+        if choice == "0":
+            return current
+        if choice in mapping:
+            current = mapping[choice]
+            cfg["apk_install_mode"] = current
+            save_config(cfg)
+            print(col(f"Saved: {_apk_install_mode_label(current)}", GREEN))
+            time.sleep(1)
+            return current
+        print(col("Invalid choice.", RED))
+        time.sleep(1)
+
+
+def install_apk_batch(paths, cfg=None):
+    cfg = cfg or load_config()
+    mode = _normalized_apk_install_mode(cfg)
+
+    unique = []
+    seen = set()
+    for value in paths:
+        path = Path(value)
+        key = str(path.resolve()) if path.exists() else str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+
+    unique.sort(key=lambda path: natural_package_key(path.name))
+    installed = 0
+    failed = 0
+    results = []
+
+    print(col(f"Install behavior: {_apk_install_mode_label(mode)}", CYAN))
+
+    for index, path in enumerate(unique, 1):
+        package, detected_by = apk_package_name(path)
+        installed_match = bool(package and exact_package_installed(package))
+
+        print("")
+        print(col(f"[{index}/{len(unique)}] {path.name}", BOLD))
+        if package:
+            print(f"  Package: {package} ({detected_by})")
+        else:
+            print(col("  Package: could not detect; uninstall step unavailable", YELLOW))
+
+        should_uninstall = False
+        if installed_match and mode == "uninstall_first":
+            should_uninstall = True
+        elif installed_match and mode == "ask_each":
+            print(col(
+                f"WARNING: uninstalling {package} deletes its app data/cookie.",
+                YELLOW,
+            ))
+            should_uninstall = _setup_yes_no(
+                f"Uninstall {package} before installing this APK?",
+                default=False,
+            )
+
+        if should_uninstall:
+            ok_remove, remove_note = uninstall_exact_package(package)
+            print(col(remove_note, GREEN if ok_remove else RED))
+            if not ok_remove:
+                failed += 1
+                results.append((path, False, remove_note))
+                continue
+        elif installed_match:
+            print(col(f"Keeping installed data for {package}.", DIM))
+
+        print(col(f"Installing {path.name}...", CYAN))
+        ok, note = install_apk_file(path)
+        print(col(note, GREEN if ok else RED))
+        results.append((path, ok, note))
+        if ok:
+            installed += 1
+        else:
+            failed += 1
+
+    return installed, failed, results
+
+
+def uninstall_only_menu(cfg):
+    selected = choose_packages_common(
+        cfg,
+        title="UNINSTALL PACKAGES ONLY",
+        multi=True,
+        installed_only=True,
+        include_discovered=True,
+        allow_all=True,
+    )
+    if not selected:
+        return
+
+    clear()
+    banner("CONFIRM UNINSTALL ONLY", cfg)
+    print(col("This removes the selected apps AND their app data/cookies.", RED))
+    print("")
+    for package in selected:
+        print(f"  - {package}")
+    print("")
+
+    if not _setup_yes_no(
+        f"Uninstall these {len(selected)} exact packages?",
+        default=False,
+    ):
+        print(col("Uninstall cancelled.", YELLOW))
+        pause()
+        return
+
+    removed = 0
+    failed = 0
+    for index, package in enumerate(selected, 1):
+        print(col(f"[{index}/{len(selected)}] Uninstalling {package}...", CYAN))
+        ok, note = uninstall_exact_package(package)
+        print(col(note, GREEN if ok else RED))
+        if ok:
+            removed += 1
+        else:
+            failed += 1
+
+    print("")
+    print(col(
+        f"Finished: {removed} removed, {failed} failed.",
+        GREEN if failed == 0 else YELLOW,
+    ))
+    pause()
+
+
+def _github_repo_parts(value):
+    raw = str(value or "").strip().rstrip("/")
+    match = re.search(r"github\.com/([^/]+)/([^/#?]+)", raw, re.I)
+    if match:
+        return match.group(1), re.sub(r"\.git$", "", match.group(2))
+    if "/" in raw and not raw.startswith(("http://", "https://")):
+        owner, repo = raw.split("/", 1)
+        return owner.strip(), re.sub(r"\.git$", "", repo.strip())
+    return None, None
+
+
+def github_latest_release_assets(repo_value, token=""):
+    owner, repo = _github_repo_parts(repo_value)
+    if not owner or not repo:
+        return False, "Use owner/repo or a GitHub repository URL.", []
+
+    url = f"https://api.github.com/repos/{owner}/{repo}/releases/latest"
+    headers = {
+        "User-Agent": "NOMO-Rejoin/4.47",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2026-03-10",
+    }
+    token = str(token or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as exc:
+        return False, f"GitHub API HTTP {exc.code}: {exc.reason}", []
+    except Exception as exc:
+        return False, f"GitHub release lookup failed: {exc}", []
+
+    assets = []
+    for asset in payload.get("assets", []) or []:
+        name = str(asset.get("name", "") or "")
+        download_url = str(asset.get("browser_download_url", "") or "")
+        if download_url and name.lower().endswith((".apk", ".zip")):
+            assets.append({
+                "name": name,
+                "url": download_url,
+                "size": int(asset.get("size", 0) or 0),
+            })
+
+    if not assets:
+        return False, "Latest release has no APK or ZIP assets.", []
+    return True, f"Found {len(assets)} release assets.", assets
+
+
+def _gofile_content_id(value):
+    raw = str(value or "").strip()
+    match = re.search(r"gofile\.io/d/([A-Za-z0-9_-]+)", raw, re.I)
+    if match:
+        return match.group(1)
+    if re.fullmatch(r"[A-Za-z0-9_-]{5,}", raw):
+        return raw
+    return ""
+
+
+def _gofile_collect_assets(payload):
+    found = []
+    seen_urls = set()
+
+    def walk(value):
+        if isinstance(value, dict):
+            name = str(
+                value.get("name")
+                or value.get("fileName")
+                or value.get("filename")
+                or ""
+            )
+            if name.lower().endswith((".apk", ".zip")):
+                for key in (
+                    "link",
+                    "downloadLink",
+                    "downloadUrl",
+                    "directLink",
+                    "directUrl",
+                    "url",
+                ):
+                    candidate = value.get(key)
+                    if isinstance(candidate, str) and candidate.startswith(
+                        ("http://", "https://")
+                    ):
+                        if candidate not in seen_urls:
+                            seen_urls.add(candidate)
+                            found.append({
+                                "name": _safe_download_filename(
+                                    name, "gofile.bin"
+                                ),
+                                "url": candidate,
+                                "size": int(value.get("size", 0) or 0),
+                            })
+                        break
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(payload)
+    return found
+
+
+def gofile_share_assets(share_value, token):
+    content_id = _gofile_content_id(share_value)
+    if not content_id:
+        return False, "Invalid GoFile share URL/content ID.", []
+
+    token = str(token or "").strip()
+    if not token:
+        return False, "GoFile API token is required.", []
+
+    url = (
+        f"https://api.gofile.io/contents/{urllib.parse.quote(content_id)}"
+        "?maxdepth=5&pageSize=1000"
+    )
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "NOMO-Rejoin/4.47",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as exc:
+        return False, f"GoFile API HTTP {exc.code}: {exc.reason}", []
+    except Exception as exc:
+        return False, f"GoFile lookup failed: {exc}", []
+
+    assets = _gofile_collect_assets(payload)
+    if not assets:
+        return False, (
+            "No downloadable APK/ZIP link was exposed by the API. "
+            "Use a GoFile direct link or a Premium direct-link API."
+        ), []
+    return True, f"Found {len(assets)} GoFile assets.", assets
+
+
+def _download_assets_then_install(assets, extra_headers=None, cfg=None):
+    downloaded = []
+    for index, asset in enumerate(assets, 1):
+        name = _safe_download_filename(asset.get("name"), f"asset_{index}.bin")
+        url = str(asset.get("url") or "")
+        size = int(asset.get("size", 0) or 0)
+        size_note = f" ({size // 1048576} MB)" if size > 0 else ""
+        print(col(
+            f"[{index}/{len(assets)}] Downloading {name}{size_note}...",
+            CYAN,
+        ))
+        ok, note, path = download_url_to_apk_dir(
+            url, filename=name, headers=extra_headers
+        )
+        print(col(note, GREEN if ok else RED))
+        if not ok or not path:
+            continue
+        collect_ok, collect_note, apks = _collect_installable_apks(path)
+        print(col(collect_note, GREEN if collect_ok else RED))
+        if collect_ok:
+            downloaded.extend(apks)
+
+    if not downloaded:
+        print(col("No installable APK files were downloaded.", RED))
+        return 0, 0
+    installed, failed, _ = install_apk_batch(downloaded, cfg=cfg)
+    return installed, failed
+
+
+def apk_download_install_menu(cfg):
+    while True:
+        cfg = load_config()
+        install_mode = _normalized_apk_install_mode(cfg)
+
+        clear()
+        banner("APK DOWNLOAD / INSTALL", cfg)
+        print(f"Download folder : {APK_DOWNLOAD_DIR}")
+        print(f"Install behavior: {_apk_install_mode_label(install_mode)}")
+        print("")
+        print("1. Direct APK/ZIP URL -> download + install")
+        print("2. GitHub latest release -> download + install all APK/ZIP assets")
+        print("3. GoFile share -> API token lookup + download + install")
+        print("4. Install APKs from a local folder")
+        print("5. Uninstall installed packages only")
+        print("6. Change install/uninstall behavior")
+        print("7. Show download folder")
+        print("0. Back")
+        drain_stdin()
+        choice = clean_terminal_input(input("\nChoose: "))
+
+        if choice == "0":
+            return
+
+        if choice == "1":
+            url = clean_terminal_input(input("Direct APK/ZIP URL: "))
+            if not url:
+                continue
+            print(col("Downloading...", CYAN))
+            ok, note, path = download_url_to_apk_dir(url)
+            print(col(note, GREEN if ok else RED))
+            if not ok or not path:
+                pause()
+                continue
+            collect_ok, collect_note, apks = _collect_installable_apks(path)
+            print(col(collect_note, GREEN if collect_ok else RED))
+            if collect_ok and _setup_yes_no("Install now?", default=True):
+                installed, failed, _ = install_apk_batch(apks, cfg=cfg)
+                print(col(
+                    f"Finished: {installed} installed, {failed} failed.",
+                    GREEN if failed == 0 else YELLOW,
+                ))
+            pause()
+            continue
+
+        if choice == "2":
+            repo = clean_terminal_input(input(
+                "GitHub repository [owner/repo or URL]: "
+            ))
+            if not repo:
+                continue
+            token = str(cfg.get("github_download_token", "") or "").strip()
+            ok, note, assets = github_latest_release_assets(repo, token)
+            print(col(note, GREEN if ok else RED))
+            if not ok:
+                pause()
+                continue
+            for index, asset in enumerate(assets, 1):
+                print(
+                    f"  {index}. {asset['name']} "
+                    f"({int(asset.get('size', 0)) // 1048576} MB)"
+                )
+            if not _setup_yes_no(
+                "Download and install all listed assets?", default=True
+            ):
+                continue
+            installed, failed = _download_assets_then_install(
+                assets,
+                cfg=cfg,
+            )
+            print(col(
+                f"Finished: {installed} installed, {failed} failed.",
+                GREEN if failed == 0 else YELLOW,
+            ))
+            pause()
+            continue
+
+        if choice == "3":
+            share = clean_terminal_input(input("GoFile share URL/content ID: "))
+            if not share:
+                continue
+            token = getpass.getpass("GoFile API token: ").strip()
+            ok, note, assets = gofile_share_assets(share, token)
+            print(col(note, GREEN if ok else RED))
+            if not ok:
+                pause()
+                continue
+            for index, asset in enumerate(assets, 1):
+                print(f"  {index}. {asset['name']}")
+            if not _setup_yes_no(
+                "Download and install all listed assets?", default=True
+            ):
+                continue
+            installed, failed = _download_assets_then_install(
+                assets,
+                extra_headers={"Authorization": f"Bearer {token}"},
+                cfg=cfg,
+            )
+            print(col(
+                f"Finished: {installed} installed, {failed} failed.",
+                GREEN if failed == 0 else YELLOW,
+            ))
+            pause()
+            continue
+
+        if choice == "4":
+            raw = clean_terminal_input(input(
+                f"APK folder [ENTER={APK_DOWNLOAD_DIR}]: "
+            ))
+            folder = Path(raw) if raw else APK_DOWNLOAD_DIR
+            if not folder.exists() or not folder.is_dir():
+                print(col(f"Folder not found: {folder}", RED))
+                pause()
+                continue
+            apks = sorted(
+                folder.glob("*.apk"),
+                key=lambda p: natural_package_key(p.name),
+            )
+            if not apks:
+                print(col("No APK files found in that folder.", RED))
+                pause()
+                continue
+            print(f"Found {len(apks)} APK files.")
+            if _setup_yes_no("Install all now?", default=True):
+                installed, failed, _ = install_apk_batch(apks, cfg=cfg)
+                print(col(
+                    f"Finished: {installed} installed, {failed} failed.",
+                    GREEN if failed == 0 else YELLOW,
+                ))
+            pause()
+            continue
+
+        if choice == "5":
+            uninstall_only_menu(cfg)
+            continue
+
+        if choice == "6":
+            choose_apk_install_mode(cfg)
+            continue
+
+        if choice == "7":
+            APK_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+            print(APK_DOWNLOAD_DIR)
+            pause()
+            continue
+
+        print(col("Invalid choice.", RED))
+        time.sleep(1)
+
+
+def _workspace_zip_relative_path(member_name):
+    """Return safe destination-relative path for supported workspace ZIP layouts."""
+    raw = str(member_name or "").replace("\\", "/").lstrip("/")
+    while raw.startswith("./"):
+        raw = raw[2:]
+
+    prefixes = (
+        "Arceus X/Workspace/",
+        "Delta/Workspace/",
+        "Workspace/",
+    )
+    relative = raw
+    for prefix in prefixes:
+        if raw.lower().startswith(prefix.lower()):
+            relative = raw[len(prefix):]
+            break
+
+    relative = relative.strip("/")
+    if not relative:
+        return None
+
+    parts = []
+    for part in relative.split("/"):
+        part = part.strip()
+        if not part or part == ".":
+            continue
+        if part == "..":
+            return None
+        if "\x00" in part:
+            return None
+        parts.append(part)
+
+    if not parts:
+        return None
+    return Path(*parts)
+
+
+def _workspace_zip_is_symlink(info):
+    try:
+        mode = (int(info.external_attr) >> 16) & 0o170000
+        return mode == 0o120000
+    except Exception:
+        return False
+
+
+def _workspace_zip_members(zip_path):
+    """Return supported, safe file members as (ZipInfo, relative Path)."""
+    items = []
+    with zipfile.ZipFile(zip_path, "r") as archive:
+        for info in archive.infolist():
+            if info.is_dir() or _workspace_zip_is_symlink(info):
+                continue
+            relative = _workspace_zip_relative_path(info.filename)
+            if relative is None:
+                continue
+            items.append((info, relative))
+    return items
+
+
+def import_workspace_zip_to_delta(zip_path, *, make_backup=True):
+    """Import a supported config/workspace ZIP into Delta's global Workspace."""
+    zip_path = Path(zip_path).expanduser()
+    if not zip_path.exists() or not zip_path.is_file():
+        return False, f"ZIP not found: {zip_path}", None
+
+    try:
+        members = _workspace_zip_members(zip_path)
+    except zipfile.BadZipFile:
+        return False, "Invalid or damaged ZIP file.", None
+    except Exception as exc:
+        return False, f"Could not inspect ZIP: {exc}", None
+
+    if not members:
+        return False, (
+            "No workspace files found. Supported layouts: "
+            "Arceus X/Workspace/, Delta/Workspace/, Workspace/, or flat files."
+        ), None
+
+    DELTA_GLOBAL_WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
+    overwritten = []
+    for _, relative in members:
+        target = DELTA_GLOBAL_WORKSPACE_DIR / relative
+        if target.exists() and target.is_file():
+            overwritten.append(relative)
+
+    backup_path = None
+    if make_backup and overwritten:
+        DELTA_WORKSPACE_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = DELTA_WORKSPACE_BACKUP_DIR / f"delta_overwrite_backup_{stamp}.zip"
+        with zipfile.ZipFile(
+            backup_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
+        ) as backup:
+            for relative in overwritten:
+                existing = DELTA_GLOBAL_WORKSPACE_DIR / relative
+                if existing.exists() and existing.is_file():
+                    backup.write(existing, arcname=str(relative).replace("\\", "/"))
+
+    imported = 0
+    with zipfile.ZipFile(zip_path, "r") as archive:
+        for info, relative in members:
+            target = DELTA_GLOBAL_WORKSPACE_DIR / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temporary = target.with_name(target.name + ".nomo_import_tmp")
+            try:
+                with archive.open(info, "r") as src, open(temporary, "wb") as dst:
+                    shutil.copyfileobj(src, dst, length=1024 * 1024)
+                os.replace(str(temporary), str(target))
+                imported += 1
+            finally:
+                try:
+                    if temporary.exists():
+                        temporary.unlink()
+                except Exception:
+                    pass
+
+    note = (
+        f"Imported {imported} files into {DELTA_GLOBAL_WORKSPACE_DIR}; "
+        f"overwritten {len(overwritten)}"
+    )
+    return True, note, backup_path
+
+
+def export_delta_workspace_zip():
+    """Export the current Delta global Workspace to a timestamped ZIP."""
+    if not DELTA_GLOBAL_WORKSPACE_DIR.exists():
+        return False, f"Workspace not found: {DELTA_GLOBAL_WORKSPACE_DIR}", None, 0
+
+    files = sorted(
+        path for path in DELTA_GLOBAL_WORKSPACE_DIR.rglob("*")
+        if path.is_file() and not path.name.endswith(".nomo_import_tmp")
+    )
+    if not files:
+        return False, "Delta Workspace is empty.", None, 0
+
+    DELTA_WORKSPACE_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output = DELTA_WORKSPACE_EXPORT_DIR / f"delta_workspace_{stamp}.zip"
+
+    with zipfile.ZipFile(
+        output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
+    ) as archive:
+        for path in files:
+            relative = path.relative_to(DELTA_GLOBAL_WORKSPACE_DIR)
+            archive.write(
+                path,
+                arcname=f"Delta/Workspace/{str(relative).replace(chr(92), '/')}",
+            )
+
+    return True, f"Exported {len(files)} files.", output, len(files)
+
+
+def workspace_zip_tools_menu(cfg):
+    while True:
+        clear()
+        banner("WORKSPACE ZIP TOOLS", cfg)
+        print(f"Delta Workspace: {DELTA_GLOBAL_WORKSPACE_DIR}")
+        print("")
+        print("1. Import config/workspace ZIP -> Delta Workspace")
+        print("2. Export Delta Workspace -> timestamped ZIP")
+        print("3. Show supported ZIP layouts")
+        print("0. Back")
+        drain_stdin()
+        choice = clean_terminal_input(input("\nChoose: "))
+
+        if choice == "0":
+            return
+
+        if choice == "1":
+            raw = clean_terminal_input(input(
+                f"ZIP path [ENTER={DELTA_WORKSPACE_DEFAULT_IMPORT_ZIP}]: "
+            ))
+            zip_path = Path(raw) if raw else DELTA_WORKSPACE_DEFAULT_IMPORT_ZIP
+
+            try:
+                members = _workspace_zip_members(zip_path)
+            except Exception as exc:
+                print(col(f"Cannot read ZIP: {exc}", RED))
+                pause()
+                continue
+
+            if not members:
+                print(col("No supported workspace files found in that ZIP.", RED))
+                pause()
+                continue
+
+            existing = sum(
+                1 for _, relative in members
+                if (DELTA_GLOBAL_WORKSPACE_DIR / relative).is_file()
+            )
+            print("")
+            print(f"Files detected : {len(members)}")
+            print(f"Will overwrite : {existing}")
+            print(f"Destination    : {DELTA_GLOBAL_WORKSPACE_DIR}")
+            print(col(
+                "Overwritten files are backed up automatically before import.",
+                DIM,
+            ))
+
+            if not _setup_yes_no("Import now?", default=True):
+                print(col("Import cancelled.", YELLOW))
+                pause()
+                continue
+
+            ok, note, backup = import_workspace_zip_to_delta(
+                zip_path, make_backup=True
+            )
+            print(col(note, GREEN if ok else RED))
+            if backup:
+                print(f"Backup: {backup}")
+            pause()
+            continue
+
+        if choice == "2":
+            print(col("Building Delta Workspace export...", CYAN))
+            try:
+                ok, note, output, count = export_delta_workspace_zip()
+            except Exception as exc:
+                ok, note, output = False, f"Export failed: {exc}", None
+            print(col(note, GREEN if ok else RED))
+            if output:
+                print(f"ZIP: {output}")
+            pause()
+            continue
+
+        if choice == "3":
+            print("")
+            print("Supported input layouts:")
+            print("  Arceus X/Workspace/HolyV2/...")
+            print("  Delta/Workspace/HolyV2/...")
+            print("  Workspace/HolyV2/...")
+            print("  HolyV2/...  (already flat)")
+            print("")
+            print("All imported files land directly under:")
+            print(f"  {DELTA_GLOBAL_WORKSPACE_DIR}/")
+            pause()
+            continue
+
+        print(col("Invalid choice.", RED))
+        time.sleep(1)
 
 
 def _delta_state_path_for_username(username):
@@ -20593,6 +21675,16 @@ def main():
 
         elif choice == "16":
             layout_visual_menu(cfg)
+            cfg = load_config()
+            normalize_active_mode_flags(cfg)
+
+        elif choice == "17":
+            workspace_zip_tools_menu(cfg)
+            cfg = load_config()
+            normalize_active_mode_flags(cfg)
+
+        elif choice == "18":
+            apk_download_install_menu(cfg)
             cfg = load_config()
             normalize_active_mode_flags(cfg)
 
