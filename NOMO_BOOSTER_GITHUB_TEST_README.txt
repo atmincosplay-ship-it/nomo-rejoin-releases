@@ -1,55 +1,51 @@
-NOMO BOOSTER — SEPARATE GITHUB TEST CHANNEL
-===========================================
+NOMO BOOSTER — GITHUB TEST CHANNEL V0.2.1
+================================================
 
-UPLOAD THESE TWO FILES TO THE REPOSITORY ROOT
----------------------------------------------
+FIX
+---
+The old updater downloaded into Termux internal storage:
+
+/data/data/com.termux/files/usr/tmp/...
+
+and then tried to rename directly into:
+
+/storage/emulated/0/Download/...
+
+Android reports:
+
+OSError: [Errno 18] Invalid cross-device link
+
+V0.2.1 now:
+1. downloads and validates in Termux temp
+2. copies to a temporary sibling beside the destination
+3. renames that sibling on the same filesystem
+4. keeps a backup of the previous destination
+
+UPLOAD
+------
+Upload both files to the GitHub repository root:
+
 nomo_booster_test.py
 nomo_booster_probe.lua
 
-Repository:
-atmincosplay-ship-it/nomo-rejoin-releases
+ONE-TIME REPAIR
+---------------
+The installed updater is already broken, so replace it once after uploading:
 
-ONE-TIME INSTALL IN TERMUX
---------------------------
-mkdir -p /storage/emulated/0/Download/nomo_booster_test && \
-curl -fL "https://raw.githubusercontent.com/atmincosplay-ship-it/nomo-rejoin-releases/main/nomo_booster_test.py" \
--o /storage/emulated/0/Download/nomo_booster_test/nomo_booster_test.py && \
-curl -fL "https://raw.githubusercontent.com/atmincosplay-ship-it/nomo-rejoin-releases/main/nomo_booster_probe.lua" \
--o /storage/emulated/0/Download/nomo_booster_test/nomo_booster_probe.lua && \
-printf '%s\n' \
-'#!/data/data/com.termux/files/usr/bin/bash' \
-'cd /storage/emulated/0/Download/nomo_booster_test' \
-'exec python nomo_booster_test.py "$@"' \
-> "$PREFIX/bin/nomoboost" && \
-chmod +x "$PREFIX/bin/nomoboost"
+curl -fL "https://raw.githubusercontent.com/atmincosplay-ship-it/nomo-rejoin-releases/main/nomo_booster_test.py" -o /storage/emulated/0/Download/nomo_booster_test/nomo_booster_test.py
 
-COMMANDS
---------
+Then:
+
+nomoboost update && nomoboost install
+
+FUTURE COMMANDS
+---------------
 nomoboost update
 nomoboost install
 nomoboost status
 nomoboost status USERNAME --details
 nomoboost remove
-nomoboost version
 
-NORMAL TEST FLOW
-----------------
-nomoboost update && nomoboost install
+Production remains separate:
 
-Restart one Booster clone.
-
-Then:
-nomoboost status USERNAME --details
-
-After testing:
-nomoboost remove
-
-PRODUCTION IS SEPARATE
-----------------------
 nomo update && nomo
-
-The test channel never replaces:
-- nomo_rejoin.py
-- nomo_pet_counter.lua
-- the nomo launcher
-- normal <username>_state.json

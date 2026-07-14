@@ -16,7 +16,7 @@ import tempfile
 import time
 import urllib.request
 
-VERSION = "0.2-github-test"
+VERSION = "0.2.1-github-test-exdev-fix"
 
 ROOT = Path("/storage/emulated/0/Download/nomo_booster_test")
 LOCAL_PROBE = ROOT / "nomo_booster_probe.lua"
@@ -52,14 +52,43 @@ def download(url: str, destination: Path) -> None:
 
 
 def backup_replace(source: Path, destination: Path) -> None:
+    """Install a validated file safely across Android storage mounts.
+
+    Termux temporary downloads usually live under /data while NOMO files live
+    under /storage/emulated/0. A direct rename across those mounts raises EXDEV,
+    so copy to a temporary sibling beside the destination and rename there.
+    """
+    source = Path(source)
+    destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
+
     if destination.exists():
         stamp = time.strftime("%Y%m%d-%H%M%S")
         backup = destination.with_name(
             destination.name + f".bak_{stamp}"
         )
         shutil.copy2(destination, backup)
-    os.replace(source, destination)
+
+    sibling_tmp = destination.with_name(
+        destination.name
+        + f".installing_{os.getpid()}_{int(time.time())}.tmp"
+    )
+
+    try:
+        shutil.copy2(source, sibling_tmp)
+
+        try:
+            with sibling_tmp.open("rb") as handle:
+                os.fsync(handle.fileno())
+        except Exception:
+            pass
+
+        os.replace(sibling_tmp, destination)
+    finally:
+        try:
+            sibling_tmp.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def validate_python(path: Path) -> None:
@@ -99,16 +128,21 @@ def update() -> int:
         validate_python(py_tmp)
         validate_lua(lua_tmp)
 
-        backup_replace(lua_tmp, LOCAL_PROBE)
-        current = Path(__file__).resolve()
-        if current != ROOT / "nomo_booster_test.py":
-            backup_replace(
-                py_tmp,
-                ROOT / "nomo_booster_test.py",
-            )
-        else:
-            # Replacing a running Python file is safe on Android/Linux.
-            backup_replace(py_tmp, current)
+        try:
+            backup_replace(lua_tmp, LOCAL_PROBE)
+            current = Path(__file__).resolve()
+            if current != ROOT / "nomo_booster_test.py":
+                backup_replace(
+                    py_tmp,
+                    ROOT / "nomo_booster_test.py",
+                )
+            else:
+                # Replacing a running Python file is safe on Android/Linux.
+                backup_replace(py_tmp, current)
+        except Exception as exc:
+            raise RuntimeError(
+                f"validated download could not be installed: {exc}"
+            ) from exc
 
     print("Booster test channel updated.")
     print("Run: nomoboost install")
