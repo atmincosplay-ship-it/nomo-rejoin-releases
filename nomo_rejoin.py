@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+# V4.55 — EVENT HOLD 5-MINUTE STALE OVERRIDE
+# - Built directly from corrected V4.54.
+# - Event hold protects intentional hopping only below the existing old-state
+#   hard threshold (default 300 seconds).
+# - At/above that threshold, only the affected package uses the existing
+#   exact-PID hard restart and configured Hatcher server reopen.
+# - False age spikes above the existing max-valid limit remain ignored.
+#
+# V4.54 — APK BATCH SINGLE UNINSTALL CONFIRMATION
+# - Built directly from V4.53; the previous cookie-root V4.54 is discarded.
+# - APK batch "ask" mode prompts Y/N once for all selected installed packages.
+# - Y uninstalls every matching installed package before sequential installation.
+# - N keeps every matching package's app data/cookies and uses pm install -r.
+# - The Uninstall Packages Only tool already prompts once and is unchanged.
+#
 # V4.53 — HATCHER EVENT TRANSITION GUARD
 # Built directly on V4.52. No second monitor and no V5 runtime.
 # - Fresh Trade World state enters a per-package transition hold.
@@ -199,7 +214,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.53"
+__version__ = "V4.55"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -408,7 +423,7 @@ DEFAULT_CONFIG = {
 
     # install_only    = always pm install -r
     # uninstall_first = remove detected exact package first, then install
-    # ask_each        = ask Y/N before uninstalling each detected package
+    # ask_each        = legacy key; ask once for the whole selected APK batch
     "apk_install_mode": "ask_each",
 
     "cookie_webhook_url": "",   # stored locally, never hardcoded
@@ -10456,6 +10471,57 @@ def hatcher_transition_guard_update(
     reset_return = False
     elapsed = 0
 
+    # V4.55: do not let Event hold suppress the existing 5-minute old-state
+    # hard recovery. A truly closed clone leaves its last state file behind,
+    # so its age keeps increasing even while the transition phase is remembered.
+    old_enabled, old_seconds, old_max_seconds, _old_cooldown = (
+        hatcher_alive_old_state_hard_settings(hcfg, cfg)
+    )
+    state_age = state_age_seconds(state) if state else 999999
+    event_stale_hard_due = bool(
+        phase != HATCHER_TRANSITION_NORMAL
+        and old_enabled
+        and state is not None
+        and state_age >= old_seconds
+        and state_age <= old_max_seconds
+    )
+
+    if event_stale_hard_due:
+        if phase == HATCHER_TRANSITION_RETURNING:
+            reset_return = True
+        phase = HATCHER_TRANSITION_ACTIVE
+        rt_tab["hatcher_transition_phase"] = phase
+        rt_tab["hatcher_transition_return_started_at"] = 0
+        rt_tab["hatcher_transition_dead_since"] = 0
+        rt_tab["hatcher_transition_note"] = (
+            f"event hold stale {state_age}s >= {old_seconds}s; "
+            "exact-PID recovery allowed"
+        )
+        log_activity(
+            (
+                f"event hold stale age {state_age}s reached "
+                f"{old_seconds}s hard limit; exact-PID recovery allowed"
+            ),
+            package,
+            RED,
+        )
+        return {
+            "active": True,
+            "paused": False,
+            "backend_paused": bool(pause_backend),
+            "phase": phase,
+            "elapsed": 0,
+            "stable_seconds": stable_seconds,
+            "note": f"state old {state_age}s; exact-PID hard restart allowed",
+            "entered": False,
+            "released": False,
+            "explicit_failure": False,
+            "dead_confirmed": True,
+            "stale_hard_override": True,
+            "force_recovery_reason": f"event hold old state {state_age}s",
+            "reset_return": reset_return,
+        }
+
     if not enabled:
         if phase != HATCHER_TRANSITION_NORMAL:
             rt_tab["hatcher_transition_resume_report_pending"] = True
@@ -12095,6 +12161,11 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
             )
             if transition.get("dead_confirmed"):
                 alive = False
+                if transition.get("stale_hard_override"):
+                    health["note"] = str(
+                        transition.get("note")
+                        or "event hold 5m stale override"
+                    )
             note = health.get("note") or "ok"
             pets = "-"
             eggs = "-"
@@ -12338,13 +12409,20 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                 and cfg.get("rejoin_if_crash", True)
             ):
                 if cfg.get("smart_open_queue", True):
+                    dead_reason = str(
+                        transition.get("force_recovery_reason")
+                        or "crash/dead"
+                    )
                     added, _ = queue_open(
-                        open_queue, tab, "hatcher", "crash/dead",
+                        open_queue, tab, "hatcher", dead_reason,
                         force=True, skip_if_alive=True, mode="hard_force", bypass_manual=True,
                         metadata={
                             "pid_only_recovery": True,
                             "recovery_must_open_once": True,
                             "bypass_recheck": True,
+                            "event_stale_hard_override": bool(
+                                transition.get("stale_hard_override")
+                            ),
                         },
                     )
                     note = "crash queued" if added else "already queued"
@@ -13242,8 +13320,8 @@ def _apk_install_mode_label(mode):
     return {
         "install_only": "Install only",
         "uninstall_first": "Always uninstall matching package first",
-        "ask_each": "Ask Y/N before uninstalling each APK",
-    }.get(mode, "Ask Y/N before uninstalling each APK")
+        "ask_each": "Ask once before uninstalling selected APK batch",
+    }.get(mode, "Ask once before uninstalling selected APK batch")
 
 
 def choose_apk_install_mode(cfg):
@@ -13259,9 +13337,9 @@ def choose_apk_install_mode(cfg):
         print("2. Uninstall matching package first, then install")
         print("   WARNING: deletes that package's app data and cookies.")
         print("")
-        print("3. Ask Y/N before uninstalling each APK")
-        print("   Y = uninstall exact matching package, then install")
-        print("   N = keep data and use pm install -r")
+        print("3. Ask once before uninstalling selected APK batch")
+        print("   Y = uninstall ALL matching installed packages, then install")
+        print("   N = keep ALL app data/cookies and use pm install -r")
         print("")
         print("0. Back")
         drain_stdin()
@@ -13412,6 +13490,7 @@ def choose_apk_files(apks, base_folder=None):
             return selected
 
 
+
 def install_apk_batch(paths, cfg=None):
     cfg = cfg or load_config()
     mode = _normalized_apk_install_mode(cfg)
@@ -13431,31 +13510,83 @@ def install_apk_batch(paths, cfg=None):
     failed = 0
     results = []
 
-    print(col(f"Install behavior: {_apk_install_mode_label(mode)}", CYAN))
-
-    for index, path in enumerate(unique, 1):
+    # Detect every package before asking anything. This lets "ask_each"
+    # remain config-compatible while prompting only once for the whole batch.
+    batch_info = []
+    installed_matches = []
+    for path in unique:
         package, detected_by = apk_package_name(path)
         installed_match = bool(package and exact_package_installed(package))
+        entry = {
+            "path": path,
+            "package": package,
+            "detected_by": detected_by,
+            "installed_match": installed_match,
+        }
+        batch_info.append(entry)
+        if installed_match:
+            installed_matches.append(entry)
+
+    batch_uninstall = mode == "uninstall_first"
+
+    print(col(f"Install behavior: {_apk_install_mode_label(mode)}", CYAN))
+
+    if mode == "ask_each" and installed_matches:
+        clear()
+        banner("APK BATCH UNINSTALL CONFIRMATION", cfg)
+        print(col(
+            "Uninstalling removes app data and cookies for these exact packages:",
+            RED,
+        ))
+        print("")
+        for entry in installed_matches:
+            print(f"  - {entry['package']}")
+        print("")
+        print(
+            f"Selected APKs: {len(batch_info)} | "
+            f"Installed matches: {len(installed_matches)}"
+        )
+        print("")
+        batch_uninstall = _setup_yes_no(
+            (
+                f"Uninstall all {len(installed_matches)} matching "
+                "packages before installing?"
+            ),
+            default=False,
+        )
+        print("")
+        if batch_uninstall:
+            print(col(
+                "Batch choice: YES — uninstall all listed matches.",
+                YELLOW,
+            ))
+        else:
+            print(col(
+                "Batch choice: NO — keep all existing app data/cookies.",
+                GREEN,
+            ))
+
+    for index, entry in enumerate(batch_info, 1):
+        path = entry["path"]
+        package = entry["package"]
+        detected_by = entry["detected_by"]
+        installed_match = entry["installed_match"]
 
         print("")
-        print(col(f"[{index}/{len(unique)}] {path.name}", BOLD))
+        print(col(f"[{index}/{len(batch_info)}] {path.name}", BOLD))
         if package:
             print(f"  Package: {package} ({detected_by})")
         else:
-            print(col("  Package: could not detect; uninstall step unavailable", YELLOW))
-
-        should_uninstall = False
-        if installed_match and mode == "uninstall_first":
-            should_uninstall = True
-        elif installed_match and mode == "ask_each":
             print(col(
-                f"WARNING: uninstalling {package} deletes its app data/cookie.",
+                "  Package: could not detect; uninstall step unavailable",
                 YELLOW,
             ))
-            should_uninstall = _setup_yes_no(
-                f"Uninstall {package} before installing this APK?",
-                default=False,
-            )
+
+        should_uninstall = bool(
+            installed_match
+            and batch_uninstall
+            and mode in {"uninstall_first", "ask_each"}
+        )
 
         if should_uninstall:
             ok_remove, remove_note = uninstall_exact_package(package)
@@ -13477,7 +13608,6 @@ def install_apk_batch(paths, cfg=None):
             failed += 1
 
     return installed, failed, results
-
 
 def uninstall_only_menu(cfg):
     selected = choose_packages_common(
