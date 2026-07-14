@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.58.8 — BOOSTER PHASE 2
+# - Booster health/rejoin continues to use the stable v3.9 normal state file.
+# - Valuable pets are read only from <username>_booster_probe.json.
+# - D1 Booster reports now include verified valuable pets and private-server link.
+# - Reports are sent only when status/pets/link change or once per hour.
+# - Missing/stale/incomplete probe data never erases the last good Booster report.
+# - Booster Option 13 and Booster start install a GitHub/cache/embedded probe loader.
+# - Non-Booster Option 13 disables a leftover Booster probe AutoExec file.
+# - Market, Hatcher, Package Manager, Option 4, PID recovery, and stable Lua unchanged.
+#
 # V4.58.7 — OPTION 4 ALL INSTALLED USERNAMES
 # - Restores Option 4 as one direct action instead of a submenu.
 # - Detects every actually installed Roblox/Noka package.
@@ -277,7 +287,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.58.7"
+__version__ = "V4.58.8"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -302,6 +312,10 @@ NOMO_UPDATE_URL = (
 NOMO_PET_COUNTER_URL = (
     "https://raw.githubusercontent.com/atmincosplay-ship-it/"
     "nomo-rejoin-releases/refs/heads/main/nomo_pet_counter.lua"
+)
+NOMO_BOOSTER_PROBE_URL = (
+    "https://raw.githubusercontent.com/atmincosplay-ship-it/"
+    "nomo-rejoin-releases/refs/heads/main/nomo_booster_probe.lua"
 )
 NOMO_UPDATE_MAX_BYTES = 8 * 1024 * 1024
 
@@ -1188,6 +1202,7 @@ DEFAULT_BOOSTER_PROFILE = {
     "booster_name": "nomoboost1",
     "server_link": "YOUR_BOOSTER_PRIVATE_SERVER_LINK",
     "state_file": "/storage/emulated/0/RobloxClone001/Arceus X/Workspace/nomo_rejoiner/state.json",
+    "probe_file": "",
 }
 
 DEFAULT_BOOSTER_PROFILES = [
@@ -1202,6 +1217,11 @@ DEFAULT_BOOSTER_CONFIG = {
     "update_only_on_status_change": True,
     "force_update_every_seconds": 3600,
     "heartbeat_interval": 60,
+    "probe_enabled": True,
+    "probe_required_for_report": True,
+    "probe_stale_seconds": 90,
+    "probe_expected_schema_version": 2,
+    "probe_max_report_pets": 250,
     "hatcher_rejoin_alive_stale": False,
     "hatcher_dead_confirm_seconds": 30,
     "hatcher_alive_old_state_hard_force_enabled": True,
@@ -9298,6 +9318,7 @@ def normalize_booster_profile(prof, idx=0):
     base["booster_name"] = str(base.get("booster_name") or f"nomoboost{idx+1}")
     base["server_link"] = str(base.get("server_link") or "")
     base["state_file"] = str(base.get("state_file") or "")
+    base["probe_file"] = str(base.get("probe_file") or "")
     if f"/{LEGACY_STATE_FOLDER_NAME}/" in base["state_file"]:
         base["state_file"] = base["state_file"].replace(
             f"/{LEGACY_STATE_FOLDER_NAME}/",
@@ -9423,6 +9444,18 @@ def sync_booster_profiles_with_tabs(main_cfg, bcfg, create_missing=True):
                     tab.get("user_name")
                 ).strip()
 
+        state_path = str(profile.get("state_file") or "").strip()
+        probe_user = str(
+            profile.get("booster_name")
+            or tab.get("user_name")
+            or ""
+        ).strip()
+        if state_path and probe_user:
+            profile["probe_file"] = str(
+                Path(state_path).parent
+                / f"{_sanitize_state_name(probe_user)}_booster_probe.json"
+            )
+
         new_profiles.append(profile)
 
     bcfg["boosters"] = new_profiles
@@ -9454,6 +9487,244 @@ def booster_read_state(prof):
 
 
 
+
+def booster_probe_path_candidates(prof, state=None):
+    """Resolve exact Booster scanner JSON candidates without package aliasing."""
+    candidates = []
+    seen = set()
+
+    def add(path):
+        if not path:
+            return
+        item = Path(str(path))
+        key = str(item)
+        if key not in seen:
+            seen.add(key)
+            candidates.append(item)
+
+    explicit = str(prof.get("probe_file") or "").strip()
+    if explicit:
+        add(explicit)
+
+    state_file = str(prof.get("state_file") or "").strip()
+    state_parent = Path(state_file).parent if state_file else None
+
+    names = []
+    for value in (
+        (state or {}).get("username") if isinstance(state, dict) else "",
+        prof.get("booster_name"),
+    ):
+        text = str(value or "").strip()
+        if text and text not in names:
+            names.append(text)
+
+    if state_file:
+        stem = Path(state_file).stem
+        if stem.endswith("_state"):
+            stem = stem[:-6]
+        if stem and stem != "state" and stem not in names:
+            names.append(stem)
+
+    for name in names:
+        filename = f"{_sanitize_state_name(name)}_booster_probe.json"
+        if state_parent:
+            add(state_parent / filename)
+        if is_delta_global_tab({
+            "state_file": state_file,
+            "executor_storage": prof.get("executor_storage", ""),
+        }):
+            add(DELTA_GLOBAL_STATE_DIR / filename)
+
+    return candidates
+
+
+def _booster_probe_read_json(path):
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception as exc:
+        return None, str(exc)
+
+    if not isinstance(payload, dict):
+        return None, "probe JSON is not an object"
+
+    payload = dict(payload)
+    ts = int(payload.get("ts", 0) or 0)
+    payload["age"] = now() - ts if ts > 0 else 999999
+    payload["_path"] = str(path)
+    return payload, None
+
+
+def booster_read_probe(prof, state=None, bcfg=None):
+    """Read the freshest exact-identity Booster scanner JSON."""
+    bcfg = load_booster_config() if bcfg is None else bcfg
+    if not bcfg.get("probe_enabled", True):
+        return None, "disabled"
+
+    expected_names = {
+        _delta_username_key(value)
+        for value in (
+            (state or {}).get("username") if isinstance(state, dict) else "",
+            prof.get("booster_name"),
+        )
+        if _usable_detected_username(value)
+    }
+
+    candidates = booster_probe_path_candidates(prof, state)
+    parents = []
+    parent_seen = set()
+    for path in candidates:
+        key = str(path.parent)
+        if key not in parent_seen:
+            parent_seen.add(key)
+            parents.append(path.parent)
+
+    readable = []
+    errors = []
+    considered = set()
+
+    def consider(path):
+        path = Path(path)
+        key = str(path)
+        if key in considered:
+            return
+        considered.add(key)
+        if not path.exists():
+            return
+        payload, err = _booster_probe_read_json(path)
+        if err:
+            errors.append(f"{path.name}: {err}")
+            return
+        actual_key = _delta_username_key(payload.get("username"))
+        if expected_names and actual_key and actual_key not in expected_names:
+            return
+        readable.append(payload)
+
+    for path in candidates:
+        consider(path)
+
+    if not readable:
+        for parent in parents:
+            try:
+                files = list(parent.glob("*_booster_probe.json"))
+            except Exception:
+                files = []
+            for path in files:
+                consider(path)
+
+    if not readable:
+        if errors:
+            return None, "; ".join(errors[:3])
+        return None, "missing"
+
+    readable.sort(
+        key=lambda item: (
+            int(item.get("ts", 0) or 0),
+            int(item.get("write_seq", 0) or 0),
+        ),
+        reverse=True,
+    )
+    return readable[0], None
+
+
+def booster_probe_quality(probe, err, bcfg):
+    if not bcfg.get("probe_enabled", True):
+        return "disabled", True, "probe disabled by config"
+    if not isinstance(probe, dict):
+        return "missing", False, str(err or "missing")
+
+    probe_error = str(probe.get("error") or "").strip()
+    if probe_error:
+        return "error", False, probe_error
+    if not probe.get("supported_place", True):
+        return "wrong_place", False, "outside Booster place"
+
+    age = int(probe.get("age", 999999) or 999999)
+    stale_after = max(20, int(bcfg.get("probe_stale_seconds", 90) or 90))
+    if age > stale_after:
+        return "stale", False, f"{age}s old"
+
+    expected_schema = int(bcfg.get("probe_expected_schema_version", 2) or 2)
+    schema = int(probe.get("schema_version", 0) or 0)
+    if schema < expected_schema:
+        return "incompatible", False, f"schema {schema}"
+    if not probe.get("probe_ready", False):
+        return "waiting", False, "scanner not ready"
+
+    inventory = int(probe.get("inventory_entry_count", 0) or 0)
+    parsed = int(probe.get("parsed_pet_count", 0) or 0)
+    missing = probe.get("missing_fields", {})
+    if not isinstance(missing, dict):
+        missing = {}
+    missing_age = int(missing.get("age", 0) or 0)
+    missing_weight = int(missing.get("base_weight", 0) or 0)
+    if parsed != inventory or missing_age > 0 or missing_weight > 0:
+        return (
+            "incomplete",
+            False,
+            f"parsed {parsed}/{inventory}; missing age {missing_age}, weight {missing_weight}",
+        )
+    return "ready", True, f"{parsed} pets parsed"
+
+
+def booster_probe_matches(probe, bcfg):
+    """Return compact verified valuable-pet records for D1."""
+    if not isinstance(probe, dict):
+        return []
+    raw = probe.get("valuable_pets", [])
+    if not isinstance(raw, list):
+        return []
+
+    min_age = int(probe.get("min_age", 500) or 500)
+    min_weight = float(probe.get("min_age1_base_weight_kg", 6.0) or 6.0)
+    limit = max(1, int(bcfg.get("probe_max_report_pets", 250) or 250))
+
+    output = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        age_value = item.get("age")
+        age = int(age_value) if isinstance(age_value, (int, float)) else None
+        age0_value = item.get("base_weight_age0_kg")
+        age1_value = item.get("base_weight_age1_kg")
+        age0 = float(age0_value) if isinstance(age0_value, (int, float)) else None
+        age1 = float(age1_value) if isinstance(age1_value, (int, float)) else None
+
+        reasons = []
+        if age is not None and age >= min_age:
+            reasons.append("age")
+        if age1 is not None and age1 >= min_weight:
+            reasons.append("weight")
+        if not reasons:
+            continue
+
+        mutations = item.get("mutations", [])
+        if not isinstance(mutations, list):
+            mutations = []
+        output.append({
+            "uuid": str(item.get("uuid") or ""),
+            "name": str(item.get("name") or ""),
+            "age": age,
+            "base_weight_kg": age1,
+            "base_weight_age0_kg": age0,
+            "base_weight_age1_kg": age1,
+            "mutation": str(item.get("mutation") or "Normal"),
+            "mutations": [str(value) for value in mutations],
+            "is_favorite": bool(item.get("is_favorite", False)),
+            "hatched_from": str(item.get("hatched_from") or ""),
+            "boost_count": int(item.get("boost_count", 0) or 0),
+            "valuable_reasons": reasons,
+        })
+
+    output.sort(
+        key=lambda item: (
+            -float(item.get("base_weight_age1_kg") or -1),
+            -int(item.get("age") or -1),
+            str(item.get("name") or "").lower(),
+            str(item.get("uuid") or ""),
+        )
+    )
+    return output[:limit]
+
 def load_booster_runtime():
     rt = load_json(BOOSTER_RUNTIME_FILE, {})
     for key in ("last_update_ts", "last_signature", "last_status"):
@@ -9466,19 +9737,24 @@ def save_booster_runtime(rt):
     save_json(BOOSTER_RUNTIME_FILE, rt)
 
 
-def booster_entry(prof, state, err):
+
+def booster_entry(prof, state, err, probe=None, probe_err=None, bcfg=None):
+    bcfg = load_booster_config() if bcfg is None else bcfg
     link = str(prof.get("server_link") or "").strip()
-    matches = state.get("boosting_matches", []) if isinstance(state, dict) else []
-    if not isinstance(matches, list):
-        matches = []
+    probe_status, probe_reportable, probe_note = booster_probe_quality(probe, probe_err, bcfg)
+    matches = booster_probe_matches(probe, bcfg) if probe_reportable else []
+
     if not prof.get("enabled", True):
         status = "disabled"
     elif not link or link.startswith(("YOUR_", "PUT_")):
         status = "no_server"
-    elif state:
+    elif not state:
+        status = "no_state"
+    elif probe_reportable:
         status = "available" if matches else "online"
     else:
-        status = "no_state"
+        status = "probe_wait"
+
     entry = {
         "enabled": bool(prof.get("enabled", True)),
         "package": prof.get("package", ""),
@@ -9492,11 +9768,28 @@ def booster_entry(prof, state, err):
         "egg_total": int((state or {}).get("egg_total", 0) or 0),
         "boosting_match_count": len(matches),
         "boosting_matches": matches,
-        "boosting_min_base_weight_kg": (state or {}).get("boosting_min_base_weight_kg", 6),
-        "boosting_min_age": (state or {}).get("boosting_min_age", 500),
+        "boosting_min_base_weight_kg": float((probe or {}).get("min_age1_base_weight_kg", 6.0) or 6.0),
+        "boosting_min_age": int((probe or {}).get("min_age", 500) or 500),
+        "boosting_weight_mode": str((probe or {}).get("weight_mode", "BaseWeight age-0 multiplied by 1.1")),
+        "boosting_weight_precision": str((probe or {}).get("weight_precision", "truncate_2_decimals_no_rounding")),
+        "booster_probe_status": probe_status,
+        "booster_probe_reportable": bool(probe_reportable),
+        "booster_probe_note": probe_note,
+        "booster_probe_revision": str((probe or {}).get("probe_revision", "")),
+        "booster_probe_schema_version": int((probe or {}).get("schema_version", 0) or 0),
+        "booster_probe_ts": int((probe or {}).get("ts", 0) or 0),
+        "booster_probe_age": int((probe or {}).get("age", 999999) or 999999),
+        "booster_probe_file": str((probe or {}).get("_path", prof.get("probe_file", ""))),
+        "booster_probe_inventory_count": int((probe or {}).get("inventory_entry_count", 0) or 0),
+        "booster_probe_parsed_count": int((probe or {}).get("parsed_pet_count", 0) or 0),
+        "booster_probe_missing_fields": (
+            (probe or {}).get("missing_fields", {})
+            if isinstance((probe or {}).get("missing_fields", {}), dict)
+            else {}
+        ),
         "updated_at": now(),
         "updated_text": date_time_text(),
-        "source": "nomo_rejoin_booster",
+        "source": "nomo_rejoin_booster_phase2",
     }
     if state:
         for key in ("username", "place_id", "job_id", "state_ts"):
@@ -9510,17 +9803,28 @@ def booster_entry(prof, state, err):
 
 def booster_signature(entry):
     compact_matches = []
-    for item in entry.get("boosting_matches", []) if isinstance(entry.get("boosting_matches"), list) else []:
-        if isinstance(item, dict):
-            compact_matches.append({
-                "uuid": item.get("uuid"), "name": item.get("name"), "age": item.get("age"),
-                "base_weight_kg": item.get("base_weight_kg"), "mutation": item.get("mutation"),
-            })
+    raw_matches = entry.get("boosting_matches", [])
+    if not isinstance(raw_matches, list):
+        raw_matches = []
+    for item in raw_matches:
+        if not isinstance(item, dict):
+            continue
+        compact_matches.append({
+            "uuid": item.get("uuid"),
+            "name": item.get("name"),
+            "age": item.get("age"),
+            "base_weight_age0_kg": item.get("base_weight_age0_kg"),
+            "base_weight_age1_kg": item.get("base_weight_age1_kg"),
+            "mutation": item.get("mutation"),
+            "valuable_reasons": item.get("valuable_reasons"),
+        })
     return json.dumps({
-        "enabled": entry.get("enabled"), "status": entry.get("status"),
-        "server_link": entry.get("server_link"), "matches": compact_matches,
+        "enabled": entry.get("enabled"),
+        "status": entry.get("status"),
+        "server_link": entry.get("server_link"),
+        "probe_revision": entry.get("booster_probe_revision"),
+        "matches": compact_matches,
     }, sort_keys=True, separators=(",", ":"))
-
 
 def booster_should_update(bcfg, name, entry, force=False):
     if force:
@@ -9537,15 +9841,17 @@ def booster_should_update(bcfg, name, entry, force=False):
     return False, "unchanged"
 
 
+
 def booster_report_once(bcfg=None, force=False, state_cache=None):
     bcfg = load_booster_config() if bcfg is None else bcfg
     if not bcfg.get("enabled", True):
         return False, "booster mode disabled"
     if hatcher_backend_missing(bcfg):
         return False, "backend missing"
+
     updates = []
     removes = []
-
+    probe_waiting = []
     brt = load_booster_runtime()
     profiles = booster_profiles(bcfg, enabled_only=False)
     current_profile_names = {
@@ -9554,44 +9860,74 @@ def booster_report_once(bcfg=None, force=False, state_cache=None):
     }
     pending_identity_removes = [
         name
-        for name in _unique_identity_names(
-            brt.get("pending_remove_names", [])
-        )
+        for name in _unique_identity_names(brt.get("pending_remove_names", []))
         if name not in current_profile_names
     ]
-    removes.extend(
-        (name, "renamed")
-        for name in pending_identity_removes
-    )
+    removes.extend((name, "renamed") for name in pending_identity_removes)
     if brt.get("mapping_force_report"):
         force = True
 
     for prof in profiles:
         name = str(prof.get("booster_name") or "booster")
         pkg = str(prof.get("package") or "")
+        state = None
+        err = "missing"
+        probe = None
+        probe_err = "missing"
+
         cached = state_cache.get(pkg) if isinstance(state_cache, dict) else None
-        if isinstance(cached, tuple) and len(cached) == 2:
+        if isinstance(cached, dict):
+            state = cached.get("state")
+            err = cached.get("state_err")
+            probe = cached.get("probe")
+            probe_err = cached.get("probe_err")
+        elif isinstance(cached, tuple) and len(cached) == 2:
             state, err = cached
         else:
             state, err = booster_read_state(prof)
-        entry = booster_entry(prof, state, err)
+
+        if probe is None and probe_err in (None, "missing"):
+            probe, probe_err = booster_read_probe(prof, state=state, bcfg=bcfg)
+
+        entry = booster_entry(
+            prof, state, err,
+            probe=probe,
+            probe_err=probe_err,
+            bcfg=bcfg,
+        )
         if entry["status"] in ("disabled", "no_server", "no_state"):
             removes.append((name, entry["status"]))
             continue
-        should, _ = booster_should_update(bcfg, name, entry, force=force)
+        if bcfg.get("probe_required_for_report", True) and not entry.get("booster_probe_reportable", False):
+            probe_waiting.append((name, entry.get("booster_probe_status", "missing")))
+            continue
+
+        should, _reason = booster_should_update(bcfg, name, entry, force=force)
         if should:
             updates.append((name, entry))
+
     if not updates and not removes:
+        if probe_waiting:
+            detail = ", ".join(f"{name}:{status}" for name, status in probe_waiting[:4])
+            return True, f"waiting for Booster probe ({detail})"
         return True, "no update; unchanged"
+
     if backend_provider(bcfg) == "cloudflare":
         for name, entry in updates:
             ok, msg = cloudflare_update_one_hatcher(bcfg, name, entry)
             if not ok:
                 return False, f"{name}: {msg}"
         for name, status in removes:
-            removed_entry = {"mode": "booster", "role": "booster", "enabled": False,
-                             "status": status, "server_link": "", "boosting_matches": [],
-                             "boosting_match_count": 0, "updated_at": now()}
+            removed_entry = {
+                "mode": "booster",
+                "role": "booster",
+                "enabled": False,
+                "status": status,
+                "server_link": "",
+                "boosting_matches": [],
+                "boosting_match_count": 0,
+                "updated_at": now(),
+            }
             ok, msg = cloudflare_update_one_hatcher(bcfg, name, removed_entry)
             if not ok:
                 return False, f"remove {name}: {msg}"
@@ -9601,24 +9937,23 @@ def booster_report_once(bcfg=None, force=False, state_cache=None):
             return False, err
         record = record if isinstance(record, dict) else {}
         pool = record.setdefault("hatchers", {})
-        for name, status in removes:
+        for name, _status in removes:
             pool.pop(name, None)
         for name, entry in updates:
             pool[name] = entry
         ok, msg = jsonbin_update_bin(bcfg, record)
         if not ok:
             return False, msg
+
     rt = load_booster_runtime()
     for name, entry in updates:
         rt["last_update_ts"][name] = now()
         rt["last_signature"][name] = booster_signature(entry)
         rt["last_status"][name] = entry.get("status")
     save_booster_runtime(rt)
-    _clear_booster_pending_identity_removes(
-        pending_identity_removes
-    )
-    return True, f"updated {len(updates)} removed {len(removes)}"
-
+    _clear_booster_pending_identity_removes(pending_identity_removes)
+    waiting_note = f"; probe waiting {len(probe_waiting)}" if probe_waiting else ""
+    return True, f"updated {len(updates)} removed {len(removes)}{waiting_note}"
 
 def booster_status_screen(rows, bcfg, cfg, session_start, loops, last_msg=""):
     clear(); print_banner(cfg)
@@ -9639,6 +9974,7 @@ def booster_status_screen(rows, bcfg, cfg, session_start, loops, last_msg=""):
     render_activity_log(cfg, int(cfg.get("activity_log_lines", 6) or 6))
 
 
+
 def start_booster_safe_rejoiner(main_cfg=None):
     global _STOP_REQUESTED
     _STOP_REQUESTED = False
@@ -9651,57 +9987,136 @@ def start_booster_safe_rejoiner(main_cfg=None):
     cfg["wait_fresh_after_open"] = True
     cfg["alive_recovery_soft_first"] = False
     cfg["alive_recovery_hard_fallback"] = True
+
     bcfg = load_booster_config()
+    enabled_profiles = booster_profiles(bcfg, enabled_only=True)
+    enabled_packages = [
+        str(profile.get("package") or "")
+        for profile in enabled_profiles
+        if str(profile.get("package") or "")
+    ]
+    probe_install_results = []
+    try:
+        probe_install_results = _setup_install_booster_probe_for_packages(
+            cfg, enabled_packages, "1"
+        )
+    except Exception as exc:
+        log_activity(
+            f"Booster probe loader install warning: {cut(exc, 80)}",
+            "",
+            YELLOW,
+        )
+
     rt = load_runtime()
-    session_start = now(); loops = 0; open_queue = []; last_report_at = 0
-    last_msg = "not uploaded yet"
+    session_start = now()
+    loops = 0
+    open_queue = []
+    last_report_at = 0
+    installed_ok = any(ok for _pkg, ok, _note in probe_install_results)
+    last_msg = (
+        "probe loader ready; waiting for scanner JSON"
+        if installed_ok
+        else "waiting for scanner JSON"
+    )
 
     while True:
         if stop_requested():
-            save_runtime(rt); return
+            save_runtime(rt)
+            return
         loops += 1
         bcfg = load_booster_config()
-        tabs = [booster_profile_to_tab(p) for p in booster_profiles(bcfg, enabled_only=True)]
-        profiles = {str(p.get("package") or ""): p for p in booster_profiles(bcfg, enabled_only=True)}
-        rows = []; state_cache = {}
+        profiles_list = booster_profiles(bcfg, enabled_only=True)
+        tabs = [booster_profile_to_tab(profile) for profile in profiles_list]
+        profiles = {
+            str(profile.get("package") or ""): profile
+            for profile in profiles_list
+        }
+        rows = []
+        state_cache = {}
         capture_android_ui_snapshot(cfg, force=False)
+
         for tab in tabs:
             pkg = tab["package"]
+            prof = profiles.get(pkg) or {}
             rt_tab = get_runtime_tab(rt, pkg)
             rt_tab["target"] = "hatcher"
+
             state, err = read_state(tab)
-            state_cache[pkg] = (state, err)
+            probe, probe_err = booster_read_probe(prof, state=state, bcfg=bcfg)
+            probe_status, probe_ready, probe_note = booster_probe_quality(probe, probe_err, bcfg)
+            probe_matches = booster_probe_matches(probe, bcfg) if probe_ready else []
+            state_cache[pkg] = {
+                "state": state,
+                "state_err": err,
+                "probe": probe,
+                "probe_err": probe_err,
+            }
+
             alive = package_alive(pkg, cfg)
-            health = evaluate_package_health(tab, cfg, rt_tab, mode="hatcher", hcfg=bcfg,
-                                             prof=profiles.get(pkg), raw_alive=alive, state=state, err=err)
-            if not str(tab.get("server_link") or "").strip() or str(tab.get("server_link") or "").startswith(("YOUR_", "PUT_")):
+            health = evaluate_package_health(
+                tab, cfg, rt_tab,
+                mode="hatcher",
+                hcfg=bcfg,
+                prof=prof,
+                raw_alive=alive,
+                state=state,
+                err=err,
+            )
+            server_link = str(tab.get("server_link") or "").strip()
+            if not server_link or server_link.startswith(("YOUR_", "PUT_")):
                 status, note, handled = "No server", "server_link missing", True
                 cancel_queued_package(open_queue, pkg)
             else:
-                status, note, handled = apply_rejoin_action(open_queue, tab, "hatcher", rt_tab,
-                                                            cfg, rt, health, hcfg=bcfg, mode="booster")
+                status, note, handled = apply_rejoin_action(
+                    open_queue, tab, "hatcher", rt_tab,
+                    cfg, rt, health,
+                    hcfg=bcfg,
+                    mode="booster",
+                )
             if not handled:
                 status = health.get("status") or status
                 note = health.get("note") or note
+
+            probe_ui_note = (
+                f"probe ready; {len(probe_matches)} valuable"
+                if probe_ready
+                else f"probe {probe_status}: {probe_note}"
+            )
+            note = "; ".join(
+                value
+                for value in (str(note or "").strip(), probe_ui_note)
+                if value
+            )
             pets = int((state or {}).get("pet_count", 0) or 0) if state else "-"
-            matches = int((state or {}).get("boosting_match_count", 0) or 0) if state else "-"
+            matches = len(probe_matches) if probe_ready else "-"
             age = int((state or {}).get("age", 999999) or 999999) if state else "-"
             update_clone_session(rt_tab, status, cfg)
-            rows.append({"user": tab.get("user_name", pkg), "pkg": pkg, "pets": pets,
-                         "matches": matches, "status": status, "age": age,
-                         "session": format_session(rt_tab), "note": note})
+            rows.append({
+                "user": tab.get("user_name", pkg),
+                "pkg": pkg,
+                "pets": pets,
+                "matches": matches,
+                "status": status,
+                "age": age,
+                "session": format_session(rt_tab),
+                "note": note,
+            })
+
         save_runtime(rt)
         interval = max(10, int(bcfg.get("heartbeat_interval", 60) or 60))
         if last_report_at <= 0 or now() - last_report_at >= interval:
             ok, msg = booster_report_once(bcfg, force=False, state_cache=state_cache)
-            last_report_at = now(); last_msg = ("OK: " if ok else "ERR: ") + msg
+            last_report_at = now()
+            last_msg = ("OK: " if ok else "ERR: ") + msg
         booster_status_screen(rows, bcfg, cfg, session_start, loops, last_msg)
+
         if open_queue:
-            if not wait_seconds(2, rt): return
+            if not wait_seconds(2, rt):
+                return
             process_open_queue(open_queue, cfg, rt, session_start, loops)
             continue
-        if not wait_seconds(int(cfg.get("check_interval", 10)), rt): return
-
+        if not wait_seconds(int(cfg.get("check_interval", 10)), rt):
+            return
 
 def booster_server_link_menu(cfg):
     bcfg = load_booster_config()
@@ -16433,8 +16848,101 @@ if not runOk then
 end
 '''
 
+BOOSTER_PROBE_FALLBACK_TEMPLATE = '--========================================================--\n--                  NOMO BOOSTER PROBE\n--             v0.1.1 PETDATA CONTAINER FIX\n--========================================================--\n-- PURPOSE:\n--   Validate the real Grow a Garden pet schema before Booster mode is merged\n--   into NOMO REJOIN or the stable v3.9 pet counter.\n--\n-- SAFETY:\n--   - Does not teleport or rejoin.\n--   - Does not call Cloudflare or any web endpoint.\n--   - Does not modify <username>_state.json.\n--   - Does not stop/replace NOMO PET COUNTER.\n--   - Reads DataService once every 10 seconds by default.\n--\n-- OUTPUT:\n--   nomo_rejoiner/<username>_booster_probe.json\n--\n-- VALUABLE RULE:\n--   age >= 500\n--   OR\n--   truncated age-1 base weight >= 6.00 kg\n--\n-- AGE-1 BASE WEIGHT:\n--   BaseWeight is treated as age-0.\n--   age1 = BaseWeight * 1.1\n--   displayed/compared after truncating to two decimals, never rounding up.\n--========================================================--\n\nlocal Players = game:GetService("Players")\nlocal HttpService = game:GetService("HttpService")\nlocal ReplicatedStorage = game:GetService("ReplicatedStorage")\n\nlocal LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()\n\n-- Stop only an older Booster probe. The normal NOMO counter is untouched.\ndo\n    local old = getgenv().NOMO_BOOSTER_PROBE\n    if type(old) == "table" then\n        old.Enabled = false\n        old.Stop = true\n    end\n    task.wait(0.25)\nend\n\ngetgenv().NOMO_BOOSTER_PROBE = getgenv().NOMO_BOOSTER_PROBE or {}\nlocal Config = getgenv().NOMO_BOOSTER_PROBE\n\nConfig.Enabled = true\nConfig.Stop = false\nConfig.Version = "v0.1-phase1-safe"\nConfig.Revision = "v0.1.1-petdata-container-fix"\n\nConfig.WriteFolder = Config.WriteFolder or "nomo_rejoiner"\nConfig.ScanEvery = math.max(5, tonumber(Config.ScanEvery or 10) or 10)\nConfig.MinAge = math.max(0, tonumber(Config.MinAge or 500) or 500)\nConfig.MinAge1BaseWeightKg = math.max(\n    0,\n    tonumber(Config.MinAge1BaseWeightKg or 6.00) or 6.00\n)\nConfig.MaxValuablePets = math.max(\n    1,\n    math.floor(tonumber(Config.MaxValuablePets or 250) or 250)\n)\nConfig.MaxSamplePets = math.max(\n    1,\n    math.floor(tonumber(Config.MaxSamplePets or 12) or 12)\n)\nConfig.MaxObservedKeys = math.max(\n    10,\n    math.floor(tonumber(Config.MaxObservedKeys or 100) or 100)\n)\nConfig.ExpectedPlaceId = tonumber(\n    Config.ExpectedPlaceId or 126884695634066\n) or 126884695634066\nConfig.OnlyScanExpectedPlace = Config.OnlyScanExpectedPlace ~= false\nConfig.Debug = Config.Debug == true\n\n-- Optional username allow-list:\n--   getgenv().NOMO_BOOSTER_PROBE.AllowedUsernames = {\n--       ["nomoboost1"] = true,\n--   }\n-- Empty/nil means all usernames on the test device.\nif type(Config.AllowedUsernames) ~= "table" then\n    Config.AllowedUsernames = {}\nend\n\nlocal function sanitizeName(value)\n    value = tostring(value or "")\n    value = string.gsub(value, "[^%w_]", "_")\n    if value == "" then\n        value = "unknown"\n    end\n    return value\nend\n\nlocal safeUser = sanitizeName(LocalPlayer.Name)\nConfig.WriteFile = Config.WriteFile\n    or (Config.WriteFolder .. "/" .. safeUser .. "_booster_probe.json")\n\nlocal function usernameAllowed()\n    if next(Config.AllowedUsernames) == nil then\n        return true\n    end\n    return Config.AllowedUsernames[LocalPlayer.Name] == true\nend\n\nlocal function safeMakeFolder(folder)\n    if type(writefile) ~= "function" then\n        return false, "writefile unavailable"\n    end\n\n    pcall(function()\n        if type(isfolder) == "function" then\n            if not isfolder(folder) and type(makefolder) == "function" then\n                makefolder(folder)\n            end\n        elseif type(makefolder) == "function" then\n            makefolder(folder)\n        end\n    end)\n\n    return true\nend\n\nlocal function safeWrite(path, text)\n    if type(writefile) ~= "function" then\n        return false, "writefile unavailable"\n    end\n\n    local tmp = path .. ".tmp"\n    local ok, err = pcall(function()\n        writefile(tmp, text)\n    end)\n\n    if not ok then\n        local directOk, directErr = pcall(function()\n            writefile(path, text)\n        end)\n        return directOk, directOk and nil or tostring(directErr or err)\n    end\n\n    local copied = pcall(function()\n        local content = readfile(tmp)\n        writefile(path, content)\n    end)\n\n    pcall(function()\n        if type(delfile) == "function" then\n            delfile(tmp)\n        end\n    end)\n\n    if not copied then\n        return false, "atomic copy failed"\n    end\n    return true\nend\n\nlocal MIN_VALID_EPOCH = 1600000000\n\nlocal function realEpoch()\n    local ok1, value1 = pcall(os.time)\n    if ok1 and type(value1) == "number" and value1 >= MIN_VALID_EPOCH then\n        return math.floor(value1)\n    end\n\n    local ok2, value2 = pcall(function()\n        return DateTime.now().UnixTimestamp\n    end)\n    if ok2 and type(value2) == "number" and value2 >= MIN_VALID_EPOCH then\n        return math.floor(value2)\n    end\n\n    local ok3, value3 = pcall(tick)\n    if ok3 and type(value3) == "number" and value3 >= MIN_VALID_EPOCH then\n        return math.floor(value3)\n    end\n\n    local ok4, value4 = pcall(function()\n        return workspace:GetServerTimeNow()\n    end)\n    if ok4 and type(value4) == "number" and value4 >= MIN_VALID_EPOCH then\n        return math.floor(value4)\n    end\n\n    return nil\nend\n\nlocal epochAnchor = realEpoch()\nlocal clockAnchor = os.clock()\n\nlocal function now()\n    local current = realEpoch()\n    if current then\n        epochAnchor = current\n        clockAnchor = os.clock()\n        return current\n    end\n\n    if epochAnchor then\n        return math.floor(\n            epochAnchor + math.max(0, os.clock() - clockAnchor)\n        )\n    end\n\n    return math.floor(MIN_VALID_EPOCH + os.clock())\nend\n\nlocal function toNumber(value)\n    local number = tonumber(value)\n    if type(number) ~= "number" then\n        return nil\n    end\n    if number ~= number or number == math.huge or number == -math.huge then\n        return nil\n    end\n    return number\nend\n\nlocal function truncateTwo(value)\n    value = toNumber(value)\n    if not value then\n        return nil\n    end\n    return math.floor(value * 100) / 100\nend\n\nlocal function firstValue(containers, names)\n    for _, item in ipairs(containers) do\n        local container = item\n        local path = ""\n\n        if type(item) == "table" and item.Value ~= nil then\n            container = item.Value\n            path = tostring(item.Path or "")\n        end\n\n        if type(container) == "table" then\n            for _, name in ipairs(names) do\n                local value = container[name]\n                if value ~= nil then\n                    local field = tostring(name)\n                    if path ~= "" then\n                        field = path .. "." .. field\n                    end\n                    return value, field\n                end\n            end\n        end\n    end\n    return nil, ""\nend\n\nlocal function entryContainers(entry)\n    if type(entry) ~= "table" then\n        return {}\n    end\n\n    -- Never create a sparse array here. ipairs() stops at the first nil.\n    local containers = {}\n\n    local function add(value, path)\n        if type(value) == "table" then\n            table.insert(containers, {\n                Value = value,\n                Path = tostring(path or ""),\n            })\n        end\n    end\n\n    add(entry, "")\n    add(entry.PetData, "PetData")\n    add(entry.Data, "Data")\n    add(entry.Properties, "Properties")\n    add(entry.Info, "Info")\n\n    return containers\nend\n\nlocal function scalarKeyList(entry, output, prefix)\n    if type(entry) ~= "table" then\n        return\n    end\n\n    prefix = tostring(prefix or "")\n\n    for key, value in pairs(entry) do\n        if type(key) == "string" then\n            local valueType = type(value)\n            if valueType ~= "function"\n                and valueType ~= "thread"\n                and valueType ~= "userdata" then\n                local observed = key\n                if prefix ~= "" then\n                    observed = prefix .. "." .. key\n                end\n                output[observed] = true\n            end\n        end\n    end\nend\n\nlocal function countTable(value)\n    local count = 0\n    if type(value) == "table" then\n        for _ in pairs(value) do\n            count += 1\n        end\n    end\n    return count\nend\n\nlocal function cleanString(value)\n    if value == nil then\n        return ""\n    end\n    return tostring(value)\nend\n\nlocal function collectTextValues(value, output, depth)\n    output = output or {}\n    depth = depth or 0\n\n    if depth > 3 then\n        return output\n    end\n\n    if type(value) == "string" then\n        local text = tostring(value)\n        text = string.gsub(text, "^%s+", "")\n        text = string.gsub(text, "%s+$", "")\n\n        if text ~= ""\n            and text ~= "Normal"\n            and text ~= "None"\n            and text ~= "Unknown" then\n            output[text] = true\n        end\n    elseif type(value) == "table" then\n        for key, item in pairs(value) do\n            if type(item) == "string" then\n                collectTextValues(item, output, depth + 1)\n            elseif item == true and tostring(key or "") ~= "" then\n                collectTextValues(tostring(key), output, depth + 1)\n            elseif type(item) == "table" then\n                collectTextValues(item, output, depth + 1)\n            end\n        end\n    end\n\n    return output\nend\n\nlocal function mutationInfo(entry)\n    local pd = type(entry.PetData) == "table"\n        and entry.PetData\n        or {}\n\n    local mutationMap = {}\n    local sources = {\n        {"MutationType", entry.MutationType},\n        {"Mutation", entry.Mutation},\n        {"Mutations", entry.Mutations},\n        {"MutationData", entry.MutationData},\n        {"AppliedMutations", entry.AppliedMutations},\n        {"ActiveMutations", entry.ActiveMutations},\n        {"PetData.MutationType", pd.MutationType},\n        {"PetData.Mutation", pd.Mutation},\n        {"PetData.Mutations", pd.Mutations},\n        {"PetData.MutationData", pd.MutationData},\n        {"PetData.AppliedMutations", pd.AppliedMutations},\n        {"PetData.ActiveMutations", pd.ActiveMutations},\n    }\n\n    local sourceField = ""\n    for _, item in ipairs(sources) do\n        if item[2] ~= nil and sourceField == "" then\n            sourceField = item[1]\n        end\n        collectTextValues(item[2], mutationMap, 0)\n    end\n\n    for _, key in ipairs({"Rainbow", "Gold", "Golden", "Shiny"}) do\n        if entry[key] == true or pd[key] == true then\n            mutationMap[key] = true\n            if sourceField == "" then\n                sourceField = entry[key] == true\n                    and key\n                    or ("PetData." .. key)\n            end\n        end\n    end\n\n    local names = {}\n    for name in pairs(mutationMap) do\n        table.insert(names, tostring(name))\n    end\n    table.sort(names)\n\n    if #names == 0 then\n        return "Normal", {}, (\n            sourceField ~= ""\n            and sourceField\n            or "default:Normal"\n        )\n    end\n\n    return table.concat(names, ", "), names, sourceField\nend\n\nlocal function parsePet(uuidKey, entry, observedKeys)\n    if type(entry) ~= "table" then\n        return nil, "entry_not_table"\n    end\n\n    scalarKeyList(entry, observedKeys, "")\n    scalarKeyList(entry.PetData, observedKeys, "PetData")\n    scalarKeyList(entry.Data, observedKeys, "Data")\n    scalarKeyList(entry.Properties, observedKeys, "Properties")\n    scalarKeyList(entry.Info, observedKeys, "Info")\n\n    local containers = entryContainers(entry)\n\n    local uuidValue = firstValue(\n        containers,\n        {"UUID", "Uuid", "uuid", "PetUUID", "PET_UUID", "Id", "ID"}\n    )\n    local nameValue, nameField = firstValue(\n        containers,\n        {"PetType", "PetName", "Name", "Type", "Species"}\n    )\n    local ageValue, ageField = firstValue(\n        containers,\n        {"Level", "Age", "PetAge"}\n    )\n    local baseWeightValue, baseWeightField = firstValue(\n        containers,\n        {\n            "BaseWeight",\n            "BaseWeightKg",\n            "BaseWeightKG",\n            "BaseWeight_kg",\n            "BaseWeightInKg",\n        }\n    )\n    local hatchedFromValue = firstValue(\n        containers,\n        {"HatchedFrom", "EggType", "SourceEgg"}\n    )\n    local favoriteValue = firstValue(\n        containers,\n        {"IsFavorite", "Favorite", "Favorited"}\n    )\n    local boostsValue = firstValue(\n        containers,\n        {"Boosts", "PetBoosts"}\n    )\n\n    local mutationText, mutationList, mutationField = mutationInfo(entry)\n\n    local uuid = cleanString(uuidValue)\n    if uuid == "" then\n        uuid = cleanString(uuidKey)\n    end\n\n    local name = cleanString(nameValue)\n    local age = toNumber(ageValue)\n    local rawBaseWeightAge0 = toNumber(baseWeightValue)\n\n    local baseWeightAge0 = nil\n    local baseWeightAge1 = nil\n\n    if rawBaseWeightAge0 then\n        baseWeightAge0 = truncateTwo(rawBaseWeightAge0)\n        baseWeightAge1 = truncateTwo(rawBaseWeightAge0 * 1.1)\n    end\n\n    local reasons = {}\n    if age and age >= Config.MinAge then\n        table.insert(reasons, "age")\n    end\n    if baseWeightAge1\n        and baseWeightAge1 >= Config.MinAge1BaseWeightKg then\n        table.insert(reasons, "weight")\n    end\n\n    return {\n        uuid = uuid,\n        name = name,\n        age = age,\n        base_weight_age0_kg = baseWeightAge0,\n        base_weight_age1_kg = baseWeightAge1,\n        mutation = mutationText,\n        mutations = mutationList,\n        hatched_from = cleanString(hatchedFromValue),\n        is_favorite = favoriteValue == true,\n        boost_count = countTable(boostsValue),\n        valuable = #reasons > 0,\n        valuable_reasons = reasons,\n\n        parsed_fields = {\n            name = nameField,\n            age = ageField,\n            base_weight = baseWeightField,\n            mutation = mutationField,\n        },\n    }, nil\nend\n\nlocal DataService = nil\nlocal function getDataService()\n    if DataService then\n        return DataService\n    end\n\n    local ok, result = pcall(function()\n        local modules = ReplicatedStorage:WaitForChild("Modules", 20)\n        local module = modules and modules:WaitForChild("DataService", 10)\n        return module and require(module)\n    end)\n\n    if ok and result then\n        DataService = result\n        return DataService\n    end\n\n    return nil\nend\n\nlocal function getPetInventory()\n    local service = getDataService()\n    if not service then\n        return nil, "DataService unavailable"\n    end\n\n    local ok, data = pcall(function()\n        return service:GetData()\n    end)\n    if not ok or type(data) ~= "table" then\n        return nil, "DataService:GetData failed"\n    end\n\n    local petsData = data.PetsData\n    local inventory = petsData and petsData.PetInventory\n    local petData = inventory and inventory.Data\n\n    if type(petData) ~= "table" then\n        return nil, "PetsData.PetInventory.Data missing"\n    end\n\n    return petData, nil\nend\n\nlocal function sortParsedPets(items)\n    table.sort(items, function(left, right)\n        local leftWeight = tonumber(left.base_weight_age1_kg) or -1\n        local rightWeight = tonumber(right.base_weight_age1_kg) or -1\n        if leftWeight ~= rightWeight then\n            return leftWeight > rightWeight\n        end\n\n        local leftAge = tonumber(left.age) or -1\n        local rightAge = tonumber(right.age) or -1\n        if leftAge ~= rightAge then\n            return leftAge > rightAge\n        end\n\n        local leftName = string.lower(tostring(left.name or ""))\n        local rightName = string.lower(tostring(right.name or ""))\n        if leftName ~= rightName then\n            return leftName < rightName\n        end\n\n        return tostring(left.uuid or "") < tostring(right.uuid or "")\n    end)\nend\n\nlocal WRITE_SEQ = 0\nlocal START_CLOCK = os.clock()\nlocal lastState = nil\n\nlocal function buildProbeState()\n    WRITE_SEQ += 1\n\n    local state = {\n        probe_version = Config.Version,\n        probe_revision = Config.Revision,\n        schema_version = 2,\n\n        username = LocalPlayer.Name,\n        display_name = LocalPlayer.DisplayName,\n        place_id = tostring(game.PlaceId or ""),\n        job_id = tostring(game.JobId or ""),\n        expected_place_id = tostring(Config.ExpectedPlaceId),\n        supported_place = tonumber(game.PlaceId) == Config.ExpectedPlaceId,\n\n        min_age = Config.MinAge,\n        min_age1_base_weight_kg = Config.MinAge1BaseWeightKg,\n        weight_mode = "BaseWeight age-0 multiplied by 1.1",\n        weight_precision = "truncate_2_decimals_no_rounding",\n\n        ts = now(),\n        write_seq = WRITE_SEQ,\n        script_uptime = math.floor(math.max(0, os.clock() - START_CLOCK)),\n        probe_alive = true,\n        probe_ready = false,\n        error = "",\n\n        inventory_entry_count = 0,\n        parsed_pet_count = 0,\n        valuable_pet_count = 0,\n        valuable_pets = {},\n        sample_pets = {},\n        observed_entry_keys = {},\n        missing_fields = {\n            name = 0,\n            age = 0,\n            base_weight = 0,\n            mutation = 0,\n            entry_not_table = 0,\n        },\n    }\n\n    if not usernameAllowed() then\n        state.error = "username not in AllowedUsernames"\n        return state\n    end\n\n    if Config.OnlyScanExpectedPlace\n        and tonumber(game.PlaceId) ~= Config.ExpectedPlaceId then\n        state.error = "outside expected Booster place"\n        return state\n    end\n\n    local petData, inventoryError = getPetInventory()\n    if not petData then\n        state.error = tostring(inventoryError or "pet inventory unavailable")\n        return state\n    end\n\n    local parsed = {}\n    local valuable = {}\n    local observedKeys = {}\n\n    for uuid, entry in pairs(petData) do\n        state.inventory_entry_count += 1\n\n        local pet, parseError = parsePet(uuid, entry, observedKeys)\n        if not pet then\n            if parseError == "entry_not_table" then\n                state.missing_fields.entry_not_table += 1\n            end\n        else\n            state.parsed_pet_count += 1\n\n            if pet.name == "" then\n                state.missing_fields.name += 1\n            end\n            if pet.age == nil then\n                state.missing_fields.age += 1\n            end\n            if pet.base_weight_age0_kg == nil then\n                state.missing_fields.base_weight += 1\n            end\n            if pet.mutation == "" then\n                state.missing_fields.mutation += 1\n            end\n\n            table.insert(parsed, pet)\n            if pet.valuable then\n                table.insert(valuable, pet)\n            end\n        end\n    end\n\n    sortParsedPets(parsed)\n    sortParsedPets(valuable)\n\n    for index = 1, math.min(#parsed, Config.MaxSamplePets) do\n        table.insert(state.sample_pets, parsed[index])\n    end\n\n    for index = 1, math.min(#valuable, Config.MaxValuablePets) do\n        table.insert(state.valuable_pets, valuable[index])\n    end\n\n    local keys = {}\n    for key in pairs(observedKeys) do\n        table.insert(keys, key)\n    end\n    table.sort(keys)\n\n    for index = 1, math.min(#keys, Config.MaxObservedKeys) do\n        table.insert(state.observed_entry_keys, keys[index])\n    end\n\n    state.valuable_pet_count = #valuable\n    state.valuable_pet_count_written = #state.valuable_pets\n    state.valuable_pet_list_truncated = #valuable > #state.valuable_pets\n    state.probe_ready = true\n    return state\nend\n\nlocal function writeProbeState(state)\n    safeMakeFolder(Config.WriteFolder)\n\n    local okEncode, encoded = pcall(function()\n        return HttpService:JSONEncode(state)\n    end)\n    if not okEncode then\n        return false, tostring(encoded)\n    end\n\n    local okWrite, writeError = safeWrite(Config.WriteFile, encoded)\n    if okWrite then\n        lastState = state\n    end\n    return okWrite, writeError\nend\n\nlocal function snapshot()\n    local state = buildProbeState()\n    local ok, err = writeProbeState(state)\n\n    if Config.Debug then\n        if ok then\n            print(\n                "[NOMO BOOSTER PROBE] wrote "\n                .. tostring(state.valuable_pet_count)\n                .. " valuable / "\n                .. tostring(state.parsed_pet_count)\n                .. " parsed"\n            )\n        else\n            warn("[NOMO BOOSTER PROBE] write failed:", tostring(err))\n        end\n    end\n\n    return state, ok, err\nend\n\ngetgenv().NOMO_BOOSTER_PROBE_STOP = function()\n    Config.Enabled = false\n    Config.Stop = true\n    print("[NOMO BOOSTER PROBE] stop requested")\nend\n\ngetgenv().NOMO_BOOSTER_PROBE_SNAPSHOT = function()\n    local state, ok, err = snapshot()\n    print(\n        "[NOMO BOOSTER PROBE] snapshot:",\n        ok and "written" or tostring(err)\n    )\n    return state\nend\n\ngetgenv().NOMO_BOOSTER_PROBE_DUMP = function()\n    local state = lastState or buildProbeState()\n    print(HttpService:JSONEncode(state))\n    return state\nend\n\nprint("========================================")\nprint("[NOMO BOOSTER PROBE] " .. Config.Version)\nprint("[NOMO BOOSTER PROBE] account = " .. LocalPlayer.Name)\nprint("[NOMO BOOSTER PROBE] writing -> " .. Config.WriteFile)\nprint(\n    "[NOMO BOOSTER PROBE] valuable = age >= "\n    .. tostring(Config.MinAge)\n    .. " OR age1 base >= "\n    .. string.format("%.2f", Config.MinAge1BaseWeightKg)\n    .. "kg"\n)\nprint("[NOMO BOOSTER PROBE] production counter/state untouched")\nprint("========================================")\n\npcall(snapshot)\n\ntask.spawn(function()\n    while Config.Enabled and not Config.Stop do\n        task.wait(Config.ScanEvery)\n\n        local ok, err = pcall(snapshot)\n        if not ok then\n            warn(\n                "[NOMO BOOSTER PROBE] loop error:",\n                tostring(err)\n            )\n        end\n    end\n\n    Config.Enabled = false\n    Config.Stop = true\n    print("[NOMO BOOSTER PROBE] stopped")\nend)\n'
+
+
+def booster_probe_autoexec_source():
+    "Build GitHub-latest -> cache -> embedded verified Booster scanner."
+    remote_url = json.dumps(NOMO_BOOSTER_PROBE_URL)
+    embedded = _lua_long_string(BOOSTER_PROBE_FALLBACK_TEMPLATE)
+
+    return f'''-- NOMO Booster scanner updater/loader
+-- Priority: GitHub latest -> local cache -> embedded verified v0.1.1
+
+local PROBE_URL = {remote_url}
+local CACHE_FOLDER = "nomo_rejoiner"
+local CACHE_FILE = CACHE_FOLDER .. "/nomo_booster_probe_cache.lua"
+local EMBEDDED_FALLBACK = {embedded}
+
+local function validProbeSource(text)
+    return type(text) == "string"
+        and #text > 5000
+        and string.find(text, "NOMO BOOSTER PROBE", 1, true) ~= nil
+        and string.find(text, "NOMO_BOOSTER_PROBE", 1, true) ~= nil
+        and string.find(text, "v0.1.1-petdata-container-fix", 1, true) ~= nil
+end
+
+local function ensureCacheFolder()
+    if type(makefolder) ~= "function" then return end
+    pcall(function()
+        if type(isfolder) == "function" then
+            if not isfolder(CACHE_FOLDER) then makefolder(CACHE_FOLDER) end
+        else
+            makefolder(CACHE_FOLDER)
+        end
+    end)
+end
+
+local function saveCache(text)
+    if type(writefile) ~= "function" or not validProbeSource(text) then return end
+    ensureCacheFolder()
+    pcall(function() writefile(CACHE_FILE, text) end)
+end
+
+local function readCache()
+    if type(readfile) ~= "function" then return nil end
+    local ok, text = pcall(function()
+        if type(isfile) == "function" and not isfile(CACHE_FILE) then return nil end
+        return readfile(CACHE_FILE)
+    end)
+    if ok and validProbeSource(text) then return text end
+    return nil
+end
+
+local selectedSource = nil
+local selectedName = ""
+local remoteOk, remoteText = pcall(function()
+    return game:HttpGet(PROBE_URL, true)
+end)
+if remoteOk and validProbeSource(remoteText) then
+    selectedSource = remoteText
+    selectedName = "github"
+    saveCache(remoteText)
+end
+if not selectedSource then
+    local cached = readCache()
+    if cached then
+        selectedSource = cached
+        selectedName = "cache"
+    end
+end
+if not selectedSource then
+    selectedSource = EMBEDDED_FALLBACK
+    selectedName = "embedded-v0.1.1"
+end
+
+local chunk, compileError = loadstring(selectedSource)
+if not chunk and selectedName ~= "embedded-v0.1.1" then
+    warn("[NOMO BOOSTER LOADER] " .. selectedName .. " compile failed; using embedded scanner:", tostring(compileError))
+    selectedSource = EMBEDDED_FALLBACK
+    selectedName = "embedded-v0.1.1"
+    chunk, compileError = loadstring(selectedSource)
+end
+if not chunk then
+    warn("[NOMO BOOSTER LOADER] unable to compile scanner:", tostring(compileError))
+    return
+end
+print("[NOMO BOOSTER LOADER] source = " .. selectedName)
+local runOk, runError = pcall(chunk)
+if not runOk then
+    warn("[NOMO BOOSTER LOADER] runtime error:", tostring(runError))
+end
+'''
+
+
 AUTOEXEC_DEFAULT_CUSTOM_FILE = "nomo_autoexec.lua"
 AUTOEXEC_PET_COUNTER_FILE = "nomo_pet_counter.lua"
+AUTOEXEC_BOOSTER_PROBE_FILE = "nomo_booster_probe.lua"
 AUTOEXEC_MARKET_LOADER_FILE = "nomo_market_loader.lua"
 _AUTOEXEC_ALLOWED_SUFFIXES = {".lua", ".luau", ".txt"}
 
@@ -20710,9 +21218,12 @@ def _legacy_setup_disabled_path(path):
 
 
 def _setup_legacy_autoexec_names_for_role(role):
+    role = str(role or "").strip().lower()
     names = set(LEGACY_SETUP_AUTOEXEC_NAMES)
-    if str(role or "").strip().lower() != "market":
+    if role != "market":
         names.add(AUTOEXEC_MARKET_LOADER_FILE.lower())
+    if role != "booster":
+        names.add(AUTOEXEC_BOOSTER_PROBE_FILE.lower())
     return names
 
 
@@ -20896,6 +21407,64 @@ def _setup_install_counter_for_packages(cfg, packages, path_mode):
         results.append((pkg, ok_count == len(paths), "; ".join(notes)))
     return results
 
+
+
+
+def _setup_install_booster_probe_for_packages(cfg, packages, path_mode):
+    """Install/update only the Booster scanner AutoExec loader."""
+    tabs_by_pkg = {
+        str(tab.get("package") or ""): tab
+        for tab in autoexec_tabs(cfg)
+    }
+    selected_tabs = [
+        tabs_by_pkg[package]
+        for package in packages
+        if package in tabs_by_pkg
+    ]
+    script = booster_probe_autoexec_source()
+    results = []
+    written = {}
+
+    for tab in selected_tabs:
+        package = str(tab.get("package") or "")
+        paths = autoexec_paths_for_tab(
+            tab, path_mode, filename=AUTOEXEC_BOOSTER_PROBE_FILE
+        )
+        if not paths:
+            results.append((package, False, "no AutoExec path"))
+            continue
+        ok_count = 0
+        notes = []
+        for path in paths:
+            key = str(path)
+            if key in written:
+                ok, note = written[key]
+                if ok:
+                    ok_count += 1
+                    notes.append(f"shared global file: {path}")
+                else:
+                    notes.append(note)
+                continue
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                old = path.read_text(encoding="utf-8") if path.exists() else None
+                if old == script:
+                    written[key] = (True, f"unchanged: {path}")
+                    ok_count += 1
+                    notes.append(f"unchanged: {path}")
+                    continue
+                tmp = path.with_suffix(path.suffix + ".tmp")
+                tmp.write_text(script, encoding="utf-8")
+                os.replace(str(tmp), str(path))
+                written[key] = (True, f"saved: {path}")
+                ok_count += 1
+                notes.append(f"saved: {path}")
+            except Exception as exc:
+                note = str(exc)
+                written[key] = (False, note)
+                notes.append(note)
+        results.append((package, ok_count == len(paths), "; ".join(notes)))
+    return results
 
 
 def _setup_install_market_loader_for_packages(cfg, packages, path_mode):
@@ -21291,6 +21860,17 @@ def new_redfinger_setup_wizard(cfg=None):
     _print_autoexec_full_paths(selected_tabs, cfg, "Pet Counter destination path(s)")
     counter_results = _setup_install_counter_for_packages(cfg, selected, "1")
 
+    booster_probe_results = []
+    if role == "booster":
+        clear()
+        banner("SETUP: BOOSTER SCANNER", cfg)
+        print(col("Install/update NOMO Booster scanner: YES (automatic)", GREEN))
+        print(col("Stable v3.9 state remains responsible for rejoin health.", DIM))
+        _print_autoexec_full_paths(selected_tabs, cfg, "Booster scanner destination path(s)")
+        booster_probe_results = _setup_install_booster_probe_for_packages(
+            cfg, selected, "1"
+        )
+
     market_loader_results = []
     if role == "market":
         clear()
@@ -21492,6 +22072,16 @@ def new_redfinger_setup_wizard(cfg=None):
     print(col("Pet Counter:", BOLD))
     for pkg, ok, note in counter_results:
         print(f"  {short_pkg(pkg):<10} {col('OK' if ok else 'FAILED', GREEN if ok else RED)}  {note}")
+
+    if role == "booster":
+        print("")
+        print(col("Booster scanner:", BOLD))
+        for pkg, ok, note in booster_probe_results:
+            print(
+                f"  {short_pkg(pkg):<10} "
+                f"{col('OK' if ok else 'FAILED', GREEN if ok else RED)}  "
+                f"{note}"
+            )
 
     if role == "market":
         print("")
