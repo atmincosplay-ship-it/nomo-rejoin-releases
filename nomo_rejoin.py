@@ -1,150 +1,11 @@
 #!/usr/bin/env python3
-# V4.57 — EVENT SYSTEM REMOVED
-# - Removes Trade World Event hold and Main Garden return confirmation.
-# - Removes transition-based Cloudflare pause/unavailable reporting.
-# - Clears all old hatcher_transition_* runtime state automatically.
-# - Restores the normal Hatcher health/rejoin/CAPTCHA queue for every package.
-# - Keeps V4.56 legacy state-folder cleanup, audit cleanup, APK batch one-Y,
-#   exact-package PID recovery, and stable v3.9 Lua.
-#
-# V4.56 — LEGACY STATE CLEANUP + AUDIT FIXES
-# - Automatically migrates/quarantines Delta/Workspace/gag_rejoiner once.
-# - Patches legacy state-folder references in unified config and template.
-# - Adds a 15-minute maximum active Event hold for fresh wrong-place heartbeats.
-# - Keeps V4.55's 5-minute stale override and exact-package PID recovery.
-# - Removes dead old_inject_cookie_unused code.
-# - Clarifies dashboard columns: StateAge and RunTime.
-#
-# V4.55 — EVENT HOLD 5-MINUTE STALE OVERRIDE
-# - Built directly from corrected V4.54.
-# - Event hold protects intentional hopping only below the existing old-state
-#   hard threshold (default 300 seconds).
-# - At/above that threshold, only the affected package uses the existing
-#   exact-PID hard restart and configured Hatcher server reopen.
-# - False age spikes above the existing max-valid limit remain ignored.
-#
-# V4.54 — APK BATCH SINGLE UNINSTALL CONFIRMATION
-# - Built directly from V4.53; the previous cookie-root V4.54 is discarded.
-# - APK batch "ask" mode prompts Y/N once for all selected installed packages.
-# - Y uninstalls every matching installed package before sequential installation.
-# - N keeps every matching package's app data/cookies and uses pm install -r.
-# - The Uninstall Packages Only tool already prompts once and is unchanged.
-#
-# V4.53 — HATCHER EVENT TRANSITION GUARD
-# Built directly on V4.52. No second monitor and no V5 runtime.
-# - Fresh Trade World state enters a per-package transition hold.
-# - While held, wrong-place/stale/no-state/periodic rejoin actions are paused.
-# - Exact dead-process and explicit kick/CAPTCHA recovery remain enabled.
-# - Cloudflare/JSONBin receives one unavailable transition update, then freezes.
-# - Returning to Main Garden must remain clean/fresh for 300 continuous seconds.
-# - After the stable return, stale timers reset and one fresh backend report resumes.
-#
-# V4.52 — DELTA FULL-SYSTEM IDENTITY SYNC
-# Built from V4.51/V4.49 recovery baseline. Rejoin behavior is unchanged.
-# - One package->username edit synchronizes Main, Hatcher, Booster, and paths.
-# - Runtime username/signature caches are invalidated immediately.
-# - Old backend identity keys are queued for removal after a rename.
-# - New identity is forced into the next Hatcher/Booster backend report.
-# - Auto Refresh no longer overwrites fresh mappings with stale config objects.
-#
-# V4.51 — DELTA GLOBAL PACKAGE MAPPING LOCK
-# Built from V4.49. Rejoin/recovery behavior is unchanged.
-# - Each Delta package reads only its configured username state file.
-# - Shared-folder "freshest JSON" fallback is disabled for Delta.
-# - Delta usernames update only from that package's cookie/API or manual map.
-# - Duplicate package->username mappings are blocked as CONFLICT.
-# - Option 4 adds a manual Delta mapping editor.
-#
-# V4.49 — APK FOLDER + PACKAGE SELECTION
-# - NEW: Local APK installer defaults to /storage/emulated/0/Download.
-# - NEW: Select one APK, multiple APKs, or all APKs before install.
-# - NEW: APK list shows detected Android package names when available.
-# - NEW: Recursive APK scan includes APKs inside Download subfolders.
-# - SAFE: Existing install-only / uninstall-first / ask-each behavior remains.
-# - KEEP: Exact-package uninstall, cookie setup, Delta tools, and exact-PID rules.
-#
-# V4.48 — APK INSTALL / UNINSTALL MODES
-# - NEW: APK install behavior: install-only, uninstall-first, or ask per APK.
-# - NEW: Default ask-per-APK mode asks Y/N before removing the matching package.
-# - NEW: Uninstall-only tool selects exact installed Roblox/Noka packages.
-# - SAFE: Uninstall is always exact-package and requires explicit confirmation.
-# - SAFE: Choosing N keeps app data and continues with pm install -r.
-# - WARNING: Choosing Y removes that package's app data/cookies before install.
-# - KEEP: Direct/GitHub/GoFile downloads, Delta tools, and exact-PID recovery.
-#
-# V4.47 — APK DOWNLOAD / INSTALL TOOLS
-# - NEW: Main menu Option 18 downloads and installs APKs from direct URLs.
-# - NEW: Supports direct APK/ZIP links from any HTTPS host with redirects.
-# - NEW: Supports all APK/ZIP assets from a public GitHub latest release.
-# - NEW: Supports GoFile folder/share lookup through an official API token.
-# - NEW: Installs all APKs from a local folder, sequentially with pm install -r.
-# - SAFE: ZIP extraction accepts APK files only and rejects traversal entries.
-# - SAFE: APKs are ZIP-signature checked before installation.
-# - KEEP: Delta workspace tools, cookie setup, exact-PID rules, and stable v3.9.
-#
-# V4.46 — DELTA WORKSPACE ZIP TOOLS
-# - NEW: Main menu Option 17 imports config/workspace ZIPs into Delta Workspace.
-# - NEW: Recognizes Arceus X/Workspace/, Delta/Workspace/, Workspace/, or
-#        already-flat workspace archive layouts.
-# - NEW: Existing destination files that will be overwritten are backed up first.
-# - NEW: Manual export creates a timestamped Delta Workspace ZIP.
-# - SAFE: ZIP paths are normalized and traversal/symlink entries are rejected.
-# - KEEP: Delta global setup, cookie first-launch OK handler, and exact-PID rules.
-#
-# V4.45 — COOKIE FIRST-LAUNCH OK HANDLER
-# - FIX: A fresh clone with no WebView Cookies DB is initialized automatically.
-# - NEW: After first launch, NOMO waits 3 seconds and taps the Delta/clone OK
-#        position twice (default 868,403) before waiting for cookie storage.
-# - NEW: Cookie DB readiness is polled for up to 35 seconds instead of sleeping
-#        blindly for only 12 seconds.
-# - SAFE: The OK taps run only after injection reports a missing cookie database.
-# - SAFE: Exact-package PID stop remains required before database injection.
-#
-# V4.44 — DELTA GLOBAL AUTO SETUP
-# - NEW: Option 13 asks for executor storage: Delta Global or Arceus X per-clone.
-# - DELTA: Uses /storage/emulated/0/Delta/Autoexecute and
-#          /storage/emulated/0/Delta/Workspace globally for all selected clones.
-# - DELTA: Per-account state stays separated as
-#          Delta/Workspace/nomo_rejoiner/<username>_state.json.
-# - DELTA: Shared AutoExec files are written once, not once per package.
-# - KEEP: Exact-PID recovery, startup loading grace, saved detector rectangles,
-#         and readable Termux Float bounds.
-#
-# V4.43 — HATCHER STARTUP LOADING GRACE
-# - FIX: An already-alive clone with an old state file is no longer PID-stopped
-#        immediately when NOMO starts.
-# - NEW: Existing alive clones receive a 240-second startup observation grace.
-#        During that grace NOMO waits for the game/counter to produce fresh state.
-# - SAFE: No solver preflight and no hard restart are queued during startup grace.
-# - RECOVERY: If state is still old after grace, exact-PID recovery runs normally.
-# - ROLLBACK: Shared GitHub/embedded counter restored to stable v3.9.
-#
-# V4.42 — SLOW-LOAD PROCESS WAIT FIX
-# - FIX: A newly opened clone is no longer declared dead after only 20 seconds.
-# - NEW: Wait up to 120 seconds for the selected package PID to first appear.
-# - NEW: After the PID has appeared, require 45 continuous seconds missing
-#        before treating that package as having died during loading.
-# - SAFE: Continue waiting for the normal fresh state for up to the existing
-#         open/homepage timeout; do not restart merely because Roblox is slow.
-# - KEEP: Exact-PID-only recovery, V4.41 queue fixes, and Booster pet schema.
-#
-# V4.41 — RECOVERY QUEUE HOTFIX + CONFIRMED BOOSTER PET SCHEMA
-# - FIX: Hatcher old-state cooldown is stamped only after a real open succeeds,
-#        never when a restart is merely queued.
-# - FIX: Dead/crashed Hatcher and Booster packages can perform one recovery open
-#        even when stale manual-login/cookie flags would otherwise discard it.
-# - FIX: One-time migration clears the bad queued-only cooldown and stale open lock.
-# - FIX: Hatcher shows Stale instead of misleading Online while cooldown-blocked.
-# - BOOSTER: Uses confirmed PetInventory fields and age-1 base weight,
-#            truncated to 2 decimals with no rounding.
-#
 # V4.40 — BOOSTER STAY-SERVER MODE
 # - NEW: AutoExec installs a loader that fetches the latest
 #        nomo_pet_counter.lua from GitHub on Roblox startup.
 # - SAFE: Successful downloads are cached locally in the executor workspace.
 # - FALLBACK: If GitHub is unavailable, the last cache is used; if no cache
 #             exists yet, the complete tested v3.9 counter embedded here runs.
-# - UPDATE: The embedded fallback is v3.9-release-data-counts.
+# - UPDATE: The embedded fallback is v4.0-booster-matches.
 # - KEEP: V4.38 no-PID-stop Market/Restock routing and exact-PID hard recovery.
 #
 # V4.38 — EMBEDDED DATA-SERVICE COUNTER + SAFE MARKET ROUTING
@@ -230,23 +91,11 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.57"
+__version__ = "V4.40"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 NOMO_APP_FILE = BASE_DIR / "nomo_rejoin.py"
-
-DELTA_GLOBAL_ROOT = Path("/storage/emulated/0/Delta")
-DELTA_GLOBAL_AUTOEXEC_DIR = DELTA_GLOBAL_ROOT / "Autoexecute"
-DELTA_GLOBAL_WORKSPACE_DIR = DELTA_GLOBAL_ROOT / "Workspace"
-DELTA_GLOBAL_STATE_DIR = DELTA_GLOBAL_WORKSPACE_DIR / "nomo_rejoiner"
-DELTA_WORKSPACE_DEFAULT_IMPORT_ZIP = Path("/storage/emulated/0/Download/config.zip")
-DELTA_WORKSPACE_EXPORT_DIR = BASE_DIR / "workspace_exports"
-DELTA_WORKSPACE_BACKUP_DIR = BASE_DIR / "workspace_backups"
-
-APK_DOWNLOAD_DIR = Path("/storage/emulated/0/Download/NOMO_APK")
-APK_LOCAL_DEFAULT_DIR = Path("/storage/emulated/0/Download")
-APK_EXTRACT_DIR = APK_DOWNLOAD_DIR / "_extracted"
 NOMO_BACKUP_DIR = BASE_DIR / "backups"
 NOMO_UPDATE_URL = (
     "https://raw.githubusercontent.com/atmincosplay-ship-it/"
@@ -370,199 +219,6 @@ COOKIE_CACHE = BASE_DIR / "cookie_cache.json"
 
 STATE_FOLDER_NAME = "nomo_rejoiner"
 LEGACY_STATE_FOLDER_NAME = "gag_rejoiner"
-LEGACY_DELTA_STATE_MIGRATION_VERSION = 456
-
-
-def _legacy_state_payload_timestamp(path):
-    """Prefer payload ts; fall back to mtime for non-state/invalid files."""
-    path = Path(path)
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        ts = int(payload.get("ts", 0) or 0)
-        if ts > 0:
-            return ts
-    except Exception:
-        pass
-    try:
-        return int(path.stat().st_mtime)
-    except Exception:
-        return 0
-
-
-def _replace_legacy_state_folder_strings(value):
-    """Recursively patch exact /gag_rejoiner/ path components."""
-    changed = False
-
-    if isinstance(value, dict):
-        for key in list(value.keys()):
-            new_value, item_changed = _replace_legacy_state_folder_strings(
-                value[key]
-            )
-            if item_changed:
-                value[key] = new_value
-                changed = True
-        return value, changed
-
-    if isinstance(value, list):
-        for index, item in enumerate(list(value)):
-            new_value, item_changed = _replace_legacy_state_folder_strings(item)
-            if item_changed:
-                value[index] = new_value
-                changed = True
-        return value, changed
-
-    if isinstance(value, str):
-        old_component = f"/{LEGACY_STATE_FOLDER_NAME}/"
-        if old_component in value:
-            return (
-                value.replace(
-                    old_component,
-                    f"/{STATE_FOLDER_NAME}/",
-                ),
-                True,
-            )
-
-    return value, False
-
-
-def _unique_legacy_quarantine_path(parent):
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    candidate = parent / (
-        f"{LEGACY_STATE_FOLDER_NAME}_legacy_v456_{stamp}"
-    )
-    suffix = 1
-    while candidate.exists():
-        candidate = parent / (
-            f"{LEGACY_STATE_FOLDER_NAME}_legacy_v456_{stamp}_{suffix}"
-        )
-        suffix += 1
-    return candidate
-
-
-def migrate_legacy_delta_state_folder_once(cfg=None, force=False):
-    """Move/quarantine the obsolete Delta gag_rejoiner state folder safely.
-
-    The canonical folder always wins unless the legacy file has a newer payload
-    timestamp. The old directory is renamed after migration so state discovery
-    can no longer select it, while preserving rollback data.
-    """
-    cfg = cfg if isinstance(cfg, dict) else {}
-    marker = int(
-        cfg.get("_nomo_legacy_delta_state_cleanup_migration", 0) or 0
-    )
-    if marker >= LEGACY_DELTA_STATE_MIGRATION_VERSION and not force:
-        return {
-            "ran": False,
-            "moved": 0,
-            "replaced": 0,
-            "quarantined": "",
-            "paths_patched": False,
-        }
-
-    workspace = DELTA_GLOBAL_WORKSPACE_DIR
-    canonical = workspace / STATE_FOLDER_NAME
-    legacy = workspace / LEGACY_STATE_FOLDER_NAME
-    backup_root = BASE_DIR / "legacy_state_backups"
-    moved = 0
-    replaced = 0
-    quarantined = ""
-    paths_patched = False
-
-    try:
-        canonical.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
-
-    if legacy.exists() and legacy.is_dir():
-        try:
-            backup_root.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
-
-        try:
-            legacy_items = list(legacy.iterdir())
-        except Exception:
-            legacy_items = []
-
-        for old_path in legacy_items:
-            if not old_path.is_file():
-                continue
-
-            new_path = canonical / old_path.name
-            try:
-                if not new_path.exists():
-                    shutil.copy2(old_path, new_path)
-                    moved += 1
-                    continue
-
-                old_ts = _legacy_state_payload_timestamp(old_path)
-                new_ts = _legacy_state_payload_timestamp(new_path)
-
-                if old_ts > new_ts:
-                    backup_name = (
-                        f"{new_path.name}.pre_v456."
-                        f"{int(time.time())}.bak"
-                    )
-                    backup_path = backup_root / backup_name
-                    shutil.copy2(new_path, backup_path)
-                    shutil.copy2(old_path, new_path)
-                    replaced += 1
-            except Exception:
-                continue
-
-        try:
-            quarantine_path = _unique_legacy_quarantine_path(workspace)
-            legacy.rename(quarantine_path)
-            quarantined = str(quarantine_path)
-        except Exception:
-            quarantined = ""
-
-    # Patch all sections in nomo.json in one pass.
-    try:
-        all_data = _nomo_read_all()
-        _, paths_patched = _replace_legacy_state_folder_strings(all_data)
-        if paths_patched:
-            _nomo_write_all(all_data)
-    except Exception:
-        paths_patched = False
-
-    # Also patch the optional template so it cannot recreate legacy paths.
-    try:
-        if CONFIG_TEMPLATE_FILE.exists():
-            template = json.loads(
-                CONFIG_TEMPLATE_FILE.read_text(encoding="utf-8")
-            )
-            _, template_changed = _replace_legacy_state_folder_strings(
-                template
-            )
-            if template_changed:
-                CONFIG_TEMPLATE_FILE.write_text(
-                    json.dumps(template, indent=2),
-                    encoding="utf-8",
-                )
-                paths_patched = True
-    except Exception:
-        pass
-
-    cfg["_nomo_legacy_delta_state_cleanup_migration"] = (
-        LEGACY_DELTA_STATE_MIGRATION_VERSION
-    )
-    cfg["_nomo_legacy_delta_state_cleanup_summary"] = {
-        "moved": moved,
-        "replaced": replaced,
-        "quarantined": quarantined,
-        "paths_patched": bool(paths_patched),
-        "completed_at": int(time.time()),
-    }
-
-    return {
-        "ran": True,
-        "moved": moved,
-        "replaced": replaced,
-        "quarantined": quarantined,
-        "paths_patched": bool(paths_patched),
-    }
-
 
 _STOP_REQUESTED = False
 
@@ -621,32 +277,7 @@ DEFAULT_CONFIG = {
     "update_source_url": NOMO_UPDATE_URL,
     "update_timeout_seconds": 45,
 
-    # Selected by Option 13. Existing devices remain auto/per-clone until setup
-    # explicitly chooses Delta Global.
-    "executor_storage_mode": "auto",
-    "delta_global_lock_package_mapping": True,
-
-    # Optional token for private GitHub release assets. Public release assets do
-    # not need this. GoFile tokens are requested interactively and not saved.
-    "github_download_token": "",
-
-    # install_only    = always pm install -r
-    # uninstall_first = remove detected exact package first, then install
-    # ask_each        = legacy key; ask once for the whole selected APK batch
-    "apk_install_mode": "ask_each",
-
     "cookie_webhook_url": "",   # stored locally, never hardcoded
-
-    # Fresh Delta/App-Cloner packages show a one-time OK dialog before WebView
-    # creates the Cookies database. These taps run only in the missing-DB path.
-    "cookie_first_launch_ok_enabled": True,
-    "cookie_first_launch_ok_x": 868,
-    "cookie_first_launch_ok_y": 403,
-    "cookie_first_launch_ok_delay_seconds": 3.0,
-    "cookie_first_launch_ok_repeats": 2,
-    "cookie_first_launch_ok_interval_seconds": 0.25,
-    "cookie_first_launch_db_wait_seconds": 35,
-
     "login_challenge_detection_enabled": True,
     "login_challenge_api_detection_enabled": True,
     "login_challenge_ui_detection_enabled": True,
@@ -772,10 +403,6 @@ DEFAULT_CONFIG = {
     # readable state file before the table stops showing "waiting" and surfaces
     # an actionable "check Lua/username" note. Short so it never looks stuck.
     "hatcher_startup_grace_seconds": 75,
-    # When NOMO is started while Roblox clones are already opening, their old
-    # state files remain visible until AutoExec reaches the game. Do not treat
-    # those old files as proof that the live clone is stuck.
-    "hatcher_startup_stale_grace_seconds": 240,
     # V3.79: automatically resolve each package's real username from its cookie
     # (Roblox API) -> fallback state file, so the table always matches the
     # account actually logged in. Makes the manual "get username" step optional.
@@ -803,12 +430,6 @@ DEFAULT_CONFIG = {
     "wait_fresh_after_open": True,
     "open_wait_fresh_seconds": 300,
     "open_wait_check_seconds": 5,
-    # Redfinger/App Cloner can take well over 20 seconds before the new Roblox
-    # process becomes visible in ps. Never hard-retry during this startup window.
-    "open_process_start_grace_seconds": 120,
-    # Once the PID has been observed, require a sustained disappearance before
-    # declaring that package dead. Brief process transitions are ignored.
-    "open_process_dead_confirm_seconds": 45,
     "post_open_grace_seconds": 360,
 
     # Homepage / cold-start recovery:
@@ -1103,19 +724,6 @@ DEFAULT_HATCHER_CONFIG = {
     "rejoin_public_server": True,
     "public_server_rejoin_after_seconds": 20,
     "expected_place_id": "126884695634066",
-
-    # V4.53: intentional Main Garden -> Trade World -> Main Garden event flow.
-    # The selected package remains protected from stale/wrong-place rejoin while
-    # the in-game script crafts/server-hops in Trade World. A real dead process,
-    # explicit disconnect, CAPTCHA, or face lock still uses normal recovery.
-    "transition_guard_enabled": False,
-    "transition_guard_place_id": "129954712878723",
-    "transition_guard_return_place_id": "126884695634066",
-    "transition_guard_return_stable_seconds": 300,
-    "transition_guard_max_active_seconds": 900,
-    "transition_guard_pause_rejoin": False,
-    "transition_guard_pause_backend": False,
-    "transition_guard_publish_unavailable_once": False,
 
     "backend_provider": "jsonbin",
     "jsonbin_bin_id": "YOUR_BIN_ID",
@@ -1725,10 +1333,6 @@ def apply_update_migrations(cfg):
     # stuck and cause unnecessary rejoin loops. Raise only known-aggressive values.
     if _int_cfg(cfg.get("open_wait_fresh_seconds"), 0) <= 120:
         set_cfg("open_wait_fresh_seconds", 300)
-    if _int_cfg(cfg.get("open_process_start_grace_seconds"), 0) < 60:
-        set_cfg("open_process_start_grace_seconds", 120)
-    if _int_cfg(cfg.get("open_process_dead_confirm_seconds"), 0) < 20:
-        set_cfg("open_process_dead_confirm_seconds", 45)
     if _int_cfg(cfg.get("soft_hop_wait_fresh_seconds"), 0) <= 90:
         set_cfg("soft_hop_wait_fresh_seconds", 240)
     if _int_cfg(cfg.get("post_open_grace_seconds"), 0) <= 180:
@@ -1742,8 +1346,6 @@ def apply_update_migrations(cfg):
     # for the full 6-minute post-open window.
     if _int_cfg(cfg.get("hatcher_startup_grace_seconds"), 0) <= 0:
         set_cfg("hatcher_startup_grace_seconds", 75)
-    if _int_cfg(cfg.get("hatcher_startup_stale_grace_seconds"), 0) < 120:
-        set_cfg("hatcher_startup_stale_grace_seconds", 240)
 
     # V3.79: auto username resolution ON by default so the table matches the
     # logged-in account without the manual step.
@@ -2068,12 +1670,6 @@ def load_config():
     cfg = load_json(CONFIG_FILE, DEFAULT_CONFIG)
     changed = False
 
-    if int(
-        cfg.get("_nomo_legacy_delta_state_cleanup_migration", 0) or 0
-    ) < LEGACY_DELTA_STATE_MIGRATION_VERSION:
-        migrate_legacy_delta_state_folder_once(cfg)
-        changed = True
-
     # If config was just created, make sure template values are saved after any load fallback.
     if created_new and apply_global_template_to_config(cfg, force=True):
         changed = True
@@ -2163,12 +1759,6 @@ def load_config():
         if "enabled" not in tab:
             tab["enabled"] = True
             changed = True
-
-    if normalize_delta_global_mappings(cfg):
-        changed = True
-    if int(cfg.get("_nomo_delta_mapping_migration", 0) or 0) < 451:
-        cfg["_nomo_delta_mapping_migration"] = 451
-        changed = True
 
     if normalize_active_mode_flags(cfg):
         changed = True
@@ -2848,398 +2438,41 @@ def _state_file_freshness(path):
             return -1
 
 
-
-def _path_is_under(path_value, root_value):
-    try:
-        path = Path(str(path_value or "")).resolve(strict=False)
-        root = Path(str(root_value or "")).resolve(strict=False)
-        return path == root or root in path.parents
-    except Exception:
-        path = str(path_value or "").replace("\\", "/").rstrip("/")
-        root = str(root_value or "").replace("\\", "/").rstrip("/")
-        return bool(path and root and (path == root or path.startswith(root + "/")))
-
-
-def is_delta_global_tab(tab):
-    if not isinstance(tab, dict):
-        return False
-    if str(tab.get("executor_storage", "") or "").lower() == "delta_global":
-        return True
-    state_path = str(tab.get("stat_file") or tab.get("state_file") or "")
-    autoexec_path = str(tab.get("autoexec_path") or "")
-    return (
-        _path_is_under(state_path, DELTA_GLOBAL_STATE_DIR)
-        or _path_is_under(state_path, DELTA_GLOBAL_WORKSPACE_DIR)
-        or _path_is_under(autoexec_path, DELTA_GLOBAL_AUTOEXEC_DIR)
-    )
-
-
-def _delta_username_key(value):
-    value = _usable_detected_username(value)
-    return _sanitize_state_name(value).lower() if value else ""
-
-
-def delta_global_state_path(username):
-    username = _usable_detected_username(username)
-    if not username:
-        return None
-    return DELTA_GLOBAL_STATE_DIR / (
-        f"{_sanitize_state_name(username)}_state.json"
-    )
-
-
-def normalize_delta_global_mappings(cfg):
-    """Lock Delta tabs to exact username files and flag duplicates."""
-    if not isinstance(cfg, dict):
-        return False
-
-    tabs = [
-        tab for tab in cfg.get("tabs", [])
-        if isinstance(tab, dict) and is_delta_global_tab(tab)
-    ]
-    changed = False
-    groups = {}
-
-    for tab in tabs:
-        username = _usable_detected_username(tab.get("user_name"))
-        if username:
-            exact = delta_global_state_path(username)
-            if exact and str(tab.get("stat_file") or "") != str(exact):
-                tab["stat_file"] = str(exact)
-                changed = True
-            groups.setdefault(_delta_username_key(username), []).append(tab)
-        if tab.get("executor_storage") != "delta_global":
-            tab["executor_storage"] = "delta_global"
-            changed = True
-        if tab.get("delta_mapping_locked") is not True:
-            tab["delta_mapping_locked"] = True
-            changed = True
-
-    for tab in tabs:
-        key = _delta_username_key(tab.get("user_name"))
-        conflict = bool(key and len(groups.get(key, [])) > 1)
-        if bool(tab.get("delta_mapping_conflict", False)) != conflict:
-            tab["delta_mapping_conflict"] = conflict
-            changed = True
-
-    return changed
-
-
-def delta_mapping_conflict_for_tab(tab):
-    if not is_delta_global_tab(tab):
-        return False
-    if bool(tab.get("delta_mapping_conflict", False)):
-        return True
-
-    package = str(tab.get("package") or "")
-    key = _delta_username_key(
-        tab.get("user_name") or tab.get("username")
-    )
-    if not key:
-        return False
-
-    try:
-        raw_cfg = load_json(CONFIG_FILE, DEFAULT_CONFIG)
-    except Exception:
-        return False
-
-    packages = set()
-    for other in raw_cfg.get("tabs", []):
-        if not isinstance(other, dict) or not is_delta_global_tab(other):
-            continue
-        if _delta_username_key(other.get("user_name")) == key:
-            packages.add(str(other.get("package") or ""))
-
-    return len(packages) > 1 and (not package or package in packages)
-
-
-def delta_state_username_candidates():
-    found = {}
-    if not DELTA_GLOBAL_STATE_DIR.exists():
-        return []
-
-    for path in DELTA_GLOBAL_STATE_DIR.glob("*_state.json"):
-        username = ""
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            username = _usable_detected_username(payload.get("username")) or ""
-        except Exception:
-            pass
-        if not username:
-            username = _usable_detected_username(
-                path.name[:-len("_state.json")]
-            ) or ""
-        key = _delta_username_key(username)
-        if key:
-            found[key] = username
-
-    return sorted(found.values(), key=str.lower)
-
-
-
-def _unique_identity_names(values):
-    result = []
-    seen = set()
-    for value in values:
-        name = _usable_detected_username(value)
-        key = _delta_username_key(name)
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        result.append(name)
-    return result
-
-
-def _queue_identity_backend_sync(package, old_names, new_name):
-    """Invalidate report caches and queue removal of old backend identity keys."""
-    package = str(package or "").strip()
-    new_name = _usable_detected_username(new_name)
-    old_names = [
-        name
-        for name in _unique_identity_names(old_names)
-        if _delta_username_key(name) != _delta_username_key(new_name)
-    ]
-
-    hrt = load_hatcher_runtime()
-    pending_h = set(
-        _unique_identity_names(hrt.get("pending_remove_names", []))
-    )
-    pending_h.update(old_names)
-    hrt["pending_remove_names"] = sorted(pending_h, key=str.lower)
-    hrt["mapping_force_report"] = True
-    for name in _unique_identity_names(old_names + [new_name]):
-        for key in (
-            "last_update_ts",
-            "last_signature",
-            "last_status",
-            "last_reason",
-        ):
-            bucket = hrt.get(key)
-            if isinstance(bucket, dict):
-                bucket.pop(name, None)
-    save_hatcher_runtime(hrt)
-
-    brt = load_booster_runtime()
-    pending_b = set(
-        _unique_identity_names(brt.get("pending_remove_names", []))
-    )
-    pending_b.update(old_names)
-    brt["pending_remove_names"] = sorted(pending_b, key=str.lower)
-    brt["mapping_force_report"] = True
-    for name in _unique_identity_names(old_names + [new_name]):
-        for key in ("last_update_ts", "last_signature", "last_status"):
-            bucket = brt.get(key)
-            if isinstance(bucket, dict):
-                bucket.pop(name, None)
-    save_booster_runtime(brt)
-
-    rt = load_runtime()
-    rt["_last_username_resolve"] = 0
-    if package:
-        rt_tab = get_runtime_tab(rt, package)
-        rt_tab["note"] = f"identity synced -> {new_name}"
-        rt_tab["delta_mapping_synced_at"] = now()
-    save_runtime(rt)
-
-
-def _clear_hatcher_pending_identity_removes(names):
-    names = {_delta_username_key(name) for name in names if name}
-    if not names:
-        return
-    rt = load_hatcher_runtime()
-    pending = [
-        name
-        for name in _unique_identity_names(rt.get("pending_remove_names", []))
-        if _delta_username_key(name) not in names
-    ]
-    rt["pending_remove_names"] = pending
-    if not pending:
-        rt["mapping_force_report"] = False
-    save_hatcher_runtime(rt)
-
-
-def _clear_booster_pending_identity_removes(names):
-    names = {_delta_username_key(name) for name in names if name}
-    if not names:
-        return
-    rt = load_booster_runtime()
-    pending = [
-        name
-        for name in _unique_identity_names(rt.get("pending_remove_names", []))
-        if _delta_username_key(name) not in names
-    ]
-    rt["pending_remove_names"] = pending
-    if not pending:
-        rt["mapping_force_report"] = False
-    save_booster_runtime(rt)
-
-
-def apply_delta_package_mapping(cfg, package, username, source_name):
-    """Synchronize one Delta package identity across every NOMO subsystem."""
-    package = str(package or "").strip()
-    username = _usable_detected_username(username)
-    if not package or not username:
-        return False
-
-    # Use the caller's current object for immediate flow, but load fresh profile
-    # configs so an older in-memory Hatcher/Booster object cannot overwrite us.
-    hcfg = load_hatcher_config()
-    bcfg = load_booster_config()
-    exact_path = delta_global_state_path(username)
-    changed = False
-    old_names = []
-
-    tab = next(
-        (
-            item for item in cfg.get("tabs", [])
-            if str(item.get("package") or "") == package
-        ),
-        None,
-    )
-    if tab is not None:
-        old_names.append(tab.get("user_name"))
-        desired = {
-            "user_name": username,
-            "stat_file": str(exact_path),
-            "autoexec_path": str(DELTA_GLOBAL_AUTOEXEC_DIR),
-            "executor_storage": "delta_global",
-            "delta_mapping_locked": True,
-            "delta_mapping_source": source_name,
-            "delta_mapping_conflict": False,
-        }
-        for key, value in desired.items():
-            if tab.get(key) != value:
-                tab[key] = value
-                changed = True
-
-    h_profile = next(
-        (
-            profile
-            for profile in hatcher_profiles(hcfg, enabled_only=False)
-            if str(profile.get("package") or "") == package
-        ),
-        None,
-    )
-    if h_profile is not None:
-        old_names.append(h_profile.get("hatcher_name"))
-        desired = {
-            "hatcher_name": username,
-            "state_file": str(exact_path),
-            "executor_storage": "delta_global",
-            "delta_mapping_locked": True,
-            "delta_mapping_source": source_name,
-            "delta_mapping_conflict": False,
-        }
-        for key, value in desired.items():
-            if h_profile.get(key) != value:
-                h_profile[key] = value
-                changed = True
-
-    b_profile = next(
-        (
-            profile
-            for profile in booster_profiles(bcfg)
-            if str(profile.get("package") or "") == package
-        ),
-        None,
-    )
-    if b_profile is not None:
-        old_names.append(b_profile.get("booster_name"))
-        desired = {
-            "booster_name": username,
-            "state_file": str(exact_path),
-            "executor_storage": "delta_global",
-            "delta_mapping_locked": True,
-            "delta_mapping_source": source_name,
-            "delta_mapping_conflict": False,
-        }
-        for key, value in desired.items():
-            if b_profile.get(key) != value:
-                b_profile[key] = value
-                changed = True
-
-    if normalize_delta_global_mappings(cfg):
-        changed = True
-
-    # Re-apply conflict flags to the role configs after main normalization.
-    main_by_package = {
-        str(item.get("package") or ""): item
-        for item in cfg.get("tabs", [])
-        if isinstance(item, dict)
-    }
-    for profile in hatcher_profiles(hcfg, enabled_only=False):
-        main_tab = main_by_package.get(str(profile.get("package") or ""))
-        if main_tab and is_delta_global_tab(main_tab):
-            profile["delta_mapping_conflict"] = bool(
-                main_tab.get("delta_mapping_conflict", False)
-            )
-    for profile in booster_profiles(bcfg):
-        main_tab = main_by_package.get(str(profile.get("package") or ""))
-        if main_tab and is_delta_global_tab(main_tab):
-            profile["delta_mapping_conflict"] = bool(
-                main_tab.get("delta_mapping_conflict", False)
-            )
-
-    save_config(cfg)
-    save_hatcher_config(hcfg)
-    save_booster_config(bcfg)
-
-    if changed:
-        _queue_identity_backend_sync(package, old_names, username)
-        log_activity(
-            f"identity synced everywhere -> {username} [{source_name}]",
-            package,
-            GREEN,
-        )
-    return changed
-
-
-
 def resolve_state_path(tab):
-    """Return exact Delta state; preserve legacy fallback elsewhere."""
+    """Return the freshest matching state across nomo_rejoiner and legacy gag_rejoiner."""
     raw = str(tab.get("stat_file", "") or "")
     if not raw:
         return None
-
     configured = Path(raw)
+    folders = _state_folder_candidates(configured.parent)
     user = tab.get("user_name") or tab.get("username") or ""
 
-    if is_delta_global_tab(tab):
-        exact = delta_global_state_path(user)
-        return exact if exact is not None else configured
-
-    folders = _state_folder_candidates(configured.parent)
     per_user_candidates = []
     if user:
         safe = _sanitize_state_name(user)
-        per_user_candidates = [
-            folder / f"{safe}_state.json" for folder in folders
-        ]
+        per_user_candidates = [folder / f"{safe}_state.json" for folder in folders]
 
     freshest = _freshest_state_file(configured.parent)
     existing_per_user = [p for p in per_user_candidates if p.exists()]
     if existing_per_user:
         per_user = max(existing_per_user, key=_state_file_freshness)
-        if (
-            freshest is None
-            or _state_file_freshness(per_user)
-            >= _state_file_freshness(freshest)
-        ):
+        if freshest is None or _state_file_freshness(per_user) >= _state_file_freshness(freshest):
             return per_user
 
     if freshest is not None:
         return freshest
 
+    # Legacy state.json fallback in either folder.
     for folder in folders:
         legacy = folder / configured.name
         if legacy.exists():
             return legacy
 
+    # Stable missing target always points at the new canonical folder.
     canonical = folders[0] if folders else configured.parent
     if user:
         return canonical / f"{_sanitize_state_name(user)}_state.json"
     return canonical / configured.name
-
 
 def cleanup_orphan_state_files(tab, cfg):
     """Delete ONLY proven-orphan state files in this clone's NOMO state folder."""
@@ -3311,9 +2544,6 @@ def format_session(rt_tab):
 
 
 def read_state(tab):
-    if delta_mapping_conflict_for_tab(tab):
-        return None, "Delta mapping conflict"
-
     path = resolve_state_path(tab)
 
     if path is None or not path.exists():
@@ -3321,22 +2551,6 @@ def read_state(tab):
 
     try:
         data = json.loads(path.read_text())
-
-        if is_delta_global_tab(tab):
-            expected = _usable_detected_username(
-                tab.get("user_name") or tab.get("username")
-            )
-            actual = _usable_detected_username(data.get("username"))
-            if (
-                expected
-                and actual
-                and _delta_username_key(expected)
-                != _delta_username_key(actual)
-            ):
-                return None, (
-                    f"Delta username mismatch: expected {expected}, "
-                    f"found {actual}"
-                )
 
         pet_count = int(data.get("pet_count", 0))
         state_ts = int(data.get("ts", 0))
@@ -3566,8 +2780,6 @@ MAIN_MENU_ITEMS = [
     ("14", "Export diagnostics ZIP"),
     ("15", "NOMO update manager"),
     ("16", "Layout / visual CAPTCHA"),
-    ("17", "Workspace ZIP tools"),
-    ("18", "APK download / install"),
     ("0",  "Exit"),
 ]
 
@@ -3801,7 +3013,7 @@ def status_screen(rows, cfg, session_start, loops):
         ])
 
     draw_table(
-        ["No", "Username", "Package", "Pet", "Egg", "Status", "StateAge", "RunTime", "Note"],
+        ["No", "Username", "Package", "Pet", "Egg", "Status", "Age", "Session", "Note"],
         table_rows,
         widths,
         cfg,
@@ -4256,14 +3468,7 @@ def _persist_market_usernames_only(cfg):
 
 
 def sync_detected_username_for_package(hcfg, package, username, tab=None, source="state"):
-    """Apply identity, except shared Delta state-derived identity."""
-    if (
-        source == "state"
-        and isinstance(tab, dict)
-        and is_delta_global_tab(tab)
-    ):
-        return tab.get("user_name") or package, False
-
+    """Apply one detected account name to the package and persist it safely."""
     username = _usable_detected_username(username)
     package = str(package or "").strip()
     if not package or not username:
@@ -4302,204 +3507,31 @@ def sync_detected_username_for_package(hcfg, package, username, tab=None, source
     return username, (changed_market or changed_hatcher)
 
 
-
-def show_delta_mapping(cfg):
-    clear()
-    banner("DELTA PACKAGE MAPPING", cfg)
-    tabs = [
-        tab for tab in cfg.get("tabs", [])
-        if isinstance(tab, dict) and is_delta_global_tab(tab)
-    ]
-    if not tabs:
-        print(col("No Delta Global packages configured.", YELLOW))
-        pause()
-        return
-
-    rows = []
-    for tab in sorted(
-        tabs,
-        key=lambda item: natural_package_key(
-            str(item.get("package") or "")
-        ),
-    ):
-        conflict = delta_mapping_conflict_for_tab(tab)
-        rows.append([
-            (short_pkg(tab.get("package", "")), CYAN),
-            (str(tab.get("user_name") or "-"), RED if conflict else GREEN),
-            ("CONFLICT" if conflict else "LOCKED", RED if conflict else GREEN),
-            (Path(str(tab.get("stat_file") or "-")).name, DIM),
-        ])
-
-    draw_table(
-        ["Package", "Username", "Mapping", "Exact file"],
-        rows,
-        [10, 18, 10, 30],
-        cfg,
+def get_all_usernames_via_api(cfg=None):
+    """Manual username refresh for selected configured packages."""
+    if cfg is None:
+        cfg = load_config()
+    selected = choose_packages_common(
+        cfg, "REFRESH USERNAMES", multi=True,
+        include_discovered=False, configured_only=True
     )
+    if not selected:
+        return
+    clear()
+    banner("REFRESH USERNAMES", cfg)
+    print(col("Cookie -> Roblox API, with freshest state fallback.", DIM))
     print("")
-    print(col(
-        "Delta reads only this exact file; newest/random fallback is OFF.",
-        DIM,
-    ))
+    refresh_usernames_for_packages(cfg, selected)
     pause()
 
-
-def manual_delta_mapping(cfg):
-    packages = [
-        str(tab.get("package") or "")
-        for tab in cfg.get("tabs", [])
-        if isinstance(tab, dict) and is_delta_global_tab(tab)
-    ]
-    if not packages:
-        print(col("No Delta Global packages configured.", RED))
-        pause()
-        return
-
-    candidates = delta_state_username_candidates()
-
-    for pkg in sorted(packages, key=natural_package_key):
-        cfg = load_config()
-        tab = next(
-            (
-                item for item in cfg.get("tabs", [])
-                if str(item.get("package") or "") == pkg
-            ),
-            None,
-        )
-        if not tab:
-            continue
-
-        while True:
-            clear()
-            banner(f"MAP {short_pkg(pkg)}", cfg)
-            print(f"Current: {tab.get('user_name') or '-'}")
-            print("")
-            for index, username in enumerate(candidates, 1):
-                used = [
-                    short_pkg(other.get("package", ""))
-                    for other in cfg.get("tabs", [])
-                    if (
-                        str(other.get("package") or "") != pkg
-                        and is_delta_global_tab(other)
-                        and _delta_username_key(other.get("user_name"))
-                        == _delta_username_key(username)
-                    )
-                ]
-                suffix = f" [used by {', '.join(used)}]" if used else ""
-                print(f"{index}. {username}{suffix}")
-            print("M. Type username manually")
-            print("S. Skip")
-            print("0. Finish")
-
-            drain_stdin()
-            choice = clean_terminal_input(input("\\nChoose: "))
-            if choice == "0":
-                show_delta_mapping(cfg)
-                return
-            if choice.lower() == "s":
-                break
-            if choice.lower() == "m":
-                username = _usable_detected_username(
-                    clean_terminal_input(input("Exact Roblox username: "))
-                )
-            elif choice.isdigit() and 1 <= int(choice) <= len(candidates):
-                username = candidates[int(choice) - 1]
-            else:
-                print(col("Invalid choice.", RED))
-                time.sleep(1)
-                continue
-
-            if not username:
-                print(col("Invalid username.", RED))
-                time.sleep(1)
-                continue
-
-            duplicate = next(
-                (
-                    str(other.get("package") or "")
-                    for other in cfg.get("tabs", [])
-                    if (
-                        str(other.get("package") or "") != pkg
-                        and is_delta_global_tab(other)
-                        and _delta_username_key(other.get("user_name"))
-                        == _delta_username_key(username)
-                    )
-                ),
-                "",
-            )
-            if duplicate:
-                print(col(
-                    f"{username} is already mapped to "
-                    f"{short_pkg(duplicate)}.",
-                    RED,
-                ))
-                pause()
-                continue
-
-            apply_delta_package_mapping(
-                cfg, pkg, username, "manual"
-            )
-            normalize_delta_global_mappings(cfg)
-            save_config(cfg)
-            print(col(
-                f"Locked {short_pkg(pkg)} -> {username}",
-                GREEN,
-            ))
-            time.sleep(1)
-            break
-
-    show_delta_mapping(load_config())
-
-
-def get_all_usernames_via_api(cfg=None):
-    cfg = load_config() if cfg is None else cfg
-
-    while True:
-        clear()
-        banner("USERNAME / DELTA MAPPING", cfg)
-        print("1. Auto refresh + sync every system")
-        print("2. Manual Delta mapping + sync every system")
-        print("3. Show Delta Global mapping")
-        print("0. Back")
-        drain_stdin()
-        choice = clean_terminal_input(input("\nChoose: "))
-
-        if choice == "0":
-            return
-        if choice == "1":
-            selected = choose_packages_common(
-                cfg,
-                "REFRESH USERNAMES",
-                multi=True,
-                include_discovered=False,
-                configured_only=True,
-            )
-            if selected:
-                clear()
-                banner("REFRESH USERNAMES", cfg)
-                print(col(
-                    "Delta: package API only; shared-state fallback disabled.",
-                    DIM,
-                ))
-                refresh_usernames_for_packages(cfg, selected)
-                cfg = load_config()
-                pause()
-            continue
-        if choice == "2":
-            manual_delta_mapping(cfg)
-            cfg = load_config()
-            continue
-        if choice == "3":
-            show_delta_mapping(cfg)
-            cfg = load_config()
-            continue
-
-        print(col("Invalid choice.", RED))
-        time.sleep(1)
-
-
 def resolve_usernames_auto(cfg, hcfg=None, rt=None, force=False, quiet=True):
-    """Resolve package identities without shared-Delta state-file guessing."""
+    """AUTOMATIC version of option 4. Resolves each package's real username from
+    its cookie (Roblox API), falling back to the freshest state file, and writes
+    it into tab['user_name'] / profile['hatcher_name'] so state matching lines up
+    without the user ever running the manual step. Cached + rate-limited via rt.
+
+    Fully guarded: any network/root failure just leaves names as-is.
+    """
     if not cfg.get("auto_resolve_usernames_enabled", True):
         return False
     if hcfg is None:
@@ -4514,104 +3546,95 @@ def resolve_usernames_auto(cfg, hcfg=None, rt=None, force=False, quiet=True):
         if last > 0 and (now() - last) < interval:
             return False
 
+    tabs = cfg.get("tabs", [])
     profiles = hatcher_profiles(hcfg, enabled_only=False)
-    profile_map = {
-        profile.get("package"): profile
-        for profile in profiles
-        if profile.get("package")
-    }
+    profile_map = {p.get("package"): p for p in profiles if p.get("package")}
 
+    # Resolve across BOTH market tabs and hatcher profiles by package.
     packages = {}
-    for tab in cfg.get("tabs", []):
+    for tab in tabs:
         pkg = tab.get("package")
         if pkg:
             packages.setdefault(pkg, {})["tab"] = tab
-    for pkg, profile in profile_map.items():
-        packages.setdefault(pkg, {})["prof"] = profile
+    for pkg, prof in profile_map.items():
+        packages.setdefault(pkg, {})["prof"] = prof
 
-    changed_main = False
-    changed_non_delta_hatcher = False
-    changed_delta = False
+    changed_market = False
+    changed_hatcher = False
 
     for pkg, refs in packages.items():
         tab = refs.get("tab")
-        profile = refs.get("prof")
-        state_tab = tab or (
-            hatcher_profile_to_tab(profile) if profile else None
-        )
+        prof = refs.get("prof")
+        # Build a tab-like object for state fallback if only a profile exists.
+        state_tab = tab or (hatcher_profile_to_tab(prof) if prof else None)
 
         username = None
         try:
-            username, uid = get_username_from_package_api(pkg)
+            username, _uid = get_username_from_package_api(pkg)
         except Exception:
             username = None
-        username = _usable_detected_username(username)
 
-        if (
-            not username
-            and state_tab is not None
-            and not is_delta_global_tab(state_tab)
-        ):
+        if not username and state_tab is not None:
             try:
-                state, error = read_state(state_tab)
-                username = _usable_detected_username(
-                    (state or {}).get("username")
-                )
+                state, _err = read_state(state_tab)  # uses freshest-file fallback
+                if state and state.get("username"):
+                    username = state.get("username")
             except Exception:
                 username = None
 
         if not username:
             continue
 
-        if tab is not None and is_delta_global_tab(tab):
-            if apply_delta_package_mapping(
-                cfg, pkg, username, "cookie/API"
-            ):
-                changed_delta = True
-                changed_main = True
-                fresh_cfg = load_config()
-                cfg.clear()
-                cfg.update(fresh_cfg)
-        else:
-            if tab is not None and tab.get("user_name") != username:
-                tab["user_name"] = username
-                changed_main = True
-            if (
-                profile is not None
-                and profile.get("hatcher_name") != username
-            ):
-                profile["hatcher_name"] = username
-                changed_non_delta_hatcher = True
-
+        if tab is not None and tab.get("user_name") != username:
+            tab["user_name"] = username
+            changed_market = True
+        if prof is not None and prof.get("hatcher_name") != username:
+            prof["hatcher_name"] = username
+            changed_hatcher = True
         if not quiet:
-            print(
-                f"{pad(short_pkg(pkg), 6, CYAN)} -> "
-                f"{col(username, GREEN)}"
-            )
+            print(f"{pad(short_pkg(pkg), 6, CYAN)} -> {col(username, GREEN)}")
 
-    if changed_main and not changed_delta:
+    if changed_market:
         try:
             _persist_market_usernames_only(cfg)
         except Exception:
             pass
-    elif changed_main:
-        save_config(cfg)
-
-    if changed_non_delta_hatcher:
+    if changed_hatcher:
         try:
             save_hatcher_config(hcfg)
         except Exception:
             pass
-
     if isinstance(rt, dict):
         rt["_last_username_resolve"] = now()
 
-    return bool(
-        changed_main
-        or changed_non_delta_hatcher
-        or changed_delta
-    )
+    return changed_market or changed_hatcher
 
+
+
+    banner("GET USERNAME", cfg)
+
+    print("")
+    for t in cfg["tabs"]:
+        state, err = read_state(t)
+
+        if state:
+            t["user_name"] = state.get("username", t.get("user_name", ""))
+            print(f"{pad(short_pkg(t['package']), 6, CYAN)} -> {col(t['user_name'], GREEN)} | pets={state.get('pet_count')}")
+        else:
+            print(f"{pad(short_pkg(t['package']), 6, CYAN)} -> {col('no state: ' + str(err), RED)}")
+
+    save_config(cfg)
+
+    print("\nJSON files found:")
+    found = auto_find_state_files()
+
+    if not found:
+        print(col("none", DIM))
+
+    for p in found[:20]:
+        print(col(p, DIM))
+
+    pause()
 
 
 
@@ -5623,8 +4646,6 @@ def config_settings(cfg):
                 ("smart_open_queue", "smart_open_queue"),
                 ("wait_fresh_after_open", "wait_fresh_after_open"),
                 ("open_wait_fresh_seconds", "wait_fresh_timeout"),
-                ("open_process_start_grace_seconds", "process_start_grace"),
-                ("open_process_dead_confirm_seconds", "process_dead_confirm"),
                 ("open_wait_check_seconds", "wait_check_seconds"),
                 ("homepage_stuck_hard_fallback_enabled", "homepage_hard_fallback"),
                 ("homepage_stuck_fallback_seconds", "homepage_fallback_after"),
@@ -6543,17 +5564,12 @@ def queue_hatcher_alive_old_state_hard(open_queue, tab, rt_tab, hcfg, cfg, age_o
         metadata={
             "bypass_recheck": True,
             "pid_only_recovery": True,
-            "recovery_must_open_once": True,
-            "hatcher_old_state_recovery": True,
-            "hatcher_old_state_age": age_i,
-            "hatcher_old_state_reason": str(reason or "alive old state"),
         },
     )
     if not added:
         return False, "already queued", True
 
-    # Cooldown starts only after _do_open_cycle confirms that Android accepted
-    # the real target open. A queued item may be blocked, cancelled, or held.
+    rt_tab["hatcher_alive_old_state_hard_last"] = t
     rt_tab["hatcher_alive_old_state_hard_age"] = age_i
     rt_tab["hatcher_alive_old_state_hard_reason"] = str(reason or "alive old state")
     return True, "old-state PID hard queued", True
@@ -7266,16 +6282,9 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
 
         # old past trigger -> kill + open THIS one clone
         if age >= trigger:
-            added, _ = queue_open(
-                open_queue, tab, target,
-                f"{mode} alive old state {format_age(age)}",
-                force=True, mode="hard_force", skip_if_alive=False, bypass_manual=True,
-                metadata={
-                    "pid_only_recovery": True,
-                    "recovery_must_open_once": True,
-                    "bypass_recheck": True,
-                },
-            )
+            added, _ = queue_open(open_queue, tab, target,
+                                  f"{mode} alive old state {format_age(age)}",
+                                  force=True, mode="hard", skip_if_alive=False)
             return ("Queued" if added else "Stale"), \
                    (f"old {format_age(age)} kill+open" if added else "already queued"), True
 
@@ -7286,28 +6295,14 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
     if alive:
         if in_grace:
             return "Loading", "no state grace", True
-        added, _ = queue_open(
-            open_queue, tab, target, f"{mode} alive no-state hard",
-            force=True, mode="hard_force", skip_if_alive=False, bypass_manual=True,
-            metadata={
-                "pid_only_recovery": True,
-                "recovery_must_open_once": True,
-                "bypass_recheck": True,
-            },
-        )
+        added, _ = queue_open(open_queue, tab, target, f"{mode} alive no-state hard",
+                              force=True, mode="hard", skip_if_alive=False)
         return ("Queued" if added else "No state"), \
                ("no-state kill+open" if added else "already queued"), True
 
     # dead -> kill + open
-    added, _ = queue_open(
-        open_queue, tab, target, f"{mode} crash/dead",
-        force=True, mode="hard_force", skip_if_alive=True, bypass_manual=True,
-        metadata={
-            "pid_only_recovery": True,
-            "recovery_must_open_once": True,
-            "bypass_recheck": True,
-        },
-    )
+    added, _ = queue_open(open_queue, tab, target, f"{mode} crash/dead",
+                          force=True, mode="hard", skip_if_alive=True)
     return ("Queued" if added else "Offline"), \
            ("crash kill+open" if added else "already queued"), True
 
@@ -8215,15 +7210,6 @@ def wait_until_fresh_after_open(tab, cfg, rt, opened_at, timeout_override=None, 
     pkg = tab.get("package")
     rt_tab = get_runtime_tab(rt, pkg)
 
-    process_start_grace = max(
-        30, int(cfg.get("open_process_start_grace_seconds", 120) or 120)
-    )
-    process_dead_confirm = max(
-        15, int(cfg.get("open_process_dead_confirm_seconds", 45) or 45)
-    )
-    seen_alive_after_open = False
-    process_missing_since = 0
-
     # V3.81: never call the solver blindly here. A job is started below only
     # when the Lua state explicitly reports a join/login challenge.
 
@@ -8236,12 +7222,6 @@ def wait_until_fresh_after_open(tab, cfg, rt, opened_at, timeout_override=None, 
 
         alive = package_alive(tab["package"], cfg)
         fresh, state, err = state_fresh_after_open(tab, cfg, opened_at)
-
-        if alive:
-            seen_alive_after_open = True
-            process_missing_since = 0
-        elif process_missing_since <= 0:
-            process_missing_since = now()
 
         # V3.84: one provider check per actual open/rejoin. An old state file may
         # still exist, so use `not fresh` rather than only `not state`.
@@ -8308,15 +7288,7 @@ def wait_until_fresh_after_open(tab, cfg, rt, opened_at, timeout_override=None, 
         elif solver_job_running(pkg):
             status_note = solver_job_note(pkg)
         elif not alive:
-            missing_for = max(0, now() - int(process_missing_since or now()))
-            if seen_alive_after_open:
-                status_note = (
-                    f"process missing {missing_for}/{process_dead_confirm}s"
-                )
-            else:
-                status_note = (
-                    f"waiting process {elapsed}/{process_start_grace}s"
-                )
+            status_note = "loading (not alive yet)"
         else:
             status_note = "waiting fresh state"
 
@@ -8341,18 +7313,8 @@ def wait_until_fresh_after_open(tab, cfg, rt, opened_at, timeout_override=None, 
             log_activity("fresh clean state - rejoin complete", pkg, GREEN)
             return True, "fresh"
     
-        if not alive:
-            missing_for = max(0, now() - int(process_missing_since or now()))
-
-            # The clone may need a long time before ps exposes its new process.
-            # Do not stop/reopen it during that initial Redfinger startup window.
-            if not seen_alive_after_open and elapsed >= process_start_grace:
-                return False, "process never appeared"
-
-            # Only treat it as dead when it was previously confirmed alive and
-            # then remained continuously absent for the configured confirmation.
-            if seen_alive_after_open and missing_for >= process_dead_confirm:
-                return False, "died while loading"
+        if not alive and elapsed >= 20:
+            return False, "died while loading"
 
         for _ in range(check_every):
             if stop_requested():
@@ -8429,13 +7391,13 @@ def solver_preflight_before_open(open_queue, item, tab, rt_tab, pkg, target, cfg
         # the restart must not disappear merely because cookie extraction failed.
         # Skip the provider for this one generation and still restart only the
         # affected PID. A genuine logged-out client will surface after reopening.
-        if item.get("disconnect_recovery") or item.get("recovery_must_open_once"):
+        if item.get("disconnect_recovery"):
             item["solver_preflight_done"] = True
             item["solver_result"] = "SOLVER_SKIPPED_COOKIE"
             item["skip_solver_once"] = True
             item["skip_solver_probe"] = True
-            rt_tab["note"] = "solver cookie unavailable; recovery open continues once"
-            log_activity("solver cookie unavailable; exact-PID recovery continues once", pkg, YELLOW)
+            rt_tab["note"] = f"solver cookie unavailable; restarting kicked package once"
+            log_activity("solver cookie unavailable; kick PID recovery continues once", pkg, YELLOW)
             save_runtime(rt)
             return "ready", item
 
@@ -8483,16 +7445,10 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0):
     # A confirmed kick/disconnect is an in-session failure, not a reason to let
     # an older persisted manual-login hold discard the recovery item. Kick items
     # are allowed to perform one target-only restart even when that stale flag exists.
-    if (
-        manual_login_blocked(rt_tab, cfg)
-        and not item.get("bypass_manual")
-        and not item.get("disconnect_recovery")
-        and not item.get("recovery_must_open_once")
-    ):
+    if manual_login_blocked(rt_tab, cfg) and not item.get("bypass_manual") and not item.get("disconnect_recovery"):
         recovered, detail = maybe_clear_manual_login_prejoin(tab, cfg, rt, rt_tab)
         if not recovered:
             rt_tab["note"] = rt_tab.get("note") or "needs manual login"
-            log_activity(f"queued open held by manual-login flag: {cut(detail, 70)}", pkg, YELLOW)
             save_runtime(rt)
             return True
 
@@ -8597,13 +7553,6 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
     log_activity(f"opening -> {target} ({display_mode})", pkg)
     ok, msg = open_target(tab, rt_tab, cfg, target, reason, force=item.get("force", False), rt=rt, mode=mode)
     opened_at = int(rt_tab.get("last_open", now()))
-
-    if ok and item.get("hatcher_old_state_recovery"):
-        rt_tab["hatcher_alive_old_state_hard_last"] = now()
-        rt_tab["hatcher_alive_old_state_hard_age"] = int(item.get("hatcher_old_state_age", 0) or 0)
-        rt_tab["hatcher_alive_old_state_hard_reason"] = str(
-            item.get("hatcher_old_state_reason", reason) or reason
-        )
     # Record pool-wide hard-open time for the stagger gate.
     if is_hard and ok:
         rt["_last_pool_hard_open"] = now()
@@ -8784,7 +7733,7 @@ def api_check_package(package, cache=None, cfg=None):
             print(col(f"[SOLVER] Attempting to solve challenge for {package}...", CYAN))
             ok, msg = solve_captcha(cookie, cfg)
             if ok:
-                print(col("[SOLVER] Solved! Re-checking API...", GREEN))
+                print(col(f"[SOLVER] Solved! Re-checking API...", GREEN))
                 status2 = check_cookie_challenge(cookie)
                 if status2 == "valid":
                     clear_hold(package)
@@ -8966,7 +7915,6 @@ def _nomo_start_market_rejoin_original(cfg):
                 if health.get("clean_fresh"):
                     clear_manual_login_block(rt_tab)
                     clear_captcha_ui_runtime(rt_tab)
-                    rt_tab["hatcher_startup_observe_until"] = 0
 
             # -----------------------------------------------------
             # SHARED REJOIN ENGINE
@@ -9114,11 +8062,6 @@ def normalize_booster_profile(prof, idx=0):
     base["booster_name"] = str(base.get("booster_name") or f"nomoboost{idx+1}")
     base["server_link"] = str(base.get("server_link") or "")
     base["state_file"] = str(base.get("state_file") or "")
-    if f"/{LEGACY_STATE_FOLDER_NAME}/" in base["state_file"]:
-        base["state_file"] = base["state_file"].replace(
-            f"/{LEGACY_STATE_FOLDER_NAME}/",
-            f"/{STATE_FOLDER_NAME}/",
-        )
     return base
 
 
@@ -9176,75 +8119,33 @@ def booster_profiles(cfg, enabled_only=False):
 
 
 def sync_booster_profiles_with_tabs(main_cfg, bcfg, create_missing=True):
-    """Ensure Booster profiles follow the main Delta identity mapping."""
-    existing = {
-        str(profile.get("package") or ""): profile
-        for profile in booster_profiles(bcfg)
-    }
+    existing = {str(p.get("package") or ""): p for p in booster_profiles(bcfg)}
     new_profiles = []
-
-    for index, tab in enumerate(main_cfg.get("tabs", [])):
+    for idx, tab in enumerate(main_cfg.get("tabs", [])):
         pkg = str(tab.get("package") or "")
         if not pkg:
             continue
-
-        profile = existing.pop(pkg, None)
-        if profile is None and create_missing:
-            profile = normalize_booster_profile({
+        prof = existing.pop(pkg, None)
+        if prof is None and create_missing:
+            prof = normalize_booster_profile({
                 "enabled": tab.get("enabled", True),
                 "package": pkg,
-                "booster_name": (
-                    tab.get("user_name")
-                    or f"nomoboost{index + 1}"
-                ),
-                "server_link": (
-                    tab.get("server_link")
-                    or "YOUR_BOOSTER_PRIVATE_SERVER_LINK"
-                ),
+                "booster_name": tab.get("user_name") or f"nomoboost{idx+1}",
+                "server_link": tab.get("server_link") or "YOUR_BOOSTER_PRIVATE_SERVER_LINK",
                 "state_file": tab.get("stat_file") or "",
-            }, index)
-
-        if profile is None:
-            continue
-
-        profile["enabled"] = bool(tab.get("enabled", True))
-        if is_delta_global_tab(tab):
-            profile["booster_name"] = str(
-                tab.get("user_name") or pkg
-            )
-            profile["state_file"] = str(tab.get("stat_file") or "")
-            profile["executor_storage"] = "delta_global"
-            profile["delta_mapping_locked"] = True
-            profile["delta_mapping_conflict"] = bool(
-                tab.get("delta_mapping_conflict", False)
-            )
-            profile["delta_mapping_source"] = tab.get(
-                "delta_mapping_source",
-                "main sync",
-            )
-        else:
+            }, idx)
+        if prof is not None:
+            prof["enabled"] = bool(tab.get("enabled", True))
             if tab.get("stat_file"):
-                profile["state_file"] = tab.get("stat_file")
-            current_name = str(profile.get("booster_name") or "")
-            defaultish = (
-                not current_name
-                or current_name == pkg
-                or current_name.startswith("nomoboost")
-            )
-            if (
-                defaultish
-                and str(tab.get("user_name") or "").strip()
-            ):
-                profile["booster_name"] = str(
-                    tab.get("user_name")
-                ).strip()
-
-        new_profiles.append(profile)
-
+                prof["state_file"] = tab.get("stat_file")
+            current_name = str(prof.get("booster_name") or "")
+            defaultish = (not current_name or current_name == pkg or current_name.startswith("nomoboost"))
+            if defaultish and str(tab.get("user_name") or "").strip():
+                prof["booster_name"] = str(tab.get("user_name")).strip()
+            new_profiles.append(prof)
     bcfg["boosters"] = new_profiles
     save_booster_config(bcfg)
     return True
-
 
 
 def booster_profile_to_tab(prof):
@@ -9258,16 +8159,7 @@ def booster_profile_to_tab(prof):
 
 
 def booster_read_state(prof):
-    return read_state({
-        "package": prof.get("package", ""),
-        "user_name": prof.get("booster_name", "booster"),
-        "stat_file": prof.get("state_file", ""),
-        "executor_storage": prof.get("executor_storage", ""),
-        "delta_mapping_conflict": bool(
-            prof.get("delta_mapping_conflict", False)
-        ),
-    })
-
+    return read_state({"user_name": prof.get("booster_name", "booster"), "stat_file": prof.get("state_file", "")})
 
 
 def load_booster_runtime():
@@ -9361,28 +8253,7 @@ def booster_report_once(bcfg=None, force=False, state_cache=None):
         return False, "backend missing"
     updates = []
     removes = []
-
-    brt = load_booster_runtime()
-    profiles = booster_profiles(bcfg, enabled_only=False)
-    current_profile_names = {
-        str(profile.get("booster_name") or "booster")
-        for profile in profiles
-    }
-    pending_identity_removes = [
-        name
-        for name in _unique_identity_names(
-            brt.get("pending_remove_names", [])
-        )
-        if name not in current_profile_names
-    ]
-    removes.extend(
-        (name, "renamed")
-        for name in pending_identity_removes
-    )
-    if brt.get("mapping_force_report"):
-        force = True
-
-    for prof in profiles:
+    for prof in booster_profiles(bcfg, enabled_only=False):
         name = str(prof.get("booster_name") or "booster")
         pkg = str(prof.get("package") or "")
         cached = state_cache.get(pkg) if isinstance(state_cache, dict) else None
@@ -9430,9 +8301,6 @@ def booster_report_once(bcfg=None, force=False, state_cache=None):
         rt["last_signature"][name] = booster_signature(entry)
         rt["last_status"][name] = entry.get("status")
     save_booster_runtime(rt)
-    _clear_booster_pending_identity_removes(
-        pending_identity_removes
-    )
     return True, f"updated {len(updates)} removed {len(removes)}"
 
 
@@ -9690,22 +8558,29 @@ def hatcher_backend_missing(hcfg):
     return is_placeholder_value(hcfg.get("jsonbin_bin_id")) or is_placeholder_value(hcfg.get("jsonbin_api_key"))
 
 def sync_hatcher_profiles_with_tabs(cfg, hcfg, create_missing=True):
-    """Ensure every main tab has a synchronized Hatcher profile."""
+    """Ensure every tab has a matching hatcher profile."""
     changed = False
+    tabs = cfg.get("tabs", [])
     profiles = hcfg.get("hatchers", [])
-    profile_map = {
-        profile.get("package"): profile
-        for profile in profiles
-        if profile.get("package")
-    }
+
+    profile_map = {}
+    for prof in profiles:
+        pkg = prof.get("package")
+        if pkg:
+            profile_map[pkg] = prof
 
     new_profiles = []
-    for tab in cfg.get("tabs", []):
+    for tab in tabs:
         pkg = tab.get("package")
-        profile = profile_map.pop(pkg, None)
-
-        if profile is None and create_missing:
-            profile = {
+        if pkg in profile_map:
+            prof = profile_map[pkg]
+            if prof.get("enabled") != tab.get("enabled", True):
+                prof["enabled"] = tab.get("enabled", True)
+                changed = True
+            new_profiles.append(prof)
+            del profile_map[pkg]
+        elif create_missing:
+            new_prof = {
                 "enabled": tab.get("enabled", True),
                 "package": pkg,
                 "hatcher_name": tab.get("user_name", pkg),
@@ -9715,36 +8590,10 @@ def sync_hatcher_profiles_with_tabs(cfg, hcfg, create_missing=True):
                 "ready_pet_count": 200,
                 "enable_egg_ready": False,
                 "required_eggs": {},
-                "status_when_not_ready": "busy",
+                "status_when_not_ready": "busy"
             }
+            new_profiles.append(new_prof)
             changed = True
-
-        if profile is None:
-            continue
-
-        desired = {
-            "enabled": tab.get("enabled", True),
-        }
-        if is_delta_global_tab(tab):
-            desired.update({
-                "hatcher_name": tab.get("user_name", pkg),
-                "state_file": tab.get("stat_file", ""),
-                "executor_storage": "delta_global",
-                "delta_mapping_locked": True,
-                "delta_mapping_conflict": bool(
-                    tab.get("delta_mapping_conflict", False)
-                ),
-                "delta_mapping_source": tab.get(
-                    "delta_mapping_source",
-                    "main sync",
-                ),
-            })
-
-        for key, value in desired.items():
-            if profile.get(key) != value:
-                profile[key] = value
-                changed = True
-        new_profiles.append(profile)
 
     if profile_map or len(new_profiles) != len(profiles):
         changed = True
@@ -9752,8 +8601,8 @@ def sync_hatcher_profiles_with_tabs(cfg, hcfg, create_missing=True):
     if changed:
         hcfg["hatchers"] = new_profiles
         save_hatcher_config(hcfg)
-    return changed
 
+    return changed
 
 
 def hatcher_apply_main_backend_if_missing(hcfg, main_cfg=None, save=True):
@@ -9820,36 +8669,6 @@ def load_hatcher_config():
         cfg["hatcher_alive_old_state_after_open_grace_seconds"] = 180
         cfg["hatcher_alive_old_state_hard_force_cooldown_seconds"] = 900
         cfg["_nomo_hatcher_old_state_hard_force_migration"] = 378
-        changed = True
-
-    # V4.57: Event/transition system was removed after it blocked normal
-    # rejoin and CAPTCHA queue processing. Keep legacy keys false even when an
-    # older nomo.json still contains True.
-    event_keys_changed = False
-    for event_key in (
-        "transition_guard_enabled",
-        "transition_guard_pause_rejoin",
-        "transition_guard_pause_backend",
-        "transition_guard_publish_unavailable_once",
-    ):
-        if cfg.get(event_key, False) is not False:
-            cfg[event_key] = False
-            event_keys_changed = True
-
-    if int(cfg.get("_nomo_event_system_removed_migration", 0) or 0) < 457:
-        cfg["_nomo_event_system_removed_migration"] = 457
-        event_keys_changed = True
-
-        # Force the next reporter cycle to overwrite any backend record that
-        # was left in status=transitioning/selectable=false.
-        try:
-            hrt = load_hatcher_runtime()
-            hrt["mapping_force_report"] = True
-            save_hatcher_runtime(hrt)
-        except Exception:
-            pass
-
-    if event_keys_changed:
         changed = True
 
     # V3.64: keep Cloudflare writes low.
@@ -9950,15 +8769,9 @@ def hatcher_effective(hcfg, prof):
 
 def hatcher_state_tab(hcfg_or_prof):
     return {
-        "package": hcfg_or_prof.get("package", ""),
         "user_name": hcfg_or_prof.get("hatcher_name", "hatcher"),
-        "stat_file": hcfg_or_prof.get("state_file", ""),
-        "executor_storage": hcfg_or_prof.get("executor_storage", ""),
-        "delta_mapping_conflict": bool(
-            hcfg_or_prof.get("delta_mapping_conflict", False)
-        ),
+        "stat_file": hcfg_or_prof.get("state_file", "")
     }
-
 
 
 def hatcher_read_state(hcfg_or_prof):
@@ -10172,7 +8985,7 @@ def cloudflare_admin_hatchers(cfg, stale_after_seconds=7200):
 
 def cloudflare_admin_accounts(cfg, role=""):
     role_q = urllib.parse.quote(str(role or ""), safe="")
-    path = "/accounts?limit=1000" + (f"&role={role_q}" if role_q else "")
+    path = f"/accounts?limit=1000" + (f"&role={role_q}" if role_q else "")
     data, err = cloudflare_request(cfg, "GET", path)
     if err:
         return None, err
@@ -10462,9 +9275,6 @@ def hatcher_entry(hcfg, state, err):
         "ready_reason": evald["ready_reason"],
         "ready_by_pet": bool(evald["pet_ok"]),
         "ready_by_egg": False,
-        "selectable": bool(status == "online"),
-        "transitioning": False,
-        "transition_phase": "normal",
         "required_eggs": {},
         "matched_eggs": [],
         "missing_eggs": [],
@@ -10567,89 +9377,7 @@ def update_hatcher_runtime(profile_name, hcfg, entry):
     save_hatcher_runtime(rt)
 
 
-
-
-HATCHER_TRANSITION_NORMAL = "normal"
-HATCHER_TRANSITION_ACTIVE = "transitioning"
-HATCHER_TRANSITION_RETURNING = "returning"
-
-
-def clear_removed_event_transition_tab(rt_tab):
-    """Remove every runtime artifact created by the discarded Event system."""
-    if not isinstance(rt_tab, dict):
-        return False
-
-    changed = False
-    for key in list(rt_tab.keys()):
-        if str(key).startswith("hatcher_transition_"):
-            rt_tab.pop(key, None)
-            changed = True
-
-    note = str(rt_tab.get("note", "") or "")
-    note_l = note.lower()
-    if (
-        "event hold" in note_l
-        or "transition" in note_l
-        or "return wait" in note_l
-    ):
-        rt_tab["note"] = "normal recovery"
-        changed = True
-
-    return changed
-
-
-def hatcher_transition_guard_update(
-    rt_tab,
-    state,
-    raw_alive,
-    hcfg,
-    cfg,
-    open_queue=None,
-    package="",
-    health=None,
-):
-    """Compatibility no-op: V4.57 removed the Event transition system."""
-    clear_removed_event_transition_tab(rt_tab)
-    return {
-        "active": False,
-        "paused": False,
-        "backend_paused": False,
-        "phase": HATCHER_TRANSITION_NORMAL,
-        "elapsed": 0,
-        "stable_seconds": 0,
-        "note": "event system removed",
-        "entered": False,
-        "released": False,
-        "explicit_failure": False,
-        "dead_confirmed": False,
-        "stale_hard_override": False,
-        "reset_return": False,
-        "previous_phase": HATCHER_TRANSITION_NORMAL,
-    }
-
-
-def hatcher_transition_backend_due(runtime, hcfg):
-    """Event-specific backend writes were removed."""
-    if isinstance(runtime, dict):
-        for value in runtime.values():
-            if isinstance(value, dict):
-                clear_removed_event_transition_tab(value)
-    return False
-
-
-def hatcher_transition_backend_entry(entry, transition):
-    """Return the normal entry unchanged; transition records no longer exist."""
-    return dict(entry or {})
-
-
-def hatcher_transition_backend_mark_success(runtime, package, action):
-    if isinstance(runtime, dict) and package:
-        clear_removed_event_transition_tab(
-            get_runtime_tab(runtime, package)
-        )
-
-
-def hatcher_report_once(hcfg, force=True, state_cache=None, main_runtime=None):
+def hatcher_report_once(hcfg, force=True, state_cache=None):
     hatcher_apply_main_backend_if_missing(hcfg, None, save=True)
 
     if not hcfg.get("enabled", True):
@@ -10666,33 +9394,6 @@ def hatcher_report_once(hcfg, force=True, state_cache=None, main_runtime=None):
     removes = []
     skips = []
 
-    hrt = load_hatcher_runtime()
-    current_profile_names = {
-        str(
-            hatcher_effective(hcfg, profile).get(
-                "hatcher_name",
-                "hatcher",
-            )
-        ).strip()
-        for profile in profiles
-    }
-    pending_identity_removes = [
-        name
-        for name in _unique_identity_names(
-            hrt.get("pending_remove_names", [])
-        )
-        if name not in current_profile_names
-    ]
-    removes.extend(
-        (name, "renamed")
-        for name in pending_identity_removes
-    )
-    if hrt.get("mapping_force_report"):
-        force = True
-
-    main_cfg = load_config()
-    runtime = main_runtime if isinstance(main_runtime, dict) else load_runtime()
-
     for prof in profiles:
         eff = hatcher_effective(hcfg, prof)
         name = str(eff.get("hatcher_name", "hatcher")).strip() or "hatcher"
@@ -10702,50 +9403,8 @@ def hatcher_report_once(hcfg, force=True, state_cache=None, main_runtime=None):
             state, state_err = cached
         else:
             state, state_err = hatcher_read_state(eff)
-
-        rt_tab = get_runtime_tab(runtime, pkg)
-        raw_alive = package_alive(pkg, main_cfg, fresh=True) if pkg else False
-        transition = hatcher_transition_guard_update(
-            rt_tab,
-            state,
-            raw_alive,
-            hcfg,
-            main_cfg,
-            open_queue=None,
-            package=pkg,
-            health=None,
-        )
-
         entry = hatcher_entry(eff, state, state_err)
         status = str(entry.get("status", "")).lower()
-
-        # During an event transition, publish one unavailable status and then
-        # freeze this package's backend record. Never remove it due to temporary
-        # Trade World stale/no-state telemetry.
-        if transition.get("backend_paused"):
-            if rt_tab.get("hatcher_transition_notice_pending"):
-                transition_entry = hatcher_transition_backend_entry(
-                    entry, transition
-                )
-                updates.append(
-                    (
-                        name,
-                        eff,
-                        transition_entry,
-                        "transition unavailable",
-                        "transition_notice",
-                        pkg,
-                    )
-                )
-            else:
-                skips.append(
-                    f"{name}:transition-{transition.get('phase')}"
-                )
-            continue
-
-        resume_pending = bool(
-            rt_tab.get("hatcher_transition_resume_report_pending")
-        )
 
         # Do not publish template/incomplete hatcher slots.
         if status in ["disabled", "no_server", "no_state"]:
@@ -10753,28 +9412,11 @@ def hatcher_report_once(hcfg, force=True, state_cache=None, main_runtime=None):
             skips.append(f"{name}:{status}")
             continue
 
-        should, why = hatcher_should_update(
-            hcfg,
-            name,
-            entry,
-            force=bool(force or resume_pending),
-        )
+        should, why = hatcher_should_update(hcfg, name, entry, force=force)
         if should:
-            updates.append(
-                (
-                    name,
-                    eff,
-                    entry,
-                    why,
-                    "transition_resume" if resume_pending else "",
-                    pkg,
-                )
-            )
+            updates.append((name, eff, entry, why))
         else:
             skips.append(f"{name}:{entry.get('status')}")
-
-    # Persist reporter-only transition detection and pending flags.
-    save_runtime(runtime)
 
     if not updates and not removes:
         return True, "no update: " + (", ".join(skips[:4]) or "unchanged")
@@ -10782,48 +9424,25 @@ def hatcher_report_once(hcfg, force=True, state_cache=None, main_runtime=None):
     provider = backend_provider(hcfg)
 
     if provider == "cloudflare":
-        update_pairs = [
-            (name, entry)
-            for name, eff, entry, why, action, pkg in updates
-        ]
+        update_pairs = [(name, entry) for name, eff, entry, why in updates]
         remove_names = [name for name, status in removes]
         if not update_pairs and not remove_names:
-            return True, "no upload: incomplete templates skipped (" + (
-                ", ".join(skips[:4]) or "none"
-            ) + ")"
-
-        ok, msg = cloudflare_update_hatchers(
-            hcfg, update_pairs, remove_names
-        )
+            return True, "no upload: incomplete templates skipped (" + (", ".join(skips[:4]) or "none") + ")"
+        ok, msg = cloudflare_update_hatchers(hcfg, update_pairs, remove_names)
         if not ok:
             return False, f"cloudflare update: {msg}"
 
-        for name, eff, entry, why, action, pkg in updates:
+        for name, eff, entry, why in updates:
             update_hatcher_runtime(name, hcfg, entry)
-            hatcher_transition_backend_mark_success(
-                runtime, pkg, action
-            )
-        save_runtime(runtime)
 
         parts = []
-        for name, eff, entry, why, action, pkg in updates[:4]:
-            parts.append(
-                f"{name} {entry.get('status')} "
-                f"pets={entry.get('pet_count')} "
-                f"eggs={entry.get('egg_total')}"
-            )
+        for name, eff, entry, why in updates[:4]:
+            parts.append(f"{name} {entry.get('status')} pets={entry.get('pet_count')} eggs={entry.get('egg_total')}")
         if len(updates) > 4:
             parts.append(f"+{len(updates)-4}")
         if remove_names:
             parts.append("removed " + ",".join(remove_names[:4]))
-        _clear_hatcher_pending_identity_removes(
-            pending_identity_removes
-        )
-        return True, (
-            f"cloudflare updated {len(updates)} "
-            f"removed {len(remove_names)} "
-            f"({', '.join(parts)})"
-        )
+        return True, f"cloudflare updated {len(updates)} removed {len(remove_names)} ({', '.join(parts)})"
 
     # JSONBin fallback/path: read-modify-write full record.
     record, read_err = jsonbin_read_bin(hcfg)
@@ -10833,9 +9452,7 @@ def hatcher_report_once(hcfg, force=True, state_cache=None, main_runtime=None):
     if not isinstance(record, dict):
         record = {}
 
-    if "hatchers" not in record or not isinstance(
-        record.get("hatchers"), dict
-    ):
+    if "hatchers" not in record or not isinstance(record.get("hatchers"), dict):
         record["hatchers"] = {}
 
     removed_names = []
@@ -10844,13 +9461,11 @@ def hatcher_report_once(hcfg, force=True, state_cache=None, main_runtime=None):
             del record["hatchers"][name]
             removed_names.append(name)
 
-    for name, eff, entry, why, action, pkg in updates:
+    for name, eff, entry, why in updates:
         record["hatchers"][name] = entry
 
     if not updates and not removed_names:
-        return True, "no upload: incomplete templates skipped (" + (
-            ", ".join(skips[:4]) or "none"
-        ) + ")"
+        return True, "no upload: incomplete templates skipped (" + (", ".join(skips[:4]) or "none") + ")"
 
     record["updated_at"] = now()
     record["updated_text"] = date_time_text()
@@ -10859,33 +9474,18 @@ def hatcher_report_once(hcfg, force=True, state_cache=None, main_runtime=None):
     if not ok:
         return False, f"jsonbin update: {msg}"
 
-    for name, eff, entry, why, action, pkg in updates:
+    for name, eff, entry, why in updates:
         update_hatcher_runtime(name, hcfg, entry)
-        hatcher_transition_backend_mark_success(
-            runtime, pkg, action
-        )
-    save_runtime(runtime)
 
     parts = []
-    for name, eff, entry, why, action, pkg in updates[:4]:
-        parts.append(
-            f"{name} {entry.get('status')} "
-            f"pets={entry.get('pet_count')} "
-            f"eggs={entry.get('egg_total')}"
-        )
+    for name, eff, entry, why in updates[:4]:
+        parts.append(f"{name} {entry.get('status')} pets={entry.get('pet_count')} eggs={entry.get('egg_total')}")
     if len(updates) > 4:
         parts.append(f"+{len(updates)-4}")
     if removed_names:
         parts.append("removed " + ",".join(removed_names[:4]))
 
-    _clear_hatcher_pending_identity_removes(
-        pending_identity_removes
-    )
-    return True, (
-        f"jsonbin updated {len(updates)} "
-        f"removed {len(removed_names)} "
-        f"({', '.join(parts)})"
-    )
+    return True, f"jsonbin updated {len(updates)} removed {len(removed_names)} ({', '.join(parts)})"
 
 def hatcher_test_upload_screen(main_cfg=None):
     hcfg = load_hatcher_config()
@@ -11072,7 +9672,7 @@ def hatcher_rejoin_status_screen(rows, hcfg, cfg, session_start, loops, last_msg
         status = r.get("status", "?")
         if status in ["Ready", "Ingame", "Online"]:
             st_code = GREEN
-        elif status in ["Queued", "Loading", "Stale", "Event hold", "Return wait"]:
+        elif status in ["Queued", "Loading", "Stale"]:
             st_code = YELLOW
         elif status in ["Offline", "No state", "No server", "Manual"]:
             st_code = RED
@@ -11091,7 +9691,7 @@ def hatcher_rejoin_status_screen(rows, hcfg, cfg, session_start, loops, last_msg
             (cut(r.get("note", ""), widths[-1]), note_color(r.get("note", ""))),
         ])
 
-    draw_table(["No", "Username", "Package", "Pet", "Egg", "Status", "StateAge", "RunTime", "Note"],
+    draw_table(["No", "Username", "Package", "Pet", "Egg", "Status", "Age", "Session", "Note"],
                table_rows, widths, cfg)
 
     render_activity_log(cfg, lines=int(cfg.get("activity_log_lines", 6) or 6))
@@ -11277,7 +9877,7 @@ def start_hatcher_reporter(main_cfg=None):
                         status = "Online"
                     else:
                         note = hard_note
-                        status = "Stale"
+                        status = "Online"
                 elif loading_grace:
                     note = "loading grace"
                     status = "Loading"
@@ -11505,7 +10105,6 @@ def hatcher_global_settings(main_cfg=None):
         print(f"10.public_rejoin_delay  = {hcfg.get('public_server_rejoin_after_seconds')}")
         print(f"11.detect_wrong_place   = {hcfg.get('detect_wrong_place')}")
         print(f"12.expected_place_id    = {hcfg.get('expected_place_id')}")
-        print(col("13-18. Event hold system removed in V4.57", YELLOW))
         print("")
         print(col("Shared backend currently from Global config:", CYAN))
         if backend_provider(main_cfg) == "cloudflare":
@@ -11745,69 +10344,6 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
     hcfg = load_hatcher_config()
     rt = load_runtime()
 
-    # V4.43 one-time startup-grace repair. Clear queue/open artifacts from the
-    # previous immediate-startup hard-recovery behavior; the current process will
-    # rebuild its in-memory queue using the new observation grace.
-    if int(cfg.get("_nomo_startup_loading_grace_migration", 0) or 0) < 443:
-        for profile in hatcher_profiles(hcfg, enabled_only=False):
-            pkg = str((profile or {}).get("package", "") or "")
-            if not pkg:
-                continue
-            rt_tab = get_runtime_tab(rt, pkg)
-            note_l = str(rt_tab.get("note", "") or "").lower()
-            if (
-                "startup stale" in note_l
-                or "solver running" in note_l
-                or "already queued" in note_l
-            ):
-                rt_tab["note"] = "startup grace reset by V4.43"
-            rt_tab["hatcher_startup_observe_until"] = 0
-        rt["_open_lock_pkg"] = ""
-        rt["_open_lock_at"] = 0
-        cfg["_nomo_startup_loading_grace_migration"] = 443
-        save_runtime(rt)
-        save_config(cfg)
-
-    # V4.42 one-time repair: clear only temporary queue/open state left by the
-    # old 20-second "died while loading" rule. Persistent config and holds stay.
-    if int(cfg.get("_nomo_loading_wait_migration", 0) or 0) < 442:
-        for profile in hatcher_profiles(hcfg, enabled_only=False):
-            pkg = str((profile or {}).get("package", "") or "")
-            if not pkg:
-                continue
-            rt_tab = get_runtime_tab(rt, pkg)
-            note_l = str(rt_tab.get("note", "") or "").lower()
-            if "died while loading" in note_l or "homepage/no-state hard retry" in note_l:
-                rt_tab["note"] = "loading wait reset by V4.42"
-                rt_tab["last_open"] = 0
-                rt_tab["last_open_mode"] = ""
-        rt["_open_lock_pkg"] = ""
-        rt["_open_lock_at"] = 0
-        cfg["_nomo_loading_wait_migration"] = 442
-        save_runtime(rt)
-        save_config(cfg)
-
-    # V4.41 one-time repair: older builds stamped the old-state cooldown when
-    # an item was queued, even if it never reached PID stop/open. Clear that bad
-    # lock once. Also clear only the stale missing-cookie manual flag that used
-    # to discard crash/dead recovery before the package could open.
-    if int(cfg.get("_nomo_recovery_queue_migration", 0) or 0) < 441:
-        for profile in hatcher_profiles(hcfg, enabled_only=False):
-            pkg = str((profile or {}).get("package", "") or "")
-            if not pkg:
-                continue
-            rt_tab = get_runtime_tab(rt, pkg)
-            rt_tab["hatcher_alive_old_state_hard_last"] = 0
-            reason = str(rt_tab.get("manual_login_reason", "") or "").lower()
-            if reason == "invalid or missing package cookie":
-                clear_manual_login_block(rt_tab)
-                clear_hold(pkg)
-        rt["_open_lock_pkg"] = ""
-        rt["_open_lock_at"] = 0
-        cfg["_nomo_recovery_queue_migration"] = 441
-        save_runtime(rt)
-        save_config(cfg)
-
     # V4.36 one-time repair: V4.34 could stamp long cooldowns even though an
     # alive clone only received a soft intent and never actually restarted.
     # Clear those stale per-package locks once so every affected clone gets a
@@ -11881,20 +10417,13 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                 continue
 
             if raw_alive and state is not None and old_enabled and old_sec <= state_age <= old_max:
-                # NOMO may have been started while this clone was already in the
-                # Roblox loading screen. Its previous state file remains old until
-                # AutoExec reaches the game, so observe first instead of killing it.
-                startup_stale_grace = max(
-                    120,
-                    int(cfg.get("hatcher_startup_stale_grace_seconds", 240) or 240),
+                added, _ = queue_open(
+                    open_queue, tab, "hatcher",
+                    f"hatcher startup old state {state_age}s",
+                    force=True, mode="hard_force", front=False,
+                    metadata={"bypass_recheck": True, "pid_only_recovery": True},
                 )
-                rt_tab["hatcher_startup_observe_until"] = now() + startup_stale_grace
-                rt_tab["last_open"] = now()
-                rt_tab["note"] = f"startup loading grace {startup_stale_grace}s"
-                log_activity(
-                    f"alive with old state; startup grace {format_age(startup_stale_grace)} (no stop)",
-                    pkg, CYAN,
-                )
+                rt_tab["note"] = "startup stale PID queued" if added else "startup stale already queued"
                 continue
 
             if raw_alive:
@@ -11909,12 +10438,8 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
 
             queue_open(
                 open_queue, tab, "hatcher", "hatcher start",
-                force=True, skip_if_alive=True, mode="hard_force", bypass_manual=True,
-                metadata={
-                    "pid_only_recovery": True,
-                    "recovery_must_open_once": True,
-                    "bypass_recheck": True,
-                },
+                force=True, skip_if_alive=True, mode="hard",
+                metadata={"pid_only_recovery": True},
             )
         save_runtime(rt)
 
@@ -11962,18 +10487,6 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                 tab, cfg, rt_tab, mode="hatcher", hcfg=hcfg, prof=prof,
                 raw_alive=alive, state=state, err=err
             )
-            transition = hatcher_transition_guard_update(
-                rt_tab,
-                state,
-                raw_alive,
-                hcfg,
-                cfg,
-                open_queue=open_queue,
-                package=pkg,
-                health=health,
-            )
-            if transition.get("dead_confirmed"):
-                alive = False
             note = health.get("note") or "ok"
             pets = "-"
             eggs = "-"
@@ -12007,9 +10520,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                     clear_manual_login_block(rt_tab)
                     clear_captcha_ui_runtime(rt_tab)
 
-                problem_code, problem_note = hatcher_teleport_problem(
-                    tab, state, hcfg, cfg
-                )
+                problem_code, problem_note = hatcher_teleport_problem(tab, state, hcfg, cfg)
                 if problem_code:
                     should_q, wait_note = should_queue_hatcher_teleport_rejoin(rt_tab, hcfg, cfg, problem_code)
                     if should_q and cfg.get("rejoin_if_crash", True):
@@ -12042,21 +10553,8 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                 old_open_age = (now() - last_open_for_old) if last_open_for_old > 0 else 999999
                 in_old_open_grace = old_open_age < old_after_open_grace
 
-                startup_observe_until = int(
-                    rt_tab.get("hatcher_startup_observe_until", 0) or 0
-                )
-                in_startup_observe = bool(
-                    alive and startup_observe_until > now()
-                )
-
                 if problem_code:
                     pass
-                elif in_startup_observe and recovery_age >= old_sec:
-                    status = "Loading"
-                    note = (
-                        "startup loading grace "
-                        + format_age(max(1, startup_observe_until - now()))
-                    )
                 elif alive and old_enabled and recovery_age > old_max:
                     status = "Online"
                     note = f"invalid old state ignored {age}s"
@@ -12153,7 +10651,6 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                         note = f"ingame,no {expected_state_name(tab)}? chk Lua"
                 else:
                     rt_tab["hatcher_no_state_since"] = 0
-                    rt_tab["hatcher_startup_observe_until"] = 0
                     status = "Offline"
 
             # Clear a previous incident as soon as the counter reports a clean
@@ -12178,16 +10675,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                 and cfg.get("rejoin_if_crash", True)
             ):
                 if cfg.get("smart_open_queue", True):
-                    dead_reason = "crash/dead"
-                    added, _ = queue_open(
-                        open_queue, tab, "hatcher", dead_reason,
-                        force=True, skip_if_alive=True, mode="hard_force", bypass_manual=True,
-                        metadata={
-                            "pid_only_recovery": True,
-                            "recovery_must_open_once": True,
-                            "bypass_recheck": True,
-                        },
-                    )
+                    added, _ = queue_open(open_queue, tab, "hatcher", "crash/dead", skip_if_alive=True)
                     note = "crash queued" if added else "already queued"
                     status = "Queued" if added else "Offline"
                 else:
@@ -12253,21 +10741,9 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
         # Backend/reporting cadence is independent from the 10-second local
         # health loop. Reuse this cycle's state reads when a report is due.
         report_interval = max(10, int(hcfg.get("heartbeat_interval", 60) or 60))
-        transition_report_due = hatcher_transition_backend_due(rt, hcfg)
-        report_due = (
-            last_report_at <= 0
-            or now() - last_report_at >= report_interval
-            or (
-                transition_report_due
-                and now() - last_report_at >= 10
-            )
-        )
-        if report_due:
+        if last_report_at <= 0 or now() - last_report_at >= report_interval:
             ok, msg = hatcher_report_once(
-                hcfg,
-                force=False,
-                state_cache=report_state_cache,
-                main_runtime=rt,
+                hcfg, force=False, state_cache=report_state_cache
             )
             last_report_at = now()
             tag = "OK" if ok else "ERR"
@@ -12767,1340 +11243,6 @@ def auto_map_packages_to_clone_workspaces(
     return results
 
 
-
-
-
-def _safe_download_filename(value, fallback="download.bin"):
-    name = str(value or "").replace("\\", "/").split("/")[-1].strip()
-    name = urllib.parse.unquote(name)
-    name = re.sub(r"[\x00-\x1f<>:\"/\\|?*]+", "_", name).strip(" .")
-    return name[:180] or fallback
-
-
-def _filename_from_response(response, url, fallback="download.bin"):
-    disposition = str(response.headers.get("Content-Disposition", "") or "")
-    match = re.search(r"filename\*=UTF-8''([^;]+)", disposition, re.I)
-    if match:
-        return _safe_download_filename(match.group(1), fallback)
-    match = re.search(r'filename="?([^";]+)"?', disposition, re.I)
-    if match:
-        return _safe_download_filename(match.group(1), fallback)
-
-    final_url = str(getattr(response, "url", "") or url)
-    parsed_name = Path(urllib.parse.urlparse(final_url).path).name
-    return _safe_download_filename(parsed_name, fallback)
-
-
-def download_url_to_apk_dir(url, filename=None, headers=None):
-    """Download a redirecting HTTP(S) URL into NOMO_APK using a .part file."""
-    url = str(url or "").strip()
-    parsed = urllib.parse.urlparse(url)
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        return False, "Only http/https URLs are supported.", None
-
-    APK_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    request_headers = {
-        "User-Agent": "NOMO-Rejoin/4.47 Android-Termux",
-        "Accept": "application/octet-stream,*/*",
-    }
-    request_headers.update(headers or {})
-
-    request = urllib.request.Request(url, headers=request_headers)
-    try:
-        response = urllib.request.urlopen(request, timeout=60)
-    except urllib.error.HTTPError as exc:
-        return False, f"HTTP {exc.code}: {exc.reason}", None
-    except Exception as exc:
-        return False, f"Download connection failed: {exc}", None
-
-    try:
-        resolved_name = _safe_download_filename(
-            filename or _filename_from_response(response, url),
-            "download.bin",
-        )
-        destination = APK_DOWNLOAD_DIR / resolved_name
-        temporary = destination.with_name(destination.name + ".part")
-
-        total = int(response.headers.get("Content-Length", 0) or 0)
-        downloaded = 0
-        last_report = 0
-        with open(temporary, "wb") as handle:
-            while True:
-                chunk = response.read(1024 * 1024)
-                if not chunk:
-                    break
-                handle.write(chunk)
-                downloaded += len(chunk)
-                if downloaded - last_report >= 5 * 1024 * 1024:
-                    if total > 0:
-                        pct = min(100, int(downloaded * 100 / total))
-                        print(
-                            f"  Downloaded {downloaded // 1048576} MB / "
-                            f"{total // 1048576} MB ({pct}%)"
-                        )
-                    else:
-                        print(f"  Downloaded {downloaded // 1048576} MB")
-                    last_report = downloaded
-
-        if downloaded <= 0:
-            try:
-                temporary.unlink()
-            except Exception:
-                pass
-            return False, "Downloaded file was empty.", None
-
-        os.replace(str(temporary), str(destination))
-        return True, f"Downloaded {downloaded} bytes", destination
-    except Exception as exc:
-        return False, f"Download write failed: {exc}", None
-    finally:
-        try:
-            response.close()
-        except Exception:
-            pass
-
-
-def _safe_extract_apks_from_zip(zip_path):
-    """Extract APK members only, with safe flattened names."""
-    zip_path = Path(zip_path)
-    APK_EXTRACT_DIR.mkdir(parents=True, exist_ok=True)
-    extract_root = APK_EXTRACT_DIR / re.sub(
-        r"[^A-Za-z0-9._-]+", "_", zip_path.stem
-    )
-    if extract_root.exists():
-        shutil.rmtree(extract_root, ignore_errors=True)
-    extract_root.mkdir(parents=True, exist_ok=True)
-
-    extracted = []
-    try:
-        with zipfile.ZipFile(zip_path, "r") as archive:
-            for info in archive.infolist():
-                if info.is_dir() or _workspace_zip_is_symlink(info):
-                    continue
-                raw = str(info.filename or "").replace("\\", "/")
-                parts = [part for part in raw.split("/") if part not in ("", ".")]
-                if ".." in parts:
-                    continue
-                if not parts or not parts[-1].lower().endswith(".apk"):
-                    continue
-
-                base_name = _safe_download_filename(parts[-1], "package.apk")
-                target = extract_root / base_name
-                counter = 2
-                while target.exists():
-                    target = extract_root / (
-                        f"{Path(base_name).stem}_{counter}{Path(base_name).suffix}"
-                    )
-                    counter += 1
-
-                with archive.open(info, "r") as src, open(target, "wb") as dst:
-                    shutil.copyfileobj(src, dst, length=1024 * 1024)
-                extracted.append(target)
-    except zipfile.BadZipFile:
-        return False, "Invalid ZIP archive.", []
-    except Exception as exc:
-        return False, f"ZIP extraction failed: {exc}", []
-
-    if not extracted:
-        return False, "No APK files were found inside the ZIP.", []
-    return True, f"Extracted {len(extracted)} APK files.", extracted
-
-
-def _collect_installable_apks(downloaded_path):
-    path = Path(downloaded_path)
-    lower = path.name.lower()
-    if lower.endswith(".apk"):
-        return True, "APK ready.", [path]
-    if lower.endswith(".zip"):
-        return _safe_extract_apks_from_zip(path)
-
-    if zipfile.is_zipfile(path):
-        try:
-            with zipfile.ZipFile(path, "r") as archive:
-                names = set(archive.namelist())
-            if "AndroidManifest.xml" in names:
-                renamed = path.with_suffix(".apk")
-                if renamed != path:
-                    os.replace(str(path), str(renamed))
-                return True, "APK detected by signature.", [renamed]
-        except Exception:
-            pass
-
-    return False, f"Unsupported download type: {path.name}", []
-
-
-def _apk_signature_valid(path):
-    path = Path(path)
-    if not path.is_file() or path.stat().st_size <= 0:
-        return False
-    try:
-        with zipfile.ZipFile(path, "r") as archive:
-            return "AndroidManifest.xml" in set(archive.namelist())
-    except Exception:
-        return False
-
-
-def _valid_android_package_name(value):
-    return bool(re.fullmatch(r"[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+", str(value or "")))
-
-
-def apk_package_name(path):
-    """Best-effort package-name detection without installing the APK."""
-    path = Path(path)
-    quoted = shlex.quote(str(path))
-
-    commands = (
-        (
-            f"aapt dump badging {quoted} 2>/dev/null | "
-            r"""sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -n 1"""
-        ),
-        (
-            f"aapt2 dump badging {quoted} 2>/dev/null | "
-            r"""sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -n 1"""
-        ),
-        f"apkanalyzer manifest application-id {quoted} 2>/dev/null | head -n 1",
-    )
-
-    for command in commands:
-        try:
-            result = subprocess.run(
-                command,
-                shell=True,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=20,
-            )
-            candidate = str(result.stdout or "").strip().splitlines()
-            candidate = candidate[0].strip() if candidate else ""
-            if _valid_android_package_name(candidate):
-                return candidate, "manifest tool"
-        except Exception:
-            pass
-
-    # Known NOMO clone filename fallback:
-    # Noka Delta Lite [Nomozo] 1.apk -> premium.nokaA ... 8.apk -> premium.nokaH
-    name = path.name
-    number_match = re.search(
-        r"noka.*?(?:nomozo.*?)?\s([1-8])(?:\D|$)",
-        name,
-        re.I,
-    )
-    if number_match:
-        suffix = chr(ord("A") + int(number_match.group(1)) - 1)
-        return f"premium.noka{suffix}", "NOMO filename mapping"
-
-    suffix_match = re.search(r"(?:premium[._-]?noka|noka)\s*([A-H])(?:\D|$)", name, re.I)
-    if suffix_match:
-        return f"premium.noka{suffix_match.group(1).upper()}", "filename suffix"
-
-    return "", "package name unavailable"
-
-
-def exact_package_installed(package):
-    if not _valid_android_package_name(package):
-        return False
-    command = f"pm path {shlex.quote(package)}"
-    try:
-        result = subprocess.run(
-            ["su", "-c", command],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=15,
-        )
-        return result.returncode == 0 and "package:" in str(result.stdout or "")
-    except Exception:
-        return False
-
-
-def uninstall_exact_package(package):
-    """Uninstall one exact package. This removes its Android app data."""
-    package = str(package or "").strip()
-    if not _valid_android_package_name(package):
-        return False, f"Invalid package name: {package!r}"
-
-    if not exact_package_installed(package):
-        return True, f"Not installed: {package}"
-
-    command = f"pm uninstall {shlex.quote(package)}"
-    try:
-        result = subprocess.run(
-            ["su", "-c", command],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=180,
-        )
-    except subprocess.TimeoutExpired:
-        return False, f"Uninstall timed out: {package}"
-    except Exception as exc:
-        return False, f"Uninstall failed: {package}: {exc}"
-
-    output = str(result.stdout or "").strip()
-    if result.returncode == 0 and "success" in output.lower():
-        return True, f"Uninstalled: {package}"
-    return False, f"{package}: {output or 'pm uninstall failed'}"
-
-
-def install_apk_file(path):
-    path = Path(path)
-    if not _apk_signature_valid(path):
-        return False, f"Not a valid APK: {path.name}"
-
-    command = f"pm install -r {shlex.quote(str(path))}"
-    try:
-        result = subprocess.run(
-            ["su", "-c", command],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=300,
-        )
-    except subprocess.TimeoutExpired:
-        return False, f"Install timed out: {path.name}"
-    except Exception as exc:
-        return False, f"Install failed: {path.name}: {exc}"
-
-    output = str(result.stdout or "").strip()
-    if result.returncode == 0 and "success" in output.lower():
-        return True, f"Installed: {path.name}"
-    return False, f"{path.name}: {output or 'pm install failed'}"
-
-
-def _normalized_apk_install_mode(cfg):
-    mode = str((cfg or {}).get("apk_install_mode", "ask_each") or "ask_each").strip().lower()
-    if mode not in {"install_only", "uninstall_first", "ask_each"}:
-        mode = "ask_each"
-    return mode
-
-
-def _apk_install_mode_label(mode):
-    return {
-        "install_only": "Install only",
-        "uninstall_first": "Always uninstall matching package first",
-        "ask_each": "Ask once before uninstalling selected APK batch",
-    }.get(mode, "Ask once before uninstalling selected APK batch")
-
-
-def choose_apk_install_mode(cfg):
-    current = _normalized_apk_install_mode(cfg)
-    while True:
-        clear()
-        banner("APK INSTALL BEHAVIOR", cfg)
-        print(f"Current: {_apk_install_mode_label(current)}")
-        print("")
-        print("1. Install only")
-        print("   Keeps existing app data and runs: pm install -r")
-        print("")
-        print("2. Uninstall matching package first, then install")
-        print("   WARNING: deletes that package's app data and cookies.")
-        print("")
-        print("3. Ask once before uninstalling selected APK batch")
-        print("   Y = uninstall ALL matching installed packages, then install")
-        print("   N = keep ALL app data/cookies and use pm install -r")
-        print("")
-        print("0. Back")
-        drain_stdin()
-        choice = clean_terminal_input(input("\nChoose: "))
-
-        mapping = {
-            "1": "install_only",
-            "2": "uninstall_first",
-            "3": "ask_each",
-        }
-        if choice == "0":
-            return current
-        if choice in mapping:
-            current = mapping[choice]
-            cfg["apk_install_mode"] = current
-            save_config(cfg)
-            print(col(f"Saved: {_apk_install_mode_label(current)}", GREEN))
-            time.sleep(1)
-            return current
-        print(col("Invalid choice.", RED))
-        time.sleep(1)
-
-
-
-def _scan_apks_in_folder(folder, recursive=True):
-    folder = Path(folder)
-    if not folder.exists() or not folder.is_dir():
-        return []
-
-    iterator = folder.rglob("*.apk") if recursive else folder.glob("*.apk")
-    found = []
-    seen = set()
-    for path in iterator:
-        try:
-            if not path.is_file():
-                continue
-            key = str(path.resolve())
-        except Exception:
-            key = str(path)
-        if key in seen:
-            continue
-        seen.add(key)
-        found.append(path)
-
-    return sorted(found, key=lambda path: natural_package_key(str(path)))
-
-
-def _parse_number_selection(raw, total):
-    """Parse 1,3-5,all into zero-based indices."""
-    text = str(raw or "").strip().lower()
-    if not text:
-        return []
-    if text in {"a", "all", "*"}:
-        return list(range(total))
-
-    selected = set()
-    for token in re.split(r"[\s,]+", text):
-        token = token.strip()
-        if not token:
-            continue
-        if "-" in token:
-            left, right = token.split("-", 1)
-            if not left.isdigit() or not right.isdigit():
-                raise ValueError(f"invalid range: {token}")
-            start = int(left)
-            end = int(right)
-            if start > end:
-                start, end = end, start
-            for number in range(start, end + 1):
-                if not 1 <= number <= total:
-                    raise ValueError(f"out of range: {number}")
-                selected.add(number - 1)
-        else:
-            if not token.isdigit():
-                raise ValueError(f"invalid number: {token}")
-            number = int(token)
-            if not 1 <= number <= total:
-                raise ValueError(f"out of range: {number}")
-            selected.add(number - 1)
-
-    return sorted(selected)
-
-
-def choose_apk_files(apks, base_folder=None):
-    apks = list(apks or [])
-    if not apks:
-        return []
-
-    package_cache = {}
-    while True:
-        clear()
-        print(col("SELECT APK FILES", BOLD))
-        if base_folder:
-            print(f"Folder: {base_folder}")
-        print("")
-        print("Enter one number, multiple numbers, a range, or A for all.")
-        print("Examples: 1   |   1,3,5   |   2-6   |   A")
-        print("0. Cancel")
-        print("")
-
-        for index, path in enumerate(apks, 1):
-            key = str(path)
-            if key not in package_cache:
-                package_cache[key] = apk_package_name(path)
-            package, detected_by = package_cache[key]
-
-            try:
-                relative = path.relative_to(base_folder) if base_folder else path
-            except Exception:
-                relative = path
-
-            package_note = package if package else "package unknown"
-            print(f"{index:>3}. {relative}")
-            print(col(f"     -> {package_note}", DIM))
-
-        drain_stdin()
-        raw = clean_terminal_input(input("\nSelect APKs: "))
-        if raw == "0":
-            return []
-
-        try:
-            indices = _parse_number_selection(raw, len(apks))
-        except ValueError as exc:
-            print(col(f"Invalid selection: {exc}", RED))
-            time.sleep(1.5)
-            continue
-
-        if not indices:
-            print(col("Nothing selected.", YELLOW))
-            time.sleep(1)
-            continue
-
-        selected = [apks[index] for index in indices]
-
-        clear()
-        print(col("SELECTED APK FILES", BOLD))
-        print("")
-        for path in selected:
-            package, _ = package_cache[str(path)]
-            print(f"  - {path.name}")
-            print(col(f"    {package or 'package unknown'}", DIM))
-        print("")
-
-        if _setup_yes_no(
-            f"Use these {len(selected)} APK file(s)?",
-            default=True,
-        ):
-            return selected
-
-
-
-def install_apk_batch(paths, cfg=None):
-    cfg = cfg or load_config()
-    mode = _normalized_apk_install_mode(cfg)
-
-    unique = []
-    seen = set()
-    for value in paths:
-        path = Path(value)
-        key = str(path.resolve()) if path.exists() else str(path)
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(path)
-
-    unique.sort(key=lambda path: natural_package_key(path.name))
-    installed = 0
-    failed = 0
-    results = []
-
-    # Detect every package before asking anything. This lets "ask_each"
-    # remain config-compatible while prompting only once for the whole batch.
-    batch_info = []
-    installed_matches = []
-    for path in unique:
-        package, detected_by = apk_package_name(path)
-        installed_match = bool(package and exact_package_installed(package))
-        entry = {
-            "path": path,
-            "package": package,
-            "detected_by": detected_by,
-            "installed_match": installed_match,
-        }
-        batch_info.append(entry)
-        if installed_match:
-            installed_matches.append(entry)
-
-    batch_uninstall = mode == "uninstall_first"
-
-    print(col(f"Install behavior: {_apk_install_mode_label(mode)}", CYAN))
-
-    if mode == "ask_each" and installed_matches:
-        clear()
-        banner("APK BATCH UNINSTALL CONFIRMATION", cfg)
-        print(col(
-            "Uninstalling removes app data and cookies for these exact packages:",
-            RED,
-        ))
-        print("")
-        for entry in installed_matches:
-            print(f"  - {entry['package']}")
-        print("")
-        print(
-            f"Selected APKs: {len(batch_info)} | "
-            f"Installed matches: {len(installed_matches)}"
-        )
-        print("")
-        batch_uninstall = _setup_yes_no(
-            (
-                f"Uninstall all {len(installed_matches)} matching "
-                "packages before installing?"
-            ),
-            default=False,
-        )
-        print("")
-        if batch_uninstall:
-            print(col(
-                "Batch choice: YES — uninstall all listed matches.",
-                YELLOW,
-            ))
-        else:
-            print(col(
-                "Batch choice: NO — keep all existing app data/cookies.",
-                GREEN,
-            ))
-
-    for index, entry in enumerate(batch_info, 1):
-        path = entry["path"]
-        package = entry["package"]
-        detected_by = entry["detected_by"]
-        installed_match = entry["installed_match"]
-
-        print("")
-        print(col(f"[{index}/{len(batch_info)}] {path.name}", BOLD))
-        if package:
-            print(f"  Package: {package} ({detected_by})")
-        else:
-            print(col(
-                "  Package: could not detect; uninstall step unavailable",
-                YELLOW,
-            ))
-
-        should_uninstall = bool(
-            installed_match
-            and batch_uninstall
-            and mode in {"uninstall_first", "ask_each"}
-        )
-
-        if should_uninstall:
-            ok_remove, remove_note = uninstall_exact_package(package)
-            print(col(remove_note, GREEN if ok_remove else RED))
-            if not ok_remove:
-                failed += 1
-                results.append((path, False, remove_note))
-                continue
-        elif installed_match:
-            print(col(f"Keeping installed data for {package}.", DIM))
-
-        print(col(f"Installing {path.name}...", CYAN))
-        ok, note = install_apk_file(path)
-        print(col(note, GREEN if ok else RED))
-        results.append((path, ok, note))
-        if ok:
-            installed += 1
-        else:
-            failed += 1
-
-    return installed, failed, results
-
-def uninstall_only_menu(cfg):
-    selected = choose_packages_common(
-        cfg,
-        title="UNINSTALL PACKAGES ONLY",
-        multi=True,
-        installed_only=True,
-        include_discovered=True,
-        allow_all=True,
-    )
-    if not selected:
-        return
-
-    clear()
-    banner("CONFIRM UNINSTALL ONLY", cfg)
-    print(col("This removes the selected apps AND their app data/cookies.", RED))
-    print("")
-    for package in selected:
-        print(f"  - {package}")
-    print("")
-
-    if not _setup_yes_no(
-        f"Uninstall these {len(selected)} exact packages?",
-        default=False,
-    ):
-        print(col("Uninstall cancelled.", YELLOW))
-        pause()
-        return
-
-    removed = 0
-    failed = 0
-    for index, package in enumerate(selected, 1):
-        print(col(f"[{index}/{len(selected)}] Uninstalling {package}...", CYAN))
-        ok, note = uninstall_exact_package(package)
-        print(col(note, GREEN if ok else RED))
-        if ok:
-            removed += 1
-        else:
-            failed += 1
-
-    print("")
-    print(col(
-        f"Finished: {removed} removed, {failed} failed.",
-        GREEN if failed == 0 else YELLOW,
-    ))
-    pause()
-
-
-def _github_repo_parts(value):
-    raw = str(value or "").strip().rstrip("/")
-    match = re.search(r"github\.com/([^/]+)/([^/#?]+)", raw, re.I)
-    if match:
-        return match.group(1), re.sub(r"\.git$", "", match.group(2))
-    if "/" in raw and not raw.startswith(("http://", "https://")):
-        owner, repo = raw.split("/", 1)
-        return owner.strip(), re.sub(r"\.git$", "", repo.strip())
-    return None, None
-
-
-def github_latest_release_assets(repo_value, token=""):
-    owner, repo = _github_repo_parts(repo_value)
-    if not owner or not repo:
-        return False, "Use owner/repo or a GitHub repository URL.", []
-
-    url = f"https://api.github.com/repos/{owner}/{repo}/releases/latest"
-    headers = {
-        "User-Agent": "NOMO-Rejoin/4.47",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2026-03-10",
-    }
-    token = str(token or "").strip()
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-
-    request = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(request, timeout=45) as response:
-            payload = json.loads(response.read().decode("utf-8", errors="replace"))
-    except urllib.error.HTTPError as exc:
-        return False, f"GitHub API HTTP {exc.code}: {exc.reason}", []
-    except Exception as exc:
-        return False, f"GitHub release lookup failed: {exc}", []
-
-    assets = []
-    for asset in payload.get("assets", []) or []:
-        name = str(asset.get("name", "") or "")
-        download_url = str(asset.get("browser_download_url", "") or "")
-        if download_url and name.lower().endswith((".apk", ".zip")):
-            assets.append({
-                "name": name,
-                "url": download_url,
-                "size": int(asset.get("size", 0) or 0),
-            })
-
-    if not assets:
-        return False, "Latest release has no APK or ZIP assets.", []
-    return True, f"Found {len(assets)} release assets.", assets
-
-
-def _gofile_content_id(value):
-    raw = str(value or "").strip()
-    match = re.search(r"gofile\.io/d/([A-Za-z0-9_-]+)", raw, re.I)
-    if match:
-        return match.group(1)
-    if re.fullmatch(r"[A-Za-z0-9_-]{5,}", raw):
-        return raw
-    return ""
-
-
-def _gofile_collect_assets(payload):
-    found = []
-    seen_urls = set()
-
-    def walk(value):
-        if isinstance(value, dict):
-            name = str(
-                value.get("name")
-                or value.get("fileName")
-                or value.get("filename")
-                or ""
-            )
-            if name.lower().endswith((".apk", ".zip")):
-                for key in (
-                    "link",
-                    "downloadLink",
-                    "downloadUrl",
-                    "directLink",
-                    "directUrl",
-                    "url",
-                ):
-                    candidate = value.get(key)
-                    if isinstance(candidate, str) and candidate.startswith(
-                        ("http://", "https://")
-                    ):
-                        if candidate not in seen_urls:
-                            seen_urls.add(candidate)
-                            found.append({
-                                "name": _safe_download_filename(
-                                    name, "gofile.bin"
-                                ),
-                                "url": candidate,
-                                "size": int(value.get("size", 0) or 0),
-                            })
-                        break
-            for child in value.values():
-                walk(child)
-        elif isinstance(value, list):
-            for child in value:
-                walk(child)
-
-    walk(payload)
-    return found
-
-
-def gofile_share_assets(share_value, token):
-    content_id = _gofile_content_id(share_value)
-    if not content_id:
-        return False, "Invalid GoFile share URL/content ID.", []
-
-    token = str(token or "").strip()
-    if not token:
-        return False, "GoFile API token is required.", []
-
-    url = (
-        f"https://api.gofile.io/contents/{urllib.parse.quote(content_id)}"
-        "?maxdepth=5&pageSize=1000"
-    )
-    request = urllib.request.Request(
-        url,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "User-Agent": "NOMO-Rejoin/4.47",
-            "Accept": "application/json",
-        },
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            payload = json.loads(response.read().decode("utf-8", errors="replace"))
-    except urllib.error.HTTPError as exc:
-        return False, f"GoFile API HTTP {exc.code}: {exc.reason}", []
-    except Exception as exc:
-        return False, f"GoFile lookup failed: {exc}", []
-
-    assets = _gofile_collect_assets(payload)
-    if not assets:
-        return False, (
-            "No downloadable APK/ZIP link was exposed by the API. "
-            "Use a GoFile direct link or a Premium direct-link API."
-        ), []
-    return True, f"Found {len(assets)} GoFile assets.", assets
-
-
-def _download_assets_then_install(assets, extra_headers=None, cfg=None):
-    downloaded = []
-    for index, asset in enumerate(assets, 1):
-        name = _safe_download_filename(asset.get("name"), f"asset_{index}.bin")
-        url = str(asset.get("url") or "")
-        size = int(asset.get("size", 0) or 0)
-        size_note = f" ({size // 1048576} MB)" if size > 0 else ""
-        print(col(
-            f"[{index}/{len(assets)}] Downloading {name}{size_note}...",
-            CYAN,
-        ))
-        ok, note, path = download_url_to_apk_dir(
-            url, filename=name, headers=extra_headers
-        )
-        print(col(note, GREEN if ok else RED))
-        if not ok or not path:
-            continue
-        collect_ok, collect_note, apks = _collect_installable_apks(path)
-        print(col(collect_note, GREEN if collect_ok else RED))
-        if collect_ok:
-            downloaded.extend(apks)
-
-    if not downloaded:
-        print(col("No installable APK files were downloaded.", RED))
-        return 0, 0
-    installed, failed, _ = install_apk_batch(downloaded, cfg=cfg)
-    return installed, failed
-
-
-def apk_download_install_menu(cfg):
-    while True:
-        cfg = load_config()
-        install_mode = _normalized_apk_install_mode(cfg)
-
-        clear()
-        banner("APK DOWNLOAD / INSTALL", cfg)
-        print(f"Download folder : {APK_DOWNLOAD_DIR}")
-        print(f"Install behavior: {_apk_install_mode_label(install_mode)}")
-        print("")
-        print("1. Direct APK/ZIP URL -> download + install")
-        print("2. GitHub latest release -> download + install all APK/ZIP assets")
-        print("3. GoFile share -> API token lookup + download + install")
-        print("4. Select APKs from local folder -> install")
-        print("5. Uninstall installed packages only")
-        print("6. Change install/uninstall behavior")
-        print("7. Show download folder")
-        print("0. Back")
-        drain_stdin()
-        choice = clean_terminal_input(input("\nChoose: "))
-
-        if choice == "0":
-            return
-
-        if choice == "1":
-            url = clean_terminal_input(input("Direct APK/ZIP URL: "))
-            if not url:
-                continue
-            print(col("Downloading...", CYAN))
-            ok, note, path = download_url_to_apk_dir(url)
-            print(col(note, GREEN if ok else RED))
-            if not ok or not path:
-                pause()
-                continue
-            collect_ok, collect_note, apks = _collect_installable_apks(path)
-            print(col(collect_note, GREEN if collect_ok else RED))
-            if collect_ok and _setup_yes_no("Install now?", default=True):
-                installed, failed, _ = install_apk_batch(apks, cfg=cfg)
-                print(col(
-                    f"Finished: {installed} installed, {failed} failed.",
-                    GREEN if failed == 0 else YELLOW,
-                ))
-            pause()
-            continue
-
-        if choice == "2":
-            repo = clean_terminal_input(input(
-                "GitHub repository [owner/repo or URL]: "
-            ))
-            if not repo:
-                continue
-            token = str(cfg.get("github_download_token", "") or "").strip()
-            ok, note, assets = github_latest_release_assets(repo, token)
-            print(col(note, GREEN if ok else RED))
-            if not ok:
-                pause()
-                continue
-            for index, asset in enumerate(assets, 1):
-                print(
-                    f"  {index}. {asset['name']} "
-                    f"({int(asset.get('size', 0)) // 1048576} MB)"
-                )
-            if not _setup_yes_no(
-                "Download and install all listed assets?", default=True
-            ):
-                continue
-            installed, failed = _download_assets_then_install(
-                assets,
-                cfg=cfg,
-            )
-            print(col(
-                f"Finished: {installed} installed, {failed} failed.",
-                GREEN if failed == 0 else YELLOW,
-            ))
-            pause()
-            continue
-
-        if choice == "3":
-            share = clean_terminal_input(input("GoFile share URL/content ID: "))
-            if not share:
-                continue
-            token = getpass.getpass("GoFile API token: ").strip()
-            ok, note, assets = gofile_share_assets(share, token)
-            print(col(note, GREEN if ok else RED))
-            if not ok:
-                pause()
-                continue
-            for index, asset in enumerate(assets, 1):
-                print(f"  {index}. {asset['name']}")
-            if not _setup_yes_no(
-                "Download and install all listed assets?", default=True
-            ):
-                continue
-            installed, failed = _download_assets_then_install(
-                assets,
-                extra_headers={"Authorization": f"Bearer {token}"},
-                cfg=cfg,
-            )
-            print(col(
-                f"Finished: {installed} installed, {failed} failed.",
-                GREEN if failed == 0 else YELLOW,
-            ))
-            pause()
-            continue
-
-        if choice == "4":
-            raw = clean_terminal_input(input(
-                f"APK folder [ENTER={APK_LOCAL_DEFAULT_DIR}]: "
-            ))
-            folder = Path(raw) if raw else APK_LOCAL_DEFAULT_DIR
-            if not folder.exists() or not folder.is_dir():
-                print(col(f"Folder not found: {folder}", RED))
-                pause()
-                continue
-
-            apks = _scan_apks_in_folder(folder, recursive=True)
-            if not apks:
-                print(col(
-                    f"No APK files found under: {folder}",
-                    RED,
-                ))
-                pause()
-                continue
-
-            print(col(
-                f"Found {len(apks)} APK files. Opening selector...",
-                GREEN,
-            ))
-            time.sleep(0.7)
-
-            selected_apks = choose_apk_files(apks, base_folder=folder)
-            if not selected_apks:
-                print(col("No APK files selected.", YELLOW))
-                pause()
-                continue
-
-            installed, failed, _ = install_apk_batch(
-                selected_apks,
-                cfg=cfg,
-            )
-            print(col(
-                f"Finished: {installed} installed, {failed} failed.",
-                GREEN if failed == 0 else YELLOW,
-            ))
-            pause()
-            continue
-
-        if choice == "5":
-            uninstall_only_menu(cfg)
-            continue
-
-        if choice == "6":
-            choose_apk_install_mode(cfg)
-            continue
-
-        if choice == "7":
-            APK_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-            print(APK_DOWNLOAD_DIR)
-            pause()
-            continue
-
-        print(col("Invalid choice.", RED))
-        time.sleep(1)
-
-
-def _workspace_zip_relative_path(member_name):
-    """Return safe destination-relative path for supported workspace ZIP layouts."""
-    raw = str(member_name or "").replace("\\", "/").lstrip("/")
-    while raw.startswith("./"):
-        raw = raw[2:]
-
-    prefixes = (
-        "Arceus X/Workspace/",
-        "Delta/Workspace/",
-        "Workspace/",
-    )
-    relative = raw
-    for prefix in prefixes:
-        if raw.lower().startswith(prefix.lower()):
-            relative = raw[len(prefix):]
-            break
-
-    relative = relative.strip("/")
-    if not relative:
-        return None
-
-    parts = []
-    for part in relative.split("/"):
-        part = part.strip()
-        if not part or part == ".":
-            continue
-        if part == "..":
-            return None
-        if "\x00" in part:
-            return None
-        parts.append(part)
-
-    if not parts:
-        return None
-    return Path(*parts)
-
-
-def _workspace_zip_is_symlink(info):
-    try:
-        mode = (int(info.external_attr) >> 16) & 0o170000
-        return mode == 0o120000
-    except Exception:
-        return False
-
-
-def _workspace_zip_members(zip_path):
-    """Return supported, safe file members as (ZipInfo, relative Path)."""
-    items = []
-    with zipfile.ZipFile(zip_path, "r") as archive:
-        for info in archive.infolist():
-            if info.is_dir() or _workspace_zip_is_symlink(info):
-                continue
-            relative = _workspace_zip_relative_path(info.filename)
-            if relative is None:
-                continue
-            items.append((info, relative))
-    return items
-
-
-def import_workspace_zip_to_delta(zip_path, *, make_backup=True):
-    """Import a supported config/workspace ZIP into Delta's global Workspace."""
-    zip_path = Path(zip_path).expanduser()
-    if not zip_path.exists() or not zip_path.is_file():
-        return False, f"ZIP not found: {zip_path}", None
-
-    try:
-        members = _workspace_zip_members(zip_path)
-    except zipfile.BadZipFile:
-        return False, "Invalid or damaged ZIP file.", None
-    except Exception as exc:
-        return False, f"Could not inspect ZIP: {exc}", None
-
-    if not members:
-        return False, (
-            "No workspace files found. Supported layouts: "
-            "Arceus X/Workspace/, Delta/Workspace/, Workspace/, or flat files."
-        ), None
-
-    DELTA_GLOBAL_WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
-    overwritten = []
-    for _, relative in members:
-        target = DELTA_GLOBAL_WORKSPACE_DIR / relative
-        if target.exists() and target.is_file():
-            overwritten.append(relative)
-
-    backup_path = None
-    if make_backup and overwritten:
-        DELTA_WORKSPACE_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_path = DELTA_WORKSPACE_BACKUP_DIR / f"delta_overwrite_backup_{stamp}.zip"
-        with zipfile.ZipFile(
-            backup_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
-        ) as backup:
-            for relative in overwritten:
-                existing = DELTA_GLOBAL_WORKSPACE_DIR / relative
-                if existing.exists() and existing.is_file():
-                    backup.write(existing, arcname=str(relative).replace("\\", "/"))
-
-    imported = 0
-    with zipfile.ZipFile(zip_path, "r") as archive:
-        for info, relative in members:
-            target = DELTA_GLOBAL_WORKSPACE_DIR / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            temporary = target.with_name(target.name + ".nomo_import_tmp")
-            try:
-                with archive.open(info, "r") as src, open(temporary, "wb") as dst:
-                    shutil.copyfileobj(src, dst, length=1024 * 1024)
-                os.replace(str(temporary), str(target))
-                imported += 1
-            finally:
-                try:
-                    if temporary.exists():
-                        temporary.unlink()
-                except Exception:
-                    pass
-
-    note = (
-        f"Imported {imported} files into {DELTA_GLOBAL_WORKSPACE_DIR}; "
-        f"overwritten {len(overwritten)}"
-    )
-    return True, note, backup_path
-
-
-def export_delta_workspace_zip():
-    """Export the current Delta global Workspace to a timestamped ZIP."""
-    if not DELTA_GLOBAL_WORKSPACE_DIR.exists():
-        return False, f"Workspace not found: {DELTA_GLOBAL_WORKSPACE_DIR}", None, 0
-
-    files = sorted(
-        path for path in DELTA_GLOBAL_WORKSPACE_DIR.rglob("*")
-        if path.is_file() and not path.name.endswith(".nomo_import_tmp")
-    )
-    if not files:
-        return False, "Delta Workspace is empty.", None, 0
-
-    DELTA_WORKSPACE_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output = DELTA_WORKSPACE_EXPORT_DIR / f"delta_workspace_{stamp}.zip"
-
-    with zipfile.ZipFile(
-        output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
-    ) as archive:
-        for path in files:
-            relative = path.relative_to(DELTA_GLOBAL_WORKSPACE_DIR)
-            archive.write(
-                path,
-                arcname=f"Delta/Workspace/{str(relative).replace(chr(92), '/')}",
-            )
-
-    return True, f"Exported {len(files)} files.", output, len(files)
-
-
-def workspace_zip_tools_menu(cfg):
-    while True:
-        clear()
-        banner("WORKSPACE ZIP TOOLS", cfg)
-        print(f"Delta Workspace: {DELTA_GLOBAL_WORKSPACE_DIR}")
-        print("")
-        print("1. Import config/workspace ZIP -> Delta Workspace")
-        print("2. Export Delta Workspace -> timestamped ZIP")
-        print("3. Show supported ZIP layouts")
-        print("0. Back")
-        drain_stdin()
-        choice = clean_terminal_input(input("\nChoose: "))
-
-        if choice == "0":
-            return
-
-        if choice == "1":
-            raw = clean_terminal_input(input(
-                f"ZIP path [ENTER={DELTA_WORKSPACE_DEFAULT_IMPORT_ZIP}]: "
-            ))
-            zip_path = Path(raw) if raw else DELTA_WORKSPACE_DEFAULT_IMPORT_ZIP
-
-            try:
-                members = _workspace_zip_members(zip_path)
-            except Exception as exc:
-                print(col(f"Cannot read ZIP: {exc}", RED))
-                pause()
-                continue
-
-            if not members:
-                print(col("No supported workspace files found in that ZIP.", RED))
-                pause()
-                continue
-
-            existing = sum(
-                1 for _, relative in members
-                if (DELTA_GLOBAL_WORKSPACE_DIR / relative).is_file()
-            )
-            print("")
-            print(f"Files detected : {len(members)}")
-            print(f"Will overwrite : {existing}")
-            print(f"Destination    : {DELTA_GLOBAL_WORKSPACE_DIR}")
-            print(col(
-                "Overwritten files are backed up automatically before import.",
-                DIM,
-            ))
-
-            if not _setup_yes_no("Import now?", default=True):
-                print(col("Import cancelled.", YELLOW))
-                pause()
-                continue
-
-            ok, note, backup = import_workspace_zip_to_delta(
-                zip_path, make_backup=True
-            )
-            print(col(note, GREEN if ok else RED))
-            if backup:
-                print(f"Backup: {backup}")
-            pause()
-            continue
-
-        if choice == "2":
-            print(col("Building Delta Workspace export...", CYAN))
-            try:
-                ok, note, output, count = export_delta_workspace_zip()
-            except Exception as exc:
-                ok, note, output = False, f"Export failed: {exc}", None
-            print(col(note, GREEN if ok else RED))
-            if output:
-                print(f"ZIP: {output}")
-            pause()
-            continue
-
-        if choice == "3":
-            print("")
-            print("Supported input layouts:")
-            print("  Arceus X/Workspace/HolyV2/...")
-            print("  Delta/Workspace/HolyV2/...")
-            print("  Workspace/HolyV2/...")
-            print("  HolyV2/...  (already flat)")
-            print("")
-            print("All imported files land directly under:")
-            print(f"  {DELTA_GLOBAL_WORKSPACE_DIR}/")
-            pause()
-            continue
-
-        print(col("Invalid choice.", RED))
-        time.sleep(1)
-
-
-def _delta_state_path_for_username(username):
-    safe = _sanitize_state_name(username or "unknown")
-    return DELTA_GLOBAL_STATE_DIR / f"{safe}_state.json"
-
-
-def _setup_choose_executor_storage(cfg):
-    """Choose the executor storage model used by Option 13."""
-    saved = str(cfg.get("executor_storage_mode", "auto") or "auto").strip().lower()
-    delta_exists = DELTA_GLOBAL_ROOT.exists() or DELTA_GLOBAL_AUTOEXEC_DIR.exists()
-
-    default_choice = "1" if saved == "delta_global" or (saved == "auto" and delta_exists) else "2"
-
-    clear()
-    banner("SETUP: EXECUTOR STORAGE", cfg)
-    print("1. Delta GLOBAL")
-    print(f"   AutoExec : {DELTA_GLOBAL_AUTOEXEC_DIR}")
-    print(f"   Workspace: {DELTA_GLOBAL_WORKSPACE_DIR}")
-    print("")
-    print("2. Arceus X PER-CLONE")
-    print("   AutoExec : RobloxClone###/Arceus X/Autoexec")
-    print("   Workspace: RobloxClone###/Arceus X/Workspace")
-    print("")
-    print(f"ENTER = {'Delta Global' if default_choice == '1' else 'Arceus X per-clone'}")
-    print("0. Cancel")
-
-    drain_stdin()
-    raw = clean_terminal_input(input("\nExecutor storage: "))
-    if raw == "":
-        raw = default_choice
-    if raw == "0":
-        return None
-    if raw == "1":
-        return "delta_global"
-    if raw == "2":
-        return "arceus_per_clone"
-
-    print(col("Invalid choice.", RED))
-    pause()
-    return None
-
-
-def _configure_delta_global_storage(cfg, packages):
-    """Configure shared Delta storage with a locked identity per package."""
-    DELTA_GLOBAL_AUTOEXEC_DIR.mkdir(parents=True, exist_ok=True)
-    DELTA_GLOBAL_STATE_DIR.mkdir(parents=True, exist_ok=True)
-
-    wanted = set(packages or [])
-    results = []
-
-    for tab in cfg.get("tabs", []):
-        pkg = str(tab.get("package") or "")
-        if pkg not in wanted:
-            continue
-
-        api_username = ""
-        try:
-            api_username, _ = get_username_from_package_api(pkg)
-        except Exception:
-            api_username = ""
-
-        username = (
-            _usable_detected_username(api_username)
-            or _usable_detected_username(tab.get("user_name"))
-            or pkg
-        )
-        source_name = "cookie/API" if api_username else "existing config"
-        apply_delta_package_mapping(
-            cfg, pkg, username, source_name
-        )
-
-        exact = delta_global_state_path(username)
-        results.append({
-            "package": pkg,
-            "clone_no": 0,
-            "username": username,
-            "state_file": str(exact),
-            "autoexec_path": str(DELTA_GLOBAL_AUTOEXEC_DIR),
-            "reason": f"Delta locked ({source_name})",
-            "storage": "delta_global",
-        })
-
-    cfg["executor_storage_mode"] = "delta_global"
-    normalize_delta_global_mappings(cfg)
-    save_config(cfg)
-    return results
-
-
-
-def _prepare_arceus_per_clone_storage(cfg, packages):
-    """Clear Delta overrides before running the existing per-clone mapper."""
-    wanted = set(packages or [])
-    for tab in cfg.get("tabs", []):
-        pkg = str(tab.get("package") or "")
-        if pkg not in wanted:
-            continue
-        tab.pop("autoexec_path", None)
-        tab["executor_storage"] = "arceus_per_clone"
-
-    cfg["executor_storage_mode"] = "arceus_per_clone"
-    save_config(cfg)
-
-
 def _new_tab_for_package(pkg, position=0):
     hint = _package_clone_number_hint(pkg)
     idx = max(0, int(hint - 1 if hint else (position or 0)))
@@ -14267,90 +11409,32 @@ def set_enabled_package_set(cfg, selected):
 
 
 def refresh_usernames_for_packages(cfg, packages):
+    hcfg = load_hatcher_config()
+    profile_map = {p.get("package"): p for p in hatcher_profiles(hcfg, enabled_only=False)}
     changed = False
-    non_delta_hcfg = load_hatcher_config()
-    non_delta_changed = False
-
     for pkg in packages:
-        tab = next(
-            (
-                item for item in cfg.get("tabs", [])
-                if item.get("package") == pkg
-            ),
-            None,
-        )
+        tab = next((t for t in cfg.get("tabs", []) if t.get("package") == pkg), None)
         if tab is None:
             continue
-
         username, uid = get_username_from_package_api(pkg)
-        username = _usable_detected_username(username)
-        source_name = "cookie/API"
-
-        if not username and not is_delta_global_tab(tab):
+        source = "cookie/API"
+        if not username:
             state, _ = read_state(tab)
-            username = _usable_detected_username(
-                (state or {}).get("username")
-            )
-            source_name = "state"
-
+            username = _usable_detected_username((state or {}).get("username"))
+            source = "state"
         if username:
-            if is_delta_global_tab(tab):
-                changed |= apply_delta_package_mapping(
-                    cfg, pkg, username, source_name
-                )
-                # Reload the just-saved main config into the caller object so
-                # subsequent packages see the newest conflict/path state.
-                fresh_cfg = load_config()
-                cfg.clear()
-                cfg.update(fresh_cfg)
-            else:
-                if tab.get("user_name") != username:
-                    tab["user_name"] = username
-                    changed = True
-                profile = next(
-                    (
-                        profile
-                        for profile in hatcher_profiles(
-                            non_delta_hcfg,
-                            enabled_only=False,
-                        )
-                        if profile.get("package") == pkg
-                    ),
-                    None,
-                )
-                if (
-                    profile is not None
-                    and profile.get("hatcher_name") != username
-                ):
-                    profile["hatcher_name"] = username
-                    non_delta_changed = True
-                    changed = True
-
-            print(col(
-                f"{short_pkg(pkg)} -> {username} [{source_name}]",
-                GREEN if source_name == "cookie/API" else YELLOW,
-            ))
+            tab["user_name"] = username
+            prof = profile_map.get(pkg)
+            if prof is not None:
+                prof["hatcher_name"] = username
+            print(col(f"{short_pkg(pkg)} -> {username} [{source}]", GREEN if source == "cookie/API" else YELLOW))
+            changed = True
         else:
-            current = _usable_detected_username(tab.get("user_name"))
-            if is_delta_global_tab(tab):
-                print(col(
-                    f"{short_pkg(pkg)} -> {current or 'unresolved'} "
-                    "[locked; package API unavailable]",
-                    YELLOW if current else RED,
-                ))
-            else:
-                print(col(f"{short_pkg(pkg)} -> unresolved", RED))
-
-    if normalize_delta_global_mappings(cfg):
-        changed = True
-
+            print(col(f"{short_pkg(pkg)} -> unresolved", RED))
     if changed:
         save_config(cfg)
-    if non_delta_changed:
-        save_hatcher_config(non_delta_hcfg)
+        save_hatcher_config(hcfg)
     return changed
-
-
 
 def compute_age(created_str):
     """Return days since account creation, or 'N/A' if invalid."""
@@ -14366,7 +11450,7 @@ def compute_age(created_str):
 
 PET_COUNTER_FALLBACK_TEMPLATE = r'''--========================================================--
 --                    NOMO PET COUNTER
---       v3.9 RELEASE DATA COUNTS
+--       v4.0 BOOSTER MATCHES
 --========================================================--
 -- Writes per-account state to:
 --   nomo_rejoiner/<username>_state.json
@@ -14444,7 +11528,7 @@ local Config = getgenv().NOMO_PET_COUNTER
 
 Config.Enabled = true
 Config.Stop = false
-Config.Version = "v3.9-release-data-counts"
+Config.Version = "v4.0-booster-matches"
 
 Config.WriteFolder = Config.WriteFolder or "nomo_rejoiner"
 
@@ -14464,6 +11548,12 @@ Config.WriteFile = Config.WriteFile or (Config.WriteFolder .. "/" .. _safeUser .
 -- Scan fast, write light.
 Config.ScanEvery = tonumber(Config.ScanEvery or 2) or 2
 Config.WriteEvery = tonumber(Config.WriteEvery or 5) or 5
+
+-- Booster match defaults. The counter only exports matching pet details, never
+-- the full pet inventory, keeping state files compact.
+Config.BoosterMinBaseWeightKg = tonumber(Config.BoosterMinBaseWeightKg or 6) or 6
+Config.BoosterMinAge = tonumber(Config.BoosterMinAge or 500) or 500
+Config.BoosterMaxMatches = math.max(1, math.floor(tonumber(Config.BoosterMaxMatches or 100) or 100))
 
 Config.Debug = Config.Debug == true
 Config.Verbose = Config.Verbose == true
@@ -15093,19 +12183,157 @@ local function firstTable(...)
     return nil
 end
 
-local function countPetsFromData(data)
-    local petInv = data and data.PetsData and data.PetsData.PetInventory
-    local petData = petInv and firstTable(petInv.Data, petInv.PetData, petInv.Inventory)
-    if type(petData) ~= "table" then
+local PET_NAME_FIELDS = {
+    "PetType", "PetName", "pet_type", "pet_name", "Name", "name",
+    "ItemName", "item_name", "Type", "type"
+}
+local PET_AGE_FIELDS = {"Age", "age", "PetAge", "pet_age"}
+local PET_WEIGHT_FIELDS = {
+    "WeightKg", "WeightKG", "weight_kg", "Weight", "weight",
+    "CurrentWeight", "current_weight", "FinalWeight", "final_weight"
+}
+local PET_BASE_WEIGHT_FIELDS = {
+    "BaseWeightKg", "BaseWeightKG", "base_weight_kg", "BaseWeight",
+    "base_weight", "OriginalWeight", "original_weight", "BaseKG", "base_kg"
+}
+local PET_MUTATION_FIELDS = {
+    "Mutation", "mutation", "MutationType", "mutation_type",
+    "Mutations", "mutations"
+}
+local PET_UUID_FIELDS = {
+    "PET_UUID", "PetUUID", "pet_uuid", "UUID", "uuid", "Id", "id"
+}
+
+local function entryTables(entry)
+    local out = {}
+    local seen = {}
+    local function add(value)
+        if type(value) == "table" and not seen[value] then
+            seen[value] = true
+            table.insert(out, value)
+        end
+    end
+    add(entry)
+    if type(entry) == "table" then
+        add(entry.Data)
+        add(entry.data)
+        add(entry.PetData)
+        add(entry.petData)
+        add(entry.Pet)
+        add(entry.pet)
+        add(entry.Info)
+        add(entry.info)
+    end
+    return out
+end
+
+local function firstEntryField(entry, fields)
+    for _, container in ipairs(entryTables(entry)) do
+        for _, field in ipairs(fields) do
+            local value = container[field]
+            if value ~= nil then
+                return value
+            end
+        end
+    end
+    return nil
+end
+
+local function numericEntryField(entry, fields)
+    local value = firstEntryField(entry, fields)
+    if type(value) == "table" then
+        value = value.Value or value.value or value.Amount or value.amount
+    end
+    return tonumber(value)
+end
+
+local function stringEntryField(entry, fields)
+    local value = firstEntryField(entry, fields)
+    if value == nil then
+        return ""
+    end
+    if type(value) == "table" then
+        local parts = {}
+        for key, enabled in pairs(value) do
+            if enabled ~= false and enabled ~= nil then
+                table.insert(parts, tostring(key))
+            end
+        end
+        table.sort(parts)
+        return table.concat(parts, ",")
+    end
+    return tostring(value)
+end
+
+local function boosterPetDetail(key, entry)
+    local name = stringEntryField(entry, PET_NAME_FIELDS)
+    if name == "" then
+        name = "Unknown Pet"
+    end
+
+    local uuid = stringEntryField(entry, PET_UUID_FIELDS)
+    if uuid == "" and key ~= nil then
+        uuid = tostring(key)
+    end
+
+    local age = numericEntryField(entry, PET_AGE_FIELDS) or 0
+    local weight = numericEntryField(entry, PET_WEIGHT_FIELDS)
+    local baseWeight = numericEntryField(entry, PET_BASE_WEIGHT_FIELDS)
+    local mutation = stringEntryField(entry, PET_MUTATION_FIELDS)
+
+    local ageMatch = age >= Config.BoosterMinAge
+    local weightMatch = baseWeight ~= nil and baseWeight >= Config.BoosterMinBaseWeightKg
+    if not ageMatch and not weightMatch then
         return nil
     end
 
+    return {
+        uuid = uuid,
+        name = name,
+        age = age,
+        weight_kg = weight,
+        base_weight_kg = baseWeight,
+        mutation = mutation,
+        match_age = ageMatch,
+        match_base_weight = weightMatch,
+    }
+end
+
+local function analyzePetsFromData(data)
+    local petInv = data and data.PetsData and data.PetsData.PetInventory
+    local petData = petInv and firstTable(petInv.Data, petInv.PetData, petInv.Inventory)
+    if type(petData) ~= "table" then
+        return nil, {}
+    end
+
     local count = 0
-    for _, entry in pairs(petData) do
+    local matches = {}
+    for key, entry in pairs(petData) do
         if entry ~= nil and entry ~= false then
             count += 1
+            if #matches < Config.BoosterMaxMatches then
+                local detail = boosterPetDetail(key, entry)
+                if detail then
+                    table.insert(matches, detail)
+                end
+            end
         end
     end
+
+    table.sort(matches, function(a, b)
+        local aw = tonumber(a.base_weight_kg) or -1
+        local bw = tonumber(b.base_weight_kg) or -1
+        if aw ~= bw then
+            return aw > bw
+        end
+        return (tonumber(a.age) or 0) > (tonumber(b.age) or 0)
+    end)
+
+    return count, matches
+end
+
+local function countPetsFromData(data)
+    local count = analyzePetsFromData(data)
     return count
 end
 
@@ -15255,7 +12483,7 @@ local function countPetsAndEggs()
     end
 
     local data = getLiveData()
-    local petCount = countPetsFromData(data)
+    local petCount, boostingMatches = analyzePetsFromData(data)
     local dataEggsOk = countEggsFromData(data, eggs)
 
     if petCount == nil or not dataEggsOk then
@@ -15270,7 +12498,7 @@ local function countPetsAndEggs()
         eggTotal += tonumber(amount) or 0
     end
 
-    return tonumber(petCount) or 0, eggTotal, eggs
+    return tonumber(petCount) or 0, eggTotal, eggs, boostingMatches or {}
 end
 
 --========================================================--
@@ -15741,6 +12969,7 @@ end
 local lastGoodPetCount = 0
 local lastGoodEggTotal = 0
 local lastGoodEggs = {}
+local lastGoodBoostingMatches = {}
 
 -- Heartbeat: increments every successful state build. Lets the harness tell
 -- "script running but game stuck" (seq advancing, pets frozen) from
@@ -15749,9 +12978,9 @@ local WRITE_SEQ = 0
 local SCRIPT_START = os.time()
 
 local function buildState()
-    local petCount, eggTotal, eggs = 0, 0, {}
+    local petCount, eggTotal, eggs, boostingMatches = 0, 0, {}, {}
 
-    local okCount, a, b, c = pcall(function()
+    local okCount, a, b, c, d = pcall(function()
         return countPetsAndEggs()
     end)
 
@@ -15759,13 +12988,16 @@ local function buildState()
         petCount = tonumber(a) or 0
         eggTotal = tonumber(b) or 0
         eggs = type(c) == "table" and c or {}
+        boostingMatches = type(d) == "table" and d or {}
         lastGoodPetCount = petCount
         lastGoodEggTotal = eggTotal
         lastGoodEggs = eggs
+        lastGoodBoostingMatches = boostingMatches
     else
         petCount = lastGoodPetCount
         eggTotal = lastGoodEggTotal
         eggs = lastGoodEggs
+        boostingMatches = lastGoodBoostingMatches
         if Config.Debug then
             warn("[NOMO PET COUNTER] countPetsAndEggs error:", tostring(a))
         end
@@ -15818,6 +13050,11 @@ local function buildState()
         egg_catalog_count = countTable(EGG_CATALOG),
         egg_catalog_source = EGG_CATALOG_SOURCE,
         egg_counts_include_zero = Config.IncludeZeroCountEggs == true,
+
+        boosting_match_count = #boostingMatches,
+        boosting_matches = boostingMatches,
+        boosting_min_base_weight_kg = Config.BoosterMinBaseWeightKg,
+        boosting_min_age = Config.BoosterMinAge,
 
         ts = now(),
         write_seq = WRITE_SEQ,
@@ -16060,7 +13297,7 @@ def pet_counter_autoexec_source():
     embedded = _lua_long_string(PET_COUNTER_FALLBACK_TEMPLATE)
 
     return f'''-- NOMO Pet Counter updater/loader
--- Priority: GitHub latest -> local cache -> embedded stable v3.9 fallback
+-- Priority: GitHub latest -> local cache -> embedded v4.0 fallback
 
 local COUNTER_URL = {remote_url}
 local CACHE_FOLDER = "nomo_rejoiner"
@@ -17097,7 +14334,7 @@ def autoexec_menu(cfg):
         ]
         draw_boxed_menu(rows, cfg)
         print("")
-        print(col("Pet Counter source: GitHub latest -> cache -> embedded stable v3.9 fallback", DIM))
+        print(col("Pet Counter source: GitHub latest -> cache -> embedded v4.0 fallback", DIM))
         choice = read_menu_choice("\nOption: ", valid={"0", "1", "2", "3", "4", "5", "6", "7"})
         if choice is None:
             print(col("Invalid option. Use one of the numbers shown.", RED))
@@ -19633,6 +16870,125 @@ def inject_cookie(package, cookie):
 
     return False, "; ".join(errors[:3]) or "cookie injection failed"
 
+def old_inject_cookie_unused(package, cookie):
+    # ---- Copy DB with retry ----
+    success = False
+    owner = ""
+    ret, out, err = run_su_cmd(f"stat -c %u:%g {shlex.quote(db_src)}", timeout=5)
+    if ret == 0:
+        owner = out.strip()
+
+    for attempt in range(3):
+        ret, out, err = run_su_cmd(f"cp {shlex.quote(db_src)} {shlex.quote(db_dst)}", timeout=5)
+        if ret == 0 and os.path.exists(db_dst) and os.path.getsize(db_dst) > 0:
+            success = True
+            break
+        time.sleep(1)
+    if not success:
+        return False, "failed to copy database (may not exist or locked)"
+
+    try:
+        conn = sqlite3.connect(db_dst, timeout=2)
+        c = conn.cursor()
+
+        c.execute("PRAGMA table_info(cookies)")
+        columns_info = c.fetchall()
+        columns = [row[1] for row in columns_info]
+        col_types = {row[1]: row[2] for row in columns_info}
+        col_notnull = {row[1]: row[3] for row in columns_info}
+
+        row_data = {}
+        for col in columns:
+            col_type = col_types.get(col, "TEXT").upper()
+            if col_notnull.get(col, 0) == 1:
+                if "INT" in col_type or "REAL" in col_type:
+                    row_data[col] = 0
+                else:
+                    row_data[col] = ""
+            else:
+                row_data[col] = None
+
+        row_data["host_key"] = ".roblox.com"
+        row_data["name"] = ".ROBLOSECURITY"
+        row_data["value"] = cookie
+        row_data["path"] = "/"
+
+        chrome_now = int((time.time() + 11644473600) * 1000000)
+        chrome_expires = chrome_now + int(10 * 365 * 24 * 60 * 60 * 1000000)
+
+        for ts_col in ["expires_utc", "creation_utc", "creation_act", "last_access_utc", "last_access_act"]:
+            if ts_col in columns:
+                row_data[ts_col] = chrome_expires if ts_col == "expires_utc" else chrome_now
+
+        optional_values = {
+            "secure": 1,
+            "httponly": 1,
+            "is_secure": 1,
+            "is_httponly": 1,
+            "has_expires": 1,
+            "is_persistent": 1,
+            "priority": 1,
+            "samesite": -1,
+            "source_scheme": 2,
+            "source_port": 443,
+            "is_same_party": 0,
+            "same_party": 0,
+        }
+        for opt_col, opt_val in optional_values.items():
+            if opt_col in columns:
+                row_data[opt_col] = opt_val
+
+        c.execute("DELETE FROM cookies WHERE host_key LIKE ? AND name = ?", ("%.roblox.com", ".ROBLOSECURITY"))
+
+        placeholders = ",".join(["?" for _ in columns])
+        col_names = ",".join(columns)
+        c.execute(f"INSERT OR REPLACE INTO cookies ({col_names}) VALUES ({placeholders})", [row_data.get(col) for col in columns])
+
+        conn.commit()
+        conn.close()
+
+        success = False
+        for attempt in range(3):
+            ret, out, err = run_su_cmd(f"cp {shlex.quote(db_dst)} {shlex.quote(db_src)}", timeout=5)
+            if ret == 0:
+                success = True
+                break
+            time.sleep(1)
+        if not success:
+            return False, "failed to copy back database"
+
+        if owner:
+            run_su_cmd(f"chown {shlex.quote(owner)} {shlex.quote(db_src)}", timeout=5)
+
+        try:
+            ret, out, err = run_su_cmd(f"cp {shlex.quote(db_src)} {shlex.quote(db_dst)}", timeout=5)
+            if ret == 0 and os.path.exists(db_dst):
+                conn2 = sqlite3.connect(db_dst, timeout=2)
+                c2 = conn2.cursor()
+                c2.execute("SELECT value FROM cookies WHERE host_key LIKE '%.roblox.com' AND name='.ROBLOSECURITY' ORDER BY rowid DESC LIMIT 1")
+                row2 = c2.fetchone()
+                conn2.close()
+                if row2 and row2[0] == cookie:
+                    return True, "cookie injected and verified"
+                else:
+                    return False, "verification failed: cookie mismatch"
+        except Exception as e:
+            pass
+        finally:
+            if os.path.exists(db_dst):
+                try: os.remove(db_dst)
+                except: pass
+
+        return True, "cookie injected (verification skipped)"
+
+    except Exception as e:
+        return False, f"DB error: {e}"
+    finally:
+        if os.path.exists(db_dst):
+            try: os.remove(db_dst)
+            except: pass
+
+
 def import_cookie_menu(cfg):
     """Login via one pasted cookie or a local TXT chosen from BASE_DIR/cookies."""
 
@@ -19661,95 +17017,11 @@ def import_cookie_menu(cfg):
         except Exception as exc:
             return False, f"first launch failed: {exc}"
 
-        tapped_ok = False
-        if bool(cfg.get("cookie_first_launch_ok_enabled", True)):
-            delay = max(
-                0.5,
-                float(cfg.get("cookie_first_launch_ok_delay_seconds", 3.0) or 3.0),
-            )
-            x = int(cfg.get("cookie_first_launch_ok_x", 868) or 868)
-            y = int(cfg.get("cookie_first_launch_ok_y", 403) or 403)
-            repeats = max(
-                1,
-                int(cfg.get("cookie_first_launch_ok_repeats", 2) or 2),
-            )
-            interval = max(
-                0.05,
-                float(cfg.get("cookie_first_launch_ok_interval_seconds", 0.25) or 0.25),
-            )
-
-            print(col(
-                f"[{pkg}] Waiting {delay:g}s, then tapping first-launch OK "
-                f"{repeats}x at {x},{y}...",
-                CYAN,
-            ))
-            time.sleep(delay)
-
-            tap_parts = []
-            for index in range(repeats):
-                tap_parts.append(f"input tap {x} {y}")
-                if index + 1 < repeats:
-                    tap_parts.append(f"sleep {interval:g}")
-            tap_cmd = "; ".join(tap_parts)
-
-            try:
-                tap_result = subprocess.run(
-                    ["su", "-c", tap_cmd],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=max(8, int(repeats * interval + 6)),
-                )
-                tapped_ok = tap_result.returncode == 0
-            except Exception:
-                tapped_ok = False
-
-        # Wait until Delta/Roblox creates a non-empty WebView Cookies database.
-        wait_seconds = max(
-            10,
-            int(cfg.get("cookie_first_launch_db_wait_seconds", 35) or 35),
-        )
-        cookie_candidates = [
-            f"/data/data/{pkg}/app_webview/Default/Cookies",
-            f"/data/user/0/{pkg}/app_webview/Default/Cookies",
-            f"/data/data/{pkg}/app_webview/Cookies",
-            f"/data/user/0/{pkg}/app_webview/Cookies",
-        ]
-        quoted_candidates = " ".join(shlex.quote(path) for path in cookie_candidates)
-        ready = False
-        started_wait = time.time()
-
-        while time.time() - started_wait < wait_seconds:
-            check_cmd = (
-                "for f in " + quoted_candidates
-                + '; do [ -s "$f" ] && exit 0; done; exit 1'
-            )
-            try:
-                check = subprocess.run(
-                    ["su", "-c", check_cmd],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=5,
-                )
-                if check.returncode == 0:
-                    ready = True
-                    break
-            except Exception:
-                pass
-            time.sleep(1)
-
-        # Release the DB before NOMO copies/edits it. This remains exact-PID only.
+        # Give WebView time to create app_webview/.../Cookies on a fresh clone.
+        time.sleep(12)
         force_stop_package(pkg, cfg)
         time.sleep(1)
-
-        tap_note = "OK tapped" if tapped_ok else "OK tap skipped/failed"
-        if ready:
-            return True, f"clone initialized; {tap_note}; cookie DB ready"
-        return True, (
-            f"clone initialized; {tap_note}; DB not visible after "
-            f"{wait_seconds}s (injection will retry discovery)"
-        )
+        return True, "clone initialized"
 
     def inject_with_first_launch(pkg, cookie):
         ok, msg = inject_and_restart(pkg, cookie, cfg)
@@ -20390,39 +17662,24 @@ def _setup_install_counter_for_packages(cfg, packages, path_mode):
     tabs_by_pkg = {str(t.get("package") or ""): t for t in autoexec_tabs(cfg)}
     selected_tabs = [tabs_by_pkg[p] for p in packages if p in tabs_by_pkg]
     results = []
-    written = {}
-
     for tab in selected_tabs:
         pkg = str(tab.get("package") or "")
         paths = autoexec_paths_for_tab(tab, path_mode, filename=AUTOEXEC_PET_COUNTER_FILE)
         if not paths:
             results.append((pkg, False, "no AutoExec path"))
             continue
-
         ok_count = 0
-        notes = []
+        errors = []
         for path in paths:
-            key = str(path)
-            if key in written:
-                ok, note = written[key]
-                ok_count += 1 if ok else 0
-                notes.append(f"shared global file: {path}" if ok else note)
-                continue
-
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 tmp = path.with_suffix(path.suffix + ".tmp")
                 tmp.write_text(pet_counter_autoexec_source(), encoding="utf-8")
                 os.replace(str(tmp), str(path))
-                written[key] = (True, f"saved: {path}")
                 ok_count += 1
-                notes.append(f"saved: {path}")
             except Exception as exc:
-                note = str(exc)
-                written[key] = (False, note)
-                notes.append(note)
-
-        results.append((pkg, ok_count == len(paths), "; ".join(notes)))
+                errors.append(str(exc))
+        results.append((pkg, ok_count == len(paths), "; ".join(errors) if errors else f"saved {ok_count}"))
     return results
 
 
@@ -20432,8 +17689,6 @@ def _setup_install_market_loader_for_packages(cfg, packages, path_mode):
     tabs_by_pkg = {str(t.get("package") or ""): t for t in autoexec_tabs(cfg)}
     selected_tabs = [tabs_by_pkg[p] for p in packages if p in tabs_by_pkg]
     results = []
-    written = {}
-
     for tab in selected_tabs:
         pkg = str(tab.get("package") or "")
         paths = autoexec_paths_for_tab(
@@ -20446,36 +17701,37 @@ def _setup_install_market_loader_for_packages(cfg, packages, path_mode):
             continue
 
         ok_count = 0
-        notes = []
+        errors = []
+        unchanged = 0
         for path in paths:
-            key = str(path)
-            if key in written:
-                ok, note = written[key]
-                ok_count += 1 if ok else 0
-                notes.append(f"shared global file: {path}" if ok else note)
-                continue
-
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
-                old = path.read_text(encoding="utf-8") if path.exists() else None
+                old = None
+                try:
+                    if path.exists():
+                        old = path.read_text(encoding="utf-8")
+                except Exception:
+                    old = None
+
                 if old == MARKET_LOADER_AUTOEXEC_TEMPLATE:
-                    written[key] = (True, f"unchanged: {path}")
+                    unchanged += 1
                     ok_count += 1
-                    notes.append(f"unchanged: {path}")
                     continue
 
                 tmp = path.with_suffix(path.suffix + ".tmp")
                 tmp.write_text(MARKET_LOADER_AUTOEXEC_TEMPLATE, encoding="utf-8")
                 os.replace(str(tmp), str(path))
-                written[key] = (True, f"saved: {path}")
                 ok_count += 1
-                notes.append(f"saved: {path}")
             except Exception as exc:
-                note = str(exc)
-                written[key] = (False, note)
-                notes.append(note)
+                errors.append(str(exc))
 
-        results.append((pkg, ok_count == len(paths), "; ".join(notes)))
+        if errors:
+            note = "; ".join(errors)
+        elif unchanged == len(paths):
+            note = f"unchanged {unchanged}"
+        else:
+            note = f"saved {ok_count}"
+        results.append((pkg, ok_count == len(paths), note))
     return results
 
 
@@ -20551,7 +17807,7 @@ def _setup_prompt_private_server_place_id(cfg, role):
 
 
 def new_redfinger_setup_wizard(cfg=None):
-    """Full-auto one-time setup with Delta-global or Arceus per-clone storage.
+    """Full-auto one-time setup for MARKET, HATCHER, or LOCAL roles.
 
     The user still selects the role/packages and enters NOMO_SECRET for backend
     roles. All safe recommended actions then run automatically. Paid private
@@ -20609,22 +17865,6 @@ def new_redfinger_setup_wizard(cfg=None):
     bcfg = load_booster_config()
     sync_booster_profiles_with_tabs(cfg, bcfg)
 
-    executor_storage = _setup_choose_executor_storage(cfg)
-    if executor_storage is None:
-        print(col("Setup cancelled.", YELLOW))
-        pause()
-        return
-
-    if executor_storage == "delta_global":
-        cfg["executor_storage_mode"] = "delta_global"
-        selected_set = set(selected)
-        for tab in cfg.get("tabs", []):
-            if str(tab.get("package") or "") in selected_set:
-                tab["executor_storage"] = "delta_global"
-                tab["autoexec_path"] = str(DELTA_GLOBAL_AUTOEXEC_DIR)
-        save_config(cfg)
-        cfg = load_config()
-
     clear()
     banner("SETUP: USERNAMES", cfg)
     refresh_usernames_for_packages(cfg, selected)
@@ -20632,20 +17872,8 @@ def new_redfinger_setup_wizard(cfg=None):
 
     clear()
     banner("SETUP: PACKAGE / WORKSPACE MAPPING", cfg)
-    if executor_storage == "delta_global":
-        print(col("Using Delta GLOBAL storage for every selected package.", GREEN))
-        print(f"AutoExec : {DELTA_GLOBAL_AUTOEXEC_DIR}")
-        print(f"Workspace: {DELTA_GLOBAL_WORKSPACE_DIR}")
-        mapping_results = _configure_delta_global_storage(cfg, selected)
-    else:
-        print(col("Using Arceus X per-clone storage.", GREEN))
-        print(col("Mapping packages from real state usernames first; package suffix is fallback.", DIM))
-        _prepare_arceus_per_clone_storage(cfg, selected)
-        cfg = load_config()
-        mapping_results = auto_map_packages_to_clone_workspaces(
-            cfg, selected, resolve_api=True, persist=True, verbose=True
-        )
-
+    print(col("Mapping packages from real state usernames first; package suffix is fallback.", DIM))
+    mapping_results = auto_map_packages_to_clone_workspaces(cfg, selected, resolve_api=True, persist=True, verbose=True)
     cfg = load_config()
     hcfg = load_hatcher_config()
     sync_hatcher_profiles_with_tabs(cfg, hcfg)
@@ -20809,27 +18037,12 @@ def new_redfinger_setup_wizard(cfg=None):
         print(f"  {short_pkg(pkg):<10} {tabs.get(pkg, {}).get('user_name', '-')}")
 
     print("")
-    print(col("Executor storage:", BOLD))
-    if executor_storage == "delta_global":
-        print(f"  Mode       : {col('Delta GLOBAL', GREEN)}")
-        print(f"  AutoExec   : {DELTA_GLOBAL_AUTOEXEC_DIR}")
-        print(f"  Workspace  : {DELTA_GLOBAL_WORKSPACE_DIR}")
-    else:
-        print(f"  Mode       : {col('Arceus X per-clone', GREEN)}")
-
-    print("")
     print(col("Workspace mapping:", BOLD))
     for item in sorted(mapping_results, key=lambda value: natural_package_key(value["package"])):
-        if item.get("storage") == "delta_global":
-            print(
-                f"  {short_pkg(item['package']):<10} Delta global  "
-                f"{item['username']} -> {item['state_file']}"
-            )
-        else:
-            print(
-                f"  {short_pkg(item['package']):<10} RobloxClone{item['clone_no']:03d}  "
-                f"{item['username']}"
-            )
+        print(
+            f"  {short_pkg(item['package']):<10} RobloxClone{item['clone_no']:03d}  "
+            f"{item['username']}"
+        )
 
     print("")
     print(col("Pet Counter:", BOLD))
@@ -23021,16 +20234,6 @@ def main():
 
         elif choice == "16":
             layout_visual_menu(cfg)
-            cfg = load_config()
-            normalize_active_mode_flags(cfg)
-
-        elif choice == "17":
-            workspace_zip_tools_menu(cfg)
-            cfg = load_config()
-            normalize_active_mode_flags(cfg)
-
-        elif choice == "18":
-            apk_download_install_menu(cfg)
             cfg = load_config()
             normalize_active_mode_flags(cfg)
 
