@@ -1,5 +1,31 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.58.13 — BOOSTER DOUBLE SOFT ROUTE
+# - Removes the incorrect Roblox homepage age/access-gate assumption.
+# - Market->Booster sends the same task-reuse private-server deep link a second
+#   time when the first intent leaves Roblox on Home with no fresh state.
+# - The second intent is soft/task-reuse only: no PID stop and no duplicate
+#   solver submission.
+# - A fresh state after the first intent skips the second intent.
+# - Route success still requires a fresh Main Garden state after routing.
+# - Only after both soft intents fail may the existing one exact-PID hard
+#   fallback run.
+# - Booster reporter, Package Manager, Option 4, Market/Hatcher loops and Lua
+#   files remain unchanged.
+#
+# V4.58.12 — BOOSTER ROUTE AGE-GATE / CONFIRMATION FIX
+# - Manual Market->Booster route no longer reports success merely because its
+#   queue emptied; it requires fresh state written after the route began.
+# - Detects Roblox age/access/manual gates such as "Access to popular games has
+#   changed" and "check your age" during the interactive route.
+# - Manual gates stop the route without a hard PID fallback and hold only the
+#   selected account for manual Unlock/verification.
+# - Failed routes clear the fake Booster hold and never leave target=booster.
+# - Solver preflight is restored for every manual Booster route generation.
+# - Private links normalize to privateServerLinkCode instead of linkCode.
+# - Booster reporter, Market/Hatcher loops, Package Manager, Option 4 and Lua
+#   files remain unchanged.
+#
 # V4.58.11 — MARKET BOOSTER POOL + MANUAL SAFE JOIN
 # - Market reads Booster records from the existing shared backend.
 # - Pool shows only fresh, enabled, link-ready, probe-ready Boosters with pets.
@@ -316,7 +342,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.58.11"
+__version__ = "V4.58.13"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -1073,6 +1099,9 @@ DEFAULT_CONFIG = {
     "market_booster_top_pets": 3,
     # 0 = stay in the selected Booster until manually returned to Market.
     "market_booster_manual_hold_seconds": 0,
+    "market_booster_manual_route_wait_seconds": 90,
+    "market_booster_second_intent_enabled": True,
+    "market_booster_second_intent_delay_seconds": 5,
     "market_booster_expected_place_id": "126884695634066",
 
     "prefer_experience_start_links": True,
@@ -2827,7 +2856,8 @@ def android_safe_roblox_link(link, cfg=None):
     if pid and parsed_code:
         return (
             "roblox://experiences/start?placeId=" + str(pid)
-            + "&linkCode=" + urllib.parse.quote(parsed_code, safe="")
+            + "&privateServerLinkCode="
+            + urllib.parse.quote(parsed_code, safe="")
         )
     if pid and parsed_access:
         return (
@@ -6370,8 +6400,6 @@ def market_run_route_queue(cfg, tabs, target, reason):
             mode="route",
             bypass_manual=True,
             metadata={
-                "skip_solver_once": True,
-                "skip_solver_probe": True,
                 "manual_booster_route": target == "booster",
             },
         )
@@ -6401,41 +6429,144 @@ def market_run_route_queue(cfg, tabs, target, reason):
 def market_manual_join_booster(cfg, booster, package):
     tab = next(
         (
-            tab for tab in cfg.get("tabs", [])
-            if str(tab.get("package") or "") == str(package or "")
+            tab
+            for tab in cfg.get("tabs", [])
+            if str(tab.get("package") or "")
+            == str(package or "")
         ),
         None,
     )
     if not isinstance(tab, dict):
         return False, "package not configured"
 
-    link = str(booster.get("link") or "").strip()
-    if not link:
+    raw_link = str(booster.get("link") or "").strip()
+    if not raw_link:
         return False, "Booster has no link"
 
+    link = android_safe_roblox_link(raw_link, cfg)
+    expected_place = (
+        extract_place_id_from_link(link)
+        or str(
+            cfg.get(
+                "market_booster_expected_place_id",
+                "126884695634066",
+            )
+            or ""
+        )
+    )
+
+    low_link = link.lower()
+    if (
+        "roblox.com/share?" in low_link
+        and "privateserverlinkcode=" not in low_link
+        and "linkcode=" not in low_link
+        and "accesscode=" not in low_link
+    ):
+        return (
+            False,
+            "Booster backend contains a share link, not "
+            "privateServerLinkCode",
+        )
+
+    booster = dict(booster)
+    booster["link"] = link
+
+    route_started_at = now()
     rt = load_runtime()
     rt_tab = get_runtime_tab(rt, package)
-    market_prepare_booster_route(rt_tab, booster, cfg)
+    market_prepare_booster_route(
+        rt_tab,
+        booster,
+        cfg,
+    )
+    rt_tab["manual_booster_route_started_at"] = (
+        route_started_at
+    )
     save_runtime(rt)
 
     ok, note = market_run_route_queue(
         cfg,
         [tab],
         "booster",
-        f"manual Booster join: {booster.get('name', 'booster')}",
+        (
+            "manual Booster join: "
+            f"{booster.get('name', 'booster')}"
+        ),
     )
-    if not ok:
-        return False, note
 
     latest_rt = load_runtime()
-    latest_tab = get_runtime_tab(latest_rt, package)
-    active, expired, left = market_booster_hold_info(latest_tab)
+    latest_tab = get_runtime_tab(
+        latest_rt,
+        package,
+    )
+
+    if not ok:
+        market_clear_booster_route(latest_tab)
+        latest_tab["target"] = "market"
+        save_runtime(latest_rt)
+        return False, note
+
+    fresh, state, state_err = state_fresh_after_open(
+        tab,
+        cfg,
+        route_started_at,
+    )
+    actual_place = str(
+        (state or {}).get("place_id")
+        or ""
+    )
+
+    if (
+        not fresh
+        or (
+            expected_place
+            and actual_place
+            and actual_place != expected_place
+        )
+    ):
+        market_clear_booster_route(latest_tab)
+        latest_tab["target"] = "market"
+        latest_tab["note"] = (
+            "Booster route not confirmed"
+        )
+        save_runtime(latest_rt)
+
+        detail = str(
+            state_err
+            or (
+                f"wrong place {actual_place}"
+                if actual_place
+                else "no fresh Booster state"
+            )
+        )
+        return (
+            False,
+            "Booster route not confirmed: "
+            + cut(detail, 90),
+        )
+
+    active, _expired, left = market_booster_hold_info(
+        latest_tab
+    )
     hold_note = (
         "manual return"
         if active and left <= 0
-        else (f"hold {format_age(left)}" if active else "hold ended")
+        else (
+            f"hold {format_age(left)}"
+            if active
+            else "hold ended"
+        )
     )
-    return True, f"joined {booster.get('name', 'booster')}; {hold_note}"
+    latest_tab["note"] = (
+        f"joined {booster.get('name', 'booster')}; "
+        f"{hold_note}"
+    )
+    save_runtime(latest_rt)
+    return (
+        True,
+        f"joined {booster.get('name', 'booster')}; "
+        f"{hold_note}",
+    )
 
 
 def market_return_packages_from_booster(cfg, packages):
@@ -8923,7 +9054,14 @@ def test_login_challenge_detection_menu(cfg):
             print(col("Detection inconclusive.", YELLOW))
         pause()
 
-def wait_until_fresh_after_open(tab, cfg, rt, opened_at, timeout_override=None, allow_solver_probe=True):
+def wait_until_fresh_after_open(
+    tab,
+    cfg,
+    rt,
+    opened_at,
+    timeout_override=None,
+    allow_solver_probe=True,
+):
     if not cfg.get("wait_fresh_after_open", True):
         return True, "fresh wait disabled"
 
@@ -9309,6 +9447,96 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0):
             save_runtime(rt)
 
 
+
+def market_booster_second_soft_intent(
+    tab,
+    rt_tab,
+    cfg,
+    rt,
+    target,
+    reason,
+    first_opened_at,
+):
+    """Retry the same task-reuse deep link once when Roblox lands on Home."""
+    if not cfg.get(
+        "market_booster_second_intent_enabled",
+        True,
+    ):
+        return True, first_opened_at, "second intent disabled"
+
+    delay = max(
+        1,
+        int(
+            cfg.get(
+                "market_booster_second_intent_delay_seconds",
+                5,
+            )
+            or 5
+        ),
+    )
+
+    for _ in range(delay):
+        if stop_requested():
+            save_runtime(rt)
+            return False, first_opened_at, "stop"
+
+        fresh, _state, _err = state_fresh_after_open(
+            tab,
+            cfg,
+            first_opened_at,
+        )
+        if fresh:
+            return True, first_opened_at, "first intent confirmed"
+
+        if not wait_seconds(1, rt):
+            return False, first_opened_at, "stop"
+
+    package = str(tab.get("package") or "")
+    if not package_alive(package, cfg, fresh=True):
+        return (
+            True,
+            first_opened_at,
+            "package not alive for second soft intent",
+        )
+
+    log_activity(
+        "first Booster route left no fresh state; "
+        "sending second soft deep link",
+        package,
+        YELLOW,
+    )
+    rt_tab["note"] = "Booster second soft intent"
+    rt_tab["market_booster_second_intent_at"] = now()
+    save_runtime(rt)
+
+    ok, note = open_target(
+        tab,
+        rt_tab,
+        cfg,
+        target,
+        reason + " second soft intent",
+        force=True,
+        rt=rt,
+        mode="route",
+    )
+    second_opened_at = int(
+        rt_tab.get("last_open", now())
+    )
+
+    log_activity(
+        f"second Booster soft intent "
+        f"{'ok' if ok else 'FAILED'}: {note}",
+        package,
+        GREEN if ok else RED,
+    )
+    save_runtime(rt)
+
+    if not ok:
+        return True, first_opened_at, f"second intent failed: {note}"
+
+    return True, second_opened_at, "second soft intent sent"
+
+
 def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_hard, cfg, rt):
     """The actual target-only open -> wait-for-fresh cycle for one package."""
     display_mode = str(mode or "hard")
@@ -9335,7 +9563,42 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
     save_runtime(rt)
 
     if ok:
-        actual_open_mode = str(rt_tab.get("last_open_mode", mode) or mode).lower()
+        actual_open_mode = str(
+            rt_tab.get("last_open_mode", mode)
+            or mode
+        ).lower()
+
+        if (
+            item.get("manual_booster_route")
+            and actual_open_mode == "route"
+            and not item.get(
+                "manual_booster_second_intent_done"
+            )
+        ):
+            (
+                retry_continue,
+                retry_opened_at,
+                retry_note,
+            ) = market_booster_second_soft_intent(
+                tab,
+                rt_tab,
+                cfg,
+                rt,
+                target,
+                reason,
+                opened_at,
+            )
+            if not retry_continue:
+                rt_tab["note"] = retry_note
+                save_runtime(rt)
+                return True
+
+            opened_at = retry_opened_at
+            item[
+                "manual_booster_second_intent_done"
+            ] = True
+            rt_tab["note"] = retry_note
+            save_runtime(rt)
 
         if item.get("disconnect_recovery"):
             timeout = max(20, int(cfg.get("disconnect_recovery_wait_seconds", 60) or 60))
@@ -9351,9 +9614,31 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
         else:
             timeout = None
 
+        if item.get("manual_booster_route"):
+            route_timeout = max(
+                20,
+                int(
+                    cfg.get(
+                        "market_booster_manual_route_wait_seconds",
+                        90,
+                    )
+                    or 90
+                ),
+            )
+            timeout = min(
+                int(timeout or route_timeout),
+                route_timeout,
+            )
+
         fresh_ok, fresh_msg = wait_until_fresh_after_open(
-            tab, cfg, rt, opened_at, timeout_override=timeout,
-            allow_solver_probe=not bool(item.get("skip_solver_probe")),
+            tab,
+            cfg,
+            rt,
+            opened_at,
+            timeout_override=timeout,
+            allow_solver_probe=not bool(
+                item.get("skip_solver_probe")
+            ),
         )
         if actual_open_mode == "soft":
             rt_tab["note"] = "soft " + fresh_msg
@@ -9366,7 +9651,12 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
         if fresh_msg == "solver result":
             poll_solver_jobs(cfg, rt, open_queue)
 
-        if not fresh_ok and fresh_msg not in ("stop", "solver pending", "manual challenge", "solver result"):
+        if not fresh_ok and fresh_msg not in (
+            "stop",
+            "solver pending",
+            "manual challenge",
+            "solver result",
+        ):
             if rt_tab.get("solver_busy_retry_pending"):
                 retry_at = int(rt_tab.get("solver_busy_retry_at", 0) or 0)
                 left = max(1, retry_at - now()) if retry_at else 600
@@ -9441,8 +9731,22 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                         "skip_solver_once": True,
                         "skip_solver_probe": True,
                         "solver_result": str(item.get("solver_result", "") or ""),
-                        "disconnect_recovery": bool(item.get("disconnect_recovery")),
-                        "disconnect_recovery_stage": "hard_fallback" if item.get("disconnect_recovery") else "",
+                        "disconnect_recovery": bool(
+                            item.get("disconnect_recovery")
+                        ),
+                        "disconnect_recovery_stage": (
+                            "hard_fallback"
+                            if item.get("disconnect_recovery")
+                            else ""
+                        ),
+                        "manual_booster_route": bool(
+                            item.get("manual_booster_route")
+                        ),
+                        "manual_booster_second_intent_done": bool(
+                            item.get(
+                                "manual_booster_second_intent_done"
+                            )
+                        ),
                     },
                 )
                 if added:
@@ -19586,7 +19890,12 @@ def _private_server_item_from_profile(profile):
     # Recover codes from both current and older saved link formats.
     if saved_link:
         if not link_code:
-            m = re.search(r"(?:[?&]|\b)linkCode=([^&\s]+)", saved_link, flags=re.I)
+            m = re.search(
+                r"(?:[?&]|\b)(?:privateServerLinkCode|linkCode)="
+                r"([^&\s]+)",
+                saved_link,
+                flags=re.I,
+            )
             if m:
                 link_code = urllib.parse.unquote(m.group(1))
         if not access_code:
@@ -19615,7 +19924,8 @@ def build_private_server_link(place_id, item):
     if code:
         return (
             f"roblox://experiences/start?placeId={place_id}"
-            f"&linkCode={urllib.parse.quote(code, safe='')}"
+            f"&privateServerLinkCode="
+            f"{urllib.parse.quote(code, safe='')}"
         )
     access = str(item.get("access_code") or "").strip()
     if access:
