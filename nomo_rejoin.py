@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+# V4.58 — SETUP MODE LOCK + SOLVER EVERY OPEN
+# - Option 13 reapplies and verifies the selected role after every setup step.
+# - LOCAL setup correctly maps to REJOIN ONLY instead of HATCHER.
+# - Every actual Market/Hatcher/Booster open generation runs one solver preflight
+#   when the solver is enabled, including route/switch and Option 6 restarts.
+# - An unavailable Roblox cookie precheck no longer suppresses the provider POST;
+#   only an explicitly invalid/expired cookie blocks submission.
+# - Keeps V4.57 Event-system removal and all V4.56 maintenance fixes.
+#
 # V4.57 — EVENT SYSTEM REMOVED
 # - Removes Trade World Event hold and Main Garden return confirmation.
 # - Removes transition-based Cloudflare pause/unavailable reporting.
@@ -230,7 +239,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.57"
+__version__ = "V4.58"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -711,6 +720,10 @@ DEFAULT_CONFIG = {
     # The unique queue generation prevents duplicate submissions during the same
     # rejoin attempt. Healthy packages skipped at startup never reach this gate.
     "solver_once_per_rejoin": True,
+    # V4.58: every actual queued Market/Hatcher/Booster open generation owns one
+    # provider request. This includes hard, soft, route, switch, reuse-task, and
+    # manual Option 6 opens. It is still gated by solver_enabled and credentials.
+    "solver_preflight_every_open": True,
     # When the provider itself errors/times out (not INVALID_COOKIES/SERVER_BUSY),
     # still perform the original required rejoin once. No second solver request is
     # made for that generation.
@@ -1783,6 +1796,8 @@ def apply_update_migrations(cfg):
     # solver behavior.
     if cfg.get("solver_once_per_rejoin") is not True:
         set_cfg("solver_once_per_rejoin", True)
+    if cfg.get("solver_preflight_every_open") is not True:
+        set_cfg("solver_preflight_every_open", True)
     if "solver_preflight_open_on_failure" not in cfg:
         set_cfg("solver_preflight_open_on_failure", True)
     if _int_cfg(cfg.get("solver_preflight_server_busy_retry_seconds"), 0) < 600:
@@ -4917,37 +4932,93 @@ def manual_force_restart_tab(tab, rt_tab, cfg, target, reason, rt=None):
     return ok, note
 
 
-def open_all_tabs_once(cfg, selected_packages=None):
+
+def manual_restart_tabs_via_queue(
+    cfg,
+    tabs,
+    target_for_tab,
+    reason,
+):
+    """Option 6 restart path using the same one-generation solver gate."""
     rt = load_runtime()
+    open_queue = []
+    tabs = list(tabs or [])
+
+    for tab in tabs:
+        pkg = str((tab or {}).get("package", "") or "")
+        if not pkg:
+            continue
+        target = (
+            target_for_tab(tab, rt)
+            if callable(target_for_tab)
+            else str(target_for_tab or "market")
+        )
+        added, note = queue_open(
+            open_queue,
+            tab,
+            target,
+            reason,
+            force=True,
+            skip_if_alive=False,
+            mode="hard_force",
+            bypass_manual=True,
+            metadata={
+                "pid_only_recovery": True,
+                "recovery_must_open_once": True,
+                "bypass_recheck": True,
+                "manual_option6": True,
+            },
+        )
+        if not added:
+            log_activity(
+                f"manual restart queue skipped: {note}",
+                pkg,
+                YELLOW,
+            )
+
+    while open_queue:
+        if stop_requested():
+            save_runtime(rt)
+            return False
+        process_open_queue(open_queue, cfg, rt)
+        if open_queue and not wait_seconds(1, rt):
+            return False
+
+    save_runtime(rt)
+    return True
+
+
+
+def open_all_tabs_once(cfg, selected_packages=None):
     wanted = set(selected_packages or [])
-    enabled_tabs = [t for t in cfg["tabs"] if t.get("enabled", True) and (not wanted or t.get("package") in wanted)]
+    enabled_tabs = [
+        dict(tab)
+        for tab in cfg.get("tabs", [])
+        if tab.get("enabled", True)
+        and (not wanted or tab.get("package") in wanted)
+    ]
     if not enabled_tabs:
         print(col("No enabled tabs to open.", YELLOW))
         pause()
         return
-    total = len(enabled_tabs)
 
-    for idx, tab in enumerate(enabled_tabs, 1):
-        if stop_requested():
-            save_runtime(rt)
-            break
+    print(col(
+        "Option 6 uses the normal queue; solver submits once before every actual open.",
+        CYAN,
+    ))
 
-        rt_tab = get_runtime_tab(rt, tab["package"])
-        target = rt_tab.get("target", "market")
-        opening_screen(tab, target, cfg, idx, total, mode="hard")
-        print(col("Manual option 6: force-stop first, then open. Auto rejoin safety is unchanged.", YELLOW))
-        print(col("Type Q + ENTER to cancel after this open / during delay.", DIM))
-        manual_force_restart_tab(tab, rt_tab, cfg, target, "manual force restart", rt=rt)
-        save_runtime(rt)
+    def target_for_tab(tab, runtime):
+        rt_tab = get_runtime_tab(runtime, tab.get("package"))
+        return str(rt_tab.get("target", "market") or "market")
 
-        if idx < total:
-            if not wait_seconds(int(cfg.get("delay_between_open", 45)), rt):
-                break
-
+    manual_restart_tabs_via_queue(
+        cfg,
+        enabled_tabs,
+        target_for_tab,
+        "manual force restart",
+    )
     print(col("\nDone opening tabs.", GREEN))
     pause()
-
-
 def show_config_value(key, value):
     kl = str(key).lower()
     if "api_key" in kl or "webhook" in kl or "secret" in kl:
@@ -7092,7 +7163,7 @@ def apply_common_health_action(open_queue, tab, target, rt_tab, cfg, rt, health,
 
     if bad == "dead" and cfg.get("rejoin_if_crash", True):
         rt_tab[f"{mode}_no_state_since"] = 0
-        if cfg.get("smart_open_queue", True):
+        if cfg.get("smart_open_queue", True) or cfg.get("solver_enabled", False):
             added, _ = queue_open(open_queue, tab, target, "crash/dead", skip_if_alive=True)
             return ("Queued" if added else "Offline"), ("crash queued" if added else "already queued"), True
         ok, msg = open_target(tab, rt_tab, cfg, target, "crash/dead", rt=rt)
@@ -8370,9 +8441,9 @@ def solver_preflight_before_open(open_queue, item, tab, rt_tab, pkg, target, cfg
     queue item; handled means it was held/removed and must not be opened.
     """
     if (
-        str(item.get("mode", "") or "").lower() in ("route", "switch", "reuse_task")
-        or not cfg.get("solver_enabled", False)
+        not cfg.get("solver_enabled", False)
         or not cfg.get("solver_once_per_rejoin", True)
+        or not cfg.get("solver_preflight_every_open", True)
         or item.get("skip_solver_once")
     ):
         return "ready", item
@@ -8407,6 +8478,11 @@ def solver_preflight_before_open(open_queue, item, tab, rt_tab, pkg, target, cfg
 
         # A vanished in-memory job should not permanently wedge this queue item.
         item["solver_preflight_waiting"] = False
+
+    rt_tab["solver_preflight_generation"] = generation
+    rt_tab["solver_preflight_reason"] = str(
+        item.get("reason", "queued open")
+    )
 
     started, note = start_solver_job(
         tab, cfg, rt, rt_tab,
@@ -9565,17 +9641,37 @@ def booster_config_menu(cfg):
                 save_booster_config(bcfg)
 
 
+
 def open_all_booster_tabs_once(main_cfg=None):
     cfg = dict(load_config())
-    if isinstance(main_cfg, dict): cfg.update(main_cfg)
-    rt = load_runtime(); tabs = [booster_profile_to_tab(p) for p in booster_profiles(load_booster_config(), True)]
-    for idx, tab in enumerate(tabs, 1):
-        rt_tab = get_runtime_tab(rt, tab["package"])
-        opening_screen(tab, "hatcher", cfg, idx, len(tabs), mode="hard")
-        manual_force_restart_tab(tab, rt_tab, cfg, "hatcher", "manual booster force restart", rt=rt)
-        save_runtime(rt)
-        if idx < len(tabs) and not wait_seconds(int(cfg.get("delay_between_open", 45)), rt): break
+    if isinstance(main_cfg, dict):
+        cfg.update(main_cfg)
+    tabs = [
+        booster_profile_to_tab(profile)
+        for profile in booster_profiles(
+            load_booster_config(),
+            enabled_only=True,
+        )
+    ]
+    if not tabs:
+        print(col("No enabled Booster tabs.", YELLOW))
+        pause()
+        return
+
+    print(col(
+        "Option 6 uses the normal queue; solver submits once before every actual Booster open.",
+        CYAN,
+    ))
+    manual_restart_tabs_via_queue(
+        cfg,
+        tabs,
+        "hatcher",
+        "manual booster force restart",
+    )
+    print(col("\nDone opening booster tabs.", GREEN))
     pause()
+
+
 
 # ============================================================
 # HATCHING MODE / JSONBIN REPORTER
@@ -12086,7 +12182,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                         disconnect_stale = should_force_disconnect_rejoin(alive, recovery_age, cfg)
 
                         if disconnect_stale and cfg.get("force_stop_alive_on_disconnect_popup", True) and cfg.get("rejoin_if_crash", True):
-                            if cfg.get("smart_open_queue", True):
+                            if cfg.get("smart_open_queue", True) or cfg.get("solver_enabled", False):
                                 added, _ = queue_open(open_queue, tab, "hatcher", "disconnect popup/stale", force=True, mode="hard_force")
                                 note = "disconnect queued" if added else "already queued"
                                 status = "Queued" if added else "Stale"
@@ -12095,7 +12191,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                                 note = "disconnect reopen" if ok else msg
                                 status = "Loading" if ok else "Stale"
                         elif hcfg.get("hatcher_rejoin_alive_stale", False) and age >= force_stale and cfg.get("rejoin_if_crash", True):
-                            if cfg.get("smart_open_queue", True):
+                            if cfg.get("smart_open_queue", True) or cfg.get("solver_enabled", False):
                                 added, _ = queue_open(open_queue, tab, "hatcher", "stale too long", force=True, mode="soft")
                                 note = "stale queued" if added else "already queued"
                                 status = "Queued" if added else "Stale"
@@ -12177,7 +12273,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                 and not alive
                 and cfg.get("rejoin_if_crash", True)
             ):
-                if cfg.get("smart_open_queue", True):
+                if cfg.get("smart_open_queue", True) or cfg.get("solver_enabled", False):
                     dead_reason = "crash/dead"
                     added, _ = queue_open(
                         open_queue, tab, "hatcher", dead_reason,
@@ -12345,37 +12441,35 @@ HATCHER_MENU_ITEMS = [
 ]
 
 
+
 def open_all_hatcher_tabs_once(main_cfg=None, selected_packages=None):
     cfg = dict(load_config())
     if isinstance(main_cfg, dict):
         cfg.update(main_cfg)
     hcfg = load_hatcher_config()
-    rt = load_runtime()
     wanted = set(selected_packages or [])
-    tabs = [hatcher_profile_to_tab(p) for p in hatcher_profiles(hcfg, enabled_only=True)
-            if not wanted or p.get("package") in wanted]
-    total = len(tabs)
+    tabs = [
+        hatcher_profile_to_tab(profile)
+        for profile in hatcher_profiles(hcfg, enabled_only=True)
+        if not wanted or profile.get("package") in wanted
+    ]
+    if not tabs:
+        print(col("No enabled Hatcher tabs selected.", YELLOW))
+        pause()
+        return
 
-    for idx, tab in enumerate(tabs, 1):
-        if stop_requested():
-            save_runtime(rt)
-            break
-
-        rt_tab = get_runtime_tab(rt, tab["package"])
-        opening_screen(tab, "hatcher", cfg, idx, total, mode="hard")
-        print(col("Manual option 6: force-stop first, then open. Auto hatcher rejoin safety is unchanged.", YELLOW))
-        print(col("Type Q + ENTER to cancel after this open / during delay.", DIM))
-        manual_force_restart_tab(tab, rt_tab, cfg, "hatcher", "manual hatcher force restart", rt=rt)
-        save_runtime(rt)
-
-        if idx < total:
-            if not wait_seconds(int(cfg.get("delay_between_open", 45)), rt):
-                break
-
+    print(col(
+        "Option 6 uses the normal queue; solver submits once before every actual Hatcher open.",
+        CYAN,
+    ))
+    manual_restart_tabs_via_queue(
+        cfg,
+        tabs,
+        "hatcher",
+        "manual hatcher force restart",
+    )
     print(col("\nDone opening hatcher tabs.", GREEN))
     pause()
-
-
 def hatching_mode_menu(main_cfg):
     while True:
         main_cfg = load_config()
@@ -18640,7 +18734,18 @@ def start_solver_job(tab, cfg, rt, rt_tab, reason, force=False, phase="solve", o
         if existing and not existing.get("done"):
             return True, solver_job_note(pkg)
         if existing and existing.get("done"):
-            return True, "solver finishing"
+            old_generation = str(existing.get("open_generation", "") or "")
+            new_generation = str(open_generation or "")
+            if (
+                str(phase or "") == "preopen"
+                and new_generation
+                and old_generation != new_generation
+            ):
+                # A completed result from an older rejoin must never suppress
+                # this new open generation.
+                del _SOLVER_JOBS[pkg]
+            else:
+                return True, "solver finishing"
 
     cooldown = max(0, int(cfg.get("solver_retry_cooldown_seconds", 300) or 300))
     last_attempt = int(rt_tab.get("solver_last_attempt", 0) or 0)
@@ -18652,10 +18757,17 @@ def start_solver_job(tab, cfg, rt, rt_tab, reason, force=False, phase="solve", o
     if not cookie:
         return False, "solver: no package cookie"
     api_hit, api_detail = roblox_cookie_detection(cookie)
-    if cfg.get("solver_require_cookie_precheck", True) and api_hit not in (True, False):
+    if cfg.get("solver_require_cookie_precheck", True) and api_hit is None:
         if "invalid/expired" in str(api_detail).lower():
             return False, "solver: package cookie invalid/expired"
-        return False, "solver: cookie precheck unavailable; not sent"
+        # V4.58: an API timeout/unavailable response is not proof that the
+        # package cookie is bad. The user's rule is one provider request per
+        # actual rejoin, so continue with the locally extracted cookie.
+        log_activity(
+            f"solver cookie precheck unavailable; provider send continues: {cut(api_detail, 60)}",
+            pkg,
+            YELLOW,
+        )
 
     place_id = solver_place_id_for_tab(tab, cfg)
     timeout = max(15, int(cfg.get("solver_timeout_seconds", 180) or 180))
@@ -18691,7 +18803,16 @@ def start_solver_job(tab, cfg, rt, rt_tab, reason, force=False, phase="solve", o
     rt_tab["note"] = "solver before open" if job["phase"] == "preopen" else "solver starting"
     save_runtime(rt)
     prefix = "solver before open" if job["phase"] == "preopen" else "solver started"
-    log_activity(f"{prefix}: {cut(job['reason'], 60)}", pkg, CYAN)
+    generation_note = (
+        f" gen={str(job.get('open_generation', ''))[-8:]}"
+        if job["phase"] == "preopen"
+        else ""
+    )
+    log_activity(
+        f"{prefix}{generation_note}: {cut(job['reason'], 60)}",
+        pkg,
+        CYAN,
+    )
 
     thread = threading.Thread(
         target=_solver_worker,
@@ -20550,6 +20671,45 @@ def _setup_prompt_private_server_place_id(cfg, role):
     return place_id
 
 
+
+def setup_runtime_mode_for_role(role):
+    role = str(role or "").strip().lower()
+    return {
+        "market": "market",
+        "hatcher": "hatcher",
+        "booster": "booster",
+        "local": "rejoin_only",
+        "rejoin_only": "rejoin_only",
+    }.get(role, "market")
+
+
+def lock_setup_selected_mode(role, cfg=None):
+    """Persist the Option 13 role using a freshly loaded unified config."""
+    desired = setup_runtime_mode_for_role(role)
+    fresh = load_config() if cfg is None else cfg
+
+    fresh["local_rejoin_only"] = desired == "rejoin_only"
+    fresh = set_active_rejoin_mode(desired, fresh)
+
+    # Re-read and repair once more. This protects against a stale helper save
+    # performed during the long setup wizard.
+    persisted = load_config()
+    persisted["local_rejoin_only"] = desired == "rejoin_only"
+    if active_rejoin_mode(persisted) != desired:
+        persisted = set_active_rejoin_mode(desired, persisted)
+    else:
+        normalize_active_mode_flags(persisted)
+        save_config(persisted)
+
+    verified = load_config()
+    normalize_active_mode_flags(verified)
+    return verified, (
+        active_rejoin_mode(verified) == desired
+        and bool(verified.get("local_rejoin_only", False))
+        == (desired == "rejoin_only")
+    )
+
+
 def new_redfinger_setup_wizard(cfg=None):
     """Full-auto one-time setup with Delta-global or Arceus per-clone storage.
 
@@ -20572,7 +20732,7 @@ def new_redfinger_setup_wizard(cfg=None):
         return
 
     role = {"1": "market", "2": "hatcher", "3": "booster", "4": "local"}[mode_choice]
-    runtime_mode = role if role in ("market", "hatcher", "booster") else "hatcher"
+    runtime_mode = setup_runtime_mode_for_role(role)
     role_label = "LOCAL REJOIN ONLY" if role == "local" else role.upper()
 
     clear()
@@ -20602,7 +20762,7 @@ def new_redfinger_setup_wizard(cfg=None):
     cfg = load_config()
     cfg["local_rejoin_only"] = role == "local"
     save_config(cfg)
-    cfg = set_active_rejoin_mode(runtime_mode, cfg)
+    cfg, initial_mode_ok = lock_setup_selected_mode(role, load_config())
     hcfg = load_hatcher_config()
     sync_hatcher_profiles_with_tabs(cfg, hcfg)
     save_hatcher_config(hcfg)
@@ -20791,9 +20951,29 @@ def new_redfinger_setup_wizard(cfg=None):
         print(col(f"Auto layout warning: {auto_layout_result['error']}", YELLOW))
     cfg = load_config()
 
+    # V4.58: setup helpers may save stale mode flags. The user's selected role
+    # is authoritative and is reapplied after every setup operation completes.
+    cfg, final_mode_ok = lock_setup_selected_mode(role, cfg)
+    final_active_mode = active_rejoin_mode(cfg)
+
     clear()
     banner("SETUP COMPLETE", cfg)
     print(f"Role       : {col(role_label, GREEN)}")
+    mode_color = GREEN if final_mode_ok and final_active_mode == runtime_mode else RED
+    print(
+        f"Active mode: "
+        f"{col(active_mode_label(cfg), mode_color)} "
+        f"({'VERIFIED' if mode_color == GREEN else 'FAILED'})"
+    )
+    solver_ready = bool(
+        cfg.get("solver_enabled", False)
+        and str(cfg.get("solver_endpoint", "") or "").strip()
+        and str(cfg.get("solver_api_key", "") or "").strip()
+    )
+    print(
+        f"Solver     : "
+        f"{col('READY - one submit per actual open' if solver_ready else 'DISABLED / credentials missing', GREEN if solver_ready else YELLOW)}"
+    )
     print(f"Packages   : {', '.join(short_pkg(p) for p in selected)}")
     if setup_place_id:
         print(f"Place ID   : {setup_place_id}")
