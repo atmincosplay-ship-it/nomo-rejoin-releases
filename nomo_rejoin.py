@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# NOMO REJOIN
+# V4.58.2 — AUTOSETUP LEGACY AUTOEXEC CLEANUP
+# - Option 13 disables obsolete AutoExec Lua files before installing current files.
+# - Stops old gag/gap pet-counter loaders and Hatching.lua from running beside NOMO.
+# - HATCHER/BOOSTER/LOCAL also disable a leftover nomo_market_loader.lua.
+# - Files are renamed to .disabled_v4582.bak instead of permanently deleted.
+# - Keeps V4.58.1 mode lock, solver-every-open, and updater header fix.
+#
 # V4.58 — SETUP MODE LOCK + SOLVER EVERY OPEN
 # - Option 13 reapplies and verifies the selected role after every setup step.
 # - LOCAL setup correctly maps to REJOIN ONLY instead of HATCHER.
@@ -239,7 +247,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.58"
+__version__ = "V4.58.2"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -16265,6 +16273,18 @@ AUTOEXEC_PET_COUNTER_FILE = "nomo_pet_counter.lua"
 AUTOEXEC_MARKET_LOADER_FILE = "nomo_market_loader.lua"
 _AUTOEXEC_ALLOWED_SUFFIXES = {".lua", ".luau", ".txt"}
 
+# Obsolete names created by older NOMO/GAG setup versions. Delta executes every
+# root Autoexecute Lua, so these must be disabled rather than left beside NOMO.
+LEGACY_SETUP_AUTOEXEC_NAMES = {
+    "gag_pet_counter_loader.lua",
+    "gap_pet_counter_loader.lua",
+    "gag_pet_counter.lua",
+    "gap_pet_counter.lua",
+    "pet_counter_loader.lua",
+    "hatching.lua",
+}
+LEGACY_SETUP_DISABLED_SUFFIX = ".disabled_v4582.bak"
+
 
 def autoexec_dir_from_state_path(state_path):
     """Resolve the one real executor AutoExec directory from a clone state path.
@@ -20507,6 +20527,171 @@ def _setup_configure_cloudflare(cfg, automatic=False):
     return cfg, hcfg, bool(ok)
 
 
+
+def _legacy_setup_disabled_path(path):
+    path = Path(path)
+    candidate = path.with_name(
+        path.name + LEGACY_SETUP_DISABLED_SUFFIX
+    )
+    suffix = 1
+    while candidate.exists():
+        candidate = path.with_name(
+            path.name
+            + LEGACY_SETUP_DISABLED_SUFFIX
+            + f".{suffix}"
+        )
+        suffix += 1
+    return candidate
+
+
+def _setup_legacy_autoexec_names_for_role(role):
+    names = set(LEGACY_SETUP_AUTOEXEC_NAMES)
+    if str(role or "").strip().lower() != "market":
+        names.add(AUTOEXEC_MARKET_LOADER_FILE.lower())
+    return names
+
+
+def _setup_cleanup_legacy_autoexec_for_packages(
+    cfg,
+    packages,
+    path_mode,
+    role,
+):
+    """Disable obsolete root AutoExec scripts for Option 13 packages."""
+    tabs_by_pkg = {
+        str(tab.get("package") or ""): tab
+        for tab in autoexec_tabs(cfg)
+    }
+    selected_tabs = [
+        tabs_by_pkg[pkg]
+        for pkg in packages
+        if pkg in tabs_by_pkg
+    ]
+    legacy_names = _setup_legacy_autoexec_names_for_role(role)
+
+    folders = []
+    seen = set()
+    for tab in selected_tabs:
+        for _label, folder in autoexec_dirs_for_tab(
+            tab,
+            path_mode,
+        ):
+            folder = Path(folder)
+            key = str(folder)
+            if key in seen:
+                continue
+            seen.add(key)
+            folders.append(folder)
+
+    results = []
+    for folder in folders:
+        disabled = []
+        errors = []
+
+        if not folder.exists():
+            results.append(
+                {
+                    "folder": str(folder),
+                    "disabled": disabled,
+                    "errors": errors,
+                    "missing": True,
+                }
+            )
+            continue
+
+        try:
+            entries = list(folder.iterdir())
+        except Exception as exc:
+            results.append(
+                {
+                    "folder": str(folder),
+                    "disabled": disabled,
+                    "errors": [str(exc)],
+                    "missing": False,
+                }
+            )
+            continue
+
+        for path in entries:
+            if not path.is_file():
+                continue
+            if path.name.lower() not in legacy_names:
+                continue
+
+            try:
+                target = _legacy_setup_disabled_path(path)
+                path.rename(target)
+                disabled.append(
+                    {
+                        "old": str(path),
+                        "new": str(target),
+                    }
+                )
+            except Exception as exc:
+                errors.append(f"{path}: {exc}")
+
+        results.append(
+            {
+                "folder": str(folder),
+                "disabled": disabled,
+                "errors": errors,
+                "missing": False,
+            }
+        )
+
+    return results
+
+
+def _print_setup_legacy_autoexec_cleanup(results):
+    disabled_count = sum(
+        len(item.get("disabled", []))
+        for item in results
+    )
+    error_count = sum(
+        len(item.get("errors", []))
+        for item in results
+    )
+
+    if disabled_count == 0 and error_count == 0:
+        print(
+            col(
+                "Legacy AutoExec cleanup: clean; nothing obsolete found.",
+                DIM,
+            )
+        )
+        return
+
+    for item in results:
+        for moved in item.get("disabled", []):
+            print(
+                col(
+                    f"Disabled legacy AutoExec: {moved.get('old')}",
+                    YELLOW,
+                )
+            )
+            print(
+                col(
+                    f"  Backup: {moved.get('new')}",
+                    DIM,
+                )
+            )
+        for error in item.get("errors", []):
+            print(
+                col(
+                    f"Legacy AutoExec cleanup failed: {error}",
+                    RED,
+                )
+            )
+
+    print(
+        col(
+            f"Legacy AutoExec cleanup: disabled {disabled_count}; "
+            f"errors {error_count}.",
+            GREEN if error_count == 0 else YELLOW,
+        )
+    )
+
+
 def _setup_install_counter_for_packages(cfg, packages, path_mode):
     tabs_by_pkg = {str(t.get("package") or ""): t for t in autoexec_tabs(cfg)}
     selected_tabs = [tabs_by_pkg[p] for p in packages if p in tabs_by_pkg]
@@ -20837,6 +21022,19 @@ def new_redfinger_setup_wizard(cfg=None):
                 bcfg[key] = cfg.get(key)
         save_booster_config(bcfg)
 
+    # V4.58.2: disable legacy root AutoExec Lua before writing the current
+    # loader. Otherwise Delta executes obsolete Pastebin/Hatching scripts
+    # beside nomo_pet_counter.lua on every Roblox launch.
+    clear()
+    banner("SETUP: LEGACY AUTOEXEC CLEANUP", cfg)
+    cleanup_results = _setup_cleanup_legacy_autoexec_for_packages(
+        cfg,
+        selected,
+        "1",
+        role,
+    )
+    _print_setup_legacy_autoexec_cleanup(cleanup_results)
+
     # Automatic YES on every role: always install/update the counter.
     clear()
     banner("SETUP: PET COUNTER", cfg)
@@ -21011,6 +21209,15 @@ def new_redfinger_setup_wizard(cfg=None):
                 f"{item['username']}"
             )
 
+    print("")
+    cleanup_disabled_count = sum(
+        len(item.get("disabled", []))
+        for item in cleanup_results
+    )
+    print(
+        f"Legacy Lua : "
+        f"{col(str(cleanup_disabled_count) + ' disabled', GREEN if cleanup_disabled_count else DIM)}"
+    )
     print("")
     print(col("Pet Counter:", BOLD))
     for pkg, ok, note in counter_results:
@@ -21586,8 +21793,11 @@ def _nomo_fetch_remote_source(cfg):
     beginning = text.lstrip()[:300].lower()
     if "text/html" in content_type or beginning.startswith("<!doctype html") or beginning.startswith("<html"):
         raise RuntimeError("remote server returned HTML instead of Python")
-    if "# nomo rejoin" not in text[:3000].lower():
-        raise RuntimeError("remote file is missing the NOMO REJOIN header")
+    source_head = text[:3000].lower()
+    if "# nomo rejoin" not in source_head:
+        raise RuntimeError(
+            "remote file is missing the required '# NOMO REJOIN' header"
+        )
     if "def main(" not in text or "if __name__" not in text:
         raise RuntimeError("remote file is missing required NOMO entry points")
 
