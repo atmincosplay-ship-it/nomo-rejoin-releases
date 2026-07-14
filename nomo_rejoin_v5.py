@@ -30,7 +30,7 @@ import tempfile
 import time
 
 
-VERSION = "5.0.2-phase1-shadow"
+VERSION = "5.0.3-phase1-shadow-clean-ui"
 
 V4_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 V4_NOMO_FILE = V4_BASE_DIR / "nomo.json"
@@ -1190,87 +1190,196 @@ class NomoV5ShadowEngine:
         return evaluations
 
 
+
 def _trim(value: object, width: int) -> str:
     text = str(value)
     if len(text) <= width:
         return text
-    return text[: max(0, width - 1)] + "…"
+    if width <= 1:
+        return text[:width]
+    return text[: width - 1] + "…"
+
+
+def _package_label(package: str) -> str:
+    package = str(package or "")
+    if package.startswith("premium.noka"):
+        suffix = package[len("premium.noka"):]
+        return suffix or "N"
+    if package == "free.noka":
+        return "F"
+    if package == "com.roblox":
+        return "R"
+    return _trim(package, 3)
+
+
+def _place_label(place_id: int | None) -> str:
+    if place_id == MAIN_GARDEN_PLACE_ID:
+        return "MAIN"
+    if place_id == TRADE_WORLD_PLACE_ID:
+        return "TRADE"
+    if place_id is None:
+        return "-"
+    return "OTHER"
+
+
+def _phase_label(
+    evaluation: AccountEvaluation,
+    return_target: int,
+) -> str:
+    transition = evaluation.transition
+    if transition.phase == TransitionPhase.TRANSITIONING:
+        return "HOLD"
+    if transition.phase == TransitionPhase.RETURNING:
+        return (
+            f"BACK {transition.stable_seconds}/"
+            f"{return_target}s"
+        )
+    return "NORMAL"
+
+
+def _decision_label(
+    evaluation: AccountEvaluation,
+) -> str:
+    decision = evaluation.decision
+    state = evaluation.state
+
+    if decision.kind == DecisionKind.HEALTHY:
+        return "OK"
+    if decision.kind == DecisionKind.HOLD_TRANSITION:
+        return "PAUSED"
+    if decision.kind == DecisionKind.RECOVER_DEAD:
+        return "DEAD"
+    if decision.kind == DecisionKind.RECOVER_DISCONNECT:
+        return "DISCONNECT"
+    if decision.kind == DecisionKind.RECOVER_STALE:
+        age = (
+            state.age_seconds
+            if state.age_seconds is not None
+            else 0
+        )
+        return f"STALE {age}s"
+    if decision.kind == DecisionKind.WAIT_NO_STATE:
+        return "NO STATE"
+    if decision.kind == DecisionKind.ROUTE_EXPECTED:
+        return "WRONG PLACE"
+    if decision.kind == DecisionKind.BLOCKED_IDENTITY:
+        return "CONFLICT"
+    return decision.kind.value.upper()
+
+
+def _backend_label(
+    evaluation: AccountEvaluation,
+) -> str:
+    plan = evaluation.transition.backend_plan
+    if plan == BackendPlanKind.MARK_TRANSITIONING:
+        return "PAUSE ONCE"
+    if plan == BackendPlanKind.PAUSE:
+        return "PAUSED"
+    if plan == BackendPlanKind.RESUME_FORCE_REPORT:
+        return "RESUME ONCE"
+    return "NORMAL"
+
+
+def _terminal_width() -> int:
+    try:
+        return max(58, shutil.get_terminal_size((80, 24)).columns)
+    except Exception:
+        return 80
 
 
 def clear_screen() -> None:
     print("\033[2J\033[H", end="")
 
 
-def print_banner() -> None:
-    print("=" * 78)
-    print(
-        f"NOMO REJOIN V5 {VERSION} — "
-        "PHASE 1 SHADOW"
-    )
-    print(
-        "READ-ONLY: no PID stop, launch, "
-        "route, or Cloudflare write"
-    )
-    print("=" * 78)
+def print_banner(compact: bool = True) -> None:
+    width = min(_terminal_width(), 96)
+    print("=" * width)
+    print(f"NOMO V5 SHADOW  {VERSION}")
+    print("Read-only: no restart, route, or Cloudflare write")
+    print("=" * width)
 
 
 def print_evaluations(
     engine: NomoV5ShadowEngine,
     evaluations: list[AccountEvaluation],
 ) -> None:
-    print_banner()
-    print(f"V4 config : {V4_NOMO_FILE}")
-    print(f"V5 runtime: {V5_RUNTIME_FILE}")
-    print("")
-    print(
-        f"{'Package':<13} "
-        f"{'Username':<18} "
-        f"{'Alive':<6} "
-        f"{'Place':<15} "
-        f"{'Phase':<14} "
-        f"{'Decision':<20}"
+    width = _terminal_width()
+    compact = width < 92
+    print_banner(compact=compact)
+
+    return_target = int(
+        engine.settings["transitionGuard"]["returnStableSeconds"]
     )
-    print("-" * 94)
 
-    for item in evaluations:
-        place = (
-            item.state.place_id
-            if item.state.place_id is not None
-            else "-"
-        )
-        print(
-            f"{_trim(item.account.package, 13):<13} "
-            f"{_trim(item.account.username, 18):<18} "
-            f"{('yes' if item.process.alive else 'no'):<6} "
-            f"{str(place):<15} "
-            f"{item.transition.phase.value:<14} "
-            f"{item.decision.kind.value:<20}"
-        )
-        print(
-            f"  Rejoin plan : "
-            f"{item.decision.reason}"
-        )
-        print(
-            f"  Backend plan: "
-            f"{engine.backend.describe(item)}"
-        )
+    if not evaluations:
+        print("No configured accounts found.")
+        return
 
-        if (
-            item.transition.phase
-            == TransitionPhase.RETURNING
-        ):
-            target = int(
-                engine.settings[
-                    "transitionGuard"
-                ]["returnStableSeconds"]
+    if compact:
+        print(
+            f"{'ID':<3} {'USER':<13} {'PID':<4} "
+            f"{'PLACE':<6} {'PHASE':<15} {'STATUS':<14}"
+        )
+        print("-" * min(width, 72))
+        for item in evaluations:
+            package = _package_label(item.account.package)
+            username = _trim(item.account.username, 13)
+            alive = "ON" if item.process.alive else "OFF"
+            place = _place_label(item.state.place_id)
+            phase = _trim(
+                _phase_label(item, return_target),
+                15,
+            )
+            status = _trim(
+                _decision_label(item),
+                14,
             )
             print(
-                f"  Return timer: "
-                f"{item.transition.stable_seconds}s/"
-                f"{target}s"
+                f"{package:<3} {username:<13} {alive:<4} "
+                f"{place:<6} {phase:<15} {status:<14}"
             )
-        print("")
+    else:
+        print(
+            f"{'ID':<3} {'PACKAGE':<17} {'USER':<16} "
+            f"{'PID':<4} {'PLACE':<6} {'PHASE':<16} "
+            f"{'STATUS':<15} {'CLOUDFLARE':<12}"
+        )
+        print("-" * min(width, 96))
+        for item in evaluations:
+            print(
+                f"{_package_label(item.account.package):<3} "
+                f"{_trim(item.account.package, 17):<17} "
+                f"{_trim(item.account.username, 16):<16} "
+                f"{('ON' if item.process.alive else 'OFF'):<4} "
+                f"{_place_label(item.state.place_id):<6} "
+                f"{_trim(_phase_label(item, return_target), 16):<16} "
+                f"{_trim(_decision_label(item), 15):<15} "
+                f"{_trim(_backend_label(item), 12):<12}"
+            )
 
+    hold_count = sum(
+        1
+        for item in evaluations
+        if item.transition.rejoin_paused
+    )
+    would_recover = sum(
+        1
+        for item in evaluations
+        if item.decision.would_act
+    )
+    healthy = sum(
+        1
+        for item in evaluations
+        if item.decision.kind == DecisionKind.HEALTHY
+    )
+
+    print("")
+    print(
+        f"Healthy {healthy} | Hold {hold_count} | "
+        f"Would recover {would_recover} | "
+        f"Scan {engine.settings.get('scanSeconds', 10)}s"
+    )
+    print("Shadow only — no action is performed.")
 
 def run_once() -> int:
     engine = NomoV5ShadowEngine()
@@ -1303,8 +1412,7 @@ def run_watch() -> int:
                 evaluations,
             )
             print(
-                f"Next shadow scan in {interval}s "
-                "— Ctrl+C to stop"
+                f"Next scan {interval}s | Ctrl+C stops dashboard"
             )
             time.sleep(interval)
     except KeyboardInterrupt:
@@ -1525,43 +1633,45 @@ def self_test() -> int:
         )
 
 
+
 def menu() -> int:
     while True:
         clear_screen()
         print_banner()
-        print("1. Run one shadow scan")
-        print("2. Start shadow watcher")
-        print(
-            "3. Show package/username/state mapping"
-        )
-        print("4. Show V5 settings")
-        print("5. Reset V5 shadow runtime")
-        print("6. Run built-in self-test")
+        print("1. One clean scan")
+        print("2. Live clean dashboard")
+        print("3. Show identity mapping")
+        print("4. Show settings")
+        print("5. Reset shadow runtime")
+        print("6. Self-test")
         print("0. Exit")
 
         choice = input("\nChoose: ").strip()
 
         if choice == "1":
+            clear_screen()
             run_once()
-            input("\nEnter to continue...")
+            time.sleep(3)
         elif choice == "2":
-            run_watch()
-            input("\nEnter to continue...")
+            return run_watch()
         elif choice == "3":
+            clear_screen()
             show_mapping()
-            input("\nEnter to continue...")
+            time.sleep(4)
         elif choice == "4":
+            clear_screen()
             show_settings()
-            input("\nEnter to continue...")
+            time.sleep(4)
         elif choice == "5":
+            clear_screen()
             reset_shadow_runtime()
-            input("\nEnter to continue...")
+            time.sleep(2)
         elif choice == "6":
+            clear_screen()
             self_test()
-            input("\nEnter to continue...")
+            time.sleep(2)
         elif choice == "0":
             return 0
-
 
 def main(
     argv: list[str] | None = None,
