@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.58.10 — BOOSTER SCHEMA COMPATIBILITY
+# - Validates Booster probe contents before enforcing its schema number.
+# - A complete ready probe with parsed==inventory and no missing age/weight is
+#   accepted even when an older writer labels it schema 0/1.
+# - Old broken probes with missing age/weight remain rejected as incomplete.
+# - Booster health fallback, backend reporting, package/menu fixes, and PID
+#   recovery remain unchanged.
+# - Stable v3.9 counter and verified Booster probe Lua are byte-identical.
+#
 # V4.58.9 — BOOSTER FRESH-PROBE HEALTH FALLBACK
 # - Stable v3.9 state remains the primary Booster health heartbeat.
 # - A fresh verified Booster probe is a safe secondary in-game heartbeat.
@@ -297,7 +306,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.58.9"
+__version__ = "V4.58.10"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -9650,30 +9659,81 @@ def booster_probe_quality(probe, err, bcfg):
         return "wrong_place", False, "outside Booster place"
 
     age = int(probe.get("age", 999999) or 999999)
-    stale_after = max(20, int(bcfg.get("probe_stale_seconds", 90) or 90))
+    stale_after = max(
+        20,
+        int(bcfg.get("probe_stale_seconds", 90) or 90),
+    )
     if age > stale_after:
         return "stale", False, f"{age}s old"
 
-    expected_schema = int(bcfg.get("probe_expected_schema_version", 2) or 2)
-    schema = int(probe.get("schema_version", 0) or 0)
-    if schema < expected_schema:
-        return "incompatible", False, f"schema {schema}"
     if not probe.get("probe_ready", False):
         return "waiting", False, "scanner not ready"
 
-    inventory = int(probe.get("inventory_entry_count", 0) or 0)
-    parsed = int(probe.get("parsed_pet_count", 0) or 0)
+    inventory = int(
+        probe.get("inventory_entry_count", 0) or 0
+    )
+    parsed = int(
+        probe.get("parsed_pet_count", 0) or 0
+    )
     missing = probe.get("missing_fields", {})
     if not isinstance(missing, dict):
         missing = {}
-    missing_age = int(missing.get("age", 0) or 0)
-    missing_weight = int(missing.get("base_weight", 0) or 0)
-    if parsed != inventory or missing_age > 0 or missing_weight > 0:
+
+    missing_age = int(
+        missing.get("age", 0) or 0
+    )
+    missing_weight = int(
+        missing.get("base_weight", 0) or 0
+    )
+
+    # Data integrity is authoritative. This rejects the original broken probe
+    # that parsed names but missed every age/weight field, regardless of what
+    # schema number it claimed.
+    if (
+        parsed != inventory
+        or missing_age > 0
+        or missing_weight > 0
+    ):
         return (
             "incomplete",
             False,
-            f"parsed {parsed}/{inventory}; missing age {missing_age}, weight {missing_weight}",
+            f"parsed {parsed}/{inventory}; "
+            f"missing age {missing_age}, weight {missing_weight}",
         )
+
+    expected_schema = int(
+        bcfg.get(
+            "probe_expected_schema_version",
+            2,
+        )
+        or 2
+    )
+    schema = int(
+        probe.get("schema_version", 0) or 0
+    )
+
+    # Some already-running verified v0.1.1 writers retained schema 0/1 while
+    # producing the complete PetData.Level/BaseWeight payload. Accept those
+    # contents instead of hiding valid Booster matches behind a metadata-only
+    # mismatch.
+    if schema < expected_schema:
+        revision = str(
+            probe.get("probe_revision") or ""
+        ).strip()
+        suffix = (
+            f"; schema {schema} compatibility"
+            + (
+                f" ({revision})"
+                if revision
+                else ""
+            )
+        )
+        return (
+            "ready",
+            True,
+            f"{parsed} pets parsed{suffix}",
+        )
+
     return "ready", True, f"{parsed} pets parsed"
 
 
