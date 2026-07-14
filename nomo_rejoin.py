@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.58.5 — INSTALLED PACKAGE TABLE ONLY
+# - Built directly from V4.58.3; the package-ID conversion experiment is discarded.
+# - Package Manager's main table is sourced only from Android-installed packages.
+# - Config/template packages that are not installed are hidden from the main table.
+# - Exact package IDs only; no aliasing or family/slot migration.
+# - Merely opening Package Manager never edits configuration or profiles.
+# - Sync remains an explicit user action through Package Manager option 1.
+#
 # V4.58.3 — INSTALLED PACKAGE LOCK
 # - Option 13 re-locks the exact selected installed package set at completion.
 # - Configured but uninstalled packages are forced OFF in Market/Hatcher/Booster.
@@ -253,7 +261,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.58.3"
+__version__ = "V4.58.5"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -14232,6 +14240,71 @@ def _new_tab_for_package(pkg, position=0):
     return tab
 
 
+
+def installed_package_table_entries(cfg):
+    """Build Package Manager's main table from Android's installed list.
+
+    Config is attached only when the exact package ID matches. This function is
+    read-only: no aliasing, migration, conversion, or config save is performed.
+    """
+    installed = sorted(
+        {
+            str(package or "").strip()
+            for package in get_installed_packages()
+            if str(package or "").strip()
+        },
+        key=natural_package_key,
+    )
+
+    configured = {}
+    for tab in cfg.get("tabs", []):
+        if not isinstance(tab, dict):
+            continue
+        package = str(tab.get("package") or "").strip()
+        if package and package not in configured:
+            configured[package] = tab
+
+    entries = []
+    for package in installed:
+        tab = configured.get(package)
+        entries.append(
+            {
+                "package": package,
+                "username": str(
+                    (tab or {}).get("user_name")
+                    or package
+                ),
+                "enabled": bool(
+                    (tab or {}).get("enabled", False)
+                ),
+                "installed": True,
+                "configured": tab is not None,
+                "tab": tab,
+            }
+        )
+
+    return entries
+
+
+def configured_uninstalled_packages(cfg):
+    """List exact configured IDs that Android does not currently report."""
+    installed = set(get_installed_packages())
+    output = []
+
+    for tab in cfg.get("tabs", []):
+        if not isinstance(tab, dict):
+            continue
+        package = str(tab.get("package") or "").strip()
+        if (
+            package
+            and package not in installed
+            and package not in output
+        ):
+            output.append(package)
+
+    return sorted(output, key=natural_package_key)
+
+
 def package_registry_entries(cfg, include_discovered=True, configured_only=False):
     """Build the shared package table used by every package-aware menu."""
     installed = set(get_installed_packages())
@@ -22313,8 +22386,9 @@ def select_package_menu(cfg):
     while True:
         cfg = load_config()
         clear()
-        banner("PACKAGE MANAGER", cfg)
-        entries = package_registry_entries(cfg, include_discovered=True)
+        banner("PACKAGE MANAGER — INSTALLED PACKAGES", cfg)
+        entries = installed_package_table_entries(cfg)
+        hidden_configured = configured_uninstalled_packages(cfg)
         rows = []
         for i, e in enumerate(entries, 1):
             rows.append([
@@ -22329,9 +22403,37 @@ def select_package_menu(cfg):
             draw_table(["No", "Use", "Inst", "Package", "Username"], rows,
                        [3, 4, 4, 12, 18], cfg)
         else:
-            print(col("No packages configured or detected.", YELLOW))
+            print(col("No Android Roblox/Noka packages are installed.", YELLOW))
+
+        if hidden_configured:
+            print("")
+            print(
+                col(
+                    f"Hidden configured entries not installed: "
+                    f"{len(hidden_configured)}",
+                    DIM,
+                )
+            )
+            print(
+                col(
+                    "  "
+                    + ", ".join(
+                        short_pkg(package)
+                        for package in hidden_configured
+                    ),
+                    DIM,
+                )
+            )
+
         print("")
-        print("1. Sync installed packages into NOMO")
+        print(
+            col(
+                "Detection is read-only; exact package IDs are never converted.",
+                DIM,
+            )
+        )
+        print("")
+        print("1. Add detected installed packages to NOMO config")
         print("2. Set exact active package set")
         print("3. Toggle enable/disable package(s)")
         print("4. Add custom package name(s)")
@@ -22355,8 +22457,13 @@ def select_package_menu(cfg):
                 print(col("No new installed packages found.", YELLOW))
             pause()
         elif ch == "2":
-            selected = choose_packages_common(cfg, "SET ACTIVE PACKAGES", multi=True,
-                                              include_discovered=True, installed_only=False)
+            selected = choose_packages_common(
+                cfg,
+                "SET ACTIVE INSTALLED PACKAGES",
+                multi=True,
+                include_discovered=True,
+                installed_only=True,
+            )
             if selected:
                 # Add any selected discovered package before enabling it.
                 configured = {t.get("package") for t in cfg.get("tabs", [])}
