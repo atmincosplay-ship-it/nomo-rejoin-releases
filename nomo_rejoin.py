@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+# V4.53 — HATCHER EVENT TRANSITION GUARD
+# Built directly on V4.52. No second monitor and no V5 runtime.
+# - Fresh Trade World state enters a per-package transition hold.
+# - While held, wrong-place/stale/no-state/periodic rejoin actions are paused.
+# - Exact dead-process and explicit kick/CAPTCHA recovery remain enabled.
+# - Cloudflare/JSONBin receives one unavailable transition update, then freezes.
+# - Returning to Main Garden must remain clean/fresh for 300 continuous seconds.
+# - After the stable return, stale timers reset and one fresh backend report resumes.
+#
 # V4.52 — DELTA FULL-SYSTEM IDENTITY SYNC
 # Built from V4.51/V4.49 recovery baseline. Rejoin behavior is unchanged.
 # - One package->username edit synchronizes Main, Hatcher, Booster, and paths.
@@ -190,7 +199,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.52"
+__version__ = "V4.53"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -870,6 +879,18 @@ DEFAULT_HATCHER_CONFIG = {
     "rejoin_public_server": True,
     "public_server_rejoin_after_seconds": 20,
     "expected_place_id": "126884695634066",
+
+    # V4.53: intentional Main Garden -> Trade World -> Main Garden event flow.
+    # The selected package remains protected from stale/wrong-place rejoin while
+    # the in-game script crafts/server-hops in Trade World. A real dead process,
+    # explicit disconnect, CAPTCHA, or face lock still uses normal recovery.
+    "transition_guard_enabled": True,
+    "transition_guard_place_id": "129954712878723",
+    "transition_guard_return_place_id": "126884695634066",
+    "transition_guard_return_stable_seconds": 300,
+    "transition_guard_pause_rejoin": True,
+    "transition_guard_pause_backend": True,
+    "transition_guard_publish_unavailable_once": True,
 
     "backend_provider": "jsonbin",
     "jsonbin_bin_id": "YOUR_BIN_ID",
@@ -10175,6 +10196,9 @@ def hatcher_entry(hcfg, state, err):
         "ready_reason": evald["ready_reason"],
         "ready_by_pet": bool(evald["pet_ok"]),
         "ready_by_egg": False,
+        "selectable": bool(status == "online"),
+        "transitioning": False,
+        "transition_phase": "normal",
         "required_eggs": {},
         "matched_eggs": [],
         "missing_eggs": [],
@@ -10277,7 +10301,459 @@ def update_hatcher_runtime(profile_name, hcfg, entry):
     save_hatcher_runtime(rt)
 
 
-def hatcher_report_once(hcfg, force=True, state_cache=None):
+
+HATCHER_TRANSITION_NORMAL = "normal"
+HATCHER_TRANSITION_ACTIVE = "transitioning"
+HATCHER_TRANSITION_RETURNING = "returning"
+
+
+def _hatcher_transition_place(value):
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        return str(int(float(raw)))
+    except Exception:
+        return raw
+
+
+def _hatcher_transition_phase(rt_tab):
+    phase = str(
+        (rt_tab or {}).get(
+            "hatcher_transition_phase",
+            HATCHER_TRANSITION_NORMAL,
+        )
+        or HATCHER_TRANSITION_NORMAL
+    ).strip().lower()
+    if phase not in {
+        HATCHER_TRANSITION_NORMAL,
+        HATCHER_TRANSITION_ACTIVE,
+        HATCHER_TRANSITION_RETURNING,
+    }:
+        phase = HATCHER_TRANSITION_NORMAL
+    return phase
+
+
+def _hatcher_transition_queue_item_is_emergency(item):
+    item = item if isinstance(item, dict) else {}
+    if item.get("disconnect_recovery") or item.get("recovery_must_open_once"):
+        return True
+
+    reason = str(item.get("reason", "") or "").strip().lower()
+    emergency_words = (
+        "crash/dead",
+        "process dead",
+        "dead package",
+        "disconnect",
+        "kicked",
+        "challenge",
+        "captcha",
+        "face lock",
+        "account locked",
+    )
+    return any(word in reason for word in emergency_words)
+
+
+def cancel_hatcher_transition_non_emergency_queue(open_queue, package):
+    """Cancel only stale/place/periodic items for one transitioning package."""
+    if open_queue is None:
+        return 0
+
+    package = str(package or "")
+    kept = []
+    removed = 0
+    for item in list(open_queue or []):
+        item_pkg = str((item.get("tab") or {}).get("package", "") or "")
+        if item_pkg != package:
+            kept.append(item)
+            continue
+        if _hatcher_transition_queue_item_is_emergency(item):
+            kept.append(item)
+            continue
+        removed += 1
+
+    open_queue[:] = kept
+    return removed
+
+
+def _hatcher_transition_explicit_failure(state, health=None):
+    if state and (
+        state_disconnect_ui(state)
+        or state_login_challenge_detail(state)
+    ):
+        return True
+
+    bad = str((health or {}).get("bad", "") or "").strip().lower()
+    return bad in {
+        "disconnect",
+        "challenge",
+        "ui_challenge",
+        "face_lock",
+        "manual",
+    }
+
+
+def _reset_hatcher_transition_return_timers(rt_tab):
+    rt_tab["hatcher_transition_return_started_at"] = 0
+    rt_tab["hatcher_no_state_since"] = 0
+    rt_tab["hatcher_startup_observe_until"] = 0
+    rt_tab["hatcher_teleport_since"] = 0
+    rt_tab["hatcher_teleport_problem"] = ""
+    rt_tab["dead_since"] = 0
+
+
+def hatcher_transition_guard_update(
+    rt_tab,
+    state,
+    raw_alive,
+    hcfg,
+    cfg,
+    open_queue=None,
+    package="",
+    health=None,
+):
+    """Update one package's intentional event transition state.
+
+    Returns a small dict used by both the local rejoin loop and backend reporter.
+    The guard never suppresses an exact dead-process recovery or an explicit
+    disconnect/CAPTCHA/face-lock recovery.
+    """
+    rt_tab = rt_tab if isinstance(rt_tab, dict) else {}
+    package = str(package or "")
+    enabled = bool(hcfg.get("transition_guard_enabled", True))
+    pause_rejoin = bool(hcfg.get("transition_guard_pause_rejoin", True))
+    pause_backend = bool(hcfg.get("transition_guard_pause_backend", True))
+    publish_once = bool(
+        hcfg.get("transition_guard_publish_unavailable_once", True)
+    )
+    transition_place = _hatcher_transition_place(
+        hcfg.get("transition_guard_place_id", "129954712878723")
+    )
+    return_place = _hatcher_transition_place(
+        hcfg.get(
+            "transition_guard_return_place_id",
+            hcfg.get("expected_place_id", "126884695634066"),
+        )
+    )
+    try:
+        stable_seconds = max(
+            1,
+            int(hcfg.get("transition_guard_return_stable_seconds", 300) or 300),
+        )
+    except Exception:
+        stable_seconds = 300
+
+    phase = _hatcher_transition_phase(rt_tab)
+    previous_phase = phase
+    current_place = _hatcher_transition_place(
+        (state or {}).get("place_id") if state else ""
+    )
+    clean_fresh = bool(state and state_is_clean_fresh(state, cfg))
+    explicit_failure = _hatcher_transition_explicit_failure(state, health)
+    t = now()
+    entered = False
+    released = False
+    reset_return = False
+    elapsed = 0
+
+    if not enabled:
+        if phase != HATCHER_TRANSITION_NORMAL:
+            rt_tab["hatcher_transition_resume_report_pending"] = True
+        rt_tab["hatcher_transition_phase"] = HATCHER_TRANSITION_NORMAL
+        rt_tab["hatcher_transition_notice_pending"] = False
+        _reset_hatcher_transition_return_timers(rt_tab)
+        return {
+            "active": False,
+            "paused": False,
+            "backend_paused": False,
+            "phase": HATCHER_TRANSITION_NORMAL,
+            "elapsed": 0,
+            "stable_seconds": stable_seconds,
+            "note": "transition guard disabled",
+            "entered": False,
+            "released": False,
+            "explicit_failure": explicit_failure,
+        }
+
+    # Explicit kick/CAPTCHA/face-lock recovery is never paused. Keep the
+    # transition remembered and require a fresh five-minute return afterward.
+    if explicit_failure:
+        rt_tab["hatcher_transition_dead_since"] = 0
+        if phase != HATCHER_TRANSITION_NORMAL:
+            if phase == HATCHER_TRANSITION_RETURNING:
+                reset_return = True
+            phase = HATCHER_TRANSITION_ACTIVE
+            rt_tab["hatcher_transition_phase"] = phase
+            rt_tab["hatcher_transition_return_started_at"] = 0
+            rt_tab["hatcher_transition_note"] = (
+                "explicit failure recovery allowed; transition remembered"
+            )
+        return {
+            "active": phase != HATCHER_TRANSITION_NORMAL,
+            "paused": False,
+            "backend_paused": bool(
+                pause_backend and phase != HATCHER_TRANSITION_NORMAL
+            ),
+            "phase": phase,
+            "elapsed": 0,
+            "stable_seconds": stable_seconds,
+            "note": (
+                "explicit failure: normal recovery allowed"
+                if phase != HATCHER_TRANSITION_NORMAL
+                else "normal recovery"
+            ),
+            "entered": False,
+            "released": False,
+            "explicit_failure": True,
+            "dead_confirmed": False,
+            "reset_return": reset_return,
+        }
+
+    # A single failed `ps` read must not kill a clone. While a transition is
+    # active, require the existing Hatcher dead-confirm window before allowing
+    # the normal exact-PID dead-package recovery.
+    if not bool(raw_alive):
+        if phase != HATCHER_TRANSITION_NORMAL:
+            if phase == HATCHER_TRANSITION_RETURNING:
+                reset_return = True
+            phase = HATCHER_TRANSITION_ACTIVE
+            rt_tab["hatcher_transition_phase"] = phase
+            rt_tab["hatcher_transition_return_started_at"] = 0
+
+            dead_since = int(
+                rt_tab.get("hatcher_transition_dead_since", 0) or 0
+            )
+            if dead_since <= 0:
+                dead_since = t
+                rt_tab["hatcher_transition_dead_since"] = dead_since
+            dead_for = max(0, t - dead_since)
+            dead_confirm = max(
+                1,
+                int(hcfg.get("hatcher_dead_confirm_seconds", 60) or 60),
+            )
+            dead_confirmed = dead_for >= dead_confirm
+            rt_tab["hatcher_transition_note"] = (
+                f"process missing {dead_for}/{dead_confirm}s"
+            )
+            return {
+                "active": True,
+                "paused": bool(pause_rejoin and not dead_confirmed),
+                "backend_paused": bool(pause_backend),
+                "phase": phase,
+                "elapsed": 0,
+                "stable_seconds": stable_seconds,
+                "note": (
+                    "dead confirmed; exact-package recovery allowed"
+                    if dead_confirmed
+                    else f"process missing {dead_for}/{dead_confirm}s; hold continues"
+                ),
+                "entered": False,
+                "released": False,
+                "explicit_failure": False,
+                "dead_confirmed": dead_confirmed,
+                "reset_return": reset_return,
+            }
+
+        return {
+            "active": False,
+            "paused": False,
+            "backend_paused": False,
+            "phase": HATCHER_TRANSITION_NORMAL,
+            "elapsed": 0,
+            "stable_seconds": stable_seconds,
+            "note": "normal dead-package recovery",
+            "entered": False,
+            "released": False,
+            "explicit_failure": False,
+            "dead_confirmed": False,
+            "reset_return": False,
+        }
+
+    rt_tab["hatcher_transition_dead_since"] = 0
+
+    if (
+        phase == HATCHER_TRANSITION_NORMAL
+        and clean_fresh
+        and transition_place
+        and current_place == transition_place
+    ):
+        phase = HATCHER_TRANSITION_ACTIVE
+        entered = True
+        rt_tab["hatcher_transition_phase"] = phase
+        rt_tab["hatcher_transition_entered_at"] = t
+        rt_tab["hatcher_transition_return_started_at"] = 0
+        rt_tab["hatcher_transition_resume_report_pending"] = False
+        rt_tab["hatcher_transition_notice_pending"] = bool(publish_once)
+        rt_tab["hatcher_transition_note"] = (
+            "Trade World event hold: rejoin + backend paused"
+        )
+        removed = cancel_hatcher_transition_non_emergency_queue(
+            open_queue, package
+        )
+        log_activity(
+            "event transition hold entered; stale/place rejoin paused"
+            + (f"; cancelled {removed} queued item(s)" if removed else ""),
+            package,
+            CYAN,
+        )
+
+    elif phase == HATCHER_TRANSITION_ACTIVE:
+        if clean_fresh and return_place and current_place == return_place:
+            phase = HATCHER_TRANSITION_RETURNING
+            rt_tab["hatcher_transition_phase"] = phase
+            rt_tab["hatcher_transition_return_started_at"] = t
+            rt_tab["hatcher_transition_note"] = (
+                f"Main Garden stable 0/{stable_seconds}s"
+            )
+            log_activity(
+                f"event returned to Main Garden; confirming {format_age(stable_seconds)}",
+                package,
+                CYAN,
+            )
+
+    elif phase == HATCHER_TRANSITION_RETURNING:
+        if clean_fresh and return_place and current_place == return_place:
+            started = int(
+                rt_tab.get("hatcher_transition_return_started_at", 0) or 0
+            )
+            if started <= 0:
+                started = t
+                rt_tab["hatcher_transition_return_started_at"] = started
+            elapsed = max(0, t - started)
+
+            if elapsed >= stable_seconds:
+                phase = HATCHER_TRANSITION_NORMAL
+                released = True
+                rt_tab["hatcher_transition_phase"] = phase
+                rt_tab["hatcher_transition_return_started_at"] = 0
+                rt_tab["hatcher_transition_entered_at"] = 0
+                rt_tab["hatcher_transition_notice_pending"] = False
+                rt_tab["hatcher_transition_resume_report_pending"] = True
+                rt_tab["hatcher_transition_resumed_at"] = t
+                rt_tab["hatcher_transition_note"] = (
+                    "Main Garden stable; rejoin + backend resumed"
+                )
+                _reset_hatcher_transition_return_timers(rt_tab)
+                removed = cancel_hatcher_transition_non_emergency_queue(
+                    open_queue, package
+                )
+                log_activity(
+                    "event return stable; transition hold released"
+                    + (f"; cancelled {removed} stale queued item(s)" if removed else ""),
+                    package,
+                    GREEN,
+                )
+            else:
+                rt_tab["hatcher_transition_note"] = (
+                    f"Main Garden stable {elapsed}/{stable_seconds}s"
+                )
+        else:
+            phase = HATCHER_TRANSITION_ACTIVE
+            reset_return = True
+            rt_tab["hatcher_transition_phase"] = phase
+            rt_tab["hatcher_transition_return_started_at"] = 0
+            rt_tab["hatcher_transition_note"] = (
+                "return confirmation reset; event hold continues"
+            )
+            log_activity(
+                "event return confirmation reset",
+                package,
+                YELLOW,
+            )
+
+    active = phase != HATCHER_TRANSITION_NORMAL
+    paused = bool(active and pause_rejoin and raw_alive and not explicit_failure)
+    if paused:
+        cancel_hatcher_transition_non_emergency_queue(open_queue, package)
+
+    if phase == HATCHER_TRANSITION_RETURNING:
+        started = int(
+            rt_tab.get("hatcher_transition_return_started_at", 0) or 0
+        )
+        elapsed = max(0, t - started) if started > 0 else 0
+        note = f"Main Garden stable {elapsed}/{stable_seconds}s"
+    elif phase == HATCHER_TRANSITION_ACTIVE:
+        note = "Trade World/event hop hold"
+    elif released:
+        note = "Main Garden stable; resumed"
+    else:
+        note = "normal"
+
+    rt_tab["hatcher_transition_phase"] = phase
+    rt_tab["hatcher_transition_last_place_id"] = current_place
+    rt_tab["hatcher_transition_last_job_id"] = str(
+        (state or {}).get("job_id", "") if state else ""
+    )
+    rt_tab["hatcher_transition_updated_at"] = t
+
+    return {
+        "active": active,
+        "paused": paused,
+        "backend_paused": bool(active and pause_backend),
+        "phase": phase,
+        "elapsed": elapsed,
+        "stable_seconds": stable_seconds,
+        "note": note,
+        "entered": entered,
+        "released": released,
+        "explicit_failure": explicit_failure,
+        "dead_confirmed": False,
+        "reset_return": reset_return,
+        "previous_phase": previous_phase,
+    }
+
+
+def hatcher_transition_backend_due(runtime, hcfg):
+    if not bool(hcfg.get("transition_guard_pause_backend", True)):
+        return False
+    for profile in hatcher_profiles(hcfg, enabled_only=False):
+        pkg = str((profile or {}).get("package", "") or "")
+        if not pkg:
+            continue
+        rt_tab = get_runtime_tab(runtime, pkg)
+        if (
+            rt_tab.get("hatcher_transition_notice_pending")
+            or rt_tab.get("hatcher_transition_resume_report_pending")
+        ):
+            return True
+    return False
+
+
+def hatcher_transition_backend_entry(entry, transition):
+    out = dict(entry or {})
+    phase = str((transition or {}).get("phase", HATCHER_TRANSITION_ACTIVE))
+    out["status"] = "transitioning"
+    out["selectable"] = False
+    out["transitioning"] = True
+    out["transition_phase"] = phase
+    out["transition_return_elapsed"] = int(
+        (transition or {}).get("elapsed", 0) or 0
+    )
+    out["transition_return_required"] = int(
+        (transition or {}).get("stable_seconds", 300) or 300
+    )
+    out["ready_by_pet"] = False
+    out["ready_by_egg"] = False
+    out["ready_reason"] = "event_transition"
+    out["updated_at"] = now()
+    out["updated_text"] = date_time_text()
+    out["source"] = "nomo_rejoin_hatcher_transition_guard"
+    return out
+
+
+def hatcher_transition_backend_mark_success(runtime, package, action):
+    if not isinstance(runtime, dict):
+        return
+    rt_tab = get_runtime_tab(runtime, package)
+    if action == "transition_notice":
+        rt_tab["hatcher_transition_notice_pending"] = False
+        rt_tab["hatcher_transition_notice_sent_at"] = now()
+    elif action == "transition_resume":
+        rt_tab["hatcher_transition_resume_report_pending"] = False
+        rt_tab["hatcher_transition_resume_report_sent_at"] = now()
+
+
+def hatcher_report_once(hcfg, force=True, state_cache=None, main_runtime=None):
     hatcher_apply_main_backend_if_missing(hcfg, None, save=True)
 
     if not hcfg.get("enabled", True):
@@ -10318,6 +10794,9 @@ def hatcher_report_once(hcfg, force=True, state_cache=None):
     if hrt.get("mapping_force_report"):
         force = True
 
+    main_cfg = load_config()
+    runtime = main_runtime if isinstance(main_runtime, dict) else load_runtime()
+
     for prof in profiles:
         eff = hatcher_effective(hcfg, prof)
         name = str(eff.get("hatcher_name", "hatcher")).strip() or "hatcher"
@@ -10327,8 +10806,50 @@ def hatcher_report_once(hcfg, force=True, state_cache=None):
             state, state_err = cached
         else:
             state, state_err = hatcher_read_state(eff)
+
+        rt_tab = get_runtime_tab(runtime, pkg)
+        raw_alive = package_alive(pkg, main_cfg, fresh=True) if pkg else False
+        transition = hatcher_transition_guard_update(
+            rt_tab,
+            state,
+            raw_alive,
+            hcfg,
+            main_cfg,
+            open_queue=None,
+            package=pkg,
+            health=None,
+        )
+
         entry = hatcher_entry(eff, state, state_err)
         status = str(entry.get("status", "")).lower()
+
+        # During an event transition, publish one unavailable status and then
+        # freeze this package's backend record. Never remove it due to temporary
+        # Trade World stale/no-state telemetry.
+        if transition.get("backend_paused"):
+            if rt_tab.get("hatcher_transition_notice_pending"):
+                transition_entry = hatcher_transition_backend_entry(
+                    entry, transition
+                )
+                updates.append(
+                    (
+                        name,
+                        eff,
+                        transition_entry,
+                        "transition unavailable",
+                        "transition_notice",
+                        pkg,
+                    )
+                )
+            else:
+                skips.append(
+                    f"{name}:transition-{transition.get('phase')}"
+                )
+            continue
+
+        resume_pending = bool(
+            rt_tab.get("hatcher_transition_resume_report_pending")
+        )
 
         # Do not publish template/incomplete hatcher slots.
         if status in ["disabled", "no_server", "no_state"]:
@@ -10336,11 +10857,28 @@ def hatcher_report_once(hcfg, force=True, state_cache=None):
             skips.append(f"{name}:{status}")
             continue
 
-        should, why = hatcher_should_update(hcfg, name, entry, force=force)
+        should, why = hatcher_should_update(
+            hcfg,
+            name,
+            entry,
+            force=bool(force or resume_pending),
+        )
         if should:
-            updates.append((name, eff, entry, why))
+            updates.append(
+                (
+                    name,
+                    eff,
+                    entry,
+                    why,
+                    "transition_resume" if resume_pending else "",
+                    pkg,
+                )
+            )
         else:
             skips.append(f"{name}:{entry.get('status')}")
+
+    # Persist reporter-only transition detection and pending flags.
+    save_runtime(runtime)
 
     if not updates and not removes:
         return True, "no update: " + (", ".join(skips[:4]) or "unchanged")
@@ -10348,20 +10886,36 @@ def hatcher_report_once(hcfg, force=True, state_cache=None):
     provider = backend_provider(hcfg)
 
     if provider == "cloudflare":
-        update_pairs = [(name, entry) for name, eff, entry, why in updates]
+        update_pairs = [
+            (name, entry)
+            for name, eff, entry, why, action, pkg in updates
+        ]
         remove_names = [name for name, status in removes]
         if not update_pairs and not remove_names:
-            return True, "no upload: incomplete templates skipped (" + (", ".join(skips[:4]) or "none") + ")"
-        ok, msg = cloudflare_update_hatchers(hcfg, update_pairs, remove_names)
+            return True, "no upload: incomplete templates skipped (" + (
+                ", ".join(skips[:4]) or "none"
+            ) + ")"
+
+        ok, msg = cloudflare_update_hatchers(
+            hcfg, update_pairs, remove_names
+        )
         if not ok:
             return False, f"cloudflare update: {msg}"
 
-        for name, eff, entry, why in updates:
+        for name, eff, entry, why, action, pkg in updates:
             update_hatcher_runtime(name, hcfg, entry)
+            hatcher_transition_backend_mark_success(
+                runtime, pkg, action
+            )
+        save_runtime(runtime)
 
         parts = []
-        for name, eff, entry, why in updates[:4]:
-            parts.append(f"{name} {entry.get('status')} pets={entry.get('pet_count')} eggs={entry.get('egg_total')}")
+        for name, eff, entry, why, action, pkg in updates[:4]:
+            parts.append(
+                f"{name} {entry.get('status')} "
+                f"pets={entry.get('pet_count')} "
+                f"eggs={entry.get('egg_total')}"
+            )
         if len(updates) > 4:
             parts.append(f"+{len(updates)-4}")
         if remove_names:
@@ -10369,7 +10923,11 @@ def hatcher_report_once(hcfg, force=True, state_cache=None):
         _clear_hatcher_pending_identity_removes(
             pending_identity_removes
         )
-        return True, f"cloudflare updated {len(updates)} removed {len(remove_names)} ({', '.join(parts)})"
+        return True, (
+            f"cloudflare updated {len(updates)} "
+            f"removed {len(remove_names)} "
+            f"({', '.join(parts)})"
+        )
 
     # JSONBin fallback/path: read-modify-write full record.
     record, read_err = jsonbin_read_bin(hcfg)
@@ -10379,7 +10937,9 @@ def hatcher_report_once(hcfg, force=True, state_cache=None):
     if not isinstance(record, dict):
         record = {}
 
-    if "hatchers" not in record or not isinstance(record.get("hatchers"), dict):
+    if "hatchers" not in record or not isinstance(
+        record.get("hatchers"), dict
+    ):
         record["hatchers"] = {}
 
     removed_names = []
@@ -10388,11 +10948,13 @@ def hatcher_report_once(hcfg, force=True, state_cache=None):
             del record["hatchers"][name]
             removed_names.append(name)
 
-    for name, eff, entry, why in updates:
+    for name, eff, entry, why, action, pkg in updates:
         record["hatchers"][name] = entry
 
     if not updates and not removed_names:
-        return True, "no upload: incomplete templates skipped (" + (", ".join(skips[:4]) or "none") + ")"
+        return True, "no upload: incomplete templates skipped (" + (
+            ", ".join(skips[:4]) or "none"
+        ) + ")"
 
     record["updated_at"] = now()
     record["updated_text"] = date_time_text()
@@ -10401,12 +10963,20 @@ def hatcher_report_once(hcfg, force=True, state_cache=None):
     if not ok:
         return False, f"jsonbin update: {msg}"
 
-    for name, eff, entry, why in updates:
+    for name, eff, entry, why, action, pkg in updates:
         update_hatcher_runtime(name, hcfg, entry)
+        hatcher_transition_backend_mark_success(
+            runtime, pkg, action
+        )
+    save_runtime(runtime)
 
     parts = []
-    for name, eff, entry, why in updates[:4]:
-        parts.append(f"{name} {entry.get('status')} pets={entry.get('pet_count')} eggs={entry.get('egg_total')}")
+    for name, eff, entry, why, action, pkg in updates[:4]:
+        parts.append(
+            f"{name} {entry.get('status')} "
+            f"pets={entry.get('pet_count')} "
+            f"eggs={entry.get('egg_total')}"
+        )
     if len(updates) > 4:
         parts.append(f"+{len(updates)-4}")
     if removed_names:
@@ -10415,7 +10985,11 @@ def hatcher_report_once(hcfg, force=True, state_cache=None):
     _clear_hatcher_pending_identity_removes(
         pending_identity_removes
     )
-    return True, f"jsonbin updated {len(updates)} removed {len(removed_names)} ({', '.join(parts)})"
+    return True, (
+        f"jsonbin updated {len(updates)} "
+        f"removed {len(removed_names)} "
+        f"({', '.join(parts)})"
+    )
 
 def hatcher_test_upload_screen(main_cfg=None):
     hcfg = load_hatcher_config()
@@ -10590,6 +11164,12 @@ def hatcher_rejoin_status_screen(rows, hcfg, cfg, session_start, loops, last_msg
     else:
         print(f"  {col('BACKEND', DIM)}: jsonbin   {col('BIN', DIM)}: {hcfg.get('jsonbin_bin_id')}   {col('KEY', DIM)}: {mask_secret(hcfg.get('jsonbin_api_key'))}")
     print(f"  {col('REPORT', DIM)} : status-change only={hcfg.get('update_only_on_status_change')} force={format_age(hcfg.get('force_update_every_seconds'))}")
+    if hcfg.get("transition_guard_enabled", True):
+        print(
+            f"  {col('EVENT', DIM)}  : Trade World hold -> Main Garden "
+            f"{format_age(hcfg.get('transition_guard_return_stable_seconds', 300))} stable; "
+            "rejoin/backend paused"
+        )
     print("")
 
     widths = [2,  13,   10,   4,  4,  9,     6,  7,   18]
@@ -10602,7 +11182,7 @@ def hatcher_rejoin_status_screen(rows, hcfg, cfg, session_start, loops, last_msg
         status = r.get("status", "?")
         if status in ["Ready", "Ingame", "Online"]:
             st_code = GREEN
-        elif status in ["Queued", "Loading", "Stale"]:
+        elif status in ["Queued", "Loading", "Stale", "Event hold", "Return wait"]:
             st_code = YELLOW
         elif status in ["Offline", "No state", "No server", "Manual"]:
             st_code = RED
@@ -11035,6 +11615,12 @@ def hatcher_global_settings(main_cfg=None):
         print(f"10.public_rejoin_delay  = {hcfg.get('public_server_rejoin_after_seconds')}")
         print(f"11.detect_wrong_place   = {hcfg.get('detect_wrong_place')}")
         print(f"12.expected_place_id    = {hcfg.get('expected_place_id')}")
+        print(f"13.transition_guard     = {hcfg.get('transition_guard_enabled')}")
+        print(f"14.transition_place_id  = {hcfg.get('transition_guard_place_id')}")
+        print(f"15.return_place_id      = {hcfg.get('transition_guard_return_place_id')}")
+        print(f"16.return_stable_sec    = {hcfg.get('transition_guard_return_stable_seconds')}")
+        print(f"17.pause_rejoin         = {hcfg.get('transition_guard_pause_rejoin')}")
+        print(f"18.pause_backend        = {hcfg.get('transition_guard_pause_backend')}")
         print("")
         print(col("Shared backend currently from Global config:", CYAN))
         if backend_provider(main_cfg) == "cloudflare":
@@ -11084,6 +11670,12 @@ def hatcher_global_settings(main_cfg=None):
             "10": "public_server_rejoin_after_seconds",
             "11": "detect_wrong_place",
             "12": "expected_place_id",
+            "13": "transition_guard_enabled",
+            "14": "transition_guard_place_id",
+            "15": "transition_guard_return_place_id",
+            "16": "transition_guard_return_stable_seconds",
+            "17": "transition_guard_pause_rejoin",
+            "18": "transition_guard_pause_backend",
         }
 
         if ch in mapping:
@@ -11491,6 +12083,18 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                 tab, cfg, rt_tab, mode="hatcher", hcfg=hcfg, prof=prof,
                 raw_alive=alive, state=state, err=err
             )
+            transition = hatcher_transition_guard_update(
+                rt_tab,
+                state,
+                raw_alive,
+                hcfg,
+                cfg,
+                open_queue=open_queue,
+                package=pkg,
+                health=health,
+            )
+            if transition.get("dead_confirmed"):
+                alive = False
             note = health.get("note") or "ok"
             pets = "-"
             eggs = "-"
@@ -11505,6 +12109,42 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                     display_user, _ = sync_detected_username_for_package(
                         hcfg, pkg, detected_user, tab=tab, source="state"
                     )
+
+            if transition.get("paused"):
+                if state:
+                    pets = int(state.get("pet_count", 0) or 0)
+                    eggs = int(state.get("egg_total", 0) or 0)
+                    age = int(state.get("age", 999999) or 999999)
+                    ready_at = int((prof or {}).get("ready_pet_count", 200))
+                    ready_pet = pets >= ready_at
+
+                if transition.get("phase") == HATCHER_TRANSITION_RETURNING:
+                    status = "Return wait"
+                    note = (
+                        f"Main stable {transition.get('elapsed', 0)}/"
+                        f"{transition.get('stable_seconds', 300)}s; "
+                        "rejoin+backend paused"
+                    )
+                else:
+                    status = "Event hold"
+                    note = (
+                        str(transition.get("note") or "Trade hop")
+                        + "; rejoin+backend paused"
+                    )
+
+                update_clone_session(rt_tab, status, cfg)
+                rows.append({
+                    "user": display_user,
+                    "pkg": pkg,
+                    "pets": pets,
+                    "eggs": eggs,
+                    "ready_pet": ready_pet,
+                    "status": status,
+                    "age": age,
+                    "session": format_session(rt_tab),
+                    "note": note,
+                })
+                continue
 
             if not tab.get("server_link") or str(tab.get("server_link")).startswith("YOUR_"):
                 status = "No server"
@@ -11524,7 +12164,12 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                     clear_manual_login_block(rt_tab)
                     clear_captcha_ui_runtime(rt_tab)
 
-                problem_code, problem_note = hatcher_teleport_problem(tab, state, hcfg, cfg)
+                if transition.get("active"):
+                    problem_code, problem_note = None, ""
+                else:
+                    problem_code, problem_note = hatcher_teleport_problem(
+                        tab, state, hcfg, cfg
+                    )
                 if problem_code:
                     should_q, wait_note = should_queue_hatcher_teleport_rejoin(rt_tab, hcfg, cfg, problem_code)
                     if should_q and cfg.get("rejoin_if_crash", True):
@@ -11767,9 +12412,21 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
         # Backend/reporting cadence is independent from the 10-second local
         # health loop. Reuse this cycle's state reads when a report is due.
         report_interval = max(10, int(hcfg.get("heartbeat_interval", 60) or 60))
-        if last_report_at <= 0 or now() - last_report_at >= report_interval:
+        transition_report_due = hatcher_transition_backend_due(rt, hcfg)
+        report_due = (
+            last_report_at <= 0
+            or now() - last_report_at >= report_interval
+            or (
+                transition_report_due
+                and now() - last_report_at >= 10
+            )
+        )
+        if report_due:
             ok, msg = hatcher_report_once(
-                hcfg, force=False, state_cache=report_state_cache
+                hcfg,
+                force=False,
+                state_cache=report_state_cache,
+                main_runtime=rt,
             )
             last_report_at = now()
             tag = "OK" if ok else "ERR"
