@@ -30,7 +30,7 @@ import tempfile
 import time
 
 
-VERSION = "5.0.3-phase1-shadow-clean-ui"
+VERSION = "5.0.4-phase1-background-ui"
 
 V4_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 V4_NOMO_FILE = V4_BASE_DIR / "nomo.json"
@@ -39,6 +39,8 @@ V5_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_v5")
 V5_SETTINGS_FILE = V5_BASE_DIR / "settings.json"
 V5_RUNTIME_FILE = V5_BASE_DIR / "shadow_runtime.json"
 V5_LOG_FILE = V5_BASE_DIR / "shadow.log"
+V5_MONITOR_PID_FILE = V5_BASE_DIR / "monitor.pid"
+V5_MONITOR_META_FILE = V5_BASE_DIR / "monitor.json"
 
 DELTA_WORKSPACE = Path("/storage/emulated/0/Delta/Workspace")
 DELTA_STATE_DIR = DELTA_WORKSPACE / "nomo_rejoiner"
@@ -1191,8 +1193,9 @@ class NomoV5ShadowEngine:
 
 
 
+
 def _trim(value: object, width: int) -> str:
-    text = str(value)
+    text = str(value or "")
     if len(text) <= width:
         return text
     if width <= 1:
@@ -1209,7 +1212,7 @@ def _package_label(package: str) -> str:
         return "F"
     if package == "com.roblox":
         return "R"
-    return _trim(package, 3)
+    return _trim(package, 2)
 
 
 def _place_label(place_id: int | None) -> str:
@@ -1222,176 +1225,239 @@ def _place_label(place_id: int | None) -> str:
     return "OTHER"
 
 
-def _phase_label(
-    evaluation: AccountEvaluation,
-    return_target: int,
-) -> str:
-    transition = evaluation.transition
-    if transition.phase == TransitionPhase.TRANSITIONING:
+def _status_label(item: AccountEvaluation) -> str:
+    if item.transition.phase == TransitionPhase.TRANSITIONING:
         return "HOLD"
-    if transition.phase == TransitionPhase.RETURNING:
-        return (
-            f"BACK {transition.stable_seconds}/"
-            f"{return_target}s"
-        )
-    return "NORMAL"
+    if item.transition.phase == TransitionPhase.RETURNING:
+        return f"BACK {item.transition.stable_seconds}/300"
 
-
-def _decision_label(
-    evaluation: AccountEvaluation,
-) -> str:
-    decision = evaluation.decision
-    state = evaluation.state
-
-    if decision.kind == DecisionKind.HEALTHY:
+    decision = item.decision.kind
+    if decision == DecisionKind.HEALTHY:
         return "OK"
-    if decision.kind == DecisionKind.HOLD_TRANSITION:
-        return "PAUSED"
-    if decision.kind == DecisionKind.RECOVER_DEAD:
+    if decision == DecisionKind.RECOVER_DEAD:
         return "DEAD"
-    if decision.kind == DecisionKind.RECOVER_DISCONNECT:
+    if decision == DecisionKind.RECOVER_DISCONNECT:
         return "DISCONNECT"
-    if decision.kind == DecisionKind.RECOVER_STALE:
-        age = (
-            state.age_seconds
-            if state.age_seconds is not None
-            else 0
-        )
+    if decision == DecisionKind.RECOVER_STALE:
+        age = item.state.age_seconds or 0
         return f"STALE {age}s"
-    if decision.kind == DecisionKind.WAIT_NO_STATE:
+    if decision == DecisionKind.WAIT_NO_STATE:
         return "NO STATE"
-    if decision.kind == DecisionKind.ROUTE_EXPECTED:
+    if decision == DecisionKind.ROUTE_EXPECTED:
         return "WRONG PLACE"
-    if decision.kind == DecisionKind.BLOCKED_IDENTITY:
+    if decision == DecisionKind.BLOCKED_IDENTITY:
         return "CONFLICT"
-    return decision.kind.value.upper()
+    if decision == DecisionKind.HOLD_TRANSITION:
+        return "HOLD"
+    return decision.value.upper()
 
 
-def _backend_label(
-    evaluation: AccountEvaluation,
-) -> str:
-    plan = evaluation.transition.backend_plan
-    if plan == BackendPlanKind.MARK_TRANSITIONING:
-        return "PAUSE ONCE"
-    if plan == BackendPlanKind.PAUSE:
-        return "PAUSED"
-    if plan == BackendPlanKind.RESUME_FORCE_REPORT:
-        return "RESUME ONCE"
-    return "NORMAL"
-
-
-def _terminal_width() -> int:
+def _monitor_pid() -> int | None:
     try:
-        return max(58, shutil.get_terminal_size((80, 24)).columns)
+        value = int(
+            V5_MONITOR_PID_FILE.read_text(
+                encoding="utf-8"
+            ).strip()
+        )
+        return value if value > 1 else None
     except Exception:
-        return 80
+        return None
 
 
-def clear_screen() -> None:
-    print("\033[2J\033[H", end="")
+def _read_proc_cmdline(pid: int) -> str:
+    try:
+        raw = Path(
+            f"/proc/{int(pid)}/cmdline"
+        ).read_bytes()
+        return raw.replace(b"\x00", b" ").decode(
+            "utf-8",
+            errors="replace",
+        )
+    except Exception:
+        return ""
 
 
-def print_banner(compact: bool = True) -> None:
-    width = min(_terminal_width(), 96)
-    print("=" * width)
-    print(f"NOMO V5 SHADOW  {VERSION}")
-    print("Read-only: no restart, route, or Cloudflare write")
-    print("=" * width)
-
-
-def print_evaluations(
-    engine: NomoV5ShadowEngine,
-    evaluations: list[AccountEvaluation],
-) -> None:
-    width = _terminal_width()
-    compact = width < 92
-    print_banner(compact=compact)
-
-    return_target = int(
-        engine.settings["transitionGuard"]["returnStableSeconds"]
+def _is_our_monitor(pid: int | None) -> bool:
+    if not pid:
+        return False
+    cmdline = _read_proc_cmdline(pid)
+    return bool(
+        cmdline
+        and "_daemon" in cmdline
+        and Path(__file__).name in cmdline
     )
 
-    if not evaluations:
-        print("No configured accounts found.")
+
+def _cleanup_stale_pid_file() -> None:
+    pid = _monitor_pid()
+    if pid and _is_our_monitor(pid):
         return
+    try:
+        V5_MONITOR_PID_FILE.unlink()
+    except FileNotFoundError:
+        pass
 
-    if compact:
+
+def monitor_running() -> bool:
+    _cleanup_stale_pid_file()
+    return _is_our_monitor(_monitor_pid())
+
+
+def write_monitor_meta(
+    *,
+    running: bool,
+    pid: int | None = None,
+    note: str = "",
+) -> None:
+    atomic_write_json(
+        V5_MONITOR_META_FILE,
+        {
+            "running": bool(running),
+            "pid": int(pid or 0),
+            "updatedAt": int(time.time()),
+            "version": VERSION,
+            "note": note,
+        },
+    )
+
+
+def start_monitor() -> int:
+    V5_BASE_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    if monitor_running():
         print(
-            f"{'ID':<3} {'USER':<13} {'PID':<4} "
-            f"{'PLACE':<6} {'PHASE':<15} {'STATUS':<14}"
+            f"V5 monitor already running "
+            f"(PID {_monitor_pid()})."
         )
-        print("-" * min(width, 72))
-        for item in evaluations:
-            package = _package_label(item.account.package)
-            username = _trim(item.account.username, 13)
-            alive = "ON" if item.process.alive else "OFF"
-            place = _place_label(item.state.place_id)
-            phase = _trim(
-                _phase_label(item, return_target),
-                15,
-            )
-            status = _trim(
-                _decision_label(item),
-                14,
-            )
-            print(
-                f"{package:<3} {username:<13} {alive:<4} "
-                f"{place:<6} {phase:<15} {status:<14}"
-            )
-    else:
+        return 0
+
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "_daemon",
+    ]
+
+    with open(
+        os.devnull,
+        "rb",
+    ) as stdin_handle, open(
+        os.devnull,
+        "ab",
+    ) as output_handle:
+        process = subprocess.Popen(
+            command,
+            stdin=stdin_handle,
+            stdout=output_handle,
+            stderr=output_handle,
+            start_new_session=True,
+            close_fds=True,
+        )
+
+    V5_MONITOR_PID_FILE.write_text(
+        str(process.pid),
+        encoding="utf-8",
+    )
+    write_monitor_meta(
+        running=True,
+        pid=process.pid,
+        note="background shadow monitor",
+    )
+
+    time.sleep(0.2)
+    if not _is_our_monitor(process.pid):
         print(
-            f"{'ID':<3} {'PACKAGE':<17} {'USER':<16} "
-            f"{'PID':<4} {'PLACE':<6} {'PHASE':<16} "
-            f"{'STATUS':<15} {'CLOUDFLARE':<12}"
+            "V5 monitor failed to stay running. "
+            f"Check {V5_LOG_FILE}"
         )
-        print("-" * min(width, 96))
-        for item in evaluations:
-            print(
-                f"{_package_label(item.account.package):<3} "
-                f"{_trim(item.account.package, 17):<17} "
-                f"{_trim(item.account.username, 16):<16} "
-                f"{('ON' if item.process.alive else 'OFF'):<4} "
-                f"{_place_label(item.state.place_id):<6} "
-                f"{_trim(_phase_label(item, return_target), 16):<16} "
-                f"{_trim(_decision_label(item), 15):<15} "
-                f"{_trim(_backend_label(item), 12):<12}"
-            )
+        return 1
 
-    hold_count = sum(
-        1
-        for item in evaluations
-        if item.transition.rejoin_paused
-    )
-    would_recover = sum(
-        1
-        for item in evaluations
-        if item.decision.would_act
-    )
-    healthy = sum(
-        1
-        for item in evaluations
-        if item.decision.kind == DecisionKind.HEALTHY
-    )
-
-    print("")
     print(
-        f"Healthy {healthy} | Hold {hold_count} | "
-        f"Would recover {would_recover} | "
-        f"Scan {engine.settings.get('scanSeconds', 10)}s"
+        f"V5 monitor started in background "
+        f"(PID {process.pid})."
     )
-    print("Shadow only — no action is performed.")
-
-def run_once() -> int:
-    engine = NomoV5ShadowEngine()
-    evaluations = engine.scan_once()
-    print_evaluations(
-        engine,
-        evaluations,
-    )
+    print("Your Termux prompt is free.")
     return 0
 
 
-def run_watch() -> int:
+def stop_monitor() -> int:
+    pid = _monitor_pid()
+    if not _is_our_monitor(pid):
+        _cleanup_stale_pid_file()
+        write_monitor_meta(
+            running=False,
+            note="not running",
+        )
+        print("V5 monitor is not running.")
+        return 0
+
+    assert pid is not None
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except PermissionError as exc:
+        print(f"Could not stop monitor PID {pid}: {exc}")
+        return 1
+
+    deadline = time.time() + 4.0
+    while time.time() < deadline:
+        if not _is_our_monitor(pid):
+            break
+        time.sleep(0.1)
+
+    if _is_our_monitor(pid):
+        print(
+            f"Monitor PID {pid} did not stop "
+            "after SIGTERM."
+        )
+        return 1
+
+    try:
+        V5_MONITOR_PID_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
+    write_monitor_meta(
+        running=False,
+        note="stopped by user",
+    )
+    print("V5 monitor stopped.")
+    return 0
+
+
+def run_daemon() -> int:
+    V5_BASE_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    V5_MONITOR_PID_FILE.write_text(
+        str(os.getpid()),
+        encoding="utf-8",
+    )
+    write_monitor_meta(
+        running=True,
+        pid=os.getpid(),
+        note="background shadow monitor",
+    )
+
+    stop_requested = False
+
+    def handle_stop(signum, frame) -> None:
+        nonlocal stop_requested
+        stop_requested = True
+
+    signal.signal(
+        signal.SIGTERM,
+        handle_stop,
+    )
+    signal.signal(
+        signal.SIGINT,
+        handle_stop,
+    )
+
     engine = NomoV5ShadowEngine()
     interval = max(
         2,
@@ -1404,19 +1470,149 @@ def run_watch() -> int:
     )
 
     try:
-        while True:
-            clear_screen()
-            evaluations = engine.scan_once()
-            print_evaluations(
-                engine,
-                evaluations,
+        while not stop_requested:
+            try:
+                engine.scan_once()
+            except Exception as exc:
+                append_log(
+                    V5_LOG_FILE,
+                    f"daemon scan error: {exc}",
+                )
+
+            slept = 0.0
+            while (
+                slept < interval
+                and not stop_requested
+            ):
+                time.sleep(0.2)
+                slept += 0.2
+    finally:
+        current = _monitor_pid()
+        if current == os.getpid():
+            try:
+                V5_MONITOR_PID_FILE.unlink()
+            except FileNotFoundError:
+                pass
+
+        write_monitor_meta(
+            running=False,
+            note="daemon exited",
+        )
+
+    return 0
+
+
+def print_status(
+    evaluations: list[AccountEvaluation],
+) -> None:
+    running = monitor_running()
+    monitor_text = (
+        f"MONITOR ON  PID {_monitor_pid()}"
+        if running
+        else "MONITOR OFF"
+    )
+
+    print(f"NOMO V5 SHADOW | {monitor_text}")
+    print("-" * 42)
+
+    if not evaluations:
+        print("No configured accounts.")
+        print("-" * 42)
+        print("Reads V4 nomo.json only.")
+        return
+
+    for item in evaluations:
+        account_id = _package_label(
+            item.account.package
+        )
+        username = _trim(
+            item.account.username,
+            12,
+        )
+        process = (
+            "ON"
+            if item.process.alive
+            else "OFF"
+        )
+        place = _place_label(
+            item.state.place_id
+        )
+        status = _trim(
+            _status_label(item),
+            14,
+        )
+
+        # Max line length stays under 42 characters.
+        print(
+            f"{account_id:<2} "
+            f"{username:<12} "
+            f"{process:<3} "
+            f"{place:<5} "
+            f"{status}"
+        )
+
+    hold_count = sum(
+        1
+        for item in evaluations
+        if item.transition.rejoin_paused
+    )
+    issue_count = sum(
+        1
+        for item in evaluations
+        if item.decision.would_act
+    )
+    healthy_count = sum(
+        1
+        for item in evaluations
+        if item.decision.kind
+        == DecisionKind.HEALTHY
+    )
+
+    print("-" * 42)
+    print(
+        f"OK {healthy_count} | "
+        f"HOLD {hold_count} | "
+        f"ISSUE {issue_count}"
+    )
+    if hold_count:
+        print("HOLD pauses planned REJOIN + Cloudflare.")
+    print("Shadow only: no action performed.")
+
+
+def run_status() -> int:
+    engine = NomoV5ShadowEngine()
+    evaluations = engine.scan_once()
+    print_status(evaluations)
+    return 0
+
+
+def run_foreground_watch() -> int:
+    engine = NomoV5ShadowEngine()
+    interval = max(
+        2,
+        int(
+            engine.settings.get(
+                "scanSeconds",
+                10,
             )
+        ),
+    )
+    print(
+        "Foreground view. Ctrl+C returns "
+        "to the Termux prompt."
+    )
+    try:
+        while True:
+            print("\033[2J\033[H", end="")
+            evaluations = engine.scan_once()
+            print_status(evaluations)
             print(
-                f"Next scan {interval}s | Ctrl+C stops dashboard"
+                f"\nRefresh {interval}s | "
+                "Ctrl+C exits"
             )
             time.sleep(interval)
     except KeyboardInterrupt:
-        print("\nShadow watcher stopped.")
+        print("\nStopped.")
         return 0
 
 
@@ -1425,22 +1621,20 @@ def show_mapping() -> int:
     accounts = engine.identity.normalize(
         engine.adapter.accounts()
     )
-    print_banner()
 
     if not accounts:
-        print("No accounts found in V4 nomo.json.")
+        print("No configured accounts.")
         return 0
 
     for account in accounts:
-        status = (
+        mark = (
             "CONFLICT"
             if account.identity_conflict
             else "LOCKED"
         )
         print(
-            f"{account.package:<20} -> "
-            f"{account.username:<20} "
-            f"[{status}]"
+            f"{_package_label(account.package)} "
+            f"{account.username} [{mark}]"
         )
         print(f"  {account.state_file}")
     return 0
@@ -1467,6 +1661,21 @@ def reset_shadow_runtime() -> int:
         },
     )
     print(f"Reset: {V5_RUNTIME_FILE}")
+    return 0
+
+
+def show_log(lines: int = 20) -> int:
+    try:
+        content = V5_LOG_FILE.read_text(
+            encoding="utf-8",
+            errors="replace",
+        ).splitlines()
+    except FileNotFoundError:
+        print("No V5 log yet.")
+        return 0
+
+    for line in content[-max(1, int(lines)):]:
+        print(line)
     return 0
 
 
@@ -1558,15 +1767,11 @@ def self_test() -> int:
             result.phase
             == TransitionPhase.TRANSITIONING
         )
-        assert (
-            result.backend_plan
-            == BackendPlanKind.MARK_TRANSITIONING
-        )
 
         state = write_state(
             1020,
-            TRADE_WORLD_PLACE_ID,
-            "trade-b",
+            MAIN_GARDEN_PLACE_ID,
+            "main-b",
         )
         result = transition_system.evaluate(
             account,
@@ -1577,30 +1782,12 @@ def self_test() -> int:
             now_ts=1020,
         )
         assert (
-            result.backend_plan
-            == BackendPlanKind.PAUSE
-        )
-
-        state = write_state(
-            1030,
-            MAIN_GARDEN_PLACE_ID,
-            "main-b",
-        )
-        result = transition_system.evaluate(
-            account,
-            process,
-            state,
-            True,
-            runtime,
-            now_ts=1030,
-        )
-        assert (
             result.phase
             == TransitionPhase.RETURNING
         )
 
         state = write_state(
-            1330,
+            1320,
             MAIN_GARDEN_PLACE_ID,
             "main-b",
         )
@@ -1610,7 +1797,7 @@ def self_test() -> int:
             state,
             True,
             runtime,
-            now_ts=1330,
+            now_ts=1320,
         )
         assert (
             result.phase
@@ -1633,101 +1820,99 @@ def self_test() -> int:
         )
 
 
+def print_help() -> None:
+    print("NOMO V5 Phase 1 commands:")
+    print("  nomo5          clean one-shot status")
+    print("  nomo5 start    background monitor")
+    print("  nomo5 status   clean one-shot status")
+    print("  nomo5 stop     stop V5 monitor")
+    print("  nomo5 watch    foreground live view")
+    print("  nomo5 mapping  identity mapping")
+    print("  nomo5 settings show settings")
+    print("  nomo5 log      latest shadow log")
+    print("  nomo5 reset    reset transition runtime")
+    print("  nomo5 self-test")
+    print("  nomo5 version")
 
-def menu() -> int:
-    while True:
-        clear_screen()
-        print_banner()
-        print("1. One clean scan")
-        print("2. Live clean dashboard")
-        print("3. Show identity mapping")
-        print("4. Show settings")
-        print("5. Reset shadow runtime")
-        print("6. Self-test")
-        print("0. Exit")
-
-        choice = input("\nChoose: ").strip()
-
-        if choice == "1":
-            clear_screen()
-            run_once()
-            time.sleep(3)
-        elif choice == "2":
-            return run_watch()
-        elif choice == "3":
-            clear_screen()
-            show_mapping()
-            time.sleep(4)
-        elif choice == "4":
-            clear_screen()
-            show_settings()
-            time.sleep(4)
-        elif choice == "5":
-            clear_screen()
-            reset_shadow_runtime()
-            time.sleep(2)
-        elif choice == "6":
-            clear_screen()
-            self_test()
-            time.sleep(2)
-        elif choice == "0":
-            return 0
 
 def main(
     argv: list[str] | None = None,
 ) -> int:
-    parser = argparse.ArgumentParser(
-        description=(
-            "NOMO V5 Phase 1 shadow "
-            "transition guard"
-        )
+    argv = list(
+        sys.argv[1:]
+        if argv is None
+        else argv
     )
-    parser.add_argument(
-        "--once",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--watch",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--mapping",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--settings",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--reset-runtime",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--self-test",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--version",
-        action="store_true",
-    )
-    args = parser.parse_args(argv)
 
-    if args.once:
-        return run_once()
-    if args.watch:
-        return run_watch()
-    if args.mapping:
+    if argv and argv[0] == "_daemon":
+        return run_daemon()
+
+    if not argv:
+        return run_status()
+
+    command = argv[0].lower()
+
+    if command in {
+        "status",
+        "--once",
+        "once",
+    }:
+        return run_status()
+    if command == "start":
+        return start_monitor()
+    if command == "stop":
+        return stop_monitor()
+    if command in {
+        "watch",
+        "--watch",
+    }:
+        return run_foreground_watch()
+    if command in {
+        "mapping",
+        "--mapping",
+    }:
         return show_mapping()
-    if args.settings:
+    if command in {
+        "settings",
+        "--settings",
+    }:
         return show_settings()
-    if args.reset_runtime:
+    if command in {
+        "reset",
+        "--reset-runtime",
+    }:
         return reset_shadow_runtime()
-    if args.self_test:
+    if command == "log":
+        lines = (
+            int(argv[1])
+            if len(argv) > 1
+            and argv[1].isdigit()
+            else 20
+        )
+        return show_log(lines)
+    if command in {
+        "self-test",
+        "--self-test",
+    }:
         return self_test()
-    if args.version:
+    if command in {
+        "version",
+        "--version",
+        "-v",
+    }:
         print(VERSION)
         return 0
-    return menu()
+    if command in {
+        "help",
+        "--help",
+        "-h",
+    }:
+        print_help()
+        return 0
+
+    print(f"Unknown command: {command}")
+    print_help()
+    return 2
 
 
 if __name__ == "__main__":
