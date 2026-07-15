@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.58.15 — BOOSTER JOB-ID CONFIRMATION
+# - Removes private-flag confirmation from Market->Booster routing.
+# - Confirms the exact Booster instance using fresh place_id + exact job_id.
+# - Fresh Market state and random public Main Garden state cannot confirm.
+# - Booster report sources job_id/place_id from normal state or Booster probe.
+# - Booster signature includes job_id so server changes upload immediately.
+# - Pool hides records without a current job_id.
+# - Double-soft task reuse and exact-PID final fallback are preserved.
+#
 # V4.58.14 — PRIVATE BOOSTER ROUTE CONFIRMATION
 # - Fresh Market state cannot confirm a Market->Booster route.
 # - Fresh public Main Garden state cannot confirm a private Booster route.
@@ -351,7 +360,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.58.14"
+__version__ = "V4.58.15"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -6270,6 +6279,15 @@ def market_booster_pool_entries(cfg, rt=None, force=False):
         ):
             continue
 
+        expected_job_id = str(
+            item.get("job_id")
+            or item.get("booster_job_id")
+            or ""
+        ).strip()
+
+        if not expected_job_id:
+            continue
+
         updated_at = _cloudflare_item_updated_seconds(item)
         if not updated_at:
             try:
@@ -6327,6 +6345,7 @@ def market_booster_pool_entries(cfg, rt=None, force=False):
                 if private_link_code
                 else "accessCode"
             ),
+            "expected_job_id": expected_job_id,
             "age": max(0, age),
             "updated_at": updated_at,
             "pet_count": pet_count,
@@ -6405,6 +6424,11 @@ def market_prepare_booster_route(rt_tab, booster, cfg):
     rt_tab["booster_route_record_ts"] = int(
         booster.get("updated_at", 0) or 0
     )
+    rt_tab["booster_route_job_id"] = str(
+        booster.get("expected_job_id")
+        or booster.get("job_id")
+        or ""
+    )
     rt_tab["manual_booster_hold_active"] = True
     rt_tab["manual_booster_hold_until"] = (
         now() + hold_seconds if hold_seconds > 0 else 0
@@ -6418,6 +6442,7 @@ def market_clear_booster_route(rt_tab):
     rt_tab["booster_route_link"] = ""
     rt_tab["booster_route_name"] = ""
     rt_tab["booster_route_record_ts"] = 0
+    rt_tab["booster_route_job_id"] = ""
 
 
 def market_run_route_queue(cfg, tabs, target, reason):
@@ -6512,6 +6537,18 @@ def market_manual_join_booster(cfg, booster, package):
 
     booster = dict(booster)
     booster["link"] = link
+    expected_job_id = str(
+        booster.get("expected_job_id")
+        or (booster.get("raw") or {}).get("job_id")
+        or (booster.get("raw") or {}).get("booster_job_id")
+        or ""
+    ).strip()
+
+    if not expected_job_id:
+        return (
+            False,
+            "Booster backend job_id missing; wait for its next report",
+        )
 
     route_started_at = now()
     rt = load_runtime()
@@ -6554,7 +6591,7 @@ def market_manual_join_booster(cfg, booster, package):
             cfg,
             route_started_at,
             expected_place,
-            require_private_server=True,
+            expected_job_id,
         )
     )
     actual_place = str(
@@ -6752,6 +6789,13 @@ def market_booster_pool_menu(cfg):
             print(
                 f"Route   : PRIVATE "
                 f"({booster.get('route_kind', 'unknown')})"
+            )
+            print(
+                "Job     : "
+                + str(
+                    booster.get("expected_job_id")
+                    or "-"
+                )[:18]
             )
             print(f"Top     : {market_booster_top_summary(booster, cfg)}")
             confirm = input("Safe-route this package now? [y/N]: ").strip().lower()
@@ -9105,7 +9149,7 @@ def wait_until_fresh_after_open(
     timeout_override=None,
     allow_solver_probe=True,
     expected_place_id="",
-    require_private_server=False,
+    expected_job_id="",
 ):
     if not cfg.get("wait_fresh_after_open", True):
         return True, "fresh wait disabled"
@@ -9210,15 +9254,13 @@ def wait_until_fresh_after_open(
             status_note = solver_job_note(pkg)
         elif fresh and (
             expected_place_id
-            or require_private_server
+            or expected_job_id
         ):
             route_ok, route_note = (
                 market_booster_state_matches_route(
                     state,
                     expected_place_id,
-                    require_private_server=(
-                        require_private_server
-                    ),
+                    expected_job_id,
                 )
             )
             status_note = (
@@ -9248,15 +9290,13 @@ def wait_until_fresh_after_open(
         route_ok = True
         if fresh and (
             expected_place_id
-            or require_private_server
+            or expected_job_id
         ):
             route_ok, _route_note = (
                 market_booster_state_matches_route(
                     state,
                     expected_place_id,
-                    require_private_server=(
-                        require_private_server
-                    ),
+                    expected_job_id,
                 )
             )
 
@@ -9536,6 +9576,7 @@ def market_booster_second_soft_intent(
     reason,
     first_opened_at,
     expected_place_id,
+    expected_job_id,
 ):
     """Retry the same task-reuse deep link once when Roblox lands on Home."""
     if not cfg.get(
@@ -9566,7 +9607,7 @@ def market_booster_second_soft_intent(
                 cfg,
                 first_opened_at,
                 expected_place_id,
-                require_private_server=True,
+                expected_job_id,
             )
         )
         if confirmed:
@@ -9699,6 +9740,10 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                 reason,
                 opened_at,
                 route_expected_place,
+                str(
+                    rt_tab.get("booster_route_job_id")
+                    or ""
+                ),
             )
             if not retry_continue:
                 rt_tab["note"] = retry_note
@@ -9743,7 +9788,7 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
             )
 
         route_expected_place = ""
-        route_requires_private = False
+        route_expected_job_id = ""
 
         if item.get("manual_booster_route"):
             route_link = target_link(
@@ -9768,9 +9813,9 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                     or "126884695634066"
                 ),
             )
-            route_requires_private = bool(
-                route_link_code
-                or route_access_code
+            route_expected_job_id = str(
+                rt_tab.get("booster_route_job_id")
+                or ""
             )
 
         fresh_ok, fresh_msg = wait_until_fresh_after_open(
@@ -9783,7 +9828,7 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                 item.get("skip_solver_probe")
             ),
             expected_place_id=route_expected_place,
-            require_private_server=route_requires_private,
+            expected_job_id=route_expected_job_id,
         )
         if actual_open_mode == "soft":
             rt_tab["note"] = "soft " + fresh_msg
@@ -10987,10 +11032,39 @@ def booster_entry(prof, state, err, probe=None, probe_err=None, bcfg=None):
         "updated_text": date_time_text(),
         "source": "nomo_rejoin_booster_phase2",
     }
+    identity_source = {}
+    if isinstance(probe, dict):
+        identity_source.update({
+            "username": probe.get("username"),
+            "place_id": probe.get("place_id"),
+            "job_id": probe.get("job_id"),
+        })
+    if isinstance(state, dict):
+        for key in (
+            "username",
+            "place_id",
+            "job_id",
+            "state_ts",
+        ):
+            value = state.get(key)
+            if value not in (None, ""):
+                identity_source[key] = value
+
+    for key in (
+        "username",
+        "place_id",
+        "job_id",
+        "state_ts",
+    ):
+        value = identity_source.get(key)
+        if value not in (None, ""):
+            entry[key] = value
+
+    entry["booster_job_id"] = str(
+        entry.get("job_id") or ""
+    )
+
     if state:
-        for key in ("username", "place_id", "job_id", "state_ts"):
-            if key in state:
-                entry[key] = state.get(key)
         entry["state_age"] = state.get("age")
     else:
         entry["error"] = str(err or "no state")
@@ -11018,6 +11092,7 @@ def booster_signature(entry):
         "enabled": entry.get("enabled"),
         "status": entry.get("status"),
         "server_link": entry.get("server_link"),
+        "job_id": entry.get("job_id"),
         "probe_revision": entry.get("booster_probe_revision"),
         "matches": compact_matches,
     }, sort_keys=True, separators=(",", ":"))
@@ -20220,16 +20295,23 @@ def normalized_private_route_link(
 def market_booster_state_matches_route(
     state,
     expected_place_id,
-    require_private_server=True,
+    expected_job_id,
 ):
+    """Confirm the exact Booster instance using Roblox JobId."""
     if not isinstance(state, dict):
         return False, "no state"
 
     expected_place_id = str(
         expected_place_id or ""
     ).strip()
+    expected_job_id = str(
+        expected_job_id or ""
+    ).strip()
     actual_place_id = str(
         state.get("place_id") or ""
+    ).strip()
+    actual_job_id = str(
+        state.get("job_id") or ""
     ).strip()
 
     if (
@@ -20241,22 +20323,20 @@ def market_booster_state_matches_route(
             f"wrong place {actual_place_id or '-'}",
         )
 
-    if require_private_server:
-        private_known = bool(
-            state.get("private_server_known", False)
+    if not expected_job_id:
+        return False, "Booster backend job_id missing"
+
+    if not actual_job_id:
+        return False, "joined state job_id missing"
+
+    if actual_job_id != expected_job_id:
+        return (
+            False,
+            "wrong server job "
+            f"{actual_job_id[:12] or '-'}",
         )
-        is_private = state.get(
-            "is_private_server",
-            None,
-        )
 
-        if not private_known or is_private is None:
-            return False, "private-server status unknown"
-
-        if not bool(is_private):
-            return False, "joined public server"
-
-    return True, "private Booster confirmed"
+    return True, "exact Booster job confirmed"
 
 
 def market_booster_route_state_confirmed(
@@ -20264,7 +20344,7 @@ def market_booster_route_state_confirmed(
     cfg,
     opened_at,
     expected_place_id,
-    require_private_server=True,
+    expected_job_id,
 ):
     fresh, state, err = state_fresh_after_open(
         tab,
@@ -20277,7 +20357,7 @@ def market_booster_route_state_confirmed(
     matched, note = market_booster_state_matches_route(
         state,
         expected_place_id,
-        require_private_server=require_private_server,
+        expected_job_id,
     )
     return matched, state, note
 
