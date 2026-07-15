@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.58.14 — PRIVATE BOOSTER ROUTE CONFIRMATION
+# - Fresh Market state cannot confirm a Market->Booster route.
+# - Fresh public Main Garden state cannot confirm a private Booster route.
+# - The second soft intent is skipped only after expected-place PRIVATE state.
+# - Full route wait requires expected place plus is_private_server=true.
+# - Market rejects placeId-only public links before opening Roblox.
+# - Booster reports extracted private join material separately for the pool.
+# - Exact-PID hard fallback remains only after both soft intents fail.
+#
 # V4.58.13 — BOOSTER DOUBLE SOFT ROUTE
 # - Removes the incorrect Roblox homepage age/access-gate assumption.
 # - Market->Booster sends the same task-reuse private-server deep link a second
@@ -342,7 +351,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.58.13"
+__version__ = "V4.58.14"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -6234,8 +6243,31 @@ def market_booster_pool_entries(cfg, rt=None, force=False):
         }:
             continue
 
-        link = str(item.get("server_link") or "").strip()
-        if not link or link.startswith(("YOUR_", "PUT_")):
+        raw_link = str(
+            item.get("server_link") or ""
+        ).strip()
+        (
+            link,
+            private_place_id,
+            private_link_code,
+            private_access_code,
+        ) = normalized_private_route_link(
+            raw_link,
+            record=item,
+            default_place_id=str(
+                cfg.get(
+                    "market_booster_expected_place_id",
+                    "126884695634066",
+                )
+                or "126884695634066"
+            ),
+        )
+
+        # A placeId-only link is a public-server route.
+        if not link or not (
+            private_link_code
+            or private_access_code
+        ):
             continue
 
         updated_at = _cloudflare_item_updated_seconds(item)
@@ -6287,6 +6319,14 @@ def market_booster_pool_entries(cfg, rt=None, force=False):
         choices.append({
             "name": name,
             "link": link,
+            "private_place_id": private_place_id,
+            "private_link_code": private_link_code,
+            "private_access_code": private_access_code,
+            "route_kind": (
+                "privateServerLinkCode"
+                if private_link_code
+                else "accessCode"
+            ),
             "age": max(0, age),
             "updated_at": updated_at,
             "pet_count": pet_count,
@@ -6443,29 +6483,31 @@ def market_manual_join_booster(cfg, booster, package):
     if not raw_link:
         return False, "Booster has no link"
 
-    link = android_safe_roblox_link(raw_link, cfg)
-    expected_place = (
-        extract_place_id_from_link(link)
-        or str(
+    (
+        link,
+        expected_place,
+        private_link_code,
+        private_access_code,
+    ) = normalized_private_route_link(
+        raw_link,
+        record=booster.get("raw"),
+        default_place_id=str(
             cfg.get(
                 "market_booster_expected_place_id",
                 "126884695634066",
             )
-            or ""
-        )
+            or "126884695634066"
+        ),
     )
 
-    low_link = link.lower()
-    if (
-        "roblox.com/share?" in low_link
-        and "privateserverlinkcode=" not in low_link
-        and "linkcode=" not in low_link
-        and "accesscode=" not in low_link
+    if not link or not (
+        private_link_code
+        or private_access_code
     ):
         return (
             False,
-            "Booster backend contains a share link, not "
-            "privateServerLinkCode",
+            "Booster backend link is public-only; "
+            "private code is missing",
         )
 
     booster = dict(booster)
@@ -6506,24 +6548,21 @@ def market_manual_join_booster(cfg, booster, package):
         save_runtime(latest_rt)
         return False, note
 
-    fresh, state, state_err = state_fresh_after_open(
-        tab,
-        cfg,
-        route_started_at,
+    confirmed, state, state_err = (
+        market_booster_route_state_confirmed(
+            tab,
+            cfg,
+            route_started_at,
+            expected_place,
+            require_private_server=True,
+        )
     )
     actual_place = str(
         (state or {}).get("place_id")
         or ""
     )
 
-    if (
-        not fresh
-        or (
-            expected_place
-            and actual_place
-            and actual_place != expected_place
-        )
-    ):
+    if not confirmed:
         market_clear_booster_route(latest_tab)
         latest_tab["target"] = "market"
         latest_tab["note"] = (
@@ -6710,6 +6749,10 @@ def market_booster_pool_menu(cfg):
             print(f"Booster : {booster.get('name')}")
             print(f"Pets    : {booster.get('pet_count')}")
             print(f"Valuable: {booster.get('match_count')}")
+            print(
+                f"Route   : PRIVATE "
+                f"({booster.get('route_kind', 'unknown')})"
+            )
             print(f"Top     : {market_booster_top_summary(booster, cfg)}")
             confirm = input("Safe-route this package now? [y/N]: ").strip().lower()
             if confirm != "y":
@@ -9061,6 +9104,8 @@ def wait_until_fresh_after_open(
     opened_at,
     timeout_override=None,
     allow_solver_probe=True,
+    expected_place_id="",
+    require_private_server=False,
 ):
     if not cfg.get("wait_fresh_after_open", True):
         return True, "fresh wait disabled"
@@ -9163,6 +9208,24 @@ def wait_until_fresh_after_open(
             return False, "solver pending" if solver_status == "Solving" else "manual challenge"
         elif solver_job_running(pkg):
             status_note = solver_job_note(pkg)
+        elif fresh and (
+            expected_place_id
+            or require_private_server
+        ):
+            route_ok, route_note = (
+                market_booster_state_matches_route(
+                    state,
+                    expected_place_id,
+                    require_private_server=(
+                        require_private_server
+                    ),
+                )
+            )
+            status_note = (
+                "waiting route: " + route_note
+                if not route_ok
+                else "waiting fresh state"
+            )
         elif not alive:
             missing_for = max(0, now() - int(process_missing_since or now()))
             if seen_alive_after_open:
@@ -9182,8 +9245,24 @@ def wait_until_fresh_after_open(
 
         wait_fresh_screen(tab, cfg, elapsed, timeout, alive, state, err, status_note)
 
+        route_ok = True
+        if fresh and (
+            expected_place_id
+            or require_private_server
+        ):
+            route_ok, _route_note = (
+                market_booster_state_matches_route(
+                    state,
+                    expected_place_id,
+                    require_private_server=(
+                        require_private_server
+                    ),
+                )
+            )
+
         clean_fresh = bool(
             fresh
+            and route_ok
             and not state_disconnect_ui(state)
             and not state_login_challenge_detail(state)
         )
@@ -9456,6 +9535,7 @@ def market_booster_second_soft_intent(
     target,
     reason,
     first_opened_at,
+    expected_place_id,
 ):
     """Retry the same task-reuse deep link once when Roblox lands on Home."""
     if not cfg.get(
@@ -9480,13 +9560,21 @@ def market_booster_second_soft_intent(
             save_runtime(rt)
             return False, first_opened_at, "stop"
 
-        fresh, _state, _err = state_fresh_after_open(
-            tab,
-            cfg,
-            first_opened_at,
+        confirmed, _state, _note = (
+            market_booster_route_state_confirmed(
+                tab,
+                cfg,
+                first_opened_at,
+                expected_place_id,
+                require_private_server=True,
+            )
         )
-        if fresh:
-            return True, first_opened_at, "first intent confirmed"
+        if confirmed:
+            return (
+                True,
+                first_opened_at,
+                "first private intent confirmed",
+            )
 
         if not wait_seconds(1, rt):
             return False, first_opened_at, "stop"
@@ -9575,6 +9663,29 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                 "manual_booster_second_intent_done"
             )
         ):
+            route_link = target_link(
+                tab,
+                cfg,
+                target,
+                rt_tab,
+                rt,
+            )
+            (
+                _private_link,
+                route_expected_place,
+                _route_link_code,
+                _route_access_code,
+            ) = normalized_private_route_link(
+                route_link,
+                default_place_id=str(
+                    cfg.get(
+                        "market_booster_expected_place_id",
+                        "126884695634066",
+                    )
+                    or "126884695634066"
+                ),
+            )
+
             (
                 retry_continue,
                 retry_opened_at,
@@ -9587,6 +9698,7 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                 target,
                 reason,
                 opened_at,
+                route_expected_place,
             )
             if not retry_continue:
                 rt_tab["note"] = retry_note
@@ -9630,6 +9742,37 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                 route_timeout,
             )
 
+        route_expected_place = ""
+        route_requires_private = False
+
+        if item.get("manual_booster_route"):
+            route_link = target_link(
+                tab,
+                cfg,
+                target,
+                rt_tab,
+                rt,
+            )
+            (
+                _private_link,
+                route_expected_place,
+                route_link_code,
+                route_access_code,
+            ) = normalized_private_route_link(
+                route_link,
+                default_place_id=str(
+                    cfg.get(
+                        "market_booster_expected_place_id",
+                        "126884695634066",
+                    )
+                    or "126884695634066"
+                ),
+            )
+            route_requires_private = bool(
+                route_link_code
+                or route_access_code
+            )
+
         fresh_ok, fresh_msg = wait_until_fresh_after_open(
             tab,
             cfg,
@@ -9639,6 +9782,8 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
             allow_solver_probe=not bool(
                 item.get("skip_solver_probe")
             ),
+            expected_place_id=route_expected_place,
+            require_private_server=route_requires_private,
         )
         if actual_open_mode == "soft":
             rt_tab["note"] = "soft " + fresh_msg
@@ -10757,6 +10902,22 @@ def save_booster_runtime(rt):
 def booster_entry(prof, state, err, probe=None, probe_err=None, bcfg=None):
     bcfg = load_booster_config() if bcfg is None else bcfg
     link = str(prof.get("server_link") or "").strip()
+    (
+        private_route_link,
+        private_place_id,
+        private_link_code,
+        private_access_code,
+    ) = normalized_private_route_link(
+        link,
+        record={
+            "place_id": (
+                (state or {}).get("place_id")
+                or (probe or {}).get("place_id")
+                or "126884695634066"
+            ),
+        },
+        default_place_id="126884695634066",
+    )
     probe_status, probe_reportable, probe_note = booster_probe_quality(probe, probe_err, bcfg)
     matches = booster_probe_matches(probe, bcfg) if probe_reportable else []
 
@@ -10779,7 +10940,17 @@ def booster_entry(prof, state, err, probe=None, probe_err=None, bcfg=None):
         "mode": "booster",
         "role": "booster",
         "status": status,
-        "server_link": link,
+        "server_link": private_route_link or link,
+        "private_server_place_id": private_place_id,
+        "private_server_link_code": private_link_code,
+        "private_server_access_code": private_access_code,
+        "private_route_ready": bool(
+            private_route_link
+            and (
+                private_link_code
+                or private_access_code
+            )
+        ),
         "pet_count": int(
             (state or {}).get(
                 "pet_count",
@@ -19914,6 +20085,201 @@ def _private_server_item_from_profile(profile):
         "active": True,
         "raw": {},
     }
+
+
+
+def private_join_parts(link, default_place_id=""):
+    raw = str(link or "").strip()
+    place_id = (
+        extract_place_id_from_link(raw)
+        or str(default_place_id or "").strip()
+    )
+    link_code = ""
+    access_code = ""
+
+    try:
+        parsed = urllib.parse.urlparse(raw)
+        query = urllib.parse.parse_qs(
+            parsed.query,
+            keep_blank_values=False,
+        )
+        lowered = {
+            str(key).lower(): values
+            for key, values in query.items()
+        }
+
+        for key in (
+            "privateserverlinkcode",
+            "linkcode",
+        ):
+            values = lowered.get(key)
+            if values and values[0]:
+                link_code = str(values[0]).strip()
+                break
+
+        values = lowered.get("accesscode")
+        if values and values[0]:
+            access_code = str(values[0]).strip()
+    except Exception:
+        pass
+
+    if not link_code:
+        match = re.search(
+            r"(?:privateServerLinkCode|linkCode)=([^&#\\s]+)",
+            raw,
+            flags=re.I,
+        )
+        if match:
+            link_code = urllib.parse.unquote(
+                match.group(1)
+            ).strip()
+
+    if not access_code:
+        match = re.search(
+            r"accessCode=([^&#\\s]+)",
+            raw,
+            flags=re.I,
+        )
+        if match:
+            access_code = urllib.parse.unquote(
+                match.group(1)
+            ).strip()
+
+    return str(place_id or ""), link_code, access_code
+
+
+def normalized_private_route_link(
+    link="",
+    record=None,
+    default_place_id="",
+):
+    record = record if isinstance(record, dict) else {}
+
+    place_id, link_code, access_code = private_join_parts(
+        link,
+        default_place_id=(
+            record.get("private_server_place_id")
+            or record.get("place_id")
+            or default_place_id
+        ),
+    )
+
+    if not link_code:
+        link_code = str(
+            record.get("private_server_link_code")
+            or record.get("privateServerLinkCode")
+            or record.get("link_code")
+            or record.get("linkCode")
+            or ""
+        ).strip()
+
+    if not access_code:
+        access_code = str(
+            record.get("private_server_access_code")
+            or record.get("accessCode")
+            or record.get("access_code")
+            or ""
+        ).strip()
+
+    if not place_id:
+        place_id = str(
+            record.get("private_server_place_id")
+            or record.get("place_id")
+            or default_place_id
+            or ""
+        ).strip()
+
+    if not place_id:
+        return "", "", "", ""
+
+    if link_code:
+        return (
+            "roblox://experiences/start?"
+            f"placeId={place_id}"
+            "&privateServerLinkCode="
+            f"{urllib.parse.quote(link_code, safe='')}",
+            place_id,
+            link_code,
+            "",
+        )
+
+    if access_code:
+        return (
+            "roblox://experiences/start?"
+            f"placeId={place_id}"
+            "&accessCode="
+            f"{urllib.parse.quote(access_code, safe='')}",
+            place_id,
+            "",
+            access_code,
+        )
+
+    return "", place_id, "", ""
+
+
+def market_booster_state_matches_route(
+    state,
+    expected_place_id,
+    require_private_server=True,
+):
+    if not isinstance(state, dict):
+        return False, "no state"
+
+    expected_place_id = str(
+        expected_place_id or ""
+    ).strip()
+    actual_place_id = str(
+        state.get("place_id") or ""
+    ).strip()
+
+    if (
+        expected_place_id
+        and actual_place_id != expected_place_id
+    ):
+        return (
+            False,
+            f"wrong place {actual_place_id or '-'}",
+        )
+
+    if require_private_server:
+        private_known = bool(
+            state.get("private_server_known", False)
+        )
+        is_private = state.get(
+            "is_private_server",
+            None,
+        )
+
+        if not private_known or is_private is None:
+            return False, "private-server status unknown"
+
+        if not bool(is_private):
+            return False, "joined public server"
+
+    return True, "private Booster confirmed"
+
+
+def market_booster_route_state_confirmed(
+    tab,
+    cfg,
+    opened_at,
+    expected_place_id,
+    require_private_server=True,
+):
+    fresh, state, err = state_fresh_after_open(
+        tab,
+        cfg,
+        opened_at,
+    )
+    if not fresh:
+        return False, state, str(err or "no fresh state")
+
+    matched, note = market_booster_state_matches_route(
+        state,
+        expected_place_id,
+        require_private_server=require_private_server,
+    )
+    return matched, state, note
 
 
 def build_private_server_link(place_id, item):
