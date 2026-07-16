@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.58.20 — RESTORE PRIVATE-SERVER FETCH
+# - Restores Option 5 Fetch/create HATCHER/BOOSTER servers.
+# - Restores Booster Option 13 automatic create/reuse and Market access sync.
+# - Manual Hatcher/Booster private-link editing remains available.
+# - Booster still literally runs the real Hatcher loop.
+# - Hatcher profiles remain the sole routing/state/link authority.
+# - Booster differs only in dashboard and valuable-pet backend reporting.
+# - Stable counter and verified Booster probe Lua remain unchanged.
+#
 # V4.58.19 — BOOSTER IS HATCHER
 # - Booster mode literally runs the real Hatcher loop.
 # - Only Hatcher reporting/dashboard callbacks are swapped for Booster output.
@@ -403,7 +412,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.58.19"
+__version__ = "V4.58.20"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -5169,22 +5178,20 @@ def register_market_accounts_to_d1(cfg=None):
 
 
 
+
 def _nomo_set_global_private_server_menu_original(cfg=None):
-    """Manual link editor only; fetch/create was removed."""
+    """Market links, manual Hatcher links, and automatic server fetch/create."""
     if cfg is None:
         cfg = load_config()
 
     while True:
         cfg = load_config()
         clear()
-        banner(
-            "SET PRIVATE SERVER / LINKS — MANUAL ONLY",
-            cfg,
-        )
+        banner("SET PRIVATE SERVER / LINKS", cfg)
         print(
             col(
-                "Auto fetch/create removed. Manual links are never overwritten.",
-                GREEN,
+                "Hatcher and Booster use the same Hatcher private-server profiles.",
+                DIM,
             )
         )
         print("")
@@ -5203,14 +5210,25 @@ def _nomo_set_global_private_server_menu_original(cfg=None):
         print("")
         print("1. Edit MARKET game link")
         print("2. Edit MARKET restock/private servers")
-        print("3. Edit HATCHER / BOOSTER private servers")
-        print("4. Register MARKET accounts to D1 (one-time)")
+        print("3. Edit HATCHER / BOOSTER private servers manually")
+        print("4. Fetch/create HATCHER / BOOSTER servers + sync Market access")
+        print("5. Register MARKET accounts to D1 (one-time)")
         print("0. Back")
 
         drain_stdin()
         choice = read_menu_choice(
             "\nChoose: ",
-            {"0", "1", "2", "3", "4", "q", "b", "back"},
+            {
+                "0",
+                "1",
+                "2",
+                "3",
+                "4",
+                "5",
+                "q",
+                "b",
+                "back",
+            },
         )
 
         if choice in {"0", "q", "b", "back"}:
@@ -5224,10 +5242,16 @@ def _nomo_set_global_private_server_menu_original(cfg=None):
             elif choice == "3":
                 set_hatcher_servers(cfg)
             elif choice == "4":
+                auto_fetch_private_servers(cfg)
+            elif choice == "5":
                 register_market_accounts_to_d1(cfg)
+            else:
+                print("Invalid choice.")
+                time.sleep(1)
         except Exception as exc:
             print(col(f"Error: {exc}", RED))
             pause()
+
 
 
 
@@ -23860,20 +23884,11 @@ def new_redfinger_setup_wizard(cfg=None):
     setup_place_id = None
     auto_layout_result = None
 
-    # Booster uses existing manual Hatcher links; no fetch/create prompt.
-    if role == "booster":
-        setup_place_id = str(
-            load_hatcher_config().get(
-                "expected_place_id",
-                "126884695634066",
-            )
-            or "126884695634066"
-        )
-    else:
-        setup_place_id = _setup_prompt_private_server_place_id(
-            cfg,
-            role,
-        )
+    # All routed roles ask once for a Place ID.
+    setup_place_id = _setup_prompt_private_server_place_id(
+        cfg,
+        role,
+    )
     cfg = load_config()
 
     if role == "market":
@@ -23903,68 +23918,79 @@ def new_redfinger_setup_wizard(cfg=None):
     elif role == "booster":
         print(
             col(
-                "Booster private-server fetch/create: REMOVED",
+                "Create/reuse Booster private servers: YES (automatic)",
                 GREEN,
             )
         )
         print(
             col(
-                "Existing manual Hatcher links are preserved exactly.",
+                "Routing uses the same Hatcher profiles.",
                 CYAN,
             )
+        )
+        print(
+            col(
+                "Sync registered Market access: YES (automatic)",
+                GREEN,
+            )
+        )
+
+        server_result = auto_fetch_private_servers(
+            cfg,
+            selected_packages=selected,
+            pause_at_end=False,
+            sync_market_access=True,
+            automatic=True,
+            place_id_override=setup_place_id,
         )
 
         hcfg = load_hatcher_config()
         bcfg = load_booster_config()
+        hatcher_by_package = {
+            str(profile.get("package") or ""): profile
+            for profile in hatcher_profiles(
+                hcfg,
+                enabled_only=False,
+            )
+        }
+
+        # Booster keeps only reporting identity. Routing remains Hatcher-owned.
+        for booster_profile in booster_profiles(
+            bcfg,
+            enabled_only=False,
+        ):
+            package = str(
+                booster_profile.get("package") or ""
+            )
+            hatcher_profile = hatcher_by_package.get(package)
+            if not isinstance(hatcher_profile, dict):
+                continue
+
+            booster_profile["server_link"] = str(
+                hatcher_profile.get("server_link")
+                or ""
+            )
+            booster_profile["state_file"] = str(
+                hatcher_profile.get("state_file")
+                or booster_profile.get("state_file")
+                or ""
+            )
+
         bcfg["enabled"] = True
         save_booster_config(bcfg)
 
-        selected_set = set(selected)
-        missing_links = []
-
-        for profile in hatcher_profiles(
-            hcfg,
-            enabled_only=False,
-        ):
-            package = str(profile.get("package") or "")
-            if package not in selected_set:
-                continue
-
-            (
-                normalized,
-                _place,
-                link_code,
-                access_code,
-            ) = normalized_private_route_link(
-                str(profile.get("server_link") or ""),
-                record=profile,
-                default_place_id=setup_place_id,
-            )
-
-            if normalized and (
-                link_code
-                or access_code
-            ):
-                profile["server_link"] = normalized
-            else:
-                missing_links.append(package)
-
-        save_hatcher_config(hcfg)
-
-        mode_ok = not missing_links
+        mode_ok = bool(
+            (server_result or {}).get("changed")
+            or (server_result or {}).get("reused")
+            or (server_result or {}).get("ok")
+        )
         mode_msg = (
-            "manual Hatcher private links verified"
+            "Booster Hatcher-profile server setup completed"
             if mode_ok
-            else (
-                "manual private link required for: "
-                + ", ".join(
-                    short_pkg(package)
-                    for package in missing_links
-                )
-            )
+            else "Booster server setup made no changes"
         )
 
-        if backend_ok and mode_ok:
+        if backend_ok:
             print(
                 col(
                     "Force first Booster D1 report: YES (automatic)",
