@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.58.21 — MAIN OPTION 5 BOOSTER MENU FIX
+# - Main Option 5 no longer redirects Booster mode straight to the manual
+#   package/link editor.
+# - Booster mode now opens the complete private-server submenu:
+#     1 Market game link
+#     2 Market restock/private links
+#     3 Manual Hatcher/Booster private links
+#     4 Auto fetch/create Hatcher/Booster + Market access sync
+#     5 Register Market accounts to D1
+# - Booster Config -> Set private server still opens the manual editor directly.
+# - Rejoin Only keeps its own dedicated link menu.
+# - Booster remains the literal Hatcher loop with Booster reporting only.
+#
 # V4.58.20 — RESTORE PRIVATE-SERVER FETCH
 # - Restores Option 5 Fetch/create HATCHER/BOOSTER servers.
 # - Restores Booster Option 13 automatic create/reuse and Market access sync.
@@ -412,7 +425,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.58.20"
+__version__ = "V4.58.21"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -26724,8 +26737,10 @@ def start_rejoin(cfg):
 def set_global_private_server_menu(cfg):
     if active_rejoin_mode(cfg) == "rejoin_only":
         return rejoin_only_link_menu(cfg)
-    if active_rejoin_mode(cfg) == "booster":
-        return booster_server_link_menu(cfg)
+
+    # Main Option 5 must always expose the complete submenu in
+    # Market, Hatcher, and Booster modes. Booster Config option 2
+    # remains the direct manual-link shortcut.
     return _nomo_set_global_private_server_menu_original(cfg)
 
 
