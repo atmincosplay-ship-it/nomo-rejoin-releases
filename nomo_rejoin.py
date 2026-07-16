@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.58.18 — BOOSTER USES HATCHER CORE
+# - Booster no longer owns a separate private-server routing source.
+# - Matching Hatcher profiles are authoritative for package, private link,
+#   state file, executor mapping, startup open, and recovery destination.
+# - A placeId-only/public Hatcher link is rejected; Booster never falls back
+#   to a public server or the global Market link.
+# - Closed Booster clones use the same hard startup queue as Hatcher.
+# - Alive stale/dead/kick/CAPTCHA recovery uses the shared Hatcher engine.
+# - Booster differs only in its valuable-pet probe, dashboard, and D1 payload.
+# - Booster private-link menu now edits the matching Hatcher profile.
+# - Market Booster manual route, Package Manager, Option 4, PID policy and Lua
+#   files remain unchanged.
+#
 # V4.58.17 — DIRECT MANUAL BOOSTER HARD JOIN
 # - Manual Market->Booster no longer enters the normal open queue.
 # - Bypasses silent solver-preflight, pool-stagger, and stale single-flight waits.
@@ -380,7 +393,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.58.17"
+__version__ = "V4.58.18"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -10703,6 +10716,169 @@ def sync_booster_profiles_with_tabs(main_cfg, bcfg, create_missing=True):
 
 
 
+
+def booster_profiles_with_hatcher_routing(
+    bcfg=None,
+    hcfg=None,
+    enabled_only=False,
+):
+    """Overlay Booster reporting identity onto exact Hatcher routing profiles."""
+    bcfg = load_booster_config() if bcfg is None else bcfg
+    hcfg = load_hatcher_config() if hcfg is None else hcfg
+
+    hatcher_by_package = {
+        str(profile.get("package") or ""): profile
+        for profile in hatcher_profiles(
+            hcfg,
+            enabled_only=False,
+        )
+    }
+
+    output = []
+    default_place = str(
+        hcfg.get(
+            "expected_place_id",
+            "126884695634066",
+        )
+        or "126884695634066"
+    )
+
+    for booster in booster_profiles(
+        bcfg,
+        enabled_only=False,
+    ):
+        if (
+            enabled_only
+            and not booster.get("enabled", True)
+        ):
+            continue
+
+        package = str(
+            booster.get("package") or ""
+        )
+        routed = dict(booster)
+        hatcher = hatcher_by_package.get(package)
+
+        routed["routing_source"] = "hatcher"
+        routed["routing_profile_found"] = bool(hatcher)
+        routed["routing_error"] = ""
+
+        if not isinstance(hatcher, dict):
+            routed["server_link"] = ""
+            routed["routing_error"] = (
+                "matching Hatcher profile missing"
+            )
+            output.append(routed)
+            continue
+
+        raw_link = str(
+            hatcher.get("server_link") or ""
+        ).strip()
+        (
+            private_link,
+            private_place_id,
+            private_link_code,
+            private_access_code,
+        ) = normalized_private_route_link(
+            raw_link,
+            record=hatcher,
+            default_place_id=default_place,
+        )
+
+        # Fail closed. Never turn an invalid/private-missing profile into a
+        # public placeId join or global Market fallback.
+        if not private_link or not (
+            private_link_code
+            or private_access_code
+        ):
+            routed["server_link"] = ""
+            routed["routing_error"] = (
+                "Hatcher private link missing"
+            )
+        else:
+            routed["server_link"] = private_link
+
+        routed["private_server_place_id"] = (
+            private_place_id
+        )
+        routed["private_server_link_code"] = (
+            private_link_code
+        )
+        routed["private_server_access_code"] = (
+            private_access_code
+        )
+
+        for key in (
+            "state_file",
+            "executor_storage",
+            "delta_mapping_locked",
+            "delta_mapping_conflict",
+            "delta_mapping_source",
+        ):
+            if key in hatcher:
+                routed[key] = hatcher.get(key)
+
+        output.append(routed)
+
+    return output
+
+
+def booster_hatcher_startup_queue(
+    open_queue,
+    tabs,
+    cfg,
+    rt,
+):
+    """Use Hatcher's hard closed-package startup behavior for Booster."""
+    queued = []
+    skipped = []
+
+    if not cfg.get("open_all_on_start", True):
+        return queued, skipped
+
+    for tab in tabs:
+        package = str(tab.get("package") or "")
+        link = str(tab.get("server_link") or "").strip()
+
+        if not link:
+            skipped.append(
+                (package, "Hatcher private link missing")
+            )
+            continue
+
+        rt_tab = get_runtime_tab(rt, package)
+        rt_tab["target"] = "hatcher"
+        rt_tab["booster_routing_core"] = "hatcher"
+
+        if package_alive(package, cfg, fresh=True):
+            skipped.append((package, "already alive"))
+            continue
+
+        added, note = queue_open(
+            open_queue,
+            tab,
+            "hatcher",
+            "booster hatcher-core start",
+            force=True,
+            skip_if_alive=True,
+            mode="hard_force",
+            bypass_manual=True,
+            metadata={
+                "pid_only_recovery": True,
+                "recovery_must_open_once": True,
+                "bypass_recheck": True,
+                "booster_hatcher_core": True,
+            },
+        )
+        if added:
+            queued.append(package)
+        else:
+            skipped.append((package, note))
+
+    save_runtime(rt)
+    return queued, skipped
+
+
 def booster_profile_to_tab(prof):
     return {
         "enabled": bool(prof.get("enabled", True)),
@@ -11321,7 +11497,11 @@ def booster_report_once(bcfg=None, force=False, state_cache=None):
     removes = []
     probe_waiting = []
     brt = load_booster_runtime()
-    profiles = booster_profiles(bcfg, enabled_only=False)
+    profiles = booster_profiles_with_hatcher_routing(
+        bcfg,
+        load_hatcher_config(),
+        enabled_only=False,
+    )
     current_profile_names = {
         str(profile.get("booster_name") or "booster")
         for profile in profiles
@@ -11443,51 +11623,74 @@ def booster_status_screen(rows, bcfg, cfg, session_start, loops, last_msg=""):
 
 
 
+
 def start_booster_safe_rejoiner(main_cfg=None):
+    """Hatcher routing/rejoin core with Booster-only reporting."""
     global _STOP_REQUESTED
     _STOP_REQUESTED = False
+
     cfg = dict(load_config())
     if isinstance(main_cfg, dict):
         cfg.update(main_cfg)
-    cfg["disable_soft_rejoin"] = False
+
+    # Match the Hatcher runtime's safety/open behavior.
+    cfg["no_force_stop_alive"] = True
+    cfg["alive_open_mode"] = "soft"
+    cfg["soft_hop_fallback_hard"] = False
     cfg["scheduled_hop_enabled"] = False
+    cfg["clear_cache_on_soft_hop"] = False
     cfg["smart_open_queue"] = True
     cfg["wait_fresh_after_open"] = True
+    cfg["open_only_closed_on_start"] = True
+    cfg["disable_soft_rejoin"] = False
+    cfg["hatcher_never_force_stop_alive_automatic"] = False
     cfg["alive_recovery_soft_first"] = False
     cfg["alive_recovery_hard_fallback"] = True
 
     bcfg = load_booster_config()
-    enabled_profiles = booster_profiles(bcfg, enabled_only=True)
+    hcfg = load_hatcher_config()
+    profiles_list = booster_profiles_with_hatcher_routing(
+        bcfg,
+        hcfg,
+        enabled_only=True,
+    )
     enabled_packages = [
         str(profile.get("package") or "")
-        for profile in enabled_profiles
+        for profile in profiles_list
         if str(profile.get("package") or "")
     ]
+
     counter_install_results = []
     probe_install_results = []
 
     try:
-        counter_install_results = _setup_install_counter_for_packages(
-            cfg,
-            enabled_packages,
-            "1",
+        counter_install_results = (
+            _setup_install_counter_for_packages(
+                cfg,
+                enabled_packages,
+                "1",
+            )
         )
     except Exception as exc:
         log_activity(
-            f"Booster stable counter install warning: {cut(exc, 80)}",
+            "Booster stable counter install warning: "
+            + cut(exc, 80),
             "",
             YELLOW,
         )
 
     try:
-        probe_install_results = _setup_install_booster_probe_for_packages(
-            cfg,
-            enabled_packages,
-            "1",
+        probe_install_results = (
+            _setup_install_booster_probe_for_packages(
+                cfg,
+                enabled_packages,
+                "1",
+            )
         )
     except Exception as exc:
         log_activity(
-            f"Booster probe loader install warning: {cut(exc, 80)}",
+            "Booster probe loader install warning: "
+            + cut(exc, 80),
             "",
             YELLOW,
         )
@@ -11497,49 +11700,93 @@ def start_booster_safe_rejoiner(main_cfg=None):
     loops = 0
     open_queue = []
     last_report_at = 0
+
+    tabs = [
+        booster_profile_to_tab(profile)
+        for profile in profiles_list
+    ]
+    startup_queued, startup_skipped = (
+        booster_hatcher_startup_queue(
+            open_queue,
+            tabs,
+            cfg,
+            rt,
+        )
+    )
+
     counter_ok = any(
         ok
-        for _pkg, ok, _note in counter_install_results
+        for _pkg, ok, _note
+        in counter_install_results
     )
     probe_ok = any(
         ok
-        for _pkg, ok, _note in probe_install_results
+        for _pkg, ok, _note
+        in probe_install_results
     )
+
     last_msg = (
-        "stable counter + probe loaders ready"
-        if counter_ok and probe_ok
-        else (
-            "probe ready; stable counter loader warning"
-            if probe_ok
-            else "waiting for scanner JSON"
-        )
+        "Hatcher core ready; "
+        f"startup queued {len(startup_queued)}"
     )
+    if not counter_ok or not probe_ok:
+        last_msg += "; AutoExec loader warning"
 
     while True:
         if stop_requested():
             save_runtime(rt)
             return
+
         loops += 1
+        queue_stuck_self_heal(
+            open_queue,
+            cfg,
+            rt,
+        )
+        poll_solver_jobs(
+            cfg,
+            rt,
+            open_queue,
+        )
+
         bcfg = load_booster_config()
-        profiles_list = booster_profiles(bcfg, enabled_only=True)
-        tabs = [booster_profile_to_tab(profile) for profile in profiles_list]
+        hcfg = load_hatcher_config()
+        profiles_list = (
+            booster_profiles_with_hatcher_routing(
+                bcfg,
+                hcfg,
+                enabled_only=True,
+            )
+        )
+        tabs = [
+            booster_profile_to_tab(profile)
+            for profile in profiles_list
+        ]
         profiles = {
-            str(profile.get("package") or ""): profile
+            str(profile.get("package") or ""):
+                profile
             for profile in profiles_list
         }
+
         rows = []
         state_cache = {}
-        capture_android_ui_snapshot(cfg, force=False)
+        capture_android_ui_snapshot(
+            cfg,
+            force=False,
+        )
 
         for tab in tabs:
-            pkg = tab["package"]
-            prof = profiles.get(pkg) or {}
-            rt_tab = get_runtime_tab(rt, pkg)
-            rt_tab["target"] = "hatcher"
+            package = str(tab.get("package") or "")
+            profile = profiles.get(package) or {}
+            rt_tab = get_runtime_tab(rt, package)
 
-            state, err = read_state(tab)
+            # Booster routing is Hatcher routing. No separate target/link path.
+            rt_tab["target"] = "hatcher"
+            rt_tab["booster_routing_core"] = "hatcher"
+
+            state, state_err = read_state(tab)
             probe, probe_err = booster_read_probe(
-                prof,
+                profile,
                 state=state,
                 bcfg=bcfg,
             )
@@ -11558,14 +11805,17 @@ def start_booster_safe_rejoiner(main_cfg=None):
                 else []
             )
 
-            state_cache[pkg] = {
+            state_cache[package] = {
                 "state": state,
-                "state_err": err,
+                "state_err": state_err,
                 "probe": probe,
                 "probe_err": probe_err,
             }
 
-            alive = package_alive(pkg, cfg)
+            alive = package_alive(
+                package,
+                cfg,
+            )
             (
                 health_state,
                 probe_health_active,
@@ -11580,41 +11830,152 @@ def start_booster_safe_rejoiner(main_cfg=None):
             )
 
             if probe_health_active:
-                # A previously queued old-state recovery is obsolete now.
-                cancel_queued_package(open_queue, pkg)
+                cancel_queued_package(
+                    open_queue,
+                    package,
+                )
                 clear_manual_login_block(rt_tab)
-                clear_hold(pkg)
+                clear_hold(package)
 
             health = evaluate_package_health(
                 tab,
                 cfg,
                 rt_tab,
                 mode="hatcher",
-                hcfg=bcfg,
-                prof=prof,
+                hcfg=hcfg,
+                prof=profile,
                 raw_alive=alive,
                 state=health_state,
-                err=None if probe_health_active else err,
+                err=(
+                    None
+                    if probe_health_active
+                    else state_err
+                ),
             )
-            server_link = str(tab.get("server_link") or "").strip()
-            if not server_link or server_link.startswith(("YOUR_", "PUT_")):
-                status, note, handled = "No server", "server_link missing", True
-                cancel_queued_package(open_queue, pkg)
-            else:
-                status, note, handled = apply_rejoin_action(
-                    open_queue, tab, "hatcher", rt_tab,
-                    cfg, rt, health,
-                    hcfg=bcfg,
-                    mode="booster",
+
+            link = str(
+                tab.get("server_link") or ""
+            ).strip()
+            routing_error = str(
+                profile.get("routing_error")
+                or ""
+            ).strip()
+
+            if not link:
+                cancel_queued_package(
+                    open_queue,
+                    package,
                 )
+                status = "No server"
+                note = (
+                    routing_error
+                    or "Hatcher private link missing"
+                )
+                handled = True
+            else:
+                # Same shared action engine and target used by Hatcher mode.
+                status, note, handled = apply_rejoin_action(
+                    open_queue,
+                    tab,
+                    "hatcher",
+                    rt_tab,
+                    cfg,
+                    rt,
+                    health,
+                    hcfg=hcfg,
+                    mode="hatcher",
+                )
+
+                # Fresh wrong-place/public state uses Hatcher's own teleport
+                # validator and is sent back through the exact private profile.
+                if (
+                    alive
+                    and isinstance(health_state, dict)
+                ):
+                    problem_code, problem_note = (
+                        hatcher_teleport_problem(
+                            tab,
+                            health_state,
+                            hcfg,
+                            cfg,
+                        )
+                    )
+                    if (
+                        problem_code
+                        and cfg.get(
+                            "rejoin_if_crash",
+                            True,
+                        )
+                    ):
+                        should_queue, wait_note = (
+                            should_queue_hatcher_teleport_rejoin(
+                                rt_tab,
+                                hcfg,
+                                cfg,
+                                problem_code,
+                            )
+                        )
+                        if should_queue:
+                            cancel_queued_package(
+                                open_queue,
+                                package,
+                            )
+                            added, _ = queue_open(
+                                open_queue,
+                                tab,
+                                "hatcher",
+                                "booster "
+                                + str(problem_note),
+                                force=True,
+                                mode="hard_force",
+                                bypass_manual=True,
+                                metadata={
+                                    "pid_only_recovery": True,
+                                    "recovery_must_open_once": True,
+                                    "bypass_recheck": True,
+                                    "booster_hatcher_core": True,
+                                },
+                            )
+                            status = (
+                                "Queued"
+                                if added
+                                else "Wrong server"
+                            )
+                            note = (
+                                "private Hatcher-core rejoin queued"
+                                if added
+                                else "already queued"
+                            )
+                            handled = True
+                        elif not handled:
+                            status = "Wrong server"
+                            note = (
+                                str(problem_note)
+                                + " "
+                                + str(wait_note)
+                            ).strip()
+
             if not handled:
-                status = health.get("status") or status
-                note = health.get("note") or note
+                status = (
+                    health.get("status")
+                    or status
+                )
+                note = (
+                    health.get("note")
+                    or note
+                )
 
             probe_ui_note = (
-                f"probe ready; {len(probe_matches)} valuable"
-                if probe_status == "ready" and probe_reportable
-                else f"probe {probe_status}: {probe_note}"
+                f"probe ready; "
+                f"{len(probe_matches)} valuable"
+                if (
+                    probe_status == "ready"
+                    and probe_reportable
+                )
+                else (
+                    f"probe {probe_status}: "
+                    f"{probe_note}"
+                )
             )
 
             if probe_health_active:
@@ -11624,6 +11985,7 @@ def start_booster_safe_rejoiner(main_cfg=None):
                 value
                 for value in (
                     str(note or "").strip(),
+                    "Hatcher core",
                     probe_ui_note,
                 )
                 if value
@@ -11642,8 +12004,10 @@ def start_booster_safe_rejoiner(main_cfg=None):
             )
             matches = (
                 len(probe_matches)
-                if probe_status == "ready"
-                and probe_reportable
+                if (
+                    probe_status == "ready"
+                    and probe_reportable
+                )
                 else "-"
             )
             age = (
@@ -11657,10 +12021,18 @@ def start_booster_safe_rejoiner(main_cfg=None):
                 if health_state
                 else "-"
             )
-            update_clone_session(rt_tab, status, cfg)
+
+            update_clone_session(
+                rt_tab,
+                status,
+                cfg,
+            )
             rows.append({
-                "user": tab.get("user_name", pkg),
-                "pkg": pkg,
+                "user": tab.get(
+                    "user_name",
+                    package,
+                ),
+                "pkg": package,
                 "pets": pets,
                 "matches": matches,
                 "status": status,
@@ -11670,37 +12042,219 @@ def start_booster_safe_rejoiner(main_cfg=None):
             })
 
         save_runtime(rt)
-        interval = max(10, int(bcfg.get("heartbeat_interval", 60) or 60))
-        if last_report_at <= 0 or now() - last_report_at >= interval:
-            ok, msg = booster_report_once(bcfg, force=False, state_cache=state_cache)
-            last_report_at = now()
-            last_msg = ("OK: " if ok else "ERR: ") + msg
-        booster_status_screen(rows, bcfg, cfg, session_start, loops, last_msg)
 
-        if open_queue:
+        report_interval = max(
+            10,
+            int(
+                bcfg.get(
+                    "heartbeat_interval",
+                    60,
+                )
+                or 60
+            ),
+        )
+        if (
+            last_report_at <= 0
+            or now() - last_report_at
+                >= report_interval
+        ):
+            ok, message = booster_report_once(
+                bcfg,
+                force=False,
+                state_cache=state_cache,
+            )
+            last_report_at = now()
+            last_msg = (
+                ("OK: " if ok else "ERR: ")
+                + message
+            )
+
+        booster_status_screen(
+            rows,
+            bcfg,
+            cfg,
+            session_start,
+            loops,
+            last_msg,
+        )
+        print(
+            col(
+                "  Routing: Hatcher private profiles; "
+                "Booster changes reporting only.",
+                GREEN,
+            )
+        )
+
+        if (
+            open_queue
+            and cfg.get(
+                "smart_open_queue",
+                True,
+            )
+        ):
             if not wait_seconds(2, rt):
                 return
-            process_open_queue(open_queue, cfg, rt, session_start, loops)
+            process_open_queue(
+                open_queue,
+                cfg,
+                rt,
+                session_start,
+                loops,
+            )
             continue
-        if not wait_seconds(int(cfg.get("check_interval", 10)), rt):
+
+        if not wait_seconds(
+            int(
+                cfg.get(
+                    "check_interval",
+                    10,
+                )
+            ),
+            rt,
+        ):
             return
+
+
+
 
 def booster_server_link_menu(cfg):
     bcfg = load_booster_config()
-    profiles = booster_profiles(bcfg, enabled_only=False)
-    clear(); banner("BOOSTER PRIVATE SERVERS", cfg)
-    for i, p in enumerate(profiles, 1):
-        print(f"{i}. {short_pkg(p.get('package','')):<10} {p.get('booster_name',''):<16} {short_link(p.get('server_link',''))}")
+    hcfg = load_hatcher_config()
+
+    boosters = booster_profiles(
+        bcfg,
+        enabled_only=False,
+    )
+    hatcher_by_package = {
+        str(profile.get("package") or ""):
+            profile
+        for profile in hatcher_profiles(
+            hcfg,
+            enabled_only=False,
+        )
+    }
+
+    clear()
+    banner(
+        "BOOSTER PRIVATE SERVERS — HATCHER CORE",
+        cfg,
+    )
+    print(
+        col(
+            "Routing links are stored in the matching Hatcher profile.",
+            DIM,
+        )
+    )
+    print("")
+
+    for index, booster in enumerate(
+        boosters,
+        1,
+    ):
+        package = str(
+            booster.get("package") or ""
+        )
+        hatcher = hatcher_by_package.get(
+            package
+        )
+        link = (
+            str(
+                (hatcher or {}).get(
+                    "server_link"
+                )
+                or ""
+            )
+        )
+        print(
+            f"{index}. "
+            f"{short_pkg(package):<10} "
+            f"{booster.get('booster_name',''):<16} "
+            f"{short_link(link)}"
+        )
+
     print("0. Back")
-    ch = input("Choose profile: ").strip()
-    if not ch.isdigit() or ch == "0": return
-    idx = int(ch)-1
-    if not 0 <= idx < len(profiles): return
-    value = input("Private server link: ").strip()
-    if value:
-        profiles[idx]["server_link"] = value
-        save_booster_config(bcfg)
-        print(col("Saved Booster server link.", GREEN)); pause()
+    choice = input(
+        "Choose profile: "
+    ).strip()
+    if (
+        not choice.isdigit()
+        or choice == "0"
+    ):
+        return
+
+    index = int(choice) - 1
+    if not 0 <= index < len(boosters):
+        return
+
+    booster = boosters[index]
+    package = str(
+        booster.get("package") or ""
+    )
+    hatcher = hatcher_by_package.get(
+        package
+    )
+
+    if not isinstance(hatcher, dict):
+        print(
+            col(
+                "Matching Hatcher profile missing. "
+                "Run Option 13 Booster setup.",
+                RED,
+            )
+        )
+        pause()
+        return
+
+    value = input(
+        "Private server link: "
+    ).strip()
+    if not value:
+        return
+
+    (
+        normalized,
+        _place,
+        link_code,
+        access_code,
+    ) = normalized_private_route_link(
+        value,
+        record=hatcher,
+        default_place_id=str(
+            hcfg.get(
+                "expected_place_id",
+                "126884695634066",
+            )
+            or "126884695634066"
+        ),
+    )
+
+    if not normalized or not (
+        link_code
+        or access_code
+    ):
+        print(
+            col(
+                "Rejected: privateServerLinkCode/accessCode missing.",
+                RED,
+            )
+        )
+        pause()
+        return
+
+    hatcher["server_link"] = normalized
+    booster["server_link"] = normalized
+    save_hatcher_config(hcfg)
+    save_booster_config(bcfg)
+
+    print(
+        col(
+            "Saved to Hatcher routing profile "
+            "and Booster report mirror.",
+            GREEN,
+        )
+    )
+    pause()
+
 
 
 def booster_config_menu(cfg):
@@ -11738,10 +12292,12 @@ def open_all_booster_tabs_once(main_cfg=None):
         cfg.update(main_cfg)
     tabs = [
         booster_profile_to_tab(profile)
-        for profile in booster_profiles(
+        for profile in booster_profiles_with_hatcher_routing(
             load_booster_config(),
+            load_hatcher_config(),
             enabled_only=True,
         )
+        if str(profile.get("server_link") or "").strip()
     ]
     if not tabs:
         print(col("No enabled Booster tabs.", YELLOW))
@@ -11749,7 +12305,7 @@ def open_all_booster_tabs_once(main_cfg=None):
         return
 
     print(col(
-        "Option 6 uses the normal queue; solver submits once before every actual Booster open.",
+        "Option 6 uses Hatcher private profiles and the normal exact-PID queue.",
         CYAN,
     ))
     manual_restart_tabs_via_queue(
