@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.58.22 — OPTION 6 LITERAL HATCHER PATH
+# - Booster Option 6 no longer calls a separate Booster restart function.
+# - Booster and Hatcher Option 6 use the exact same package picker, profiles,
+#   target, hard queue, state path, and recovery flow.
+# - Option 6 reconstructs/normalizes the private link from the Hatcher profile.
+# - A profile without privateServerLinkCode/accessCode is skipped fail-closed.
+# - A placeId-only/public link can never be opened by Hatcher/Booster Option 6.
+# - Booster Option 1 remains the literal Hatcher loop with Booster reporting.
+# - Option 5 auto fetch/create and manual editing remain available.
+#
 # V4.58.21 — MAIN OPTION 5 BOOSTER MENU FIX
 # - Main Option 5 no longer redirects Booster mode straight to the manual
 #   package/link editor.
@@ -425,7 +435,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.58.21"
+__version__ = "V4.58.22"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -5268,11 +5278,14 @@ def _nomo_set_global_private_server_menu_original(cfg=None):
 
 
 
+
 def _nomo_force_restart_active_tabs_once_original(cfg=None):
     global _STOP_REQUESTED
     _STOP_REQUESTED = False
+
     if cfg is None:
         cfg = load_config()
+
     selected = choose_packages_common(
         cfg,
         "PID-RESTART ENABLED INSTALLED PACKAGES",
@@ -5284,10 +5297,19 @@ def _nomo_force_restart_active_tabs_once_original(cfg=None):
     )
     if not selected:
         return
-    if active_rejoin_mode(cfg) == "hatcher":
-        open_all_hatcher_tabs_once(cfg, selected_packages=selected)
-    else:
-        open_all_tabs_once(cfg, selected_packages=selected)
+
+    mode = active_rejoin_mode(cfg)
+    if mode in ("hatcher", "booster"):
+        return open_all_hatcher_tabs_once(
+            cfg,
+            selected_packages=selected,
+        )
+
+    return open_all_tabs_once(
+        cfg,
+        selected_packages=selected,
+    )
+
 
 def set_private_server(cfg):
     selected = choose_packages_common(
@@ -11966,36 +11988,17 @@ def booster_config_menu(cfg):
 
 
 
-def open_all_booster_tabs_once(main_cfg=None):
-    cfg = dict(load_config())
-    if isinstance(main_cfg, dict):
-        cfg.update(main_cfg)
-    tabs = [
-        booster_profile_to_tab(profile)
-        for profile in booster_profiles_with_hatcher_routing(
-            load_booster_config(),
-            load_hatcher_config(),
-            enabled_only=True,
-        )
-        if str(profile.get("server_link") or "").strip()
-    ]
-    if not tabs:
-        print(col("No enabled Booster tabs.", YELLOW))
-        pause()
-        return
 
-    print(col(
-        "Option 6 uses Hatcher private profiles and the normal exact-PID queue.",
-        CYAN,
-    ))
-    manual_restart_tabs_via_queue(
-        cfg,
-        tabs,
-        "hatcher",
-        "manual booster force restart",
+def open_all_booster_tabs_once(
+    main_cfg=None,
+    selected_packages=None,
+):
+    """Compatibility wrapper; Booster Option 6 is exactly Hatcher Option 6."""
+    return open_all_hatcher_tabs_once(
+        main_cfg,
+        selected_packages=selected_packages,
     )
-    print(col("\nDone opening booster tabs.", GREEN))
-    pause()
+
 
 
 
@@ -14768,34 +14771,124 @@ HATCHER_MENU_ITEMS = [
 
 
 
-def open_all_hatcher_tabs_once(main_cfg=None, selected_packages=None):
+
+def open_all_hatcher_tabs_once(
+    main_cfg=None,
+    selected_packages=None,
+):
+    """Exact shared Hatcher/Booster Option 6 restart path."""
     cfg = dict(load_config())
     if isinstance(main_cfg, dict):
         cfg.update(main_cfg)
+
     hcfg = load_hatcher_config()
     wanted = set(selected_packages or [])
-    tabs = [
-        hatcher_profile_to_tab(profile)
-        for profile in hatcher_profiles(hcfg, enabled_only=True)
-        if not wanted or profile.get("package") in wanted
-    ]
-    if not tabs:
-        print(col("No enabled Hatcher tabs selected.", YELLOW))
-        pause()
-        return
+    expected_place = str(
+        hcfg.get(
+            "expected_place_id",
+            "126884695634066",
+        )
+        or "126884695634066"
+    )
 
-    print(col(
-        "Option 6 uses the normal queue; solver submits once before every actual Hatcher open.",
-        CYAN,
-    ))
-    manual_restart_tabs_via_queue(
+    tabs = []
+    skipped = []
+
+    for profile in hatcher_profiles(
+        hcfg,
+        enabled_only=True,
+    ):
+        package = str(profile.get("package") or "")
+        if wanted and package not in wanted:
+            continue
+
+        (
+            private_link,
+            _place_id,
+            link_code,
+            access_code,
+        ) = normalized_private_route_link(
+            str(profile.get("server_link") or ""),
+            record=profile,
+            default_place_id=expected_place,
+        )
+
+        # Fail closed: Option 6 must never turn a missing/bad link into a
+        # public placeId launch.
+        if not private_link or not (
+            link_code
+            or access_code
+        ):
+            skipped.append(
+                (
+                    package,
+                    "privateServerLinkCode/accessCode missing",
+                )
+            )
+            continue
+
+        routed_profile = dict(profile)
+        routed_profile["server_link"] = private_link
+        tabs.append(
+            hatcher_profile_to_tab(
+                routed_profile
+            )
+        )
+
+    if skipped:
+        print(
+            col(
+                "Skipped profiles with no valid private-server code:",
+                YELLOW,
+            )
+        )
+        for package, reason in skipped:
+            print(
+                f"  {short_pkg(package):<10} "
+                f"{col(reason, RED)}"
+            )
+        print("")
+
+    if not tabs:
+        print(
+            col(
+                "No selected Hatcher/Booster package has a valid "
+                "privateServerLinkCode/accessCode.",
+                RED,
+            )
+        )
+        pause()
+        return False
+
+    print(
+        col(
+            "Option 6: literal Hatcher hard-restart path.",
+            CYAN,
+        )
+    )
+    print(
+        col(
+            "Every queued link was verified as private before PID restart.",
+            GREEN,
+        )
+    )
+
+    ok = manual_restart_tabs_via_queue(
         cfg,
         tabs,
         "hatcher",
-        "manual hatcher force restart",
+        "manual hatcher/booster force restart",
     )
-    print(col("\nDone opening hatcher tabs.", GREEN))
+
+    print(
+        col(
+            "\nDone opening Hatcher/Booster tabs.",
+            GREEN if ok else YELLOW,
+        )
+    )
     pause()
+    return bool(ok)
+
 def hatching_mode_menu(main_cfg):
     while True:
         main_cfg = load_config()
@@ -26745,12 +26838,15 @@ def set_global_private_server_menu(cfg):
 
 
 
+
 def force_restart_active_tabs_once(cfg):
     if active_rejoin_mode(cfg) == "rejoin_only":
         return rejoin_only_force_restart_all(cfg)
-    if active_rejoin_mode(cfg) == "booster":
-        return open_all_booster_tabs_once(cfg)
+
+    # Market uses Market tabs. Hatcher and Booster are resolved inside the
+    # shared original picker, where both use open_all_hatcher_tabs_once().
     return _nomo_force_restart_active_tabs_once_original(cfg)
+
 
 def main():
     cfg = load_config()
