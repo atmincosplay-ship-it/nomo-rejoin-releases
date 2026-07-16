@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.58.17 — DIRECT MANUAL BOOSTER HARD JOIN
+# - Manual Market->Booster no longer enters the normal open queue.
+# - Bypasses silent solver-preflight, pool-stagger, and stale single-flight waits.
+# - Prints visible progress immediately after the user confirms the route.
+# - Stops only the selected package's verified exact PID and opens once.
+# - Post-open CAPTCHA detection/provider probe remains available while waiting.
+# - Success still requires fresh Main Garden state with exact Booster job_id.
+# - Automatic/recovery queue behavior and every other mode remain unchanged.
+#
 # V4.58.16 — BOOSTER HARD PRIVATE JOIN
 # - Market->Booster no longer uses task reuse or double-soft deep links.
 # - It stops only the selected package's verified exact PID, then opens the
@@ -371,7 +380,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.58.16"
+__version__ = "V4.58.17"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -6457,61 +6466,159 @@ def market_clear_booster_route(rt_tab):
 
 
 
+
 def market_run_booster_hard_join_queue(
     cfg,
     tab,
     reason,
+    expected_place_id="",
+    expected_job_id="",
 ):
-    """One exact-PID hard open for Market -> private Booster."""
+    """Direct exact-PID hard open for one manual Market -> Booster route."""
     package = str(tab.get("package") or "")
     if not package:
         return False, "package missing"
 
     rt = load_runtime()
-    open_queue = []
+    rt_tab = get_runtime_tab(rt, package)
 
-    added, note = queue_open(
-        open_queue,
+    # A manual menu action must not sit silently behind a stale queue lock.
+    holder = str(rt.get("_open_lock_pkg", "") or "")
+    held_at = int(rt.get("_open_lock_at", 0) or 0)
+    max_hold = max(
+        30,
+        int(
+            cfg.get(
+                "single_flight_max_seconds",
+                420,
+            )
+            or 420
+        ),
+    )
+
+    if holder:
+        stale = (
+            held_at <= 0
+            or now() - held_at >= max_hold
+        )
+        if holder == package or stale:
+            rt["_open_lock_pkg"] = ""
+            rt["_open_lock_at"] = 0
+            save_runtime(rt)
+        else:
+            return (
+                False,
+                f"another package is opening: {short_pkg(holder)}",
+            )
+
+    clear()
+    banner("MANUAL BOOSTER HARD JOIN", cfg)
+    print(f"Package : {package}")
+    print(f"Target  : Booster")
+    print(
+        "Job     : "
+        + str(expected_job_id or "-")[:24]
+    )
+    print("")
+    print(
+        col(
+            "1/3 Stopping only the selected package PID...",
+            YELLOW,
+        )
+    )
+    log_activity(
+        "manual Booster direct hard join started",
+        package,
+        CYAN,
+    )
+
+    # This direct user-triggered navigation intentionally bypasses the
+    # pre-open provider gate. The post-open wait still detects a real
+    # package-scoped challenge and can start the configured solver.
+    rt_tab["solver_preflight_generation"] = ""
+    rt_tab["solver_preflight_reason"] = ""
+    rt_tab["note"] = "manual Booster direct hard join"
+    save_runtime(rt)
+
+    ok, open_note = open_target(
         tab,
+        rt_tab,
+        cfg,
         "booster",
         reason,
         force=True,
-        skip_if_alive=False,
+        rt=rt,
         mode="hard_force",
-        bypass_manual=True,
-        metadata={
-            "manual_booster_route": True,
-            "manual_booster_hard_route": True,
-            "manual_booster_second_intent_done": True,
-            "bypass_recheck": True,
-            "homepage_hard_retries": int(
-                cfg.get(
-                    "homepage_stuck_max_hard_retries",
-                    1,
-                )
-                or 1
-            ),
-        },
     )
-    if not added:
-        return False, note
+    save_runtime(rt)
 
-    while open_queue:
-        if stop_requested():
-            save_runtime(rt)
-            return False, "stopped"
-
-        process_open_queue(
-            open_queue,
-            cfg,
-            rt,
+    if not ok:
+        print(
+            col(
+                "FAILED: " + str(open_note),
+                RED,
+            )
         )
+        return False, str(open_note)
 
-        if open_queue and not wait_seconds(1, rt):
-            return False, "stopped"
+    opened_at = int(
+        rt_tab.get("last_open", now())
+        or now()
+    )
+
+    print(
+        col(
+            "2/3 Private link opened.",
+            GREEN,
+        )
+    )
+    print(
+        col(
+            "3/3 Waiting for exact Booster server...",
+            CYAN,
+        )
+    )
+    print("")
+
+    timeout = max(
+        30,
+        int(
+            cfg.get(
+                "market_booster_manual_route_wait_seconds",
+                90,
+            )
+            or 90
+        ),
+    )
+
+    fresh_ok, fresh_note = wait_until_fresh_after_open(
+        tab,
+        cfg,
+        rt,
+        opened_at,
+        timeout_override=timeout,
+        # No blind pre-open solver. A real challenge detected after launch
+        # may still start the configured provider once.
+        allow_solver_probe=True,
+        expected_place_id=str(
+            expected_place_id or ""
+        ),
+        expected_job_id=str(
+            expected_job_id or ""
+        ),
+    )
 
     save_runtime(rt)
-    return True, "hard private join completed"
+
+    if not fresh_ok:
+        return (
+            False,
+            "Booster hard join failed: "
+            + str(fresh_note),
+        )
+
+    return True, "exact Booster server confirmed"
+
 
 
 def market_run_route_queue(cfg, tabs, target, reason):
@@ -6639,6 +6746,8 @@ def market_manual_join_booster(cfg, booster, package):
             "manual Booster hard private join: "
             f"{booster.get('name', 'booster')}"
         ),
+        expected_place_id=expected_place,
+        expected_job_id=expected_job_id,
     )
 
     latest_rt = load_runtime()
