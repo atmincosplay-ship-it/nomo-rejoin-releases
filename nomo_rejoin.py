@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.58.23 — OFFICIAL PRIVATE APP DEEP LINK
+# - Fixes the actual public-server cause: Android private joins now use
+#   roblox://placeId=<id>&linkCode=<code>, not privateServerLinkCode on the
+#   experiences/start route.
+# - Inputs using privateServerLinkCode, linkCode, web links, or saved profile
+#   fields are still accepted and normalized to the direct-app linkCode form.
+# - accessCode routes use roblox://placeId=<id>&accessCode=<code>.
+# - The fix applies to Hatcher start/recovery, Booster, Option 6, auto-fetch,
+#   manual links, and Market->Booster private routes.
+# - Booster/Hatcher Option 6 now shows every installed clone.
+# - Installed clones without a profile/account remain visible and are skipped
+#   with an explicit reason rather than silently disappearing.
+# - Booster remains the literal Hatcher loop with Booster reporting only.
+#
 # V4.58.22 — OPTION 6 LITERAL HATCHER PATH
 # - Booster Option 6 no longer calls a separate Booster restart function.
 # - Booster and Hatcher Option 6 use the exact same package picker, profiles,
@@ -39,7 +53,7 @@
 # - Hatcher target routing is fail-closed; no Market/public fallback.
 # - Option 5 private-server fetch/create is removed.
 # - Booster Option 13 never fetches/creates or overwrites manual private links.
-# - Manual Hatcher/Booster links require privateServerLinkCode/accessCode.
+# - Manual Hatcher/Booster links require linkCode/accessCode.
 # - Stable counter and verified Booster probe Lua remain unchanged.
 #
 # V4.58.18 — BOOSTER USES HATCHER CORE
@@ -115,7 +129,7 @@
 #   selected account for manual Unlock/verification.
 # - Failed routes clear the fake Booster hold and never leave target=booster.
 # - Solver preflight is restored for every manual Booster route generation.
-# - Private links normalize to privateServerLinkCode instead of linkCode.
+# - Superseded: app private links now normalize to official linkCode form.
 # - Booster reporter, Market/Hatcher loops, Package Manager, Option 4 and Lua
 #   files remain unchanged.
 #
@@ -435,7 +449,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.58.22"
+__version__ = "V4.58.23"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -2906,69 +2920,150 @@ def extract_place_id_from_link(link):
     return ""
 
 
+
+def roblox_private_app_link(
+    place_id,
+    link_code="",
+    access_code="",
+):
+    """Build Roblox's direct-to-app private-server deep link."""
+    place_id = str(place_id or "").strip()
+    link_code = str(link_code or "").strip()
+    access_code = str(access_code or "").strip()
+
+    if not place_id:
+        return ""
+
+    base = (
+        "roblox://placeId="
+        + urllib.parse.quote(
+            place_id,
+            safe="",
+        )
+    )
+
+    if link_code:
+        return (
+            base
+            + "&linkCode="
+            + urllib.parse.quote(
+                link_code,
+                safe="",
+            )
+        )
+
+    if access_code:
+        return (
+            base
+            + "&accessCode="
+            + urllib.parse.quote(
+                access_code,
+                safe="",
+            )
+        )
+
+    return ""
+
+
 def android_safe_roblox_link(link, cfg=None):
-    """Normalize join links before Android am start without dropping private codes."""
+    """Normalize joins without dropping or misnaming private-server codes."""
     raw = str(link or "").strip()
     if not raw:
         return raw
 
     cfg = cfg or {}
     low = raw.lower()
+    place_id = extract_place_id_from_link(raw)
+    parsed_link_code = ""
+    parsed_access_code = ""
 
-    # V3.90: preserve/normalize private-server deep-link parameters. The old
-    # normalizer extracted only placeId and silently discarded linkCode, turning
-    # a valid private-server link into a public-server join.
-    pid = extract_place_id_from_link(raw)
-    parsed_code = ""
-    parsed_access = ""
     try:
         parsed = urllib.parse.urlparse(raw)
-        qs = urllib.parse.parse_qs(parsed.query)
-        for key in ("linkCode", "privateServerLinkCode", "privateServerLinkcode"):
-            vals = qs.get(key)
-            if vals and vals[0]:
-                parsed_code = str(vals[0]).strip()
+        query = urllib.parse.parse_qs(
+            parsed.query,
+            keep_blank_values=False,
+        )
+        lowered = {
+            str(key).lower(): values
+            for key, values in query.items()
+        }
+
+        for key in (
+            "linkcode",
+            "privateserverlinkcode",
+        ):
+            values = lowered.get(key)
+            if values and values[0]:
+                parsed_link_code = str(
+                    values[0]
+                ).strip()
                 break
-        vals = qs.get("accessCode")
-        if vals and vals[0]:
-            parsed_access = str(vals[0]).strip()
+
+        values = lowered.get("accesscode")
+        if values and values[0]:
+            parsed_access_code = str(
+                values[0]
+            ).strip()
     except Exception:
         pass
 
-    # Handle roblox:// links whose parameters may not parse cleanly on every
-    # Python build because of mixed-case/custom schemes.
-    if not parsed_code:
-        m = re.search(r"(?:privateServerLinkCode|linkCode)=([^&#]+)", raw, re.I)
-        if m:
-            parsed_code = urllib.parse.unquote(m.group(1))
-    if not parsed_access:
-        m = re.search(r"accessCode=([^&#]+)", raw, re.I)
-        if m:
-            parsed_access = urllib.parse.unquote(m.group(1))
-
-    if pid and parsed_code:
-        return (
-            "roblox://experiences/start?placeId=" + str(pid)
-            + "&privateServerLinkCode="
-            + urllib.parse.quote(parsed_code, safe="")
+    if not parsed_link_code:
+        match = re.search(
+            r"(?:privateServerLinkCode|linkCode)=([^&#\\s]+)",
+            raw,
+            flags=re.I,
         )
-    if pid and parsed_access:
-        return (
-            "roblox://experiences/start?placeId=" + str(pid)
-            + "&accessCode=" + urllib.parse.quote(parsed_access, safe="")
+        if match:
+            parsed_link_code = urllib.parse.unquote(
+                match.group(1)
+            ).strip()
+
+    if not parsed_access_code:
+        match = re.search(
+            r"accessCode=([^&#\\s]+)",
+            raw,
+            flags=re.I,
+        )
+        if match:
+            parsed_access_code = urllib.parse.unquote(
+                match.group(1)
+            ).strip()
+
+    if place_id and (
+        parsed_link_code
+        or parsed_access_code
+    ):
+        return roblox_private_app_link(
+            place_id,
+            link_code=parsed_link_code,
+            access_code=parsed_access_code,
         )
 
-    # Keep modern Roblox share links intact; the app resolves their share code.
-    if "roblox.com/share?" in low or "type=server" in low or ("private" in low and "share" in low):
+    # Keep modern share links intact when no decoded private code is present.
+    if (
+        "roblox.com/share?" in low
+        or "type=server" in low
+        or (
+            "private" in low
+            and "share" in low
+        )
+    ):
         return raw
 
-    if not cfg.get("prefer_experience_start_links", True):
+    if not cfg.get(
+        "prefer_experience_start_links",
+        True,
+    ):
         return raw
 
-    if pid:
-        return f"roblox://experiences/start?placeId={pid}"
+    if place_id:
+        return (
+            "roblox://experiences/start?"
+            f"placeId={place_id}"
+        )
 
     return raw
+
 
 
 def _is_noka_clone_package(pkg):
@@ -5026,7 +5121,7 @@ def set_hatcher_servers(main_cfg=None):
         )
 
     raw = input(
-        "\nPaste privateServerLinkCode/accessCode link "
+        "\nPaste linkCode/privateServerLinkCode/accessCode link "
         "for selected package(s):\n> "
     ).strip()
     if not raw:
@@ -5055,7 +5150,7 @@ def set_hatcher_servers(main_cfg=None):
         print(
             col(
                 "Rejected: placeId/share-only links can join public. "
-                "Use privateServerLinkCode or accessCode.",
+                "Use linkCode/privateServerLinkCode or accessCode.",
                 RED,
             )
         )
@@ -5279,26 +5374,42 @@ def _nomo_set_global_private_server_menu_original(cfg=None):
 
 
 
-def _nomo_force_restart_active_tabs_once_original(cfg=None):
+
+def _nomo_force_restart_active_tabs_once_original(
+    cfg=None,
+):
     global _STOP_REQUESTED
     _STOP_REQUESTED = False
 
     if cfg is None:
         cfg = load_config()
 
-    selected = choose_packages_common(
-        cfg,
-        "PID-RESTART ENABLED INSTALLED PACKAGES",
-        multi=True,
-        enabled_only=True,
-        installed_only=True,
-        include_discovered=False,
-        configured_only=True,
-    )
+    mode = active_rejoin_mode(cfg)
+
+    if mode in ("hatcher", "booster"):
+        selected = choose_packages_common(
+            cfg,
+            "PID-RESTART INSTALLED PACKAGES",
+            multi=True,
+            enabled_only=False,
+            installed_only=True,
+            include_discovered=True,
+            configured_only=False,
+        )
+    else:
+        selected = choose_packages_common(
+            cfg,
+            "PID-RESTART ENABLED INSTALLED PACKAGES",
+            multi=True,
+            enabled_only=True,
+            installed_only=True,
+            include_discovered=False,
+            configured_only=True,
+        )
+
     if not selected:
         return
 
-    mode = active_rejoin_mode(cfg)
     if mode in ("hatcher", "booster"):
         return open_all_hatcher_tabs_once(
             cfg,
@@ -5309,6 +5420,7 @@ def _nomo_force_restart_active_tabs_once_original(cfg=None):
         cfg,
         selected_packages=selected,
     )
+
 
 
 def set_private_server(cfg):
@@ -6546,7 +6658,7 @@ def market_booster_pool_entries(cfg, rt=None, force=False):
             "private_link_code": private_link_code,
             "private_access_code": private_access_code,
             "route_kind": (
-                "privateServerLinkCode"
+                "linkCode"
                 if private_link_code
                 else "accessCode"
             ),
@@ -14772,17 +14884,24 @@ HATCHER_MENU_ITEMS = [
 
 
 
+
 def open_all_hatcher_tabs_once(
     main_cfg=None,
     selected_packages=None,
 ):
-    """Exact shared Hatcher/Booster Option 6 restart path."""
+    """Exact shared Hatcher/Booster Option 6 with private-link validation."""
     cfg = dict(load_config())
     if isinstance(main_cfg, dict):
         cfg.update(main_cfg)
 
     hcfg = load_hatcher_config()
-    wanted = set(selected_packages or [])
+    selected = [
+        str(package or "")
+        for package in (
+            selected_packages or []
+        )
+        if str(package or "")
+    ]
     expected_place = str(
         hcfg.get(
             "expected_place_id",
@@ -14791,15 +14910,39 @@ def open_all_hatcher_tabs_once(
         or "126884695634066"
     )
 
+    profile_by_package = {
+        str(profile.get("package") or ""):
+            profile
+        for profile in hatcher_profiles(
+            hcfg,
+            enabled_only=False,
+        )
+    }
+
     tabs = []
     skipped = []
 
-    for profile in hatcher_profiles(
-        hcfg,
-        enabled_only=True,
-    ):
-        package = str(profile.get("package") or "")
-        if wanted and package not in wanted:
+    for package in selected:
+        profile = profile_by_package.get(
+            package
+        )
+
+        if not isinstance(profile, dict):
+            skipped.append(
+                (
+                    package,
+                    "no Hatcher/Booster profile or account",
+                )
+            )
+            continue
+
+        if not profile.get("enabled", True):
+            skipped.append(
+                (
+                    package,
+                    "Hatcher/Booster profile is OFF",
+                )
+            )
             continue
 
         (
@@ -14808,13 +14951,14 @@ def open_all_hatcher_tabs_once(
             link_code,
             access_code,
         ) = normalized_private_route_link(
-            str(profile.get("server_link") or ""),
+            str(
+                profile.get("server_link")
+                or ""
+            ),
             record=profile,
             default_place_id=expected_place,
         )
 
-        # Fail closed: Option 6 must never turn a missing/bad link into a
-        # public placeId launch.
         if not private_link or not (
             link_code
             or access_code
@@ -14822,13 +14966,15 @@ def open_all_hatcher_tabs_once(
             skipped.append(
                 (
                     package,
-                    "privateServerLinkCode/accessCode missing",
+                    "linkCode/accessCode missing",
                 )
             )
             continue
 
         routed_profile = dict(profile)
-        routed_profile["server_link"] = private_link
+        routed_profile["server_link"] = (
+            private_link
+        )
         tabs.append(
             hatcher_profile_to_tab(
                 routed_profile
@@ -14838,7 +14984,7 @@ def open_all_hatcher_tabs_once(
     if skipped:
         print(
             col(
-                "Skipped profiles with no valid private-server code:",
+                "Skipped selected packages:",
                 YELLOW,
             )
         )
@@ -14852,8 +14998,8 @@ def open_all_hatcher_tabs_once(
     if not tabs:
         print(
             col(
-                "No selected Hatcher/Booster package has a valid "
-                "privateServerLinkCode/accessCode.",
+                "No selected package has an enabled "
+                "Hatcher/Booster profile with linkCode/accessCode.",
                 RED,
             )
         )
@@ -14868,7 +15014,8 @@ def open_all_hatcher_tabs_once(
     )
     print(
         col(
-            "Every queued link was verified as private before PID restart.",
+            "Private app format: "
+            "roblox://placeId=<id>&linkCode=<redacted>",
             GREEN,
         )
     )
@@ -14888,6 +15035,7 @@ def open_all_hatcher_tabs_once(
     )
     pause()
     return bool(ok)
+
 
 def hatching_mode_menu(main_cfg):
     while True:
@@ -20749,17 +20897,28 @@ def private_join_parts(link, default_place_id=""):
     return str(place_id or ""), link_code, access_code
 
 
+
 def normalized_private_route_link(
     link="",
     record=None,
     default_place_id="",
 ):
-    record = record if isinstance(record, dict) else {}
+    record = (
+        record
+        if isinstance(record, dict)
+        else {}
+    )
 
-    place_id, link_code, access_code = private_join_parts(
+    (
+        place_id,
+        link_code,
+        access_code,
+    ) = private_join_parts(
         link,
         default_place_id=(
-            record.get("private_server_place_id")
+            record.get(
+                "private_server_place_id"
+            )
             or record.get("place_id")
             or default_place_id
         ),
@@ -20767,8 +20926,12 @@ def normalized_private_route_link(
 
     if not link_code:
         link_code = str(
-            record.get("private_server_link_code")
-            or record.get("privateServerLinkCode")
+            record.get(
+                "private_server_link_code"
+            )
+            or record.get(
+                "privateServerLinkCode"
+            )
             or record.get("link_code")
             or record.get("linkCode")
             or ""
@@ -20776,7 +20939,9 @@ def normalized_private_route_link(
 
     if not access_code:
         access_code = str(
-            record.get("private_server_access_code")
+            record.get(
+                "private_server_access_code"
+            )
             or record.get("accessCode")
             or record.get("access_code")
             or ""
@@ -20784,7 +20949,9 @@ def normalized_private_route_link(
 
     if not place_id:
         place_id = str(
-            record.get("private_server_place_id")
+            record.get(
+                "private_server_place_id"
+            )
             or record.get("place_id")
             or default_place_id
             or ""
@@ -20795,10 +20962,10 @@ def normalized_private_route_link(
 
     if link_code:
         return (
-            "roblox://experiences/start?"
-            f"placeId={place_id}"
-            "&privateServerLinkCode="
-            f"{urllib.parse.quote(link_code, safe='')}",
+            roblox_private_app_link(
+                place_id,
+                link_code=link_code,
+            ),
             place_id,
             link_code,
             "",
@@ -20806,16 +20973,17 @@ def normalized_private_route_link(
 
     if access_code:
         return (
-            "roblox://experiences/start?"
-            f"placeId={place_id}"
-            "&accessCode="
-            f"{urllib.parse.quote(access_code, safe='')}",
+            roblox_private_app_link(
+                place_id,
+                access_code=access_code,
+            ),
             place_id,
             "",
             access_code,
         )
 
     return "", place_id, "", ""
+
 
 
 def market_booster_state_matches_route(
@@ -20888,24 +21056,30 @@ def market_booster_route_state_confirmed(
     return matched, state, note
 
 
-def build_private_server_link(place_id, item):
-    """Build an Android Roblox deep link from an actual join/link code."""
+
+def build_private_server_link(
+    place_id,
+    item,
+):
+    """Build the direct Roblox app link from a fetched private-server code."""
     if not isinstance(item, dict):
         return ""
-    code = str(item.get("link_code") or "").strip()
-    if code:
-        return (
-            f"roblox://experiences/start?placeId={place_id}"
-            f"&privateServerLinkCode="
-            f"{urllib.parse.quote(code, safe='')}"
-        )
-    access = str(item.get("access_code") or "").strip()
-    if access:
-        return (
-            f"roblox://experiences/start?placeId={place_id}"
-            f"&accessCode={urllib.parse.quote(access, safe='')}"
-        )
-    return ""
+
+    link_code = str(
+        item.get("link_code")
+        or ""
+    ).strip()
+    access_code = str(
+        item.get("access_code")
+        or ""
+    ).strip()
+
+    return roblox_private_app_link(
+        place_id,
+        link_code=link_code,
+        access_code=access_code,
+    )
+
 
 
 def load_cookie_cache():
