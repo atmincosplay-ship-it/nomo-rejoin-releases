@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.58.16 — BOOSTER HARD PRIVATE JOIN
+# - Market->Booster no longer uses task reuse or double-soft deep links.
+# - It stops only the selected package's verified exact PID, then opens the
+#   normalized privateServerLinkCode/accessCode link.
+# - Solver preflight still runs once for the hard join generation.
+# - Success requires fresh Main Garden state with exact Booster job_id.
+# - A failed hard join does not enqueue a second hard retry.
+# - Return Booster->Market keeps the normal reusable route.
+# - Sibling packages, Booster reporting, Package Manager, Option 4 and Lua
+#   files remain unchanged.
+#
 # V4.58.15 — BOOSTER JOB-ID CONFIRMATION
 # - Removes private-flag confirmation from Market->Booster routing.
 # - Confirms the exact Booster instance using fresh place_id + exact job_id.
@@ -360,7 +371,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.58.15"
+__version__ = "V4.58.16"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -6445,6 +6456,64 @@ def market_clear_booster_route(rt_tab):
     rt_tab["booster_route_job_id"] = ""
 
 
+
+def market_run_booster_hard_join_queue(
+    cfg,
+    tab,
+    reason,
+):
+    """One exact-PID hard open for Market -> private Booster."""
+    package = str(tab.get("package") or "")
+    if not package:
+        return False, "package missing"
+
+    rt = load_runtime()
+    open_queue = []
+
+    added, note = queue_open(
+        open_queue,
+        tab,
+        "booster",
+        reason,
+        force=True,
+        skip_if_alive=False,
+        mode="hard_force",
+        bypass_manual=True,
+        metadata={
+            "manual_booster_route": True,
+            "manual_booster_hard_route": True,
+            "manual_booster_second_intent_done": True,
+            "bypass_recheck": True,
+            "homepage_hard_retries": int(
+                cfg.get(
+                    "homepage_stuck_max_hard_retries",
+                    1,
+                )
+                or 1
+            ),
+        },
+    )
+    if not added:
+        return False, note
+
+    while open_queue:
+        if stop_requested():
+            save_runtime(rt)
+            return False, "stopped"
+
+        process_open_queue(
+            open_queue,
+            cfg,
+            rt,
+        )
+
+        if open_queue and not wait_seconds(1, rt):
+            return False, "stopped"
+
+    save_runtime(rt)
+    return True, "hard private join completed"
+
+
 def market_run_route_queue(cfg, tabs, target, reason):
     """Use the normal route queue: task reuse first, one exact-PID fallback."""
     rt = load_runtime()
@@ -6563,12 +6632,11 @@ def market_manual_join_booster(cfg, booster, package):
     )
     save_runtime(rt)
 
-    ok, note = market_run_route_queue(
+    ok, note = market_run_booster_hard_join_queue(
         cfg,
-        [tab],
-        "booster",
+        tab,
         (
-            "manual Booster join: "
+            "manual Booster hard private join: "
             f"{booster.get('name', 'booster')}"
         ),
     )
@@ -6787,7 +6855,7 @@ def market_booster_pool_menu(cfg):
             print(f"Pets    : {booster.get('pet_count')}")
             print(f"Valuable: {booster.get('match_count')}")
             print(
-                f"Route   : PRIVATE "
+                f"Route   : HARD PRIVATE "
                 f"({booster.get('route_kind', 'unknown')})"
             )
             print(
@@ -6798,7 +6866,9 @@ def market_booster_pool_menu(cfg):
                 )[:18]
             )
             print(f"Top     : {market_booster_top_summary(booster, cfg)}")
-            confirm = input("Safe-route this package now? [y/N]: ").strip().lower()
+            confirm = input(
+                "Hard-join this selected package now? [y/N]: "
+            ).strip().lower()
             if confirm != "y":
                 continue
 
@@ -9847,6 +9917,24 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
             "manual challenge",
             "solver result",
         ):
+            if item.get("manual_booster_hard_route"):
+                cancel_queued_package(
+                    open_queue,
+                    pkg,
+                )
+                rt_tab["note"] = (
+                    "Booster hard private join failed: "
+                    + str(fresh_msg)
+                )
+                log_activity(
+                    "Booster hard private join produced no "
+                    "confirmed Booster state; no second hard retry",
+                    pkg,
+                    RED,
+                )
+                save_runtime(rt)
+                return True
+
             if rt_tab.get("solver_busy_retry_pending"):
                 retry_at = int(rt_tab.get("solver_busy_retry_at", 0) or 0)
                 left = max(1, retry_at - now()) if retry_at else 600
