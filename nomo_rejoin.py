@@ -1,5 +1,45 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.58.26 — ONE PRIVATE-SERVER FETCH ENGINE
+# - Every workflow that fetches/creates private servers now calls one canonical
+#   run_private_server_fetch_shared() entry point.
+# - Covered callers:
+#     * Main Option 5 auto fetch/create
+#     * Option 13 Hatcher setup
+#     * Option 13 Booster setup
+#     * Option 13 Local setup
+#     * future callers can use the same entry point
+# - Only the canonical entry point may call auto_fetch_private_servers().
+# - All fetched routing remains stored in Hatcher profiles.
+# - Role-specific reporting flags are applied only after the shared fetch.
+# - Booster still uses the literal Hatcher setup/runtime and different reports.
+# - Proven Hatcher link serialization and Option 6 raw-link route are unchanged.
+#
+# V4.58.25 — BOOSTER USES HATCHER SETUP
+# - Removes the duplicated Booster private-server setup branch.
+# - Hatcher and Booster Option 13 now call one identical Hatcher server
+#   fetch/create/save helper with the same arguments and same Hatcher profile.
+# - Auto-fetch writes routing only to Hatcher config; Booster config stores
+#   reporting identity/state/probe data and never owns the route.
+# - Booster cold start synchronizes Hatcher profiles, then literally calls the
+#   unchanged start_hatcher_safe_rejoiner().
+# - Switching from a running Hatcher session is no longer treated as proof of
+#   a successful Booster cold start.
+# - Proven Hatcher link serialization and Option 6 raw-link path are unchanged.
+#
+# V4.58.24 — PROVEN HATCHER JOIN PATH
+# - Reverts the unproven V4.58.23 direct-app linkCode conversion.
+# - Restores the exact private-link serializer already used by the working
+#   Hatcher runtime on the user's Redfinger/App Cloner environment.
+# - Booster Option 6 passes the untouched Hatcher profile into the same normal
+#   Hatcher queue; it no longer reconstructs or rewrites server_link first.
+# - Booster Option 1 still literally calls start_hatcher_safe_rejoiner().
+# - Option 6 still displays every installed clone; unconfigured/OFF selections
+#   are shown and skipped explicitly.
+# - Hatcher profiles remain the sole routing source and there is no Market
+#   fallback for target=hatcher.
+# - Option 5 auto-fetch/manual edit and Booster reporting remain unchanged.
+#
 # V4.58.23 — OFFICIAL PRIVATE APP DEEP LINK
 # - Fixes the actual public-server cause: Android private joins now use
 #   roblox://placeId=<id>&linkCode=<code>, not privateServerLinkCode on the
@@ -449,7 +489,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.58.23"
+__version__ = "V4.58.26"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -2921,148 +2961,72 @@ def extract_place_id_from_link(link):
 
 
 
-def roblox_private_app_link(
-    place_id,
-    link_code="",
-    access_code="",
-):
-    """Build Roblox's direct-to-app private-server deep link."""
-    place_id = str(place_id or "").strip()
-    link_code = str(link_code or "").strip()
-    access_code = str(access_code or "").strip()
-
-    if not place_id:
-        return ""
-
-    base = (
-        "roblox://placeId="
-        + urllib.parse.quote(
-            place_id,
-            safe="",
-        )
-    )
-
-    if link_code:
-        return (
-            base
-            + "&linkCode="
-            + urllib.parse.quote(
-                link_code,
-                safe="",
-            )
-        )
-
-    if access_code:
-        return (
-            base
-            + "&accessCode="
-            + urllib.parse.quote(
-                access_code,
-                safe="",
-            )
-        )
-
-    return ""
 
 
 def android_safe_roblox_link(link, cfg=None):
-    """Normalize joins without dropping or misnaming private-server codes."""
+    """Normalize join links before Android am start without dropping private codes."""
     raw = str(link or "").strip()
     if not raw:
         return raw
 
     cfg = cfg or {}
     low = raw.lower()
-    place_id = extract_place_id_from_link(raw)
-    parsed_link_code = ""
-    parsed_access_code = ""
 
+    # V3.90: preserve/normalize private-server deep-link parameters. The old
+    # normalizer extracted only placeId and silently discarded linkCode, turning
+    # a valid private-server link into a public-server join.
+    pid = extract_place_id_from_link(raw)
+    parsed_code = ""
+    parsed_access = ""
     try:
         parsed = urllib.parse.urlparse(raw)
-        query = urllib.parse.parse_qs(
-            parsed.query,
-            keep_blank_values=False,
-        )
-        lowered = {
-            str(key).lower(): values
-            for key, values in query.items()
-        }
-
-        for key in (
-            "linkcode",
-            "privateserverlinkcode",
-        ):
-            values = lowered.get(key)
-            if values and values[0]:
-                parsed_link_code = str(
-                    values[0]
-                ).strip()
+        qs = urllib.parse.parse_qs(parsed.query)
+        for key in ("linkCode", "privateServerLinkCode", "privateServerLinkcode"):
+            vals = qs.get(key)
+            if vals and vals[0]:
+                parsed_code = str(vals[0]).strip()
                 break
-
-        values = lowered.get("accesscode")
-        if values and values[0]:
-            parsed_access_code = str(
-                values[0]
-            ).strip()
+        vals = qs.get("accessCode")
+        if vals and vals[0]:
+            parsed_access = str(vals[0]).strip()
     except Exception:
         pass
 
-    if not parsed_link_code:
-        match = re.search(
-            r"(?:privateServerLinkCode|linkCode)=([^&#\\s]+)",
-            raw,
-            flags=re.I,
-        )
-        if match:
-            parsed_link_code = urllib.parse.unquote(
-                match.group(1)
-            ).strip()
+    # Handle roblox:// links whose parameters may not parse cleanly on every
+    # Python build because of mixed-case/custom schemes.
+    if not parsed_code:
+        m = re.search(r"(?:privateServerLinkCode|linkCode)=([^&#]+)", raw, re.I)
+        if m:
+            parsed_code = urllib.parse.unquote(m.group(1))
+    if not parsed_access:
+        m = re.search(r"accessCode=([^&#]+)", raw, re.I)
+        if m:
+            parsed_access = urllib.parse.unquote(m.group(1))
 
-    if not parsed_access_code:
-        match = re.search(
-            r"accessCode=([^&#\\s]+)",
-            raw,
-            flags=re.I,
-        )
-        if match:
-            parsed_access_code = urllib.parse.unquote(
-                match.group(1)
-            ).strip()
-
-    if place_id and (
-        parsed_link_code
-        or parsed_access_code
-    ):
-        return roblox_private_app_link(
-            place_id,
-            link_code=parsed_link_code,
-            access_code=parsed_access_code,
-        )
-
-    # Keep modern share links intact when no decoded private code is present.
-    if (
-        "roblox.com/share?" in low
-        or "type=server" in low
-        or (
-            "private" in low
-            and "share" in low
-        )
-    ):
-        return raw
-
-    if not cfg.get(
-        "prefer_experience_start_links",
-        True,
-    ):
-        return raw
-
-    if place_id:
+    if pid and parsed_code:
         return (
-            "roblox://experiences/start?"
-            f"placeId={place_id}"
+            "roblox://experiences/start?placeId=" + str(pid)
+            + "&privateServerLinkCode="
+            + urllib.parse.quote(parsed_code, safe="")
         )
+    if pid and parsed_access:
+        return (
+            "roblox://experiences/start?placeId=" + str(pid)
+            + "&accessCode=" + urllib.parse.quote(parsed_access, safe="")
+        )
+
+    # Keep modern Roblox share links intact; the app resolves their share code.
+    if "roblox.com/share?" in low or "type=server" in low or ("private" in low and "share" in low):
+        return raw
+
+    if not cfg.get("prefer_experience_start_links", True):
+        return raw
+
+    if pid:
+        return f"roblox://experiences/start?placeId={pid}"
 
     return raw
+
 
 
 
@@ -5360,7 +5324,13 @@ def _nomo_set_global_private_server_menu_original(cfg=None):
             elif choice == "3":
                 set_hatcher_servers(cfg)
             elif choice == "4":
-                auto_fetch_private_servers(cfg)
+                run_private_server_fetch_shared(
+                    cfg,
+                    pause_at_end=True,
+                    sync_market_access=True,
+                    automatic=False,
+                    caller="Main Option 5",
+                )
             elif choice == "5":
                 register_market_accounts_to_d1(cfg)
             else:
@@ -6658,7 +6628,7 @@ def market_booster_pool_entries(cfg, rt=None, force=False):
             "private_link_code": private_link_code,
             "private_access_code": private_access_code,
             "route_kind": (
-                "linkCode"
+                "privateServerLinkCode"
                 if private_link_code
                 else "accessCode"
             ),
@@ -10921,80 +10891,125 @@ def booster_profiles(cfg, enabled_only=False):
     return out
 
 
-def sync_booster_profiles_with_tabs(main_cfg, bcfg, create_missing=True):
-    """Ensure Booster profiles follow the main Delta identity mapping."""
+
+def sync_booster_profiles_with_tabs(
+    main_cfg,
+    bcfg,
+    create_missing=True,
+):
+    """Sync Booster reporting identity only; Hatcher owns all routing."""
     existing = {
         str(profile.get("package") or ""): profile
         for profile in booster_profiles(bcfg)
     }
     new_profiles = []
 
-    for index, tab in enumerate(main_cfg.get("tabs", [])):
-        pkg = str(tab.get("package") or "")
-        if not pkg:
+    for index, tab in enumerate(
+        main_cfg.get("tabs", [])
+    ):
+        package = str(tab.get("package") or "")
+        if not package:
             continue
 
-        profile = existing.pop(pkg, None)
+        profile = existing.pop(package, None)
         if profile is None and create_missing:
-            profile = normalize_booster_profile({
-                "enabled": tab.get("enabled", True),
-                "package": pkg,
-                "booster_name": (
-                    tab.get("user_name")
-                    or f"nomoboost{index + 1}"
-                ),
-                "server_link": (
-                    tab.get("server_link")
-                    or "YOUR_BOOSTER_PRIVATE_SERVER_LINK"
-                ),
-                "state_file": tab.get("stat_file") or "",
-            }, index)
+            profile = normalize_booster_profile(
+                {
+                    "enabled": tab.get("enabled", True),
+                    "package": package,
+                    "booster_name": (
+                        tab.get("user_name")
+                        or f"nomoboost{index + 1}"
+                    ),
+                    # Display/backward-compatible field only.
+                    # Never read for routing.
+                    "server_link": "",
+                    "state_file": (
+                        tab.get("stat_file")
+                        or ""
+                    ),
+                },
+                index,
+            )
 
         if profile is None:
             continue
 
-        profile["enabled"] = bool(tab.get("enabled", True))
+        profile["enabled"] = bool(
+            tab.get("enabled", True)
+        )
+        profile["server_link"] = ""
+
         if is_delta_global_tab(tab):
             profile["booster_name"] = str(
-                tab.get("user_name") or pkg
+                tab.get("user_name")
+                or package
             )
-            profile["state_file"] = str(tab.get("stat_file") or "")
-            profile["executor_storage"] = "delta_global"
+            profile["state_file"] = str(
+                tab.get("stat_file")
+                or ""
+            )
+            profile["executor_storage"] = (
+                "delta_global"
+            )
             profile["delta_mapping_locked"] = True
             profile["delta_mapping_conflict"] = bool(
-                tab.get("delta_mapping_conflict", False)
+                tab.get(
+                    "delta_mapping_conflict",
+                    False,
+                )
             )
-            profile["delta_mapping_source"] = tab.get(
-                "delta_mapping_source",
-                "main sync",
+            profile["delta_mapping_source"] = (
+                tab.get(
+                    "delta_mapping_source",
+                    "main sync",
+                )
             )
         else:
             if tab.get("stat_file"):
-                profile["state_file"] = tab.get("stat_file")
-            current_name = str(profile.get("booster_name") or "")
+                profile["state_file"] = (
+                    tab.get("stat_file")
+                )
+
+            current_name = str(
+                profile.get("booster_name")
+                or ""
+            )
             defaultish = (
                 not current_name
-                or current_name == pkg
-                or current_name.startswith("nomoboost")
+                or current_name == package
+                or current_name.startswith(
+                    "nomoboost"
+                )
             )
             if (
                 defaultish
-                and str(tab.get("user_name") or "").strip()
+                and str(
+                    tab.get("user_name")
+                    or ""
+                ).strip()
             ):
                 profile["booster_name"] = str(
                     tab.get("user_name")
                 ).strip()
 
-        state_path = str(profile.get("state_file") or "").strip()
+        state_path = str(
+            profile.get("state_file")
+            or ""
+        ).strip()
         probe_user = str(
             profile.get("booster_name")
             or tab.get("user_name")
             or ""
         ).strip()
+
         if state_path and probe_user:
             profile["probe_file"] = str(
                 Path(state_path).parent
-                / f"{_sanitize_state_name(probe_user)}_booster_probe.json"
+                / (
+                    f"{_sanitize_state_name(probe_user)}"
+                    "_booster_probe.json"
+                )
             )
 
         new_profiles.append(profile)
@@ -11002,6 +11017,7 @@ def sync_booster_profiles_with_tabs(main_cfg, bcfg, create_missing=True):
     bcfg["boosters"] = new_profiles
     save_booster_config(bcfg)
     return True
+
 
 
 
@@ -12031,9 +12047,36 @@ def _booster_hatcher_dashboard_adapter(
     )
 
 
+
 def start_booster_safe_rejoiner(main_cfg=None):
-    """Run the exact Hatcher engine with Booster-only output adapters."""
-    original_report = globals()["hatcher_report_once"]
+    """Exact Hatcher cold start with Booster-only output adapters."""
+    cfg = dict(load_config())
+    if isinstance(main_cfg, dict):
+        cfg.update(main_cfg)
+
+    # Refresh only mappings/identity. Existing Hatcher server_link values are
+    # preserved by sync_hatcher_profiles_with_tabs().
+    hcfg = load_hatcher_config()
+    sync_hatcher_profiles_with_tabs(
+        cfg,
+        hcfg,
+        create_missing=True,
+    )
+    hcfg = load_hatcher_config()
+    hcfg["enabled"] = True
+    save_hatcher_config(hcfg)
+
+    # Booster config is report/probe identity only.
+    bcfg = load_booster_config()
+    sync_booster_profiles_with_tabs(
+        cfg,
+        bcfg,
+        create_missing=True,
+    )
+
+    original_report = globals()[
+        "hatcher_report_once"
+    ]
     original_dashboard = globals()[
         "hatcher_rejoin_status_screen"
     ]
@@ -12046,12 +12089,17 @@ def start_booster_safe_rejoiner(main_cfg=None):
     )
 
     try:
-        return start_hatcher_safe_rejoiner(main_cfg)
-    finally:
-        globals()["hatcher_report_once"] = original_report
-        globals()["hatcher_rejoin_status_screen"] = (
-            original_dashboard
+        return start_hatcher_safe_rejoiner(
+            cfg
         )
+    finally:
+        globals()["hatcher_report_once"] = (
+            original_report
+        )
+        globals()[
+            "hatcher_rejoin_status_screen"
+        ] = original_dashboard
+
 
 
 
@@ -12071,32 +12119,107 @@ def booster_server_link_menu(cfg):
 
 
 
+
 def booster_config_menu(cfg):
     while True:
         bcfg = load_booster_config()
-        clear(); banner("BOOSTER MODE CONFIG", cfg)
-        print(col("Booster stays in its private server; Market bots come to it.", DIM))
-        for i, p in enumerate(booster_profiles(bcfg), 1):
-            print(f"{i}. {'ON' if p.get('enabled',True) else 'OFF'} {short_pkg(p.get('package','')):<10} "
-                  f"{p.get('booster_name',''):<16} {short_link(p.get('server_link',''))}")
+        hcfg = load_hatcher_config()
+        routed = {
+            str(profile.get("package") or ""):
+                profile
+            for profile in hatcher_profiles(
+                hcfg,
+                enabled_only=False,
+            )
+        }
+
+        clear()
+        banner("BOOSTER MODE CONFIG", cfg)
+        print(
+            col(
+                "Booster uses the literal Hatcher route; "
+                "only reporting is different.",
+                DIM,
+            )
+        )
+
+        for index, profile in enumerate(
+            booster_profiles(bcfg),
+            1,
+        ):
+            package = str(
+                profile.get("package") or ""
+            )
+            hatcher = routed.get(package, {})
+            print(
+                f"{index}. "
+                f"{'ON' if profile.get('enabled', True) else 'OFF'} "
+                f"{short_pkg(package):<10} "
+                f"{profile.get('booster_name', ''):<16} "
+                f"{short_link(hatcher.get('server_link', ''))}"
+            )
+
         print("\n1. Enable BOOSTER mode")
-        print("2. Set private server link")
-        print("3. Force backend report now")
-        print("4. Toggle a Booster profile")
+        print("2. Set shared Hatcher private server link")
+        print("3. Force Booster backend report now")
+        print("4. Toggle a Booster reporting profile")
         print("0. Back")
-        ch = input("Choose: ").strip()
-        if ch == "0": return
-        if ch == "1":
-            set_active_rejoin_mode("booster", cfg); print(col("BOOSTER mode enabled.", GREEN)); pause()
-        elif ch == "2": booster_server_link_menu(cfg)
-        elif ch == "3":
-            ok, msg = booster_report_once(bcfg, force=True)
-            print(col(("OK: " if ok else "ERROR: ") + msg, GREEN if ok else RED)); pause()
-        elif ch == "4":
-            pick = input("Profile number: ").strip()
-            if pick.isdigit() and 1 <= int(pick) <= len(bcfg.get("boosters", [])):
-                p = bcfg["boosters"][int(pick)-1]; p["enabled"] = not p.get("enabled", True)
-                save_booster_config(bcfg)
+
+        choice = input("Choose: ").strip()
+        if choice == "0":
+            return
+        if choice == "1":
+            set_active_rejoin_mode(
+                "booster",
+                cfg,
+            )
+            print(
+                col(
+                    "BOOSTER mode enabled.",
+                    GREEN,
+                )
+            )
+            pause()
+        elif choice == "2":
+            booster_server_link_menu(cfg)
+        elif choice == "3":
+            ok, message = booster_report_once(
+                bcfg,
+                force=True,
+            )
+            print(
+                col(
+                    ("OK: " if ok else "FAILED: ")
+                    + str(message),
+                    GREEN if ok else RED,
+                )
+            )
+            pause()
+        elif choice == "4":
+            profiles = booster_profiles(
+                bcfg,
+                enabled_only=False,
+            )
+            raw = input(
+                "Profile number: "
+            ).strip()
+            if not raw.isdigit():
+                continue
+            selected_index = int(raw) - 1
+            if not (
+                0
+                <= selected_index
+                < len(profiles)
+            ):
+                continue
+            profiles[selected_index]["enabled"] = not bool(
+                profiles[selected_index].get(
+                    "enabled",
+                    True,
+                )
+            )
+            save_booster_config(bcfg)
+
 
 
 
@@ -14885,11 +15008,12 @@ HATCHER_MENU_ITEMS = [
 
 
 
+
 def open_all_hatcher_tabs_once(
     main_cfg=None,
     selected_packages=None,
 ):
-    """Exact shared Hatcher/Booster Option 6 with private-link validation."""
+    """Exact Hatcher Option 6 path, shared unchanged by Booster."""
     cfg = dict(load_config())
     if isinstance(main_cfg, dict):
         cfg.update(main_cfg)
@@ -14902,17 +15026,9 @@ def open_all_hatcher_tabs_once(
         )
         if str(package or "")
     ]
-    expected_place = str(
-        hcfg.get(
-            "expected_place_id",
-            "126884695634066",
-        )
-        or "126884695634066"
-    )
 
     profile_by_package = {
-        str(profile.get("package") or ""):
-            profile
+        str(profile.get("package") or ""): profile
         for profile in hatcher_profiles(
             hcfg,
             enabled_only=False,
@@ -14923,9 +15039,7 @@ def open_all_hatcher_tabs_once(
     skipped = []
 
     for package in selected:
-        profile = profile_by_package.get(
-            package
-        )
+        profile = profile_by_package.get(package)
 
         if not isinstance(profile, dict):
             skipped.append(
@@ -14945,39 +15059,23 @@ def open_all_hatcher_tabs_once(
             )
             continue
 
-        (
-            private_link,
-            _place_id,
-            link_code,
-            access_code,
-        ) = normalized_private_route_link(
-            str(
-                profile.get("server_link")
-                or ""
-            ),
-            record=profile,
-            default_place_id=expected_place,
-        )
-
-        if not private_link or not (
-            link_code
-            or access_code
-        ):
+        raw_link = str(
+            profile.get("server_link") or ""
+        ).strip()
+        if not raw_link:
             skipped.append(
                 (
                     package,
-                    "linkCode/accessCode missing",
+                    "Hatcher server_link is empty",
                 )
             )
             continue
 
-        routed_profile = dict(profile)
-        routed_profile["server_link"] = (
-            private_link
-        )
+        # Important: do not normalize, rebuild, translate, or replace this link.
+        # This is exactly what the working Hatcher runtime does.
         tabs.append(
             hatcher_profile_to_tab(
-                routed_profile
+                profile
             )
         )
 
@@ -14999,7 +15097,7 @@ def open_all_hatcher_tabs_once(
         print(
             col(
                 "No selected package has an enabled "
-                "Hatcher/Booster profile with linkCode/accessCode.",
+                "Hatcher/Booster profile with a saved server link.",
                 RED,
             )
         )
@@ -15008,14 +15106,13 @@ def open_all_hatcher_tabs_once(
 
     print(
         col(
-            "Option 6: literal Hatcher hard-restart path.",
+            "Option 6: exact proven Hatcher restart path.",
             CYAN,
         )
     )
     print(
         col(
-            "Private app format: "
-            "roblox://placeId=<id>&linkCode=<redacted>",
+            "Saved Hatcher server_link is passed unchanged.",
             GREEN,
         )
     )
@@ -15035,6 +15132,7 @@ def open_all_hatcher_tabs_once(
     )
     pause()
     return bool(ok)
+
 
 
 def hatching_mode_menu(main_cfg):
@@ -20903,22 +21001,12 @@ def normalized_private_route_link(
     record=None,
     default_place_id="",
 ):
-    record = (
-        record
-        if isinstance(record, dict)
-        else {}
-    )
+    record = record if isinstance(record, dict) else {}
 
-    (
-        place_id,
-        link_code,
-        access_code,
-    ) = private_join_parts(
+    place_id, link_code, access_code = private_join_parts(
         link,
         default_place_id=(
-            record.get(
-                "private_server_place_id"
-            )
+            record.get("private_server_place_id")
             or record.get("place_id")
             or default_place_id
         ),
@@ -20926,12 +21014,8 @@ def normalized_private_route_link(
 
     if not link_code:
         link_code = str(
-            record.get(
-                "private_server_link_code"
-            )
-            or record.get(
-                "privateServerLinkCode"
-            )
+            record.get("private_server_link_code")
+            or record.get("privateServerLinkCode")
             or record.get("link_code")
             or record.get("linkCode")
             or ""
@@ -20939,9 +21023,7 @@ def normalized_private_route_link(
 
     if not access_code:
         access_code = str(
-            record.get(
-                "private_server_access_code"
-            )
+            record.get("private_server_access_code")
             or record.get("accessCode")
             or record.get("access_code")
             or ""
@@ -20949,9 +21031,7 @@ def normalized_private_route_link(
 
     if not place_id:
         place_id = str(
-            record.get(
-                "private_server_place_id"
-            )
+            record.get("private_server_place_id")
             or record.get("place_id")
             or default_place_id
             or ""
@@ -20962,10 +21042,10 @@ def normalized_private_route_link(
 
     if link_code:
         return (
-            roblox_private_app_link(
-                place_id,
-                link_code=link_code,
-            ),
+            "roblox://experiences/start?"
+            f"placeId={place_id}"
+            "&privateServerLinkCode="
+            f"{urllib.parse.quote(link_code, safe='')}",
             place_id,
             link_code,
             "",
@@ -20973,16 +21053,17 @@ def normalized_private_route_link(
 
     if access_code:
         return (
-            roblox_private_app_link(
-                place_id,
-                access_code=access_code,
-            ),
+            "roblox://experiences/start?"
+            f"placeId={place_id}"
+            "&accessCode="
+            f"{urllib.parse.quote(access_code, safe='')}",
             place_id,
             "",
             access_code,
         )
 
     return "", place_id, "", ""
+
 
 
 
@@ -21057,28 +21138,25 @@ def market_booster_route_state_confirmed(
 
 
 
-def build_private_server_link(
-    place_id,
-    item,
-):
-    """Build the direct Roblox app link from a fetched private-server code."""
+def build_private_server_link(place_id, item):
+    """Build an Android Roblox deep link from an actual join/link code."""
     if not isinstance(item, dict):
         return ""
+    code = str(item.get("link_code") or "").strip()
+    if code:
+        return (
+            f"roblox://experiences/start?placeId={place_id}"
+            f"&privateServerLinkCode="
+            f"{urllib.parse.quote(code, safe='')}"
+        )
+    access = str(item.get("access_code") or "").strip()
+    if access:
+        return (
+            f"roblox://experiences/start?placeId={place_id}"
+            f"&accessCode={urllib.parse.quote(access, safe='')}"
+        )
+    return ""
 
-    link_code = str(
-        item.get("link_code")
-        or ""
-    ).strip()
-    access_code = str(
-        item.get("access_code")
-        or ""
-    ).strip()
-
-    return roblox_private_app_link(
-        place_id,
-        link_code=link_code,
-        access_code=access_code,
-    )
 
 
 
@@ -23985,6 +24063,183 @@ def lock_setup_selected_packages(selected, cfg=None):
     }
 
 
+
+
+def run_private_server_fetch_shared(
+    cfg,
+    selected_packages=None,
+    pause_at_end=True,
+    *,
+    sync_market_access=True,
+    automatic=False,
+    place_id_override=None,
+    caller="private-server setup",
+):
+    """The only application-level entry point for private-server fetching."""
+    selected = [
+        str(package or "")
+        for package in (
+            selected_packages or []
+        )
+        if str(package or "")
+    ]
+
+    result = auto_fetch_private_servers(
+        cfg,
+        selected_packages=(
+            selected
+            if selected
+            else None
+        ),
+        pause_at_end=pause_at_end,
+        sync_market_access=sync_market_access,
+        automatic=automatic,
+        place_id_override=place_id_override,
+    )
+    result = (
+        result
+        if isinstance(result, dict)
+        else {}
+    )
+
+    result_rows = list(
+        result.get("results")
+        or []
+    )
+
+    # Interactive Option 5 chooses packages inside the low-level fetcher.
+    # Recover that selected package list from its result rows.
+    if not selected:
+        selected = [
+            str(row[0] or "")
+            for row in result_rows
+            if (
+                isinstance(row, (list, tuple))
+                and len(row) >= 1
+                and str(row[0] or "")
+            )
+        ]
+
+    hcfg = load_hatcher_config()
+    selected_set = set(selected)
+    ready = []
+    missing = []
+
+    for profile in hatcher_profiles(
+        hcfg,
+        enabled_only=False,
+    ):
+        package = str(
+            profile.get("package")
+            or ""
+        )
+        if (
+            selected_set
+            and package not in selected_set
+        ):
+            continue
+
+        link = str(
+            profile.get("server_link")
+            or ""
+        ).strip()
+
+        if link and not link.startswith("YOUR_"):
+            ready.append(package)
+        elif package:
+            missing.append(package)
+
+    changed = bool(
+        result.get("changed")
+    )
+    ok = bool(ready) and not missing
+
+    result.update({
+        "ok": ok,
+        "changed": changed,
+        "caller": str(caller or ""),
+        "selected": selected,
+        "ready": ready,
+        "missing": missing,
+        "hcfg": hcfg,
+    })
+    return result
+
+
+def setup_hatcher_private_servers_shared(
+    cfg,
+    selected,
+    setup_place_id,
+    *,
+    backend_ok=False,
+):
+    """Hatcher/Booster setup adapter around the canonical fetch engine."""
+    shared = run_private_server_fetch_shared(
+        cfg,
+        selected_packages=selected,
+        pause_at_end=False,
+        sync_market_access=True,
+        automatic=True,
+        place_id_override=setup_place_id,
+        caller="Option 13 Hatcher/Booster setup",
+    )
+
+    hcfg = shared["hcfg"]
+    hcfg["enabled"] = True
+    save_hatcher_config(hcfg)
+
+    ready = list(
+        shared.get("ready")
+        or []
+    )
+    missing = list(
+        shared.get("missing")
+        or []
+    )
+
+    ok = bool(ready) and not missing
+    if ok:
+        message = (
+            "Hatcher private-server setup ready for "
+            + ", ".join(
+                short_pkg(package)
+                for package in ready
+            )
+        )
+    else:
+        details = []
+        if ready:
+            details.append(
+                "ready "
+                + ", ".join(
+                    short_pkg(package)
+                    for package in ready
+                )
+            )
+        if missing:
+            details.append(
+                "missing "
+                + ", ".join(
+                    short_pkg(package)
+                    for package in missing
+                )
+            )
+        message = (
+            "; ".join(details)
+            or "Hatcher private-server setup made no usable profile"
+        )
+
+    return {
+        "ok": ok,
+        "message": message,
+        "result": shared,
+        "hcfg": hcfg,
+        "ready": ready,
+        "missing": missing,
+        "backend_ok": bool(backend_ok),
+    }
+
+
 def new_redfinger_setup_wizard(cfg=None):
     """Full-auto one-time setup with Delta-global or Arceus per-clone storage.
 
@@ -24179,32 +24434,59 @@ def new_redfinger_setup_wizard(cfg=None):
             mode_msg = "backend unavailable; registration skipped"
 
     elif role == "hatcher":
-        print(col("Create/reuse Hatcher private servers: YES (automatic)", GREEN))
-        print(col("Sync registered Market access: YES (automatic)", GREEN))
-        server_result = auto_fetch_private_servers(
-            cfg, selected_packages=selected, pause_at_end=False,
-            sync_market_access=True, automatic=True,
-            place_id_override=setup_place_id
-        )
-        mode_ok = bool((server_result or {}).get("changed"))
-        mode_msg = "private-server setup completed" if mode_ok else "private-server setup made no changes"
-        if backend_ok:
-            print(col("Force first Hatcher D1 report: YES (automatic)", GREEN))
-            hcfg = load_hatcher_config()
-            hcfg["enabled"] = True
-            save_hatcher_config(hcfg)
-            first_upload = hatcher_report_once(hcfg, force=True)
-
-    elif role == "booster":
         print(
             col(
-                "Create/reuse Booster private servers: YES (automatic)",
+                "Run exact shared Hatcher private-server setup: YES",
                 GREEN,
             )
         )
         print(
             col(
-                "Routing uses the same Hatcher profiles.",
+                "Sync registered Market access: YES (automatic)",
+                GREEN,
+            )
+        )
+        shared_server_setup = (
+            setup_hatcher_private_servers_shared(
+                cfg,
+                selected,
+                setup_place_id,
+                backend_ok=backend_ok,
+            )
+        )
+        server_result = shared_server_setup.get(
+            "result"
+        )
+        mode_ok = bool(
+            shared_server_setup.get("ok")
+        )
+        mode_msg = str(
+            shared_server_setup.get("message")
+            or ""
+        )
+
+        if backend_ok:
+            print(
+                col(
+                    "Force first Hatcher D1 report: YES (automatic)",
+                    GREEN,
+                )
+            )
+            first_upload = hatcher_report_once(
+                shared_server_setup["hcfg"],
+                force=True,
+            )
+
+    elif role == "booster":
+        print(
+            col(
+                "Run exact shared Hatcher private-server setup: YES",
+                GREEN,
+            )
+        )
+        print(
+            col(
+                "There is no separate Booster server fetch.",
                 CYAN,
             )
         )
@@ -24215,60 +24497,35 @@ def new_redfinger_setup_wizard(cfg=None):
             )
         )
 
-        server_result = auto_fetch_private_servers(
-            cfg,
-            selected_packages=selected,
-            pause_at_end=False,
-            sync_market_access=True,
-            automatic=True,
-            place_id_override=setup_place_id,
+        shared_server_setup = (
+            setup_hatcher_private_servers_shared(
+                cfg,
+                selected,
+                setup_place_id,
+                backend_ok=backend_ok,
+            )
+        )
+        server_result = shared_server_setup.get(
+            "result"
+        )
+        mode_ok = bool(
+            shared_server_setup.get("ok")
+        )
+        mode_msg = str(
+            shared_server_setup.get("message")
+            or ""
         )
 
-        hcfg = load_hatcher_config()
+        # Reporting identity only. Do not mirror/copy routing links.
         bcfg = load_booster_config()
-        hatcher_by_package = {
-            str(profile.get("package") or ""): profile
-            for profile in hatcher_profiles(
-                hcfg,
-                enabled_only=False,
-            )
-        }
-
-        # Booster keeps only reporting identity. Routing remains Hatcher-owned.
-        for booster_profile in booster_profiles(
+        sync_booster_profiles_with_tabs(
+            load_config(),
             bcfg,
-            enabled_only=False,
-        ):
-            package = str(
-                booster_profile.get("package") or ""
-            )
-            hatcher_profile = hatcher_by_package.get(package)
-            if not isinstance(hatcher_profile, dict):
-                continue
-
-            booster_profile["server_link"] = str(
-                hatcher_profile.get("server_link")
-                or ""
-            )
-            booster_profile["state_file"] = str(
-                hatcher_profile.get("state_file")
-                or booster_profile.get("state_file")
-                or ""
-            )
-
+            create_missing=True,
+        )
+        bcfg = load_booster_config()
         bcfg["enabled"] = True
         save_booster_config(bcfg)
-
-        mode_ok = bool(
-            (server_result or {}).get("changed")
-            or (server_result or {}).get("reused")
-            or (server_result or {}).get("ok")
-        )
-        mode_msg = (
-            "Booster Hatcher-profile server setup completed"
-            if mode_ok
-            else "Booster server setup made no changes"
-        )
 
         if backend_ok:
             print(
@@ -24283,17 +24540,49 @@ def new_redfinger_setup_wizard(cfg=None):
             )
 
     else:  # local
-        print(col("Create/reuse local private servers: YES (automatic)", GREEN))
-        print(col("D1 reporting and specific-user allowlisting: OFF", CYAN))
-        server_result = auto_fetch_private_servers(
-            cfg, selected_packages=selected, pause_at_end=False,
-            sync_market_access=False, automatic=True,
-            place_id_override=setup_place_id
+        print(
+            col(
+                "Create/reuse local private servers: YES (automatic)",
+                GREEN,
+            )
         )
-        mode_ok = bool((server_result or {}).get("changed"))
-        mode_msg = "local private-server setup completed" if mode_ok else "local private-server setup made no changes"
-        # auto_fetch writes profile links; re-disable reporting afterward.
-        hcfg = load_hatcher_config()
+        print(
+            col(
+                "Uses the same canonical private-server fetch engine.",
+                CYAN,
+            )
+        )
+        print(
+            col(
+                "D1 reporting and specific-user allowlisting: OFF",
+                CYAN,
+            )
+        )
+
+        shared_server_setup = (
+            run_private_server_fetch_shared(
+                cfg,
+                selected_packages=selected,
+                pause_at_end=False,
+                sync_market_access=False,
+                automatic=True,
+                place_id_override=setup_place_id,
+                caller="Option 13 Local setup",
+            )
+        )
+        server_result = shared_server_setup
+        mode_ok = bool(
+            shared_server_setup.get("ok")
+            or shared_server_setup.get("changed")
+        )
+        mode_msg = (
+            "local private-server setup completed"
+            if mode_ok
+            else "local private-server setup made no changes"
+        )
+
+        # Routing remains in Hatcher profiles, while Local disables reporting.
+        hcfg = shared_server_setup["hcfg"]
         hcfg["enabled"] = False
         hcfg["jsonbin_hatchers_enabled"] = False
         save_hatcher_config(hcfg)
