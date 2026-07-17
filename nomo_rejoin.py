@@ -1,5 +1,33 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.58.28 — SOLVER RESULT GETS ONE RECOVERY
+# - Every real queued rejoin still submits the provider exactly once.
+# - Post-open CAPTCHA_SUCCESS and NO_CAPTCHA are now equivalent:
+#     result -> one exact-PID hard recovery -> no second provider submission.
+# - Removes the broken NO_CAPTCHA "current open kept" behavior that left the
+#   Roblox Join Error 529 popup permanently stuck.
+# - If CAPTCHA/529 remains after the one recovery, only that package enters
+#   CAPTCHA / FACE LOCK HOLD and the other clones continue.
+# - No automatic Retry button click and no repeated restart loop.
+# - Provider resubmission remains blocked for at least 10 minutes.
+# - Hatcher/Booster routing, shared private-server fetch, Option 6, PID policy,
+#   and Lua files remain unchanged.
+#
+# V4.58.27 — JOIN ERROR 529 AUTH HOLD
+# - Detects the exact package-scoped Roblox popup:
+#     Join Error / A Http error has occurred / Error Code 529
+# - Treats it as an ambiguous CAPTCHA-or-face-lock authentication hold instead
+#   of a generic disconnect/network retry.
+# - Detection works even when screenshot-only CAPTCHA mode is enabled because
+#   this native popup is checked through package-scoped Android UI text.
+# - Solver is submitted at most once for the current rejoin when enabled.
+# - If the provider returns NO_CAPTCHA while the popup remains visible, NOMO
+#   keeps the package in manual face-lock/auth hold and continues other clones.
+# - NOMO never presses Retry automatically and never loops repeated reopens for
+#   this popup.
+# - Shared Hatcher/Booster runtime, one private-server fetch engine, PID policy,
+#   Option 6 routing, and Lua files remain unchanged.
+#
 # V4.58.26 — ONE PRIVATE-SERVER FETCH ENGINE
 # - Every workflow that fetches/creates private servers now calls one canonical
 #   run_private_server_fetch_shared() entry point.
@@ -489,7 +517,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.58.26"
+__version__ = "V4.58.28"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -913,6 +941,9 @@ DEFAULT_CONFIG = {
     "login_challenge_detection_enabled": True,
     "login_challenge_api_detection_enabled": True,
     "login_challenge_ui_detection_enabled": True,
+    # On these cloned Android clients, this native Join Error 529 screen is
+    # commonly the wrapper shown for CAPTCHA or face verification.
+    "join_error_529_auth_challenge_enabled": True,
     "login_challenge_skip_blocked_packages": True,
     "login_challenge_webhook_url": "",
     "login_challenge_alert_cooldown_seconds": 1800,
@@ -1006,9 +1037,9 @@ DEFAULT_CONFIG = {
     # configured provider to make the authoritative check once for that open.
     "solver_provider_probe_on_no_state": True,
     "solver_rejoin_on_success": True,
-    # NO_CAPTCHA means the provider found nothing to solve. Do not kill/open the
-    # package a second time after the current open already started.
-    "solver_rejoin_on_no_captcha": False,
+    # On these cloned clients, NO_CAPTCHA can still leave Roblox trapped behind
+    # the 529 auth wrapper. Both provider-clear results get one recovery open.
+    "solver_rejoin_on_no_captcha": True,
     # After CAPTCHA_SUCCESS, allow one clean rejoin. If that rejoin
     # still produces no fresh state, isolate only that package instead of
     # entering another solver/homepage hard-retry loop.
@@ -2060,10 +2091,10 @@ def apply_update_migrations(cfg):
         set_cfg("solver_provider_probe_on_no_state", True)
     if "solver_rejoin_on_success" not in cfg:
         set_cfg("solver_rejoin_on_success", True)
-    # V4.09: force the safe default. Older builds treated NO_CAPTCHA exactly like
-    # CAPTCHA_SUCCESS and immediately hard-restarted a package that had just opened.
-    if cfg.get("solver_rejoin_on_no_captcha") is not False:
-        set_cfg("solver_rejoin_on_no_captcha", False)
+    # V4.58.28: provider NO_CAPTCHA and CAPTCHA_SUCCESS both get exactly
+    # one recovery open. This clears the clone's 529 auth wrapper without loops.
+    if cfg.get("solver_rejoin_on_no_captcha") is not True:
+        set_cfg("solver_rejoin_on_no_captcha", True)
     # V4.14: solver runs once before each real queued open. This supersedes the
     # old wait-until-stale probe for those queue items without changing disabled
     # solver behavior.
@@ -9317,32 +9348,131 @@ def clear_face_lock_runtime(rt_tab):
             changed = True
     return changed
 
-def android_login_challenge_ui_detail(pkg, cfg, force=False):
-    """Return a strong package-scoped Roblox verification signal.
 
-    Automatic dashboard decisions must never use snapshot.all_text because four
-    floating clone windows can be present at once. Only nodes whose Android
-    package matches this exact clone are trusted here.
-    """
-    if not cfg.get("captcha_ui_override_enabled", True):
-        return None
-    if not cfg.get("login_challenge_ui_detection_enabled", True):
+def join_error_529_auth_detail(
+    texts,
+    cfg=None,
+):
+    """Recognize only the exact 529 join-auth wrapper used by the clones."""
+    cfg = cfg or {}
+    if not cfg.get(
+        "join_error_529_auth_challenge_enabled",
+        True,
+    ):
         return None
 
-    # V4.29: screenshot-first. On this Redfinger, uiautomator sees Termux rather
-    # than Roblox WebViews, so automatic Loading checks should not pay for both.
-    visual = visual_captcha_detail(pkg, cfg, force=force, bypass_confirm=False)
+    values = [
+        str(value)
+        for value in (texts or [])
+        if str(value or "").strip()
+    ]
+    if not values:
+        return None
+
+    joined = "\n".join(values)
+    low = joined.lower()
+
+    code_hit = bool(
+        re.search(
+            r"error\s*code\s*:?\s*529\b",
+            low,
+            flags=re.I,
+        )
+    )
+    if not code_hit:
+        return None
+
+    context_terms = [
+        "join error",
+        "a http error has occurred",
+        "an http error has occurred",
+        "please close the client and try again",
+    ]
+    hits = [
+        term
+        for term in context_terms
+        if term in low
+    ]
+
+    # Error 529 by itself is not enough. Require the actual Roblox join popup
+    # wording so unrelated logs/status text cannot hold an account.
+    if not hits:
+        return None
+
+    return {
+        "title": "Roblox Authentication Hold",
+        "text": joined,
+        "code": "529",
+        "reason": (
+            "android_package_scoped_auth_529"
+        ),
+        "challenge_kind": (
+            "captcha_or_face_lock"
+        ),
+        "hits": (
+            ["error code 529"]
+            + hits[:4]
+        ),
+    }
+
+
+def android_login_challenge_ui_detail(
+    pkg,
+    cfg,
+    force=False,
+):
+    """Return a strong package-scoped Roblox verification/auth signal."""
+    if not cfg.get(
+        "captcha_ui_override_enabled",
+        True,
+    ):
+        return None
+    if not cfg.get(
+        "login_challenge_ui_detection_enabled",
+        True,
+    ):
+        return None
+
+    # Keep the low-overhead visual CAPTCHA detector first.
+    visual = visual_captcha_detail(
+        pkg,
+        cfg,
+        force=force,
+        bypass_confirm=False,
+    )
     if visual:
         return visual
-    if cfg.get("captcha_visual_screenshot_only", True):
+
+    # Join Error 529 is a native package-scoped popup. Check it even when
+    # screenshot-only CAPTCHA mode is enabled.
+    texts, _ = android_ui_text_for_package(
+        str(pkg or ""),
+        cfg,
+        force=force,
+    )
+    auth_529 = join_error_529_auth_detail(
+        texts,
+        cfg,
+    )
+    if auth_529:
+        return auth_529
+
+    if cfg.get(
+        "captcha_visual_screenshot_only",
+        True,
+    ):
         return None
 
-    texts, _ = android_ui_text_for_package(str(pkg or ""), cfg, force=force)
     if not texts:
         return None
 
-    joined = "\n".join(str(x) for x in texts if str(x or "").strip())
+    joined = "\n".join(
+        str(value)
+        for value in texts
+        if str(value or "").strip()
+    )
     low = joined.lower()
+
     strong_terms = [
         "verifying you're not a bot",
         "verifying you are not a bot",
@@ -9357,23 +9487,43 @@ def android_login_challenge_ui_detail(pkg, cfg, force=False):
         "arkose",
         "fun captcha",
     ]
-    hits = [term for term in strong_terms if term in low]
+    hits = [
+        term
+        for term in strong_terms
+        if term in low
+    ]
 
-    # Permit the exact screenshot wording split across separate nodes. Generic
-    # "Verification" or "Security" by itself is intentionally never enough.
-    if not hits and "verification" in low and "real person" in low:
-        hits = ["verification + real person"]
-    if not hits and "not a bot" in low and ("verification" in low or "security" in low):
+    if (
+        not hits
+        and "verification" in low
+        and "real person" in low
+    ):
+        hits = [
+            "verification + real person"
+        ]
+
+    if (
+        not hits
+        and "not a bot" in low
+        and (
+            "verification" in low
+            or "security" in low
+        )
+    ):
         hits = ["not a bot"]
+
     if not hits:
         return None
 
     return {
         "title": "Roblox Verification",
         "text": joined,
-        "reason": "android_package_scoped_captcha_ui",
+        "reason": (
+            "android_package_scoped_captcha_ui"
+        ),
         "hits": hits[:5],
     }
+
 
 
 def clear_captcha_ui_runtime(rt_tab):
@@ -9391,57 +9541,168 @@ def clear_captcha_ui_runtime(rt_tab):
     return changed
 
 
-def ui_login_challenge_detection(tab, cfg, force=True, allow_unscoped=True):
-    """Package-scoped Android UI CAPTCHA detection.
 
-    Roblox's native/WebView challenge is not always exposed to uiautomator. A
-    positive result therefore requires a strong human-check phrase; generic
-    login, sign-up, continue, security, or verify text is never enough.
-    """
-    pkg = str((tab or {}).get("package", "") or "")
-    snapshot = capture_android_ui_snapshot(cfg, force=force)
-    scoped, _ = android_ui_text_for_package(pkg, cfg, force=False)
-    all_text = list(snapshot.get("all_text", []) or [])
-    source = scoped if scoped else (all_text if allow_unscoped else [])
-    low = " ".join(source).lower()
+def ui_login_challenge_detection(
+    tab,
+    cfg,
+    force=True,
+    allow_unscoped=True,
+):
+    """Package-scoped Android UI CAPTCHA, face-lock, or auth-hold detection."""
+    pkg = str(
+        (tab or {}).get("package", "")
+        or ""
+    )
+    snapshot = capture_android_ui_snapshot(
+        cfg,
+        force=force,
+    )
+    scoped, _ = android_ui_text_for_package(
+        pkg,
+        cfg,
+        force=False,
+    )
+    all_text = list(
+        snapshot.get("all_text", [])
+        or []
+    )
+    source_text = (
+        scoped
+        if scoped
+        else (
+            all_text
+            if allow_unscoped
+            else []
+        )
+    )
+    low = " ".join(source_text).lower()
+    scope_note = (
+        "package-scoped"
+        if scoped
+        else (
+            "unscoped"
+            if allow_unscoped
+            else "no package-scoped text"
+        )
+    )
+
+    auth_529 = join_error_529_auth_detail(
+        source_text,
+        cfg,
+    )
+    if auth_529:
+        return (
+            True,
+            "ui auth challenge 529 "
+            + scope_note
+            + " (CAPTCHA or face lock)",
+        )
 
     # These screens block joining but are not CAPTCHA challenges. Sending them
     # to the solver only returns NO_CAPTCHA and creates a rejoin loop.
     manual_gate_terms = [
-        "access to popular games has changed", "check your age",
-        "verify your age", "age verification", "parental controls",
-        "parental restriction", "account restrictions"
+        "access to popular games has changed",
+        "check your age",
+        "verify your age",
+        "age verification",
+        "parental controls",
+        "parental restriction",
+        "account restrictions",
     ]
-    manual_hits = [t for t in manual_gate_terms if t in low]
-    scope_note = "package-scoped" if scoped else ("unscoped" if allow_unscoped else "no package-scoped text")
+    manual_hits = [
+        term
+        for term in manual_gate_terms
+        if term in low
+    ]
     if manual_hits:
-        return True, f"ui manual join block {scope_note} " + ",".join(manual_hits[:4])
+        return (
+            True,
+            "ui manual join block "
+            + scope_note
+            + " "
+            + ",".join(
+                manual_hits[:4]
+            ),
+        )
 
     strong_terms = [
-        "captcha", "not a bot", "you are not a bot", "verify you are human",
-        "prove you are human", "human verification", "real person",
-        "start puzzle", "solve this puzzle", "solve this challenge",
-        "complete the challenge", "arkose", "fun captcha"
+        "captcha",
+        "not a bot",
+        "you are not a bot",
+        "verify you are human",
+        "prove you are human",
+        "human verification",
+        "real person",
+        "start puzzle",
+        "solve this puzzle",
+        "solve this challenge",
+        "complete the challenge",
+        "arkose",
+        "fun captcha",
     ]
-    hits = [t for t in strong_terms if t in low]
+    hits = [
+        term
+        for term in strong_terms
+        if term in low
+    ]
     if hits:
-        return True, f"ui captcha {scope_note} " + ",".join(hits[:5])
-
-    login_only = [t for t in ["log in", "login", "sign up"] if t in low]
-    if login_only:
-        return False, f"ui login text only ({scope_note}); not captcha"
-    visual = visual_captcha_detail(pkg, cfg, force=force, bypass_confirm=True)
-    if visual:
-        metrics = visual.get("visual_metrics", {}) or {}
-        return True, (
-            "visual captcha package-scoped "
-            f"white={float(metrics.get('white_ratio', 0.0)):.3f} "
-            f"green={float(metrics.get('green_ratio', 0.0)):.3f}"
+        return (
+            True,
+            "ui captcha "
+            + scope_note
+            + " "
+            + ",".join(hits[:5]),
         )
-    visual_error = str(capture_visual_captcha_snapshot(cfg, force=False).get("error", "") or "")
-    if not source:
-        return None, "ui has no accessible text" + (("; " + visual_error) if visual_error else "")
-    return False, f"ui no strong captcha text ({scope_note})"
+
+    login_only = [
+        term
+        for term in [
+            "log in",
+            "login",
+            "sign up",
+        ]
+        if term in low
+    ]
+    if login_only:
+        return (
+            False,
+            "ui login text only "
+            f"({scope_note}); not captcha",
+        )
+
+    visual = visual_captcha_detail(
+        pkg,
+        cfg,
+        force=force,
+        bypass_confirm=True,
+    )
+    if visual:
+        metrics = (
+            visual.get(
+                "visual_metrics",
+                {},
+            )
+            or {}
+        )
+        return (
+            True,
+            "visual captcha "
+            + scope_note
+            + " "
+            + str(
+                visual.get("reason")
+                or "challenge"
+            )
+            + " "
+            + str(metrics),
+        )
+
+    return (
+        None,
+        "ui no strong captcha/auth terms "
+        f"({scope_note})",
+    )
+
 
 
 def send_login_challenge_alert(cfg, tab, rt_tab, detail):
@@ -9455,7 +9716,7 @@ def send_login_challenge_alert(cfg, tab, rt_tab, detail):
         return False, "alert cooldown"
 
     content = (
-        f"NOMO REJOIN needs manual login/CAPTCHA\n"
+        f"NOMO REJOIN needs CAPTCHA/face-lock/manual login\n"
         f"Package: `{tab.get('package')}`\n"
         f"User: `{tab.get('user_name', tab.get('package'))}`\n"
         f"Detail: {detail}"
@@ -9515,7 +9776,20 @@ def detect_and_mark_manual_login(tab, cfg, rt, rt_tab, reason):
     rt_tab["manual_login_detail"] = detail
     rt_tab["manual_login_detected_at"] = now()
     low_detail = detail.lower()
-    rt_tab["note"] = "join captcha/manual" if ("captcha" in low_detail or "puzzle" in low_detail or "not a bot" in low_detail) else "needs manual login"
+    if (
+        "529" in low_detail
+        or "face lock" in low_detail
+        or "auth challenge" in low_detail
+    ):
+        rt_tab["note"] = "CAPTCHA / FACE LOCK HOLD"
+    elif (
+        "captcha" in low_detail
+        or "puzzle" in low_detail
+        or "not a bot" in low_detail
+    ):
+        rt_tab["note"] = "join captcha/manual"
+    else:
+        rt_tab["note"] = "needs manual login"
     send_login_challenge_alert(cfg, tab, rt_tab, detail)
     save_runtime(rt)
     return True, detail
@@ -9670,12 +9944,55 @@ def wait_until_fresh_after_open(
         if visible_captcha:
             rt_tab["captcha_ui_visible"] = True
             rt_tab["captcha_ui_last_seen_at"] = now()
-            if not allow_solver_probe and cfg.get("solver_once_per_rejoin", True):
-                retry_after = max(600, int(cfg.get("solver_retry_cooldown_seconds", 600) or 600))
+            if not allow_solver_probe and cfg.get(
+                "solver_once_per_rejoin",
+                True,
+            ):
+                retry_after = max(
+                    600,
+                    int(
+                        cfg.get(
+                            "solver_retry_cooldown_seconds",
+                            600,
+                        )
+                        or 600
+                    ),
+                )
+                detail = str(
+                    visible_captcha.get("text")
+                    or visible_captcha.get("reason")
+                    or "verification UI remains"
+                )
+                is_auth_529 = (
+                    str(visible_captcha.get("code") or "") == "529"
+                    or visible_captcha.get("challenge_kind")
+                    == "captcha_or_face_lock"
+                )
                 rt_tab["captcha_ui_retry_at"] = now() + retry_after
-                rt_tab["note"] = f"verification remains after one solver check; retry rejoin in {format_age(retry_after)}"
+                rt_tab["manual_login_needed"] = True
+                rt_tab["manual_login_reason"] = (
+                    "captcha or face lock remains after one recovery"
+                    if is_auth_529
+                    else "verification remains after one recovery"
+                )
+                rt_tab["manual_login_detail"] = detail
+                rt_tab["manual_login_detected_at"] = now()
+                rt_tab["note"] = (
+                    "CAPTCHA / FACE LOCK HOLD after one recovery"
+                    if is_auth_529
+                    else "verification hold after one recovery"
+                )
+                set_hold(
+                    pkg,
+                    rt_tab["manual_login_reason"],
+                )
                 save_runtime(rt)
-                log_activity("verification remains after solver-before-open; no duplicate submit", pkg, YELLOW)
+                log_activity(
+                    rt_tab["note"]
+                    + f"; provider cooldown {format_age(retry_after)}",
+                    pkg,
+                    RED,
+                )
                 return False, "manual challenge"
             solver_status, solver_note = handle_detected_solver_challenge(
                 tab, cfg, rt, rt_tab, "visible package-scoped verification UI"
@@ -9686,12 +10003,44 @@ def wait_until_fresh_after_open(
         if state_disconnect_ui(state):
             status_note = state_disconnect_note(state)
         elif state_login_challenge_detail(state):
-            if not allow_solver_probe and cfg.get("solver_once_per_rejoin", True):
-                retry_after = max(600, int(cfg.get("solver_retry_cooldown_seconds", 600) or 600))
+            if not allow_solver_probe and cfg.get(
+                "solver_once_per_rejoin",
+                True,
+            ):
+                retry_after = max(
+                    600,
+                    int(
+                        cfg.get(
+                            "solver_retry_cooldown_seconds",
+                            600,
+                        )
+                        or 600
+                    ),
+                )
+                challenge_detail = state_login_challenge_detail(
+                    state
+                )
                 rt_tab["captcha_ui_retry_at"] = now() + retry_after
-                rt_tab["note"] = f"challenge remains after one solver check; retry rejoin in {format_age(retry_after)}"
+                rt_tab["manual_login_needed"] = True
+                rt_tab["manual_login_reason"] = (
+                    "challenge remains after one recovery"
+                )
+                rt_tab["manual_login_detail"] = challenge_detail
+                rt_tab["manual_login_detected_at"] = now()
+                rt_tab["note"] = (
+                    "CAPTCHA HOLD after one recovery"
+                )
+                set_hold(
+                    pkg,
+                    rt_tab["manual_login_reason"],
+                )
                 save_runtime(rt)
-                log_activity("challenge remains after solver-before-open; no duplicate submit", pkg, YELLOW)
+                log_activity(
+                    rt_tab["note"]
+                    + f"; provider cooldown {format_age(retry_after)}",
+                    pkg,
+                    RED,
+                )
                 return False, "manual challenge"
             solver_status, solver_note = handle_detected_solver_challenge(
                 tab, cfg, rt, rt_tab, state_login_challenge_detail(state)
@@ -22011,36 +22360,29 @@ def poll_solver_jobs(cfg, rt, open_queue):
             changed = True
             continue
 
-        # V4.12: the provider can return NO_CAPTCHA even while Roblox visibly
-        # shows "Verifying you're not a bot". Recheck a fresh package-scoped UI
-        # snapshot before clearing anything. A still-visible challenge is a false
-        # negative: keep this package open/held and retry only after cooldown.
+        # The provider may return NO_CAPTCHA while the clone still displays the
+        # native 529/verification wrapper. Record that mismatch, then continue
+        # into the common result path below, which performs exactly one recovery.
         if no_captcha_result:
-            visible_ui = android_login_challenge_ui_detail(pkg, cfg, force=True)
+            visible_ui = android_login_challenge_ui_detail(
+                pkg,
+                cfg,
+                force=True,
+            )
             if visible_ui:
-                retry_after = max(
-                    600,
-                    int(cfg.get("captcha_ui_retry_seconds", 600) or 600),
-                    int(cfg.get("solver_retry_cooldown_seconds", 600) or 600),
-                )
-                cancel_queued_package(open_queue, pkg)
                 rt_tab["captcha_ui_visible"] = True
                 rt_tab["captcha_ui_false_negative"] = True
                 rt_tab["captcha_ui_last_seen_at"] = now()
-                rt_tab["captcha_ui_retry_at"] = now() + retry_after
-                rt_tab["solver_state"] = "false_negative"
-                rt_tab["solver_last_error"] = "provider NO_CAPTCHA while verification UI remains visible"
-                rt_tab["manual_login_needed"] = False
-                rt_tab["manual_login_reason"] = ""
-                rt_tab["manual_login_detail"] = ""
-                rt_tab["note"] = f"NO_CAPTCHA false negative; retry in {format_age(retry_after)}"
-                set_hold(pkg, "verification UI still visible after provider NO_CAPTCHA")
-                log_activity(
-                    f"solver NO_CAPTCHA false negative; verification UI still visible; retry in {format_age(retry_after)}",
-                    pkg, YELLOW,
+                rt_tab["solver_state"] = "clear_ui_still_visible"
+                rt_tab["solver_last_error"] = (
+                    "provider NO_CAPTCHA while auth UI remains visible"
                 )
-                changed = True
-                continue
+                log_activity(
+                    "solver NO_CAPTCHA but auth UI remains; "
+                    "one exact-PID recovery will run",
+                    pkg,
+                    YELLOW,
+                )
 
         # V4.09: keep NO_CAPTCHA separate from CAPTCHA_SUCCESS. The provider
         # returning NO_CAPTCHA means there was nothing to solve, so a package that
@@ -22067,9 +22409,10 @@ def poll_solver_jobs(cfg, rt, open_queue):
             # disturb another clone's queued recovery.
             cancel_queued_package(open_queue, pkg)
 
-            should_rejoin = bool(cfg.get("solver_rejoin_on_success", True))
-            if no_captcha_result:
-                should_rejoin = bool(cfg.get("solver_rejoin_on_no_captcha", False))
+            # This is a post-open provider result. The current Roblox task can
+            # already be trapped behind 529, so both clear statuses get exactly
+            # one hard recovery. The recovery item skips solver and probe.
+            should_rejoin = True
 
             if should_rejoin:
                 rt_tab["note"] = f"{result_label} - rejoin queued"
@@ -22083,17 +22426,19 @@ def poll_solver_jobs(cfg, rt, open_queue):
                     force=True, mode="hard_force", bypass_manual=True,
                     metadata={
                         "solver_recovery": True,
+                        "auth_result_recovery": True,
                         "solver_result": result_label,
                         "skip_solver_once": True,
                         "skip_solver_probe": True,
+                        "solver_preflight_done": True,
                         "bypass_recheck": True,
                     },
                 )
                 if not added:
                     rt_tab["note"] = f"{result_label} - already queued"
             else:
-                rt_tab["note"] = f"{result_label} - current open kept; waiting state"
-                activity = f"solver {result_label}; current open kept (no extra restart)"
+                rt_tab["note"] = f"{result_label} - one recovery required"
+                activity = f"solver {result_label}; one recovery required"
                 if detail:
                     activity += " - " + cut(detail, 70)
                 log_activity(activity, pkg, GREEN)
