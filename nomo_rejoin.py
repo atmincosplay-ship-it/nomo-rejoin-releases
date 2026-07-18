@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.58.30 — STORAGE ROOT + DELETE APK/ZIP SOURCES
+# - Option 18 local browsing now defaults to /storage/emulated/0/.
+# - The recursive scan still includes /storage/emulated/0/Download/.
+# - The root scan uses error-tolerant os.walk so inaccessible folders do not
+#   abort the complete APK/ZIP file list.
+# - Option 18 -> 4 can optionally delete the selected original APK/ZIP sources
+#   after every collected APK installs successfully.
+# - ZIP extraction leftovers are removed with that optional source cleanup.
+# - Option 18 -> 8 deletes selected local APK/ZIP files without installing.
+# - Every destructive delete has a separate confirmation defaulting to NO.
+# - Partial/failed install batches never auto-delete their source files.
+# - Rejoin, solver, routing, private-server, PID, and Lua behavior are unchanged.
+#
 # V4.58.29 — LOCAL ZIP APK INSTALL
 # - Option 18 -> 4 now scans the local folder recursively for both APK and ZIP.
 # - A selected local ZIP is safely extracted and every APK inside is installed.
@@ -528,7 +541,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.58.29"
+__version__ = "V4.58.30"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -543,7 +556,7 @@ DELTA_WORKSPACE_EXPORT_DIR = BASE_DIR / "workspace_exports"
 DELTA_WORKSPACE_BACKUP_DIR = BASE_DIR / "workspace_backups"
 
 APK_DOWNLOAD_DIR = Path("/storage/emulated/0/Download/NOMO_APK")
-APK_LOCAL_DEFAULT_DIR = Path("/storage/emulated/0/Download")
+APK_LOCAL_DEFAULT_DIR = Path("/storage/emulated/0/")
 APK_EXTRACT_DIR = APK_DOWNLOAD_DIR / "_extracted"
 NOMO_BACKUP_DIR = BASE_DIR / "backups"
 NOMO_UPDATE_URL = (
@@ -16306,35 +16319,32 @@ def _parse_number_selection(raw, total):
 
 
 
+
 def _scan_local_apk_sources(
     folder,
     recursive=True,
 ):
-    """Return local APK and ZIP install sources, case-insensitively."""
+    """Return APK/ZIP files while tolerating inaccessible Android folders."""
     folder = Path(folder)
     if not folder.exists() or not folder.is_dir():
         return []
 
-    iterator = (
-        folder.rglob("*")
-        if recursive
-        else folder.glob("*")
-    )
     found = []
     seen = set()
 
-    for path in iterator:
+    def add_candidate(path):
+        path = Path(path)
         try:
             if not path.is_file():
-                continue
+                return
         except Exception:
-            continue
+            return
 
         if path.suffix.lower() not in {
             ".apk",
             ".zip",
         }:
-            continue
+            return
 
         try:
             key = str(path.resolve())
@@ -16342,15 +16352,46 @@ def _scan_local_apk_sources(
             key = str(path)
 
         if key in seen:
-            continue
+            return
         seen.add(key)
         found.append(path)
+
+    if recursive:
+        def ignore_walk_error(_error):
+            return None
+
+        for root, dirs, files in os.walk(
+            str(folder),
+            topdown=True,
+            onerror=ignore_walk_error,
+            followlinks=False,
+        ):
+            safe_dirs = []
+            for name in dirs:
+                candidate = Path(root) / name
+                try:
+                    if candidate.is_symlink():
+                        continue
+                except Exception:
+                    continue
+                safe_dirs.append(name)
+            dirs[:] = safe_dirs
+
+            for name in files:
+                add_candidate(Path(root) / name)
+    else:
+        try:
+            for path in folder.iterdir():
+                add_candidate(path)
+        except Exception:
+            pass
 
     return sorted(
         found,
         key=lambda path:
             natural_package_key(str(path)),
     )
+
 
 
 def _local_install_source_type(path):
@@ -16537,6 +16578,237 @@ def _collect_local_installable_apks(
             natural_package_key(path.name)
     )
     return collected, notes
+
+
+def _path_is_inside(child, parent):
+    try:
+        child = Path(child).resolve()
+        parent = Path(parent).resolve()
+        child.relative_to(parent)
+        return True
+    except Exception:
+        return False
+
+
+def _delete_exact_local_apk_zip_files(paths):
+    """Delete only exact APK/ZIP files selected by the user."""
+    deleted = 0
+    failed = 0
+    notes = []
+    seen = set()
+
+    for value in paths or []:
+        path = Path(value)
+        try:
+            key = str(path.resolve())
+        except Exception:
+            key = str(path)
+
+        if key in seen:
+            continue
+        seen.add(key)
+
+        if path.suffix.lower() not in {
+            ".apk",
+            ".zip",
+        }:
+            failed += 1
+            notes.append(
+                (
+                    path,
+                    False,
+                    "refused: not an APK/ZIP file",
+                )
+            )
+            continue
+
+        try:
+            if not path.exists():
+                notes.append(
+                    (
+                        path,
+                        True,
+                        "already missing",
+                    )
+                )
+                continue
+            if not path.is_file():
+                raise OSError("not a regular file")
+
+            path.unlink()
+            deleted += 1
+            notes.append(
+                (
+                    path,
+                    True,
+                    "deleted",
+                )
+            )
+        except Exception as exc:
+            failed += 1
+            notes.append(
+                (
+                    path,
+                    False,
+                    f"delete failed: {exc}",
+                )
+            )
+
+    return deleted, failed, notes
+
+
+def _cleanup_installed_local_sources(
+    selected_sources,
+    collected_apks,
+):
+    """Delete selected originals and temporary APKs extracted from ZIPs."""
+    delete_paths = list(selected_sources or [])
+
+    for apk in collected_apks or []:
+        apk = Path(apk)
+        if _path_is_inside(
+            apk,
+            APK_EXTRACT_DIR,
+        ):
+            delete_paths.append(apk)
+
+    deleted, failed, notes = (
+        _delete_exact_local_apk_zip_files(
+            delete_paths
+        )
+    )
+
+    try:
+        extract_root = Path(APK_EXTRACT_DIR)
+        if extract_root.exists():
+            for root, dirs, _files in os.walk(
+                str(extract_root),
+                topdown=False,
+            ):
+                for name in dirs:
+                    directory = Path(root) / name
+                    try:
+                        directory.rmdir()
+                    except Exception:
+                        pass
+            try:
+                extract_root.rmdir()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return deleted, failed, notes
+
+
+def delete_local_apk_zip_menu(cfg):
+    raw = clean_terminal_input(
+        input(
+            f"APK/ZIP folder "
+            f"[ENTER={APK_LOCAL_DEFAULT_DIR}]: "
+        )
+    )
+    folder = (
+        Path(raw)
+        if raw
+        else APK_LOCAL_DEFAULT_DIR
+    )
+
+    if not folder.exists() or not folder.is_dir():
+        print(
+            col(
+                f"Folder not found: {folder}",
+                RED,
+            )
+        )
+        pause()
+        return
+
+    sources = _scan_local_apk_sources(
+        folder,
+        recursive=True,
+    )
+    if not sources:
+        print(
+            col(
+                (
+                    "No APK or ZIP files found "
+                    f"under: {folder}"
+                ),
+                RED,
+            )
+        )
+        pause()
+        return
+
+    selected = choose_apk_install_sources(
+        sources,
+        base_folder=folder,
+    )
+    if not selected:
+        print(
+            col(
+                "No APK/ZIP source selected.",
+                YELLOW,
+            )
+        )
+        pause()
+        return
+
+    clear()
+    banner(
+        "DELETE LOCAL APK / ZIP FILES",
+        cfg,
+    )
+    print(
+        col(
+            "These exact files will be permanently deleted:",
+            RED,
+        )
+    )
+    print("")
+    for path in selected:
+        print(f"  - {path}")
+    print("")
+
+    if not _setup_yes_no(
+        f"Delete these {len(selected)} file(s)?",
+        default=False,
+    ):
+        print(
+            col(
+                "Delete cancelled.",
+                YELLOW,
+            )
+        )
+        pause()
+        return
+
+    deleted, failed, notes = (
+        _delete_exact_local_apk_zip_files(
+            selected
+        )
+    )
+    print("")
+    for path, ok, note in notes:
+        print(
+            col(
+                f"{path.name}: {note}",
+                GREEN if ok else RED,
+            )
+        )
+
+    print("")
+    print(
+        col(
+            (
+                f"Finished: {deleted} deleted, "
+                f"{failed} failed."
+            ),
+            GREEN if failed == 0 else YELLOW,
+        )
+    )
+    pause()
 
 def choose_apk_files(apks, base_folder=None):
     apks = list(apks or [])
@@ -16944,108 +17216,255 @@ def _download_assets_then_install(assets, extra_headers=None, cfg=None):
     return installed, failed
 
 
+
 def apk_download_install_menu(cfg):
     while True:
         cfg = load_config()
-        install_mode = _normalized_apk_install_mode(cfg)
+        install_mode = _normalized_apk_install_mode(
+            cfg
+        )
 
         clear()
         banner("APK DOWNLOAD / INSTALL", cfg)
-        print(f"Download folder : {APK_DOWNLOAD_DIR}")
-        print(f"Install behavior: {_apk_install_mode_label(install_mode)}")
+        print(
+            f"Download folder : {APK_DOWNLOAD_DIR}"
+        )
+        print(
+            f"Local scan root : {APK_LOCAL_DEFAULT_DIR}"
+        )
+        print(
+            "Install behavior: "
+            + _apk_install_mode_label(
+                install_mode
+            )
+        )
         print("")
-        print("1. Direct APK/ZIP URL -> download + install")
-        print("2. GitHub latest release -> download + install all APK/ZIP assets")
-        print("3. GoFile share -> API token lookup + download + install")
-        print("4. Select local APK/ZIP files -> extract + install")
-        print("5. Uninstall installed packages only")
-        print("6. Change install/uninstall behavior")
+        print(
+            "1. Direct APK/ZIP URL -> download + install"
+        )
+        print(
+            "2. GitHub latest release -> download + install all APK/ZIP assets"
+        )
+        print(
+            "3. GoFile share -> API token lookup + download + install"
+        )
+        print(
+            "4. Select local APK/ZIP files -> extract + install"
+        )
+        print(
+            "5. Uninstall installed packages only"
+        )
+        print(
+            "6. Change install/uninstall behavior"
+        )
         print("7. Show download folder")
+        print(
+            "8. Delete local APK/ZIP files"
+        )
         print("0. Back")
         drain_stdin()
-        choice = clean_terminal_input(input("\nChoose: "))
+        choice = clean_terminal_input(
+            input("\nChoose: ")
+        )
 
         if choice == "0":
             return
 
         if choice == "1":
-            url = clean_terminal_input(input("Direct APK/ZIP URL: "))
+            url = clean_terminal_input(
+                input(
+                    "Direct APK/ZIP URL: "
+                )
+            )
             if not url:
                 continue
-            print(col("Downloading...", CYAN))
-            ok, note, path = download_url_to_apk_dir(url)
-            print(col(note, GREEN if ok else RED))
+            print(
+                col(
+                    "Downloading...",
+                    CYAN,
+                )
+            )
+            ok, note, path = (
+                download_url_to_apk_dir(url)
+            )
+            print(
+                col(
+                    note,
+                    GREEN if ok else RED,
+                )
+            )
             if not ok or not path:
                 pause()
                 continue
-            collect_ok, collect_note, apks = _collect_installable_apks(path)
-            print(col(collect_note, GREEN if collect_ok else RED))
-            if collect_ok and _setup_yes_no("Install now?", default=True):
-                installed, failed, _ = install_apk_batch(apks, cfg=cfg)
-                print(col(
-                    f"Finished: {installed} installed, {failed} failed.",
-                    GREEN if failed == 0 else YELLOW,
-                ))
+            collect_ok, collect_note, apks = (
+                _collect_installable_apks(
+                    path
+                )
+            )
+            print(
+                col(
+                    collect_note,
+                    GREEN
+                    if collect_ok
+                    else RED,
+                )
+            )
+            if (
+                collect_ok
+                and _setup_yes_no(
+                    "Install now?",
+                    default=True,
+                )
+            ):
+                installed, failed, _ = (
+                    install_apk_batch(
+                        apks,
+                        cfg=cfg,
+                    )
+                )
+                print(
+                    col(
+                        (
+                            f"Finished: {installed} installed, "
+                            f"{failed} failed."
+                        ),
+                        GREEN
+                        if failed == 0
+                        else YELLOW,
+                    )
+                )
             pause()
             continue
 
         if choice == "2":
-            repo = clean_terminal_input(input(
-                "GitHub repository [owner/repo or URL]: "
-            ))
+            repo = clean_terminal_input(
+                input(
+                    "GitHub repository "
+                    "[owner/repo or URL]: "
+                )
+            )
             if not repo:
                 continue
-            token = str(cfg.get("github_download_token", "") or "").strip()
-            ok, note, assets = github_latest_release_assets(repo, token)
-            print(col(note, GREEN if ok else RED))
+            token = str(
+                cfg.get(
+                    "github_download_token",
+                    "",
+                )
+                or ""
+            ).strip()
+            ok, note, assets = (
+                github_latest_release_assets(
+                    repo,
+                    token,
+                )
+            )
+            print(
+                col(
+                    note,
+                    GREEN if ok else RED,
+                )
+            )
             if not ok:
                 pause()
                 continue
-            for index, asset in enumerate(assets, 1):
+            for index, asset in enumerate(
+                assets,
+                1,
+            ):
                 print(
                     f"  {index}. {asset['name']} "
                     f"({int(asset.get('size', 0)) // 1048576} MB)"
                 )
             if not _setup_yes_no(
-                "Download and install all listed assets?", default=True
+                (
+                    "Download and install all "
+                    "listed assets?"
+                ),
+                default=True,
             ):
                 continue
-            installed, failed = _download_assets_then_install(
-                assets,
-                cfg=cfg,
+            installed, failed = (
+                _download_assets_then_install(
+                    assets,
+                    cfg=cfg,
+                )
             )
-            print(col(
-                f"Finished: {installed} installed, {failed} failed.",
-                GREEN if failed == 0 else YELLOW,
-            ))
+            print(
+                col(
+                    (
+                        f"Finished: {installed} installed, "
+                        f"{failed} failed."
+                    ),
+                    GREEN
+                    if failed == 0
+                    else YELLOW,
+                )
+            )
             pause()
             continue
 
         if choice == "3":
-            share = clean_terminal_input(input("GoFile share URL/content ID: "))
+            share = clean_terminal_input(
+                input(
+                    "GoFile share URL/content ID: "
+                )
+            )
             if not share:
                 continue
-            token = getpass.getpass("GoFile API token: ").strip()
-            ok, note, assets = gofile_share_assets(share, token)
-            print(col(note, GREEN if ok else RED))
+            token = getpass.getpass(
+                "GoFile API token: "
+            ).strip()
+            ok, note, assets = (
+                gofile_share_assets(
+                    share,
+                    token,
+                )
+            )
+            print(
+                col(
+                    note,
+                    GREEN if ok else RED,
+                )
+            )
             if not ok:
                 pause()
                 continue
-            for index, asset in enumerate(assets, 1):
-                print(f"  {index}. {asset['name']}")
+            for index, asset in enumerate(
+                assets,
+                1,
+            ):
+                print(
+                    f"  {index}. {asset['name']}"
+                )
             if not _setup_yes_no(
-                "Download and install all listed assets?", default=True
+                (
+                    "Download and install all "
+                    "listed assets?"
+                ),
+                default=True,
             ):
                 continue
-            installed, failed = _download_assets_then_install(
-                assets,
-                extra_headers={"Authorization": f"Bearer {token}"},
-                cfg=cfg,
+            installed, failed = (
+                _download_assets_then_install(
+                    assets,
+                    extra_headers={
+                        "Authorization":
+                            f"Bearer {token}",
+                    },
+                    cfg=cfg,
+                )
             )
-            print(col(
-                f"Finished: {installed} installed, {failed} failed.",
-                GREEN if failed == 0 else YELLOW,
-            ))
+            print(
+                col(
+                    (
+                        f"Finished: {installed} installed, "
+                        f"{failed} failed."
+                    ),
+                    GREEN
+                    if failed == 0
+                    else YELLOW,
+                )
+            )
             pause()
             continue
 
@@ -17094,12 +17513,14 @@ def apk_download_install_menu(cfg):
             apk_count = sum(
                 1
                 for path in sources
-                if path.suffix.lower() == ".apk"
+                if path.suffix.lower()
+                == ".apk"
             )
             zip_count = sum(
                 1
                 for path in sources
-                if path.suffix.lower() == ".zip"
+                if path.suffix.lower()
+                == ".zip"
             )
             print(
                 col(
@@ -17166,7 +17587,7 @@ def apk_download_install_menu(cfg):
             print(
                 col(
                     (
-                        f"Installable APKs collected: "
+                        "Installable APKs collected: "
                         f"{len(apks)}"
                     ),
                     GREEN,
@@ -17176,9 +17597,7 @@ def apk_download_install_menu(cfg):
                 package, _detected_by = (
                     apk_package_name(apk)
                 )
-                print(
-                    f"  - {apk.name}"
-                )
+                print(f"  - {apk.name}")
                 print(
                     col(
                         (
@@ -17200,7 +17619,17 @@ def apk_download_install_menu(cfg):
             ):
                 continue
 
-            installed, failed, _ = (
+            delete_after_success = (
+                _setup_yes_no(
+                    (
+                        "Delete selected original APK/ZIP "
+                        "files after a fully successful install?"
+                    ),
+                    default=False,
+                )
+            )
+
+            installed, failed, _results = (
                 install_apk_batch(
                     apks,
                     cfg=cfg,
@@ -17212,9 +17641,53 @@ def apk_download_install_menu(cfg):
                         f"Finished: {installed} installed, "
                         f"{failed} failed."
                     ),
-                    GREEN if failed == 0 else YELLOW,
+                    GREEN
+                    if failed == 0
+                    else YELLOW,
                 )
             )
+
+            if delete_after_success:
+                complete_success = (
+                    failed == 0
+                    and installed == len(apks)
+                )
+                if not complete_success:
+                    print(
+                        col(
+                            (
+                                "Source deletion skipped because "
+                                "the install batch was not fully successful."
+                            ),
+                            YELLOW,
+                        )
+                    )
+                else:
+                    deleted, delete_failed, notes = (
+                        _cleanup_installed_local_sources(
+                            selected_sources,
+                            apks,
+                        )
+                    )
+                    for path, ok, note in notes:
+                        print(
+                            col(
+                                f"{path.name}: {note}",
+                                GREEN if ok else RED,
+                            )
+                        )
+                    print(
+                        col(
+                            (
+                                f"Cleanup: {deleted} deleted, "
+                                f"{delete_failed} failed."
+                            ),
+                            GREEN
+                            if delete_failed == 0
+                            else YELLOW,
+                        )
+                    )
+
             pause()
             continue
 
@@ -17227,13 +17700,26 @@ def apk_download_install_menu(cfg):
             continue
 
         if choice == "7":
-            APK_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+            APK_DOWNLOAD_DIR.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
             print(APK_DOWNLOAD_DIR)
             pause()
             continue
 
-        print(col("Invalid choice.", RED))
+        if choice == "8":
+            delete_local_apk_zip_menu(cfg)
+            continue
+
+        print(
+            col(
+                "Invalid choice.",
+                RED,
+            )
+        )
         time.sleep(1)
+
 
 
 def _workspace_zip_relative_path(member_name):
