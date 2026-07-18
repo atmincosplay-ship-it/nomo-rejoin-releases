@@ -1,5 +1,25 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.58.34 — ANDROID CLEAR CACHE BUTTON
+# - Cache cleanup now uses Android Package Manager's cache-only action:
+#     pm clear --user 0 --cache-only <package>
+# - This matches the Settings -> App info -> CLEAR CACHE operation on Android
+#   builds that expose the cache-only package-manager shell flag.
+# - It clears normal cache and code cache, but never app data/login/cookies.
+# - Older builds without --cache-only use a root compatibility fallback that
+#   clears cache + code_cache under CE, DE, legacy, and external cache paths.
+# - NOMO never falls back to plain `pm clear <package>` because that would erase
+#   all application data.
+# - Option 1, Option 6, and Option 13 all use this same implementation.
+# - No package force-stop, routing, solver, private-server, APK, or Lua changes.
+#
+# V4.58.33 — CACHE STATUS FIX
+# - Missing cache directories no longer make cleanup report FAILED.
+# - Existing cache directories are cleared independently.
+# - Only a real deletion failure returns FAILED.
+# - Reports how many cache directories existed and were processed.
+# - No app data, cookies, login, Workspace, AutoExec, or package stop changes.
+#
 # V4.58.32 — CACHE CLEANUP BEFORE OPTION 6
 # - Option 6 clears cache once for only packages it will actually restart.
 # - Applies to Market, Hatcher, Booster, and Rejoin Only.
@@ -567,7 +587,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.58.32"
+__version__ = "V4.58.34"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -2985,6 +3005,8 @@ def force_stop_package(pkg, cfg, tries=3, wait_after=0.8, settle=1.0):
 
 
 
+
+
 def clear_package_cache(
     pkg,
     cfg,
@@ -2992,7 +3014,7 @@ def clear_package_cache(
     reason="",
     force=False,
 ):
-    """Clear cache contents only; never clear package app data."""
+    """Perform Android's cache-only clear without deleting app user data."""
     pkg = str(pkg or "").strip()
     if not pkg:
         return False, "package empty"
@@ -3029,32 +3051,124 @@ def clear_package_cache(
     ):
         return False, "cache cooldown"
 
-    paths = [
-        f"/data/data/{pkg}/cache",
-        f"/data/user/0/{pkg}/cache",
-        (
-            "/storage/emulated/0/Android/data/"
-            f"{pkg}/cache"
-        ),
-    ]
+    # This is the shell equivalent of Android Settings -> App info ->
+    # CLEAR CACHE. Never remove --cache-only.
+    system_cmd = (
+        "pm clear --user 0 --cache-only "
+        + shlex.quote(pkg)
+    )
+    system_code, system_out = shell(
+        system_cmd,
+        cfg,
+    )
+    system_text = str(system_out or "").strip()
+    system_low = system_text.lower()
 
-    cmd = (
-        "for d in "
-        + " ".join(
+    system_supported = not any(
+        marker in system_low
+        for marker in (
+            "unknown option",
+            "unrecognized option",
+            "illegal option",
+            "usage: pm clear",
+            "unsupported",
+            "not found",
+        )
+    )
+    system_success = (
+        system_code == 0
+        and (
+            not system_text
+            or "success" in system_low
+        )
+    )
+
+    method = "android_package_manager"
+    note = ""
+    ok = False
+
+    if system_success:
+        ok = True
+        note = "Android CLEAR CACHE completed"
+    elif system_supported:
+        # The device recognizes cache-only but the actual operation failed.
+        # Do not mask permission/package failures with manual deletion.
+        ok = False
+        note = (
+            cut(system_text, 100)
+            or "Android CLEAR CACHE failed"
+        )
+    else:
+        # Older Android/Redfinger builds may not expose --cache-only through pm,
+        # even though Settings has the internal API. Safely mirror its cache and
+        # code-cache deletion without ever touching files/ shared_prefs/databases.
+        method = "root_compatibility_fallback"
+        paths = [
+            f"/data/data/{pkg}/cache",
+            f"/data/data/{pkg}/code_cache",
+            f"/data/user/0/{pkg}/cache",
+            f"/data/user/0/{pkg}/code_cache",
+            f"/data/user_de/0/{pkg}/cache",
+            f"/data/user_de/0/{pkg}/code_cache",
+            (
+                "/storage/emulated/0/Android/data/"
+                f"{pkg}/cache"
+            ),
+        ]
+
+        quoted_paths = " ".join(
             shlex.quote(path)
             for path in paths
         )
-        + '; do '
-        + '[ -d "$d" ] && '
-        + 'find "$d" -mindepth 1 -maxdepth 1 '
-        + '-exec rm -rf -- {} + 2>/dev/null; '
-        + "done"
-    )
+        fallback_cmd = (
+            "found=0; failed=0; "
+            f"for d in {quoted_paths}; do "
+            'if [ -d "$d" ]; then '
+            "found=$((found+1)); "
+            'find "$d" -mindepth 1 -maxdepth 1 '
+            '-exec rm -rf -- {} + 2>/dev/null '
+            "|| failed=1; "
+            "fi; "
+            "done; "
+            'echo "cache_paths=$found"; '
+            '[ "$failed" -eq 0 ]'
+        )
 
-    code, out = shell(
-        cmd,
-        cfg,
-    )
+        fallback_code, fallback_out = shell(
+            fallback_cmd,
+            cfg,
+        )
+        fallback_text = str(
+            fallback_out or ""
+        ).strip()
+
+        found = 0
+        match = re.search(
+            r"cache_paths=(\d+)",
+            fallback_text,
+        )
+        if match:
+            found = int(match.group(1))
+
+        ok = fallback_code == 0
+        if ok:
+            if found > 0:
+                note = (
+                    "Android cache compatibility clear "
+                    f"completed ({found} paths)"
+                )
+            else:
+                note = "no cache/code-cache folders present"
+        else:
+            clean_detail = re.sub(
+                r"cache_paths=\d+",
+                "",
+                fallback_text,
+            ).strip()
+            note = (
+                cut(clean_detail, 100)
+                or "cache compatibility clear failed"
+            )
 
     if rt_tab is not None:
         rt_tab["last_cache_clear"] = now()
@@ -3064,15 +3178,12 @@ def clear_package_cache(
         rt_tab["last_cache_clear_forced"] = bool(
             force
         )
+        rt_tab["last_cache_clear_method"] = method
+        rt_tab["last_cache_clear_ok"] = bool(ok)
 
-    return (
-        code == 0,
-        (
-            "cache cleared"
-            if code == 0
-            else cut(out, 80)
-        ),
-    )
+    return bool(ok), str(note)
+
+
 
 
 
