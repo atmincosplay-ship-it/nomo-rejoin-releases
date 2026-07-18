@@ -1,5 +1,31 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.58.32 — CACHE CLEANUP BEFORE OPTION 6
+# - Option 6 clears cache once for only packages it will actually restart.
+# - Applies to Market, Hatcher, Booster, and Rejoin Only.
+# - Hatcher/Booster cleanup happens after profile/link validation.
+# - Cleanup runs before the existing exact-PID hard restart/open path.
+# - Independent toggle: clear_cache_before_option6_restart.
+# - Option 13 enables Option 1, Option 6, and setup-time cleanup.
+# - Cache-only: no app data, cookies, login, Workspace, or AutoExec removal.
+#
+# V4.58.31 — AUTO CACHE CLEANUP BEFORE START
+# - Main Option 1 clears cache for every active package once before starting
+#   Market, Hatcher, Booster, or Rejoin Only.
+# - Option 13 enables this startup behavior and clears selected packages once
+#   during the setup wizard.
+# - One shared helper resolves the correct active package list for every mode.
+# - Startup/setup cleanup bypasses the old per-open cache toggle and cooldown,
+#   while existing hard-open/soft-hop cache behavior remains unchanged.
+# - Cleanup removes cache contents only:
+#     /data/data/<package>/cache
+#     /data/user/0/<package>/cache
+#     /storage/emulated/0/Android/data/<package>/cache
+# - It never clears app data, cookies, login files, Workspace, or AutoExec.
+# - It never force-stops packages and remains package-scoped.
+# - Routing, private-server fetch, solver, PID policy, APK tools, and Lua files
+#   remain unchanged.
+#
 # V4.58.30 — STORAGE ROOT + DELETE APK/ZIP SOURCES
 # - Option 18 local browsing now defaults to /storage/emulated/0/.
 # - The recursive scan still includes /storage/emulated/0/Download/.
@@ -541,7 +567,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.58.30"
+__version__ = "V4.58.32"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -1323,6 +1349,11 @@ DEFAULT_CONFIG = {
     "clear_cache_on_hard_open": True,
     "clear_cache_on_soft_hop": False,
     "clear_cache_min_interval_seconds": 1800,
+    # Separate one-shot cleanup. This runs once before Option 1 starts and does
+    # not make every later hard reopen clear cache.
+    "clear_cache_before_rejoin_start": True,
+    "clear_cache_before_option6_restart": True,
+    "clear_cache_during_auto_setup": True,
 
     # Optional local file hook. Useful when config.zip must be expanded into clone
     # workspaces before Roblox/executor loads. Guarded command skips if config.zip
@@ -2953,34 +2984,96 @@ def force_stop_package(pkg, cfg, tries=3, wait_after=0.8, settle=1.0):
     return False, msg
 
 
-def clear_package_cache(pkg, cfg, rt_tab=None, reason=""):
-    """Safe cache cleanup only."""
-    if not cfg.get("clear_cache_enabled", False):
+
+def clear_package_cache(
+    pkg,
+    cfg,
+    rt_tab=None,
+    reason="",
+    force=False,
+):
+    """Clear cache contents only; never clear package app data."""
+    pkg = str(pkg or "").strip()
+    if not pkg:
+        return False, "package empty"
+
+    if (
+        not force
+        and not cfg.get(
+            "clear_cache_enabled",
+            False,
+        )
+    ):
         return False, "cache disabled"
 
-    interval = int(cfg.get("clear_cache_min_interval_seconds", 1800))
-    last = int((rt_tab or {}).get("last_cache_clear", 0) or 0)
+    interval = int(
+        cfg.get(
+            "clear_cache_min_interval_seconds",
+            1800,
+        )
+        or 0
+    )
+    last = int(
+        (rt_tab or {}).get(
+            "last_cache_clear",
+            0,
+        )
+        or 0
+    )
 
-    if interval > 0 and last > 0 and now() - last < interval:
+    if (
+        not force
+        and interval > 0
+        and last > 0
+        and now() - last < interval
+    ):
         return False, "cache cooldown"
 
     paths = [
         f"/data/data/{pkg}/cache",
         f"/data/user/0/{pkg}/cache",
-        f"/storage/emulated/0/Android/data/{pkg}/cache",
+        (
+            "/storage/emulated/0/Android/data/"
+            f"{pkg}/cache"
+        ),
     ]
 
-    cmd = "for d in " + " ".join(shlex.quote(p) for p in paths) + "; do " \
-          "[ -d \"$d\" ] && rm -rf \"$d\"/* 2>/dev/null; " \
-          "done"
+    cmd = (
+        "for d in "
+        + " ".join(
+            shlex.quote(path)
+            for path in paths
+        )
+        + '; do '
+        + '[ -d "$d" ] && '
+        + 'find "$d" -mindepth 1 -maxdepth 1 '
+        + '-exec rm -rf -- {} + 2>/dev/null; '
+        + "done"
+    )
 
-    code, out = shell(cmd, cfg)
+    code, out = shell(
+        cmd,
+        cfg,
+    )
 
     if rt_tab is not None:
         rt_tab["last_cache_clear"] = now()
-        rt_tab["last_cache_reason"] = reason
+        rt_tab["last_cache_reason"] = str(
+            reason or ""
+        )
+        rt_tab["last_cache_clear_forced"] = bool(
+            force
+        )
 
-    return code == 0, "cache cleared" if code == 0 else cut(out, 80)
+    return (
+        code == 0,
+        (
+            "cache cleared"
+            if code == 0
+            else cut(out, 80)
+        ),
+    )
+
 
 
 def should_clear_cache_for_open(cfg, soft):
@@ -2992,6 +3085,179 @@ def should_clear_cache_for_open(cfg, soft):
 
     return bool(cfg.get("clear_cache_on_hard_open", True))
 
+
+
+
+def _cache_cleanup_packages_for_mode(
+    cfg,
+    selected_packages=None,
+):
+    """Resolve package-scoped cache targets for the active mode."""
+    if selected_packages is not None:
+        candidates = [
+            str(package or "").strip()
+            for package in selected_packages
+        ]
+    else:
+        mode = active_rejoin_mode(cfg)
+        candidates = []
+
+        if mode in ("hatcher", "booster"):
+            hcfg = load_hatcher_config()
+            candidates.extend(
+                str(
+                    profile.get("package")
+                    or ""
+                ).strip()
+                for profile in hatcher_profiles(
+                    hcfg,
+                    enabled_only=True,
+                )
+            )
+
+        # Market, Rejoin Only, and a safe fallback for incomplete Hatcher
+        # profiles use the enabled shared package tabs.
+        if not candidates:
+            candidates.extend(
+                str(tab.get("package") or "").strip()
+                for tab in cfg.get("tabs", [])
+                if tab.get("enabled", True)
+            )
+
+    packages = []
+    seen = set()
+    for package in candidates:
+        if not package or package in seen:
+            continue
+        seen.add(package)
+        packages.append(package)
+
+    return sorted(
+        packages,
+        key=natural_package_key,
+    )
+
+
+
+def run_startup_cache_cleanup(
+    cfg,
+    selected_packages=None,
+    *,
+    reason="Option 1 pre-start",
+    setup=False,
+    show_screen=True,
+    setting_key=None,
+    screen_title=None,
+):
+    """Clear selected package caches once, without stopping any package."""
+    setting = (
+        str(setting_key or "").strip()
+        or (
+            "clear_cache_during_auto_setup"
+            if setup
+            else "clear_cache_before_rejoin_start"
+        )
+    )
+
+    if not cfg.get(setting, True):
+        return {
+            "enabled": False,
+            "setting": setting,
+            "packages": [],
+            "cleared": 0,
+            "failed": 0,
+            "results": [],
+        }
+
+    packages = _cache_cleanup_packages_for_mode(
+        cfg,
+        selected_packages=selected_packages,
+    )
+    if not packages:
+        return {
+            "enabled": True,
+            "setting": setting,
+            "packages": [],
+            "cleared": 0,
+            "failed": 0,
+            "results": [],
+        }
+
+    if show_screen:
+        clear()
+        banner(
+            str(screen_title or "").strip()
+            or (
+                "SETUP: CACHE CLEANUP"
+                if setup
+                else "STARTUP: CACHE CLEANUP"
+            ),
+            cfg,
+        )
+        print(
+            col(
+                f"Clearing cache contents for {len(packages)} package(s).",
+                CYAN,
+            )
+        )
+        print(
+            col(
+                "App data, login, cookies, Workspace, and AutoExec are untouched.",
+                DIM,
+            )
+        )
+        print("")
+
+    runtime = load_runtime()
+    results = []
+    cleared = 0
+    failed = 0
+
+    for package in packages:
+        rt_tab = get_runtime_tab(runtime, package)
+        ok, note = clear_package_cache(
+            package,
+            cfg,
+            rt_tab=rt_tab,
+            reason=reason,
+            force=True,
+        )
+        results.append((package, bool(ok), str(note)))
+        if ok:
+            cleared += 1
+        else:
+            failed += 1
+
+        if show_screen:
+            print(
+                f"  {short_pkg(package):<10} "
+                + col(
+                    "CLEARED" if ok else "FAILED",
+                    GREEN if ok else RED,
+                )
+                + f"  {note}"
+            )
+
+    save_runtime(runtime)
+
+    if show_screen:
+        print("")
+        print(
+            col(
+                f"Cache cleanup: {cleared} cleared, {failed} failed.",
+                GREEN if failed == 0 else YELLOW,
+            )
+        )
+        time.sleep(0.8)
+
+    return {
+        "enabled": True,
+        "setting": setting,
+        "packages": packages,
+        "cleared": cleared,
+        "failed": failed,
+        "results": results,
+    }
 
 
 def extract_place_id_from_link(link):
@@ -5546,6 +5812,7 @@ def manual_restart_tabs_via_queue(
 
 
 
+
 def open_all_tabs_once(cfg, selected_packages=None):
     wanted = set(selected_packages or [])
     enabled_tabs = [
@@ -5558,6 +5825,18 @@ def open_all_tabs_once(cfg, selected_packages=None):
         print(col("No enabled tabs to open.", YELLOW))
         pause()
         return
+
+    run_startup_cache_cleanup(
+        cfg,
+        selected_packages=[
+            str(tab.get("package") or "")
+            for tab in enabled_tabs
+        ],
+        reason="Option 6 Market force restart",
+        show_screen=True,
+        setting_key="clear_cache_before_option6_restart",
+        screen_title="OPTION 6: CACHE CLEANUP",
+    )
 
     print(col(
         "Option 6 uses the normal queue; solver submits once before every actual open.",
@@ -5576,6 +5855,7 @@ def open_all_tabs_once(cfg, selected_packages=None):
     )
     print(col("\nDone opening tabs.", GREEN))
     pause()
+
 def show_config_value(key, value):
     kl = str(key).lower()
     if "api_key" in kl or "webhook" in kl or "secret" in kl:
@@ -6300,10 +6580,13 @@ def config_settings(cfg):
         "6": (
             "CACHE CLEANUP",
             [
-                ("clear_cache_enabled", "enabled"),
+                ("clear_cache_before_rejoin_start", "before_option_1_start"),
+                ("clear_cache_before_option6_restart", "before_option_6_restart"),
+                ("clear_cache_during_auto_setup", "during_option_13_setup"),
+                ("clear_cache_enabled", "per_open_cleanup_enabled"),
                 ("clear_cache_on_hard_open", "on_hard_reopen"),
                 ("clear_cache_on_soft_hop", "on_soft_hop"),
-                ("clear_cache_min_interval_seconds", "min_interval_seconds"),
+                ("clear_cache_min_interval_seconds", "per_open_min_interval_seconds"),
             ],
         ),
         "8": (
@@ -15382,6 +15665,7 @@ HATCHER_MENU_ITEMS = [
 
 
 
+
 def open_all_hatcher_tabs_once(
     main_cfg=None,
     selected_packages=None,
@@ -15394,9 +15678,7 @@ def open_all_hatcher_tabs_once(
     hcfg = load_hatcher_config()
     selected = [
         str(package or "")
-        for package in (
-            selected_packages or []
-        )
+        for package in (selected_packages or [])
         if str(package or "")
     ]
 
@@ -15416,49 +15698,27 @@ def open_all_hatcher_tabs_once(
 
         if not isinstance(profile, dict):
             skipped.append(
-                (
-                    package,
-                    "no Hatcher/Booster profile or account",
-                )
+                (package, "no Hatcher/Booster profile or account")
             )
             continue
 
         if not profile.get("enabled", True):
             skipped.append(
-                (
-                    package,
-                    "Hatcher/Booster profile is OFF",
-                )
+                (package, "Hatcher/Booster profile is OFF")
             )
             continue
 
-        raw_link = str(
-            profile.get("server_link") or ""
-        ).strip()
+        raw_link = str(profile.get("server_link") or "").strip()
         if not raw_link:
             skipped.append(
-                (
-                    package,
-                    "Hatcher server_link is empty",
-                )
+                (package, "Hatcher server_link is empty")
             )
             continue
 
-        # Important: do not normalize, rebuild, translate, or replace this link.
-        # This is exactly what the working Hatcher runtime does.
-        tabs.append(
-            hatcher_profile_to_tab(
-                profile
-            )
-        )
+        tabs.append(hatcher_profile_to_tab(profile))
 
     if skipped:
-        print(
-            col(
-                "Skipped selected packages:",
-                YELLOW,
-            )
-        )
+        print(col("Skipped selected packages:", YELLOW))
         for package, reason in skipped:
             print(
                 f"  {short_pkg(package):<10} "
@@ -15476,6 +15736,18 @@ def open_all_hatcher_tabs_once(
         )
         pause()
         return False
+
+    run_startup_cache_cleanup(
+        cfg,
+        selected_packages=[
+            str(tab.get("package") or "")
+            for tab in tabs
+        ],
+        reason="Option 6 Hatcher/Booster force restart",
+        show_screen=True,
+        setting_key="clear_cache_before_option6_restart",
+        screen_title="OPTION 6: CACHE CLEANUP",
+    )
 
     print(
         col(
@@ -15505,6 +15777,7 @@ def open_all_hatcher_tabs_once(
     )
     pause()
     return bool(ok)
+
 
 
 
@@ -25547,6 +25820,20 @@ def new_redfinger_setup_wizard(cfg=None):
     bcfg = load_booster_config()
     sync_booster_profiles_with_tabs(cfg, bcfg)
 
+    # Cache cleanup uses one shared path for setup and every future Option 1.
+    cfg = load_config()
+    cfg["clear_cache_before_rejoin_start"] = True
+    cfg["clear_cache_before_option6_restart"] = True
+    cfg["clear_cache_during_auto_setup"] = True
+    save_config(cfg)
+    run_startup_cache_cleanup(
+        cfg,
+        selected_packages=selected,
+        reason="Option 13 automatic setup",
+        setup=True,
+        show_screen=True,
+    )
+
     # Backend roles ask only for NOMO_SECRET. LOCAL intentionally disables all
     # registration/reporting while preserving any previously saved credentials.
     if role == "local":
@@ -25900,6 +26187,15 @@ def new_redfinger_setup_wizard(cfg=None):
         f"Legacy Lua : "
         f"{col(str(cleanup_disabled_count) + ' disabled', GREEN if cleanup_disabled_count else DIM)}"
     )
+    print("")
+    print(
+        "Cache cleanup: "
+        + col(
+            "ENABLED before Option 1 and Option 6",
+            GREEN,
+        )
+    )
+
     print("")
     print(col("Pet Counter:", BOLD))
     for pkg, ok, note in counter_results:
@@ -28317,25 +28613,71 @@ def start_rejoin_only(cfg):
             return
 
 
+
 def rejoin_only_force_restart_all(cfg):
     _ensure_rejoin_only_defaults(cfg)
     tabs = [
-        tab for tab in cfg.get("tabs", [])
-        if isinstance(tab, dict) and tab.get("enabled", True) and tab.get("package")
+        tab
+        for tab in cfg.get("tabs", [])
+        if (
+            isinstance(tab, dict)
+            and tab.get("enabled", True)
+            and tab.get("package")
+        )
     ]
     if not tabs:
         print(col("No enabled packages configured.", RED))
         pause()
         return
-    delay = max(0, int(cfg.get("rejoin_only_delay_between_open_seconds", 20) or 20))
+
+    run_startup_cache_cleanup(
+        cfg,
+        selected_packages=[
+            str(tab.get("package") or "")
+            for tab in tabs
+        ],
+        reason="Option 6 Rejoin Only force restart",
+        show_screen=True,
+        setting_key="clear_cache_before_option6_restart",
+        screen_title="OPTION 6: CACHE CLEANUP",
+    )
+
+    delay = max(
+        0,
+        int(
+            cfg.get(
+                "rejoin_only_delay_between_open_seconds",
+                20,
+            )
+            or 20
+        ),
+    )
+
     for index, tab in enumerate(tabs):
         pkg = str(tab.get("package") or "")
-        print(col(f"[{pkg}] force restart -> saved Rejoin Only link", YELLOW))
-        ok, note = _rejoin_only_open(tab, cfg, "manual force restart", hard=True)
-        print(col(f"  {'OK' if ok else 'FAILED'}: {note}", GREEN if ok else RED))
+        print(
+            col(
+                f"[{pkg}] force restart -> saved Rejoin Only link",
+                YELLOW,
+            )
+        )
+        ok, note = _rejoin_only_open(
+            tab,
+            cfg,
+            "manual force restart",
+            hard=True,
+        )
+        print(
+            col(
+                f"  {'OK' if ok else 'FAILED'}: {note}",
+                GREEN if ok else RED,
+            )
+        )
         if index + 1 < len(tabs) and delay > 0:
             time.sleep(delay)
+
     pause()
+
 
 
 def rejoin_only_link_menu(cfg):
@@ -28531,7 +28873,22 @@ def main():
             continue
 
         if choice == "1":
+            cfg = load_config()
             mode = active_rejoin_mode(cfg)
+
+            # Same pre-start stage for every mode, just like other startup
+            # preparation such as Market workspace/config export.
+            run_startup_cache_cleanup(
+                cfg,
+                selected_packages=None,
+                reason=(
+                    "Option 1 pre-start "
+                    + mode
+                ),
+                setup=False,
+                show_screen=True,
+            )
+
             try:
                 if mode == "hatcher":
                     start_hatcher_safe_rejoiner(cfg)
