@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.58.29 — LOCAL ZIP APK INSTALL
+# - Option 18 -> 4 now scans the local folder recursively for both APK and ZIP.
+# - A selected local ZIP is safely extracted and every APK inside is installed.
+# - Supports one ZIP containing multiple Noka clone APKs, including subfolders.
+# - APKs and ZIPs can be selected together in one batch.
+# - ZIP traversal/symlink members are ignored by the existing safe extractor.
+# - Extracted APK packages are displayed before the final install confirmation.
+# - Existing one-time uninstall confirmation and exact-package install behavior
+#   remain unchanged.
+# - Rejoin, solver, routing, private-server, PID, and Lua behavior are unchanged.
+#
 # V4.58.28 — SOLVER RESULT GETS ONE RECOVERY
 # - Every real queued rejoin still submits the provider exactly once.
 # - Post-open CAPTCHA_SUCCESS and NO_CAPTCHA are now equivalent:
@@ -517,7 +528,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.58.28"
+__version__ = "V4.58.29"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -16294,6 +16305,239 @@ def _parse_number_selection(raw, total):
     return sorted(selected)
 
 
+
+def _scan_local_apk_sources(
+    folder,
+    recursive=True,
+):
+    """Return local APK and ZIP install sources, case-insensitively."""
+    folder = Path(folder)
+    if not folder.exists() or not folder.is_dir():
+        return []
+
+    iterator = (
+        folder.rglob("*")
+        if recursive
+        else folder.glob("*")
+    )
+    found = []
+    seen = set()
+
+    for path in iterator:
+        try:
+            if not path.is_file():
+                continue
+        except Exception:
+            continue
+
+        if path.suffix.lower() not in {
+            ".apk",
+            ".zip",
+        }:
+            continue
+
+        try:
+            key = str(path.resolve())
+        except Exception:
+            key = str(path)
+
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(path)
+
+    return sorted(
+        found,
+        key=lambda path:
+            natural_package_key(str(path)),
+    )
+
+
+def _local_install_source_type(path):
+    path = Path(path)
+    suffix = path.suffix.lower()
+    if suffix == ".apk":
+        return "APK"
+    if suffix == ".zip":
+        return "ZIP"
+    return "FILE"
+
+
+def choose_apk_install_sources(
+    sources,
+    base_folder=None,
+):
+    """Select local APK files and/or ZIP archives."""
+    sources = list(sources or [])
+    if not sources:
+        return []
+
+    while True:
+        clear()
+        print(
+            col(
+                "SELECT LOCAL APK / ZIP SOURCES",
+                BOLD,
+            )
+        )
+        if base_folder:
+            print(f"Folder: {base_folder}")
+        print("")
+        print(
+            "Select one ZIP containing many clones, "
+            "individual APKs, or both."
+        )
+        print(
+            "Enter one number, multiple numbers, "
+            "a range, or A for all."
+        )
+        print(
+            "Examples: 1   |   1,3,5   |   2-6   |   A"
+        )
+        print("0. Cancel")
+        print("")
+
+        for index, path in enumerate(
+            sources,
+            1,
+        ):
+            try:
+                relative = (
+                    path.relative_to(base_folder)
+                    if base_folder
+                    else path
+                )
+            except Exception:
+                relative = path
+
+            kind = _local_install_source_type(
+                path
+            )
+            try:
+                size_mb = (
+                    path.stat().st_size
+                    / 1048576
+                )
+                size_note = f"{size_mb:.1f} MB"
+            except Exception:
+                size_note = "size unknown"
+
+            print(
+                f"{index:>3}. [{kind}] "
+                f"{relative}"
+            )
+            print(
+                col(
+                    f"     {size_note}",
+                    DIM,
+                )
+            )
+
+        drain_stdin()
+        raw = clean_terminal_input(
+            input("\nSelect local APK/ZIP sources: ")
+        )
+        if raw == "0":
+            return []
+
+        try:
+            indices = _parse_number_selection(
+                raw,
+                len(sources),
+            )
+        except ValueError as exc:
+            print(
+                col(
+                    f"Invalid selection: {exc}",
+                    RED,
+                )
+            )
+            time.sleep(1.5)
+            continue
+
+        if not indices:
+            print(
+                col(
+                    "Nothing selected.",
+                    YELLOW,
+                )
+            )
+            time.sleep(1)
+            continue
+
+        selected = [
+            sources[index]
+            for index in indices
+        ]
+
+        clear()
+        print(
+            col(
+                "SELECTED LOCAL SOURCES",
+                BOLD,
+            )
+        )
+        print("")
+        for path in selected:
+            print(
+                f"  - [{_local_install_source_type(path)}] "
+                f"{path.name}"
+            )
+        print("")
+
+        if _setup_yes_no(
+            (
+                f"Use these {len(selected)} "
+                "local source(s)?"
+            ),
+            default=True,
+        ):
+            return selected
+
+
+def _collect_local_installable_apks(
+    selected_sources,
+):
+    """Expand selected local APK/ZIP sources into one de-duplicated APK batch."""
+    collected = []
+    notes = []
+    seen = set()
+
+    for source_path in (
+        selected_sources or []
+    ):
+        path = Path(source_path)
+        ok, note, apks = (
+            _collect_installable_apks(path)
+        )
+        notes.append(
+            (
+                path,
+                bool(ok),
+                str(note),
+            )
+        )
+        if not ok:
+            continue
+
+        for apk in apks:
+            apk = Path(apk)
+            try:
+                key = str(apk.resolve())
+            except Exception:
+                key = str(apk)
+
+            if key in seen:
+                continue
+            seen.add(key)
+            collected.append(apk)
+
+    collected.sort(
+        key=lambda path:
+            natural_package_key(path.name)
+    )
+    return collected, notes
+
 def choose_apk_files(apks, base_folder=None):
     apks = list(apks or [])
     if not apks:
@@ -16713,7 +16957,7 @@ def apk_download_install_menu(cfg):
         print("1. Direct APK/ZIP URL -> download + install")
         print("2. GitHub latest release -> download + install all APK/ZIP assets")
         print("3. GoFile share -> API token lookup + download + install")
-        print("4. Select APKs from local folder -> install")
+        print("4. Select local APK/ZIP files -> extract + install")
         print("5. Uninstall installed packages only")
         print("6. Change install/uninstall behavior")
         print("7. Show download folder")
@@ -16806,44 +17050,171 @@ def apk_download_install_menu(cfg):
             continue
 
         if choice == "4":
-            raw = clean_terminal_input(input(
-                f"APK folder [ENTER={APK_LOCAL_DEFAULT_DIR}]: "
-            ))
-            folder = Path(raw) if raw else APK_LOCAL_DEFAULT_DIR
-            if not folder.exists() or not folder.is_dir():
-                print(col(f"Folder not found: {folder}", RED))
+            raw = clean_terminal_input(
+                input(
+                    f"APK/ZIP folder "
+                    f"[ENTER={APK_LOCAL_DEFAULT_DIR}]: "
+                )
+            )
+            folder = (
+                Path(raw)
+                if raw
+                else APK_LOCAL_DEFAULT_DIR
+            )
+            if (
+                not folder.exists()
+                or not folder.is_dir()
+            ):
+                print(
+                    col(
+                        f"Folder not found: {folder}",
+                        RED,
+                    )
+                )
                 pause()
                 continue
 
-            apks = _scan_apks_in_folder(folder, recursive=True)
-            if not apks:
-                print(col(
-                    f"No APK files found under: {folder}",
-                    RED,
-                ))
+            sources = _scan_local_apk_sources(
+                folder,
+                recursive=True,
+            )
+            if not sources:
+                print(
+                    col(
+                        (
+                            "No APK or ZIP files found "
+                            f"under: {folder}"
+                        ),
+                        RED,
+                    )
+                )
                 pause()
                 continue
 
-            print(col(
-                f"Found {len(apks)} APK files. Opening selector...",
-                GREEN,
-            ))
+            apk_count = sum(
+                1
+                for path in sources
+                if path.suffix.lower() == ".apk"
+            )
+            zip_count = sum(
+                1
+                for path in sources
+                if path.suffix.lower() == ".zip"
+            )
+            print(
+                col(
+                    (
+                        f"Found {apk_count} APK and "
+                        f"{zip_count} ZIP source(s). "
+                        "Opening selector..."
+                    ),
+                    GREEN,
+                )
+            )
             time.sleep(0.7)
 
-            selected_apks = choose_apk_files(apks, base_folder=folder)
-            if not selected_apks:
-                print(col("No APK files selected.", YELLOW))
+            selected_sources = (
+                choose_apk_install_sources(
+                    sources,
+                    base_folder=folder,
+                )
+            )
+            if not selected_sources:
+                print(
+                    col(
+                        "No APK/ZIP source selected.",
+                        YELLOW,
+                    )
+                )
                 pause()
                 continue
 
-            installed, failed, _ = install_apk_batch(
-                selected_apks,
-                cfg=cfg,
+            apks, collect_notes = (
+                _collect_local_installable_apks(
+                    selected_sources
+                )
             )
-            print(col(
-                f"Finished: {installed} installed, {failed} failed.",
-                GREEN if failed == 0 else YELLOW,
-            ))
+
+            print("")
+            for source_path, ok, note in (
+                collect_notes
+            ):
+                print(
+                    col(
+                        (
+                            f"{source_path.name}: "
+                            f"{note}"
+                        ),
+                        GREEN if ok else RED,
+                    )
+                )
+
+            if not apks:
+                print(
+                    col(
+                        (
+                            "The selected sources contained "
+                            "no installable APK files."
+                        ),
+                        RED,
+                    )
+                )
+                pause()
+                continue
+
+            print("")
+            print(
+                col(
+                    (
+                        f"Installable APKs collected: "
+                        f"{len(apks)}"
+                    ),
+                    GREEN,
+                )
+            )
+            for apk in apks:
+                package, _detected_by = (
+                    apk_package_name(apk)
+                )
+                print(
+                    f"  - {apk.name}"
+                )
+                print(
+                    col(
+                        (
+                            f"    {package}"
+                            if package
+                            else "    package unknown"
+                        ),
+                        DIM,
+                    )
+                )
+            print("")
+
+            if not _setup_yes_no(
+                (
+                    f"Install all {len(apks)} "
+                    "collected APK file(s)?"
+                ),
+                default=True,
+            ):
+                continue
+
+            installed, failed, _ = (
+                install_apk_batch(
+                    apks,
+                    cfg=cfg,
+                )
+            )
+            print(
+                col(
+                    (
+                        f"Finished: {installed} installed, "
+                        f"{failed} failed."
+                    ),
+                    GREEN if failed == 0 else YELLOW,
+                )
+            )
             pause()
             continue
 
