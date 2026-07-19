@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.58.36 — DELTA PRIVATE LINK LAUNCH FIX
+# - Keeps saved Hatcher/Booster server_link values unchanged in nomo.json.
+# - Immediately before Android launch, privateServerLinkCode/linkCode routes are
+#   converted to the Delta-proven direct-app format:
+#     roblox://placeId=<placeId>&linkCode=<code>
+# - accessCode routes use roblox://placeId=<placeId>&accessCode=<code>.
+# - The shared open_roblox() path applies this to Option 1, Option 6, Hatcher,
+#   Booster, kick/timeout/loading recovery, and manual routes.
+# - Exact-package PID stopping, sibling verification, cache behavior, solver,
+#   setup, and both Lua files are unchanged.
+#
 # V4.58.35 — REDFINGER CACHE FALLBACK
 # - Redfinger returned plain `Failed` / exit 1 for Package Manager cache-only.
 # - Any failed cache-only system call now activates the safe root fallback.
@@ -597,7 +608,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.58.35"
+__version__ = "V4.58.36"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -3473,6 +3484,71 @@ def android_safe_roblox_link(link, cfg=None):
 
 
 
+def android_launch_roblox_link(link, cfg=None):
+    """Return the final Android VIEW URI without mutating saved configuration.
+
+    Delta currently honors private joins in the direct-app form:
+        roblox://placeId=<id>&linkCode=<code>
+
+    Existing saved links may continue using experiences/start and
+    privateServerLinkCode. Conversion happens only immediately before am start.
+    """
+    normalized = android_safe_roblox_link(link, cfg)
+    raw = str(normalized or "").strip()
+    if not raw:
+        return raw
+
+    place_id = extract_place_id_from_link(raw)
+    link_code = ""
+    access_code = ""
+
+    try:
+        parsed = urllib.parse.urlparse(raw)
+        query = urllib.parse.parse_qs(parsed.query)
+        for key, values in query.items():
+            key_lower = str(key).lower()
+            if key_lower in {"linkcode", "privateserverlinkcode"} and values and values[0]:
+                link_code = str(values[0]).strip()
+                break
+        for key, values in query.items():
+            if str(key).lower() == "accesscode" and values and values[0]:
+                access_code = str(values[0]).strip()
+                break
+    except Exception:
+        pass
+
+    if not link_code:
+        match = re.search(
+            r"(?:privateServerLinkCode|linkCode)=([^&#]+)",
+            raw,
+            re.I,
+        )
+        if match:
+            link_code = urllib.parse.unquote(match.group(1)).strip()
+
+    if not access_code:
+        match = re.search(r"accessCode=([^&#]+)", raw, re.I)
+        if match:
+            access_code = urllib.parse.unquote(match.group(1)).strip()
+
+    if place_id and link_code:
+        return (
+            "roblox://placeId=" + str(place_id)
+            + "&linkCode="
+            + urllib.parse.quote(link_code, safe="")
+        )
+
+    if place_id and access_code:
+        return (
+            "roblox://placeId=" + str(place_id)
+            + "&accessCode="
+            + urllib.parse.quote(access_code, safe="")
+        )
+
+    return raw
+
+
+
 def _is_noka_clone_package(pkg):
     pkg_l = str(pkg or "").strip().lower()
     return (
@@ -3486,7 +3562,7 @@ def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop
     if not link or str(link).startswith("PUT_"):
         return False, "no link"
 
-    link = android_safe_roblox_link(link, cfg)
+    link = android_launch_roblox_link(link, cfg)
 
     if not soft and require_stop and not skip_force_stop:
         stopped, stop_note = force_stop_package(pkg, cfg, tries=3, wait_after=0.8, settle=1.0)
