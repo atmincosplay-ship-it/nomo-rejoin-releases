@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# V4.58.37 — OPTION 13 SOLVER CONFIG PRESERVATION
+# - Option 13 now snapshots and restores every solver_* setting.
+# - Preserves solver_enabled, solver_endpoint, solver_api_key, and all solver policy/timer values.
+# - Restoration runs even when setup is cancelled or errors.
+# - Fresh devices still retain the normal disabled/blank defaults.
+#
 # NOMO REJOIN
 # V4.58.36 — DELTA PRIVATE LINK LAUNCH FIX
 # - Keeps saved Hatcher/Booster server_link values unchanged in nomo.json.
@@ -582,6 +588,8 @@
 # - SAFE: Auto layout reserves a spare grid cell for Termux whenever possible.
 #
 import os
+import copy
+import functools
 import re
 import sys
 import json
@@ -608,7 +616,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.58.36"
+__version__ = "V4.58.37"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -25913,6 +25921,48 @@ def setup_hatcher_private_servers_shared(
     }
 
 
+
+def _preserve_option13_solver_settings(func):
+    """Keep every existing solver_* setting unchanged across Option 13.
+
+    Setup helpers may save a stale or newly-created config while the wizard is
+    running. The wrapper snapshots the current solver configuration and restores
+    it in a finally block, so success, cancellation, or an exception cannot reset
+    solver_enabled, the endpoint, API key, or solver timing/policy settings.
+    Fresh devices still keep the normal defaults because those are what the
+    initial snapshot contains.
+    """
+    @functools.wraps(func)
+    def wrapped(*args, **kwargs):
+        before = load_config()
+        solver_snapshot = {
+            key: copy.deepcopy(value)
+            for key, value in before.items()
+            if str(key).startswith("solver_")
+        }
+        try:
+            return func(*args, **kwargs)
+        finally:
+            try:
+                current = load_config()
+                changed = False
+                for key, value in solver_snapshot.items():
+                    restored = copy.deepcopy(value)
+                    if current.get(key) != restored:
+                        current[key] = restored
+                        changed = True
+                if changed:
+                    save_config(current)
+            except Exception as exc:
+                log_activity(
+                    f"Option 13 solver-setting restore failed: {exc}",
+                    "SYSTEM",
+                    YELLOW,
+                )
+    return wrapped
+
+
+@_preserve_option13_solver_settings
 def new_redfinger_setup_wizard(cfg=None):
     """Full-auto one-time setup with Delta-global or Arceus per-clone storage.
 
