@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# V4.58.47 — OPTION 13 INVALID-SECRET REPROMPT
+# - Option 13 validates saved Cloudflare/D1 credentials before automatically
+#   reusing them.
+# - HTTP 401, unauthorized, and "Missing or invalid NOMO secret" clear only the
+#   rejected backend secret and immediately prompt for a replacement.
+# - Temporary network/server failures do not erase a potentially valid secret.
+# - CAPTCHA solver settings and every solver_* key remain untouched.
+#
 # V4.58.46 — DEVICE-NAMED WEBHOOK + SINGLE-CLONE KEY WORKER
 # - Uses the requested Delta Discord webhook by default.
 # - Webhook message contains the device name and URL; no /bypass prefix.
@@ -712,7 +720,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.58.46"
+__version__ = "V4.58.47"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -25411,6 +25419,20 @@ def _setup_secret(prompt="NOMO secret"):
     return str(value or "").strip()
 
 
+def _setup_cloudflare_auth_error(message):
+    """True only when the backend explicitly rejected the NOMO secret."""
+    value = str(message or "").strip().lower()
+    markers = (
+        "http 401",
+        "unauthorized",
+        "missing or invalid nomo secret",
+        "invalid nomo secret",
+        "invalid secret",
+        "secret rejected",
+    )
+    return any(marker in value for marker in markers)
+
+
 def _setup_configure_cloudflare(cfg, automatic=False):
     """Configure Cloudflare/D1; fresh devices only need NOMO_SECRET.
 
@@ -25435,16 +25457,77 @@ def _setup_configure_cloudflare(cfg, automatic=False):
     if saved_complete:
         print(f"Worker: {saved_url}")
         print(f"Secret: {mask_secret(saved_secret)}")
-        reuse_saved = True if automatic else _setup_yes_no("Reuse these existing backend credentials?", True)
+
+        reuse_saved = False
+        saved_auth_rejected = False
+
+        if automatic:
+            # Option 13 used to reuse any non-empty secret blindly. Validate it
+            # first so an explicit 401 immediately leads to a replacement prompt.
+            probe_cfg = dict(cfg)
+            probe_cfg["backend_provider"] = "cloudflare"
+            probe_cfg["jsonbin_hatchers_enabled"] = True
+            probe_cfg["cloudflare_worker_url"] = saved_url
+            probe_cfg["cloudflare_secret"] = saved_secret
+
+            probe_ok, probe_msg = backend_health_check(probe_cfg)
+            if probe_ok:
+                reuse_saved = True
+                print(col("Saved backend credentials verified: OK", GREEN))
+            elif _setup_cloudflare_auth_error(probe_msg):
+                saved_auth_rejected = True
+                print(col(
+                    "Saved NOMO secret was rejected by the backend.",
+                    RED,
+                ))
+                print(col(
+                    "A replacement secret is required.",
+                    YELLOW,
+                ))
+
+                # Clear only the rejected backend secret in both config files.
+                # Do not rebuild either config and do not touch solver_* keys.
+                cfg["cloudflare_secret"] = ""
+                hcfg["cloudflare_secret"] = ""
+                save_config(cfg)
+                save_hatcher_config(hcfg)
+            else:
+                # Do not destroy credentials due to a temporary outage, DNS
+                # failure, timeout, or Worker-side 5xx response.
+                reuse_saved = True
+                print(col(
+                    "Could not validate saved credentials right now; "
+                    "reusing them because the error was not an auth rejection.",
+                    YELLOW,
+                ))
+                print(col(f"Validation note: {cut(probe_msg, 120)}", DIM))
+        else:
+            reuse_saved = _setup_yes_no(
+                "Reuse these existing backend credentials?",
+                True,
+            )
+
         if reuse_saved:
             worker_url, secret = saved_url, saved_secret
             if automatic:
-                print(col("Reuse saved backend credentials: YES (automatic)", GREEN))
+                print(col("Reuse saved backend credentials: YES", GREEN))
         else:
-            configured_url = str(cfg.get("cloudflare_worker_url") or "").strip().rstrip("/")
-            worker_url = configured_url if configured_url and not is_placeholder_value(configured_url) else DEFAULT_CLOUDFLARE_WORKER_URL
+            configured_url = str(
+                cfg.get("cloudflare_worker_url")
+                or hcfg.get("cloudflare_worker_url")
+                or ""
+            ).strip().rstrip("/")
+            worker_url = (
+                configured_url
+                if configured_url and not is_placeholder_value(configured_url)
+                else (saved_url or DEFAULT_CLOUDFLARE_WORKER_URL)
+            )
             print(f"Worker: {worker_url}")
-            secret = _setup_secret("NOMO secret")
+            secret = _setup_secret(
+                "New NOMO secret"
+                if saved_auth_rejected
+                else "NOMO secret"
+            )
     else:
         configured_url = str(cfg.get("cloudflare_worker_url") or hcfg.get("cloudflare_worker_url") or "").strip().rstrip("/")
         worker_url = configured_url if configured_url and not is_placeholder_value(configured_url) else DEFAULT_CLOUDFLARE_WORKER_URL
@@ -25469,6 +25552,17 @@ def _setup_configure_cloudflare(cfg, automatic=False):
     ok, msg = backend_health_check(cfg)
     if ok:
         print(col("D1 backend health: OK", GREEN))
+    elif _setup_cloudflare_auth_error(msg):
+        print(col(f"NOMO secret rejected: {msg}", RED))
+        print(col(
+            "The rejected secret was not kept. Run Option 13 again and "
+            "enter the correct secret.",
+            YELLOW,
+        ))
+        cfg["cloudflare_secret"] = ""
+        hcfg["cloudflare_secret"] = ""
+        save_config(cfg)
+        save_hatcher_config(hcfg)
     else:
         print(col(f"Backend saved, but health check failed: {msg}", YELLOW))
     return cfg, hcfg, bool(ok)
