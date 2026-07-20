@@ -1,4 +1,100 @@
 #!/usr/bin/env python3
+# V4.58.46 — DEVICE-NAMED WEBHOOK + SINGLE-CLONE KEY WORKER
+# - Uses the requested Delta Discord webhook by default.
+# - Webhook message contains the device name and URL; no /bypass prefix.
+# - One fixed clone performs all device-key UI work.
+# - After applying the shared key, only that source clone is restarted.
+# - Option 19 -> 8 still manually restarts all enabled clones.
+#
+# V4.58.45 — PLATORELAY EXP-CLAIM EXPIRY DETECTION
+# - Treats PlatoRelay's exact expired-JWT response
+#     {"success":false,"message":"\"exp\" claim timestamp check failed"}
+#   as a dead/expired ticket.
+# - Manual waiting immediately clears that ticket and captures a replacement.
+# - Automatic mode schedules a fresh expired-panel / Copy Link cycle instead
+#   of polling the rejected URL forever.
+#
+# V4.58.44 — DELTA COLD-START + WEBHOOK + TICKET RECOVERY
+# - A clone that has never been launched is pre-warmed through its launcher,
+#   exact-PID stopped, then opened through the bootstrap deep link. The same
+#   deep link is delivered once more after a short delay so a cold first launch
+#   cannot remain on Roblox Home.
+# - Restores Discord ticket delivery as exactly: /bypass <PlatoRelay URL>.
+#   Uses delta_key_webhook_url first, then the existing login/cookie webhook.
+# - Pending minutesLeft=0 is no longer presented as expiry; it only means the
+#   server has not issued a key yet.
+# - Explicit invalid/expired server responses and over-age pending tickets are
+#   cleared and regenerated instead of polling the dead URL forever.
+#
+# V4.58.43 — DELTA VALIDITY PREFLIGHT
+# - Manual FULL refresh / ticket capture checks the saved PlatoRelay status
+#   before stopping or opening any clone.
+# - A still-valid key prints minutesLeft and exits; the bootstrap place is not
+#   opened because Delta cannot display Copy Link until the key expires.
+# - A pending renewal ticket is reused instead of generating another ticket.
+# - Missing-ticket first setup remains allowed; status errors require explicit
+#   confirmation before a manual panel test.
+#
+# V4.58.42 — DELTA BOOTSTRAP EXACT-PID + 60S LOAD WAIT
+# - Delta key bootstrap now uses PlaceId 123974602339071
+#   (https://www.roblox.com/games/123974602339071/Just-a-baseplate).
+# - Before launching the bootstrap place, NOMO stops only the selected clone's
+#   verified exact package PID(s), using the same PID-only safety policy as
+#   Option 6. It never uses am force-stop, killall, or pkill.
+# - The bootstrap load wait is now 60 seconds before visual panel scanning.
+# - Normal Market/Hatcher/Booster routes remain untouched and are restored
+#   after the device key is updated.
+#
+# V4.58.41 — DELTA BOOTSTRAP PLACE + HOME-SCREEN GUARD
+# - Uses the dedicated lightweight bootstrap PlaceId 123974602339071 for Delta
+#   key-panel initialization instead of a saved Market/Hatcher route.
+# - A Roblox Home screen is never counted as success: NOMO still requires the
+#   verified expired-panel visual match and a fresh PlatoRelay VIEW intent from
+#   the selected clone UID before accepting a ticket.
+# - At confirmed expiry, the automatic monitor opens one selected clone in the
+#   bootstrap place once, waits for Delta to initialize, then begins scanning.
+# - If the panel is not found, the bootstrap attempt is reset before the normal
+#   delayed retry. Enabled clones still return to their original saved routes
+#   only after the new device key is applied.
+#
+# V4.58.40 — DELTA EXPIRY VISUAL AUTO-MONITOR
+# - Adds a one-time expired-panel visual template tied to the exact Option 16
+#   rectangle. The template is a compact sampled fingerprint; no OCR/OpenCV.
+# - While a key is valid, NOMO performs no screenshots and never clicks early.
+# - At the stored expires_at time, the running rejoin loop scans only one alive
+#   clone every few seconds, requires two visual matches, then clicks Copy Link.
+# - The renewed ticket is polled non-blockingly; when FREE_... is ready NOMO
+#   atomically updates the shared Delta license and restarts enabled clones at
+#   the next safe idle point. Missing panels pause for 10 minutes before retry.
+# - The first manual successful Copy Link can bootstrap the visual template from
+#   the verified pre-click frame, so no blind automatic tapping is ever needed.
+#
+# V4.58.39 — DELTA KEY AUTO-OPEN PREFLIGHT
+# - Option 19 no longer requires the selected Delta clone to be opened first.
+# - It first checks an already-visible expired panel, then hard-opens only the
+#   selected clone through its saved game/private link and waits for Delta to load.
+# - Copy Link is retried only inside the selected Option 16 rectangle and is
+#   accepted only after a fresh PlatoRelay VIEW intent from that clone UID.
+# - Via Browser is exact-PID closed before every attempt and on timeout, so an
+#   old blank browser window cannot be mistaken for a captured ticket.
+# - Panel wait, initial load wait, retry interval, and per-attempt intent wait
+#   are configurable in the Delta Key Settings menu.
+#
+# V4.58.38 — DELTA DEVICE KEY MANAGER
+# - Adds Main Option 19: full Delta key refresh manager.
+# - Uses the saved Option 16 clone rectangle and the proven 84% / 63%
+#   layout-relative double tap to open Copy Link on an expired Delta panel.
+# - Verifies the fresh PlatoRelay VIEW intent came from the selected clone UID,
+#   captures the renewed d= ticket URL, closes Via Browser by exact PID, and
+#   returns to the same clone.
+# - Polls the official page status request used by the loaded web client:
+#     /api/session/status?ticket=<d value>
+# - A key is accepted only from success=true + FREE_... JSON. minutesLeft is
+#   stored as an exact local expiry estimate. No early renewal is attempted.
+# - Writes the device-wide Delta license atomically, then can restart enabled
+#   clones sequentially through their saved private/rejoin links.
+# - No DevTools, UI dump, OCR, clipboard scraping, or bypass API.
+#
 # V4.58.37 — OPTION 13 SOLVER CONFIG PRESERVATION
 # - Option 13 now snapshots and restores every solver_* setting.
 # - Preserves solver_enabled, solver_endpoint, solver_api_key, and all solver policy/timer values.
@@ -616,7 +712,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.58.37"
+__version__ = "V4.58.46"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -626,6 +722,11 @@ DELTA_GLOBAL_ROOT = Path("/storage/emulated/0/Delta")
 DELTA_GLOBAL_AUTOEXEC_DIR = DELTA_GLOBAL_ROOT / "Autoexecute"
 DELTA_GLOBAL_WORKSPACE_DIR = DELTA_GLOBAL_ROOT / "Workspace"
 DELTA_GLOBAL_STATE_DIR = DELTA_GLOBAL_WORKSPACE_DIR / "nomo_rejoiner"
+DELTA_KEY_RUNTIME_FILE = BASE_DIR / "delta_key_runtime.json"
+DELTA_KEY_PANEL_TEMPLATE_FILE = BASE_DIR / "delta_key_panel_template.json"
+DELTA_KEY_AUTH_URL_FILE = Path("/storage/emulated/0/Download/delta_auth_url.txt")
+DELTA_KEY_CAPTURED_FILE = Path("/storage/emulated/0/Download/delta_key_captured.txt")
+DELTA_KEY_DEFAULT_LICENSE_FILE = DELTA_GLOBAL_ROOT / "Internals" / "Cache" / "license"
 DELTA_WORKSPACE_DEFAULT_IMPORT_ZIP = Path("/storage/emulated/0/Download/config.zip")
 DELTA_WORKSPACE_EXPORT_DIR = BASE_DIR / "workspace_exports"
 DELTA_WORKSPACE_BACKUP_DIR = BASE_DIR / "workspace_backups"
@@ -1015,6 +1116,78 @@ DEFAULT_CONFIG = {
     # explicitly chooses Delta Global.
     "executor_storage_mode": "auto",
     "delta_global_lock_package_mapping": True,
+
+    # Device-wide Delta key manager. One accepted FREE_ key is shared by every
+    # Delta clone on the same Redfinger. Renewal can only begin after Delta
+    # exposes the expired-key panel, so NOMO never attempts an early refresh.
+    "delta_key_manager_enabled": True,
+    "delta_key_browser_package": "mark.via.gq",
+    "delta_key_license_path": str(DELTA_KEY_DEFAULT_LICENSE_FILE),
+    "delta_key_copy_x_ratio": 0.84,
+    "delta_key_copy_y_ratio": 0.63,
+    "delta_key_double_tap_delay_seconds": 0.80,
+    "delta_key_capture_timeout_seconds": 40,
+    "delta_key_auto_open_selected_clone": True,
+    "delta_key_panel_wait_timeout_seconds": 300,
+    "delta_key_initial_load_wait_seconds": 20,
+    "delta_key_panel_retry_seconds": 12,
+    "delta_key_intent_wait_per_attempt_seconds": 8,
+    "delta_key_poll_seconds": 15,
+    "delta_key_status_timeout_seconds": 30,
+    "delta_key_wait_max_seconds": 21600,
+    "delta_key_restart_after_apply": True,
+    "delta_key_restart_delay_seconds": 8,
+    "delta_key_client_name": "platoboost webclient",
+    "delta_key_client_version": "5.3.2",
+
+    # Dedicated low-load place used only to initialize Delta after expiry.
+    # The panel/template + fresh package-UID VIEW intent remain the real proof;
+    # simply landing on Roblox Home never counts as a successful renewal.
+    "delta_key_bootstrap_place_ids": [123974602339071],
+    "delta_key_bootstrap_use_saved_route_fallback": False,
+    "delta_key_bootstrap_load_wait_seconds": 60,
+
+    # Cold App-Cloner launches can initialize at Roblox Home and ignore the
+    # first VIEW intent. Pre-warm once, exact-PID stop, then deliver the
+    # bootstrap link twice.
+    "delta_key_cold_start_prewarm_enabled": True,
+    "delta_key_cold_start_prewarm_seconds": 10,
+    "delta_key_cold_start_second_deeplink_seconds": 8,
+
+    # Ticket delivery. A blank dedicated URL falls back to the existing
+    # login_challenge_webhook_url / cookie_webhook_url.
+    "delta_key_ticket_webhook_enabled": True,
+    "delta_key_webhook_url": "https://discord.com/api/webhooks/1520291358223634522/2xoV1O0qPdg8QOFxVpBfFQiAyDGpVHpOhhJ5m70E86HdgeyXKWsGyiINK_CUSHJqkUpU",
+    "delta_key_device_name": "",
+    "delta_key_webhook_retry_seconds": 60,
+
+    # One Redfinger/device has one Delta key. Use one fixed source clone.
+    "delta_key_single_clone_only": True,
+    "delta_key_worker_package": "",
+    "delta_key_restart_scope": "source_only",
+
+    # A pending ticket is regenerated only when the API explicitly rejects it
+    # or it has remained pending for this long.
+    "delta_key_ticket_max_age_seconds": 21600,
+    "delta_key_invalid_ticket_retry_seconds": 30,
+
+    # Expiry-armed visual detector. It is completely idle while expires_at is
+    # still in the future. At expiry it scans one alive saved rectangle only.
+    "delta_key_auto_monitor_enabled": True,
+    "delta_key_visual_detector_enabled": True,
+    "delta_key_visual_crop_x1": 0.70,
+    "delta_key_visual_crop_y1": 0.50,
+    "delta_key_visual_crop_x2": 0.98,
+    "delta_key_visual_crop_y2": 0.76,
+    "delta_key_visual_grid_cols": 32,
+    "delta_key_visual_grid_rows": 20,
+    "delta_key_visual_match_threshold": 0.84,
+    "delta_key_visual_confirmations": 2,
+    "delta_key_visual_scan_seconds": 5,
+    "delta_key_auto_tick_seconds": 5,
+    "delta_key_validity_refresh_seconds": 600,
+    "delta_key_expired_retry_seconds": 600,
+    "delta_key_bootstrap_template_from_manual_success": True,
 
     # Optional token for private GitHub release assets. Public release assets do
     # not need this. GoFile tokens are requested interactively and not saved.
@@ -2505,6 +2678,58 @@ def load_config():
         if k not in cfg:
             cfg[k] = v
             changed = True
+
+    # V4.58.42: migrate the previous built-in bootstrap place/wait on existing
+    # installations. Preserve any unrelated custom PlaceId.
+    bootstrap_ids = cfg.get("delta_key_bootstrap_place_ids")
+    if isinstance(bootstrap_ids, (str, int)):
+        bootstrap_ids = [bootstrap_ids]
+    normalized_bootstrap_ids = []
+    if isinstance(bootstrap_ids, list):
+        for value in bootstrap_ids:
+            try:
+                place_id = int(str(value).strip())
+            except Exception:
+                continue
+            if place_id > 0 and place_id not in normalized_bootstrap_ids:
+                normalized_bootstrap_ids.append(place_id)
+
+    if (
+        not normalized_bootstrap_ids
+        or normalized_bootstrap_ids == [116044818819649]
+    ):
+        cfg["delta_key_bootstrap_place_ids"] = [123974602339071]
+        changed = True
+
+    try:
+        current_bootstrap_wait = int(
+            cfg.get("delta_key_bootstrap_load_wait_seconds", 60) or 60
+        )
+    except Exception:
+        current_bootstrap_wait = 60
+    if current_bootstrap_wait < 60:
+        cfg["delta_key_bootstrap_load_wait_seconds"] = 60
+        changed = True
+
+    # V4.58.46 defaults. Preserve a non-blank custom webhook.
+    if not str(cfg.get("delta_key_webhook_url") or "").strip():
+        cfg["delta_key_webhook_url"] = "https://discord.com/api/webhooks/1520291358223634522/2xoV1O0qPdg8QOFxVpBfFQiAyDGpVHpOhhJ5m70E86HdgeyXKWsGyiINK_CUSHJqkUpU"
+        changed = True
+    if "delta_key_device_name" not in cfg:
+        cfg["delta_key_device_name"] = ""
+        changed = True
+    if "delta_key_single_clone_only" not in cfg:
+        cfg["delta_key_single_clone_only"] = True
+        changed = True
+    if "delta_key_worker_package" not in cfg:
+        cfg["delta_key_worker_package"] = ""
+        changed = True
+    if str(cfg.get("delta_key_restart_scope") or "").strip() not in (
+        "source_only",
+        "all_enabled",
+    ):
+        cfg["delta_key_restart_scope"] = "source_only"
+        changed = True
 
 
     # V3.44: normalize old/default game links to Roblox's current experience-start URI.
@@ -4389,6 +4614,7 @@ MAIN_MENU_ITEMS = [
     ("16", "Layout / visual CAPTCHA"),
     ("17", "Workspace ZIP tools"),
     ("18", "APK download / install"),
+    ("19", "Delta device key manager"),
     ("0",  "Exit"),
 ]
 
@@ -11664,6 +11890,14 @@ def _nomo_start_market_rejoin_original(cfg):
 
         status_screen(rows, cfg, session_start, loops)
 
+        # Device-wide Delta key watcher is idle while the key is valid. At the
+        # stored expiry it visually checks one alive clone only, and acts only
+        # while this rejoin queue is idle.
+        try:
+            delta_key_auto_monitor_tick(cfg, safe_to_act=not bool(open_queue))
+        except Exception as exc:
+            log_activity(f"Delta key auto tick failed: {cut(exc, 90)}", "", YELLOW)
+
         if open_queue and cfg.get("smart_open_queue", True):
             if not wait_seconds(2, rt):
                 return
@@ -15800,6 +16034,11 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
             f"  Hatcher: old state {format_age(_old_sec)}..{format_age(_old_max)} => exact-PID restart affected tab only; above max ignored.",
             GREEN,
         ))
+
+        try:
+            delta_key_auto_monitor_tick(cfg, safe_to_act=not bool(open_queue))
+        except Exception as exc:
+            log_activity(f"Delta key auto tick failed: {cut(exc, 90)}", "", YELLOW)
 
         if open_queue and cfg.get("smart_open_queue", True):
             if not wait_seconds(2, rt):
@@ -25923,7 +26162,7 @@ def setup_hatcher_private_servers_shared(
 
 
 def _preserve_option13_solver_settings(func):
-    """Keep every existing solver_* setting unchanged across Option 13.
+    """Keep existing solver_* and delta_key_* settings across Option 13.
 
     Setup helpers may save a stale or newly-created config while the wizard is
     running. The wrapper snapshots the current solver configuration and restores
@@ -25938,7 +26177,10 @@ def _preserve_option13_solver_settings(func):
         solver_snapshot = {
             key: copy.deepcopy(value)
             for key, value in before.items()
-            if str(key).startswith("solver_")
+            if (
+                str(key).startswith("solver_")
+                or str(key).startswith("delta_key_")
+            )
         }
         try:
             return func(*args, **kwargs)
@@ -28825,6 +29067,11 @@ def start_rejoin_only(cfg):
         _rejoin_only_print_dashboard(rows, cfg)
         _rejoin_only_save_runtime(runtime)
 
+        try:
+            delta_key_auto_monitor_tick(cfg, safe_to_act=not bool(actions))
+        except Exception as exc:
+            log_activity(f"Delta key auto tick failed: {cut(exc, 90)}", "", YELLOW)
+
         # One package at a time. Recheck health immediately before acting.
         if actions:
             tab, item, reason, hard = actions[0]
@@ -29103,6 +29350,2449 @@ def force_restart_active_tabs_once(cfg):
     return _nomo_force_restart_active_tabs_once_original(cfg)
 
 
+
+# ============================================================
+# DELTA DEVICE KEY MANAGER
+# ============================================================
+
+_DELTA_KEY_RE = re.compile(r"^FREE_[A-Za-z0-9]+$")
+
+
+def load_delta_key_runtime():
+    data = load_json(DELTA_KEY_RUNTIME_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def save_delta_key_runtime(data):
+    save_json(DELTA_KEY_RUNTIME_FILE, data if isinstance(data, dict) else {})
+
+
+def _delta_key_all_configs(primary=None):
+    configs = []
+    for candidate in (primary, load_config()):
+        if isinstance(candidate, dict) and candidate not in configs:
+            configs.append(candidate)
+    for loader in (load_hatcher_config, load_booster_config):
+        try:
+            candidate = loader()
+            if isinstance(candidate, dict):
+                configs.append(candidate)
+        except Exception:
+            pass
+    return configs
+
+
+def delta_key_saved_rect(package, cfg=None):
+    package = str(package or "").strip()
+    for candidate in _delta_key_all_configs(cfg):
+        cells = candidate.get("visual_layout_cells") or {}
+        rect = cells.get(package) if isinstance(cells, dict) else None
+        if isinstance(rect, (list, tuple)) and len(rect) == 4:
+            try:
+                left, top, right, bottom = [int(value) for value in rect]
+            except Exception:
+                continue
+            if right > left and bottom > top:
+                return [left, top, right, bottom]
+    return None
+
+
+def delta_key_package_uid(package, cfg):
+    command = (
+        "cmd package list packages -U "
+        + shlex.quote(str(package or ""))
+    )
+    code, output = shell_timeout(command, cfg, capture=True, timeout=10)
+    if code != 0:
+        return 0
+    match = re.search(
+        r"package:" + re.escape(str(package or "")) + r"\s+uid:(\d+)",
+        str(output or ""),
+    )
+    return int(match.group(1)) if match else 0
+
+
+def delta_key_resolve_activity(package, cfg):
+    command = (
+        "cmd package resolve-activity --brief "
+        + shlex.quote(str(package or ""))
+        + " 2>/dev/null | tail -n1"
+    )
+    code, output = shell_timeout(command, cfg, capture=True, timeout=10)
+    activity = str(output or "").strip().splitlines()
+    activity = activity[-1].strip() if activity else ""
+    return activity if code == 0 and "/" in activity else ""
+
+
+def delta_key_bring_package_front(package, cfg):
+    activity = delta_key_resolve_activity(package, cfg)
+    if not activity:
+        return False, "launcher activity unavailable"
+    code, output = shell_timeout(
+        "am start -n " + shlex.quote(activity),
+        cfg,
+        capture=True,
+        timeout=20,
+    )
+    return code == 0, cut(output or "started", 80)
+
+
+def delta_key_close_browser(browser_package, cfg):
+    """Close only Via's exact package PID(s); never touch clone siblings."""
+    browser_package = str(browser_package or "").strip()
+    if not browser_package:
+        return True, "browser package empty"
+    return force_stop_package(
+        browser_package,
+        cfg,
+        tries=2,
+        wait_after=0.35,
+        settle=0.35,
+    )
+
+
+def delta_key_bootstrap_place_ids(cfg):
+    raw = cfg.get("delta_key_bootstrap_place_ids", [123974602339071])
+    if isinstance(raw, (str, int)):
+        raw = [raw]
+    if not isinstance(raw, list):
+        raw = []
+
+    place_ids = []
+    for value in raw:
+        try:
+            place_id = int(str(value).strip())
+        except Exception:
+            continue
+        if place_id > 0 and place_id not in place_ids:
+            place_ids.append(place_id)
+    return place_ids
+
+
+def delta_key_bootstrap_link(cfg):
+    place_ids = delta_key_bootstrap_place_ids(cfg)
+    if not place_ids:
+        return "", 0
+    place_id = place_ids[0]
+    return f"roblox://experiences/start?placeId={place_id}", place_id
+
+
+def delta_key_open_selected_clone(package, cfg):
+    """Cold-start safely, PID-stop only this clone, then launch bootstrap."""
+    package = str(package or "").strip()
+    if not package:
+        return False, "no package"
+
+    link, place_id = delta_key_bootstrap_link(cfg)
+    if not link:
+        if bool(cfg.get("delta_key_bootstrap_use_saved_route_fallback", False)):
+            link = delta_key_link_for_package(package, cfg)
+            place_id = 0
+        if not link:
+            return False, "no Delta bootstrap PlaceId configured"
+
+    was_alive = package_alive(package, cfg, fresh=True)
+    prewarm_note = ""
+
+    # A never-opened App Cloner package can consume the first VIEW intent while
+    # initializing and remain on Roblox Home. Open the launcher once first.
+    if (
+        not was_alive
+        and bool(cfg.get("delta_key_cold_start_prewarm_enabled", True))
+    ):
+        activity = delta_key_resolve_activity(package, cfg)
+        if activity:
+            code, output = shell_timeout(
+                "am start -n " + shlex.quote(activity),
+                cfg,
+                capture=True,
+                timeout=20,
+            )
+            if code == 0:
+                warm_seconds = max(
+                    0,
+                    int(cfg.get("delta_key_cold_start_prewarm_seconds", 10) or 10),
+                )
+                prewarm_note = f"launcher pre-warmed {warm_seconds}s"
+                for _ in range(warm_seconds):
+                    time.sleep(1)
+            else:
+                prewarm_note = "launcher pre-warm warning: " + cut(output, 50)
+
+    # Option-6 safety invariant: only the selected package's verified PID(s).
+    stopped, stop_note = force_stop_package(
+        package,
+        cfg,
+        tries=3,
+        wait_after=0.8,
+        settle=1.0,
+    )
+    if not stopped:
+        return False, "exact-PID stop failed: " + cut(stop_note, 70)
+
+    time.sleep(0.6)
+
+    ok, open_note = open_roblox(
+        package,
+        link,
+        cfg,
+        soft=False,
+        reason=(
+            f"Delta key bootstrap place {place_id}"
+            if place_id
+            else "Delta key saved-route fallback"
+        ),
+        require_stop=False,
+        skip_force_stop=True,
+    )
+    if not ok:
+        return False, (
+            f"bootstrap place {place_id} failed: {cut(open_note, 70)}"
+            if place_id
+            else "saved-route fallback failed: " + cut(open_note, 70)
+        )
+
+    # On a cold package, deliver the same deep link again after Roblox has
+    # initialized its task. No PID kill occurs here.
+    second_note = ""
+    if not was_alive:
+        second_delay = max(
+            0,
+            int(
+                cfg.get(
+                    "delta_key_cold_start_second_deeplink_seconds",
+                    8,
+                )
+                or 8
+            ),
+        )
+        for _ in range(second_delay):
+            time.sleep(1)
+        second_ok, second_open_note = open_roblox(
+            package,
+            link,
+            cfg,
+            soft=True,
+            reason="Delta cold-start second bootstrap deep link",
+            require_stop=False,
+            skip_force_stop=True,
+        )
+        second_note = (
+            f"; second deep link {'sent' if second_ok else 'warning'}"
+            + (
+                ""
+                if second_ok
+                else ": " + cut(second_open_note, 45)
+            )
+        )
+
+    route_note = (
+        f"bootstrap place {place_id} opened"
+        if place_id
+        else "saved-route fallback opened"
+    )
+    return True, (
+        (prewarm_note + "; " if prewarm_note else "")
+        + f"exact PID stopped ({cut(stop_note, 45)}); "
+        + route_note
+        + second_note
+    )
+
+
+def delta_key_extract_urls_from_activity_dump(text):
+    urls = []
+    marker = "dat=https://auth.platorelay.com/a?"
+    start = 0
+    raw_text = str(text or "")
+    while True:
+        position = raw_text.find(marker, start)
+        if position < 0:
+            break
+        url_start = position + len("dat=")
+        tail = raw_text[url_start:]
+        end = re.search(r"\s+(?:flg=|cmp=|typ=|pkg=|cat=)", tail)
+        raw = tail[:end.start()] if end else tail.splitlines()[0]
+        url = re.sub(r"\s+", "", raw).strip()
+        if url.startswith("https://auth.platorelay.com/a?") and url not in urls:
+            urls.append(url)
+        start = position + len(marker)
+    return urls
+
+
+def delta_key_wait_for_view_intent(package_uid, browser_package, cfg, timeout=None):
+    timeout = (
+        max(2, int(timeout))
+        if timeout is not None
+        else max(10, int(cfg.get("delta_key_capture_timeout_seconds", 40) or 40))
+    )
+    deadline = time.time() + timeout
+    uid_marker = "from uid " + str(int(package_uid))
+    browser_package = str(browser_package or "").strip()
+    while time.time() < deadline:
+        code, output = shell_timeout(
+            "logcat -d -v brief ActivityTaskManager:I ActivityManager:I '*:S'",
+            cfg,
+            capture=True,
+            timeout=12,
+        )
+        text = str(output or "")
+        if (
+            code == 0
+            and "auth.platorelay.com" in text
+            and (
+                "android.intent.action.VIEW" in text
+                or "act=VIEW" in text
+            )
+            and uid_marker in text
+            and browser_package in text
+        ):
+            return True
+        time.sleep(0.4)
+    return False
+
+
+def delta_key_read_full_auth_url(browser_package, cfg, excluded_ticket=""):
+    timeout = max(10, int(cfg.get("delta_key_capture_timeout_seconds", 40) or 40))
+    deadline = time.time() + timeout
+    excluded_ticket = str(excluded_ticket or "").strip()
+    while time.time() < deadline:
+        code, output = shell_timeout(
+            "dumpsys activity activities",
+            cfg,
+            capture=True,
+            timeout=15,
+        )
+        text = str(output or "")
+        if code == 0 and str(browser_package or "") in text:
+            urls = delta_key_extract_urls_from_activity_dump(text)
+            fresh_urls = [
+                url for url in urls
+                if not excluded_ticket
+                or delta_key_ticket_from_url(url) != excluded_ticket
+            ]
+            if fresh_urls:
+                return max(fresh_urls, key=len)
+        time.sleep(0.5)
+    return ""
+
+def delta_key_ticket_from_url(auth_url):
+    try:
+        parsed = urllib.parse.urlsplit(str(auth_url or "").strip())
+        return str(
+            urllib.parse.parse_qs(parsed.query).get("d", [""])[0]
+            or ""
+        ).strip()
+    except Exception:
+        return ""
+
+
+
+def load_delta_key_panel_template():
+    data = load_json(DELTA_KEY_PANEL_TEMPLATE_FILE, {})
+    if not isinstance(data, dict):
+        return {}
+    samples = data.get("samples")
+    if not isinstance(samples, list) or not samples:
+        return {}
+    return data
+
+
+def save_delta_key_panel_template(data):
+    if not isinstance(data, dict) or not data.get("samples"):
+        return False
+    save_json(DELTA_KEY_PANEL_TEMPLATE_FILE, data)
+    return True
+
+
+def delta_key_panel_template_exists():
+    return bool(load_delta_key_panel_template())
+
+
+def _delta_key_visual_settings(cfg, template=None):
+    source = template if isinstance(template, dict) and template else (cfg or {})
+
+    def number(key, default, minimum=None, maximum=None, integer=False):
+        try:
+            value = source.get(key, (cfg or {}).get(key, default))
+            value = int(value) if integer else float(value)
+        except Exception:
+            value = int(default) if integer else float(default)
+        if minimum is not None:
+            value = max(minimum, value)
+        if maximum is not None:
+            value = min(maximum, value)
+        return value
+
+    x1 = number("delta_key_visual_crop_x1", 0.70, 0.0, 0.95)
+    y1 = number("delta_key_visual_crop_y1", 0.50, 0.0, 0.95)
+    x2 = number("delta_key_visual_crop_x2", 0.98, x1 + 0.02, 1.0)
+    y2 = number("delta_key_visual_crop_y2", 0.76, y1 + 0.02, 1.0)
+    cols = number("delta_key_visual_grid_cols", 32, 12, 64, integer=True)
+    rows = number("delta_key_visual_grid_rows", 20, 8, 48, integer=True)
+    return {
+        "delta_key_visual_crop_x1": float(x1),
+        "delta_key_visual_crop_y1": float(y1),
+        "delta_key_visual_crop_x2": float(x2),
+        "delta_key_visual_crop_y2": float(y2),
+        "delta_key_visual_grid_cols": int(cols),
+        "delta_key_visual_grid_rows": int(rows),
+    }
+
+
+def _delta_key_visual_crop(rect, frame, settings):
+    try:
+        left, top, right, bottom = [int(value) for value in rect]
+        screen_width = int(frame["width"])
+        screen_height = int(frame["height"])
+    except Exception:
+        return None
+
+    left = max(0, min(screen_width - 1, left))
+    right = max(left + 1, min(screen_width, right))
+    top = max(0, min(screen_height - 1, top))
+    bottom = max(top + 1, min(screen_height, bottom))
+    width = right - left
+    height = bottom - top
+    if width < 80 or height < 80:
+        return None
+
+    x1 = left + round(width * float(settings["delta_key_visual_crop_x1"]))
+    y1 = top + round(height * float(settings["delta_key_visual_crop_y1"]))
+    x2 = left + round(width * float(settings["delta_key_visual_crop_x2"]))
+    y2 = top + round(height * float(settings["delta_key_visual_crop_y2"]))
+    x1 = max(left, min(right - 2, x1))
+    y1 = max(top, min(bottom - 2, y1))
+    x2 = max(x1 + 2, min(right, x2))
+    y2 = max(y1 + 2, min(bottom, y2))
+    return [x1, y1, x2, y2]
+
+
+def _delta_key_visual_fingerprint(frame, rect, cfg, template=None):
+    settings = _delta_key_visual_settings(cfg, template=template)
+    crop = _delta_key_visual_crop(rect, frame, settings)
+    if not crop:
+        return None, "invalid visual crop"
+
+    x1, y1, x2, y2 = crop
+    cols = int(settings["delta_key_visual_grid_cols"])
+    rows = int(settings["delta_key_visual_grid_rows"])
+    screen_width = int(frame["width"])
+    pixels = frame["pixels"]
+    crop_width = x2 - x1
+    crop_height = y2 - y1
+    samples = []
+
+    # Each grid point averages a tiny 2x2 area. This reduces framebuffer noise
+    # while remaining dependency-free on minimal Termux installations.
+    for row_index in range(rows):
+        py = y1 + min(crop_height - 1, int((row_index + 0.5) * crop_height / rows))
+        for col_index in range(cols):
+            px = x1 + min(crop_width - 1, int((col_index + 0.5) * crop_width / cols))
+            red = green = blue = count = 0
+            for yy in (py, min(y2 - 1, py + 1)):
+                base = yy * screen_width * 4
+                for xx in (px, min(x2 - 1, px + 1)):
+                    index = base + xx * 4
+                    red += int(pixels[index])
+                    green += int(pixels[index + 1])
+                    blue += int(pixels[index + 2])
+                    count += 1
+            samples.extend([
+                round(red / max(1, count)),
+                round(green / max(1, count)),
+                round(blue / max(1, count)),
+            ])
+
+    return {
+        **settings,
+        "crop": crop,
+        "samples": samples,
+        "screen": [int(frame["width"]), int(frame["height"])],
+        "rect": [int(value) for value in rect],
+    }, ""
+
+
+def _delta_key_visual_similarity(template, current):
+    expected = template.get("samples") if isinstance(template, dict) else None
+    observed = current.get("samples") if isinstance(current, dict) else None
+    if not isinstance(expected, list) or not isinstance(observed, list):
+        return 0.0
+    if len(expected) != len(observed) or len(expected) < 30:
+        return 0.0
+
+    total_difference = 0.0
+    expected_gray = []
+    observed_gray = []
+    for index in range(0, len(expected), 3):
+        er, eg, eb = [float(value) for value in expected[index:index + 3]]
+        cr, cg, cb = [float(value) for value in observed[index:index + 3]]
+        total_difference += abs(er - cr) + abs(eg - cg) + abs(eb - cb)
+        expected_gray.append(0.299 * er + 0.587 * eg + 0.114 * eb)
+        observed_gray.append(0.299 * cr + 0.587 * cg + 0.114 * cb)
+
+    pixel_count = max(1, len(expected_gray))
+    color_similarity = 1.0 - total_difference / (pixel_count * 3.0 * 255.0)
+    color_similarity = max(0.0, min(1.0, color_similarity))
+
+    expected_mean = sum(expected_gray) / pixel_count
+    observed_mean = sum(observed_gray) / pixel_count
+    covariance = 0.0
+    expected_energy = 0.0
+    observed_energy = 0.0
+    for expected_value, observed_value in zip(expected_gray, observed_gray):
+        left = expected_value - expected_mean
+        right = observed_value - observed_mean
+        covariance += left * right
+        expected_energy += left * left
+        observed_energy += right * right
+    if expected_energy > 0.0 and observed_energy > 0.0:
+        correlation = covariance / ((expected_energy * observed_energy) ** 0.5)
+        correlation_score = max(0.0, min(1.0, (correlation + 1.0) / 2.0))
+    else:
+        correlation_score = color_similarity
+
+    # Direct color similarity dominates because the Delta panel and buttons are
+    # stable; correlation adds tolerance for small global brightness changes.
+    return max(0.0, min(1.0, 0.75 * color_similarity + 0.25 * correlation_score))
+
+
+def delta_key_capture_panel_fingerprint(package, cfg):
+    package = str(package or "").strip()
+    rect = delta_key_saved_rect(package, cfg)
+    if not rect:
+        return False, "no saved Option 16 rectangle", {}
+    frame, error = _capture_screencap_raw(cfg, timeout=10)
+    if not frame:
+        return False, error or "screenshot failed", {}
+    fingerprint, error = _delta_key_visual_fingerprint(frame, rect, cfg)
+    if not fingerprint:
+        return False, error or "fingerprint failed", {}
+    fingerprint.update({
+        "version": 1,
+        "package": package,
+        "captured_at": now(),
+    })
+    return True, "captured", fingerprint
+
+
+def delta_key_capture_panel_template(package, cfg, verified_fingerprint=None):
+    package = str(package or "").strip()
+    fingerprint = verified_fingerprint if isinstance(verified_fingerprint, dict) else None
+    if not fingerprint:
+        ok, note, fingerprint = delta_key_capture_panel_fingerprint(package, cfg)
+        if not ok:
+            return False, note, {}
+    fingerprint = dict(fingerprint)
+    fingerprint["package"] = package or str(fingerprint.get("package") or "")
+    fingerprint["captured_at"] = now()
+    fingerprint["verified_by_view_intent"] = bool(verified_fingerprint)
+    if not save_delta_key_panel_template(fingerprint):
+        return False, "template save failed", {}
+    return True, str(DELTA_KEY_PANEL_TEMPLATE_FILE), fingerprint
+
+
+def delta_key_panel_template_score(package, cfg):
+    template = load_delta_key_panel_template()
+    if not template:
+        return False, 0.0, "visual template missing", {}
+    rect = delta_key_saved_rect(package, cfg)
+    if not rect:
+        return False, 0.0, "no saved Option 16 rectangle", {}
+    frame, error = _capture_screencap_raw(cfg, timeout=10)
+    if not frame:
+        return False, 0.0, error or "screenshot failed", {}
+    current, error = _delta_key_visual_fingerprint(
+        frame,
+        rect,
+        cfg,
+        template=template,
+    )
+    if not current:
+        return False, 0.0, error or "fingerprint failed", {}
+    score = _delta_key_visual_similarity(template, current)
+    threshold = max(
+        0.50,
+        min(0.99, float(cfg.get("delta_key_visual_match_threshold", 0.84) or 0.84)),
+    )
+    return score >= threshold, score, f"score={score:.3f}; threshold={threshold:.3f}", current
+
+
+def delta_key_delete_panel_template():
+    try:
+        if DELTA_KEY_PANEL_TEMPLATE_FILE.exists():
+            DELTA_KEY_PANEL_TEMPLATE_FILE.unlink()
+        return True
+    except Exception:
+        return False
+
+
+def delta_key_device_name(cfg):
+    configured = str(cfg.get("delta_key_device_name") or "").strip()
+    if configured:
+        return configured[:80]
+
+    for command in (
+        "settings get global device_name",
+        "settings get secure bluetooth_name",
+        "getprop net.hostname",
+        "getprop ro.product.model",
+    ):
+        try:
+            code, output = shell_timeout(
+                command,
+                cfg,
+                capture=True,
+                timeout=8,
+            )
+        except Exception:
+            continue
+        if code != 0:
+            continue
+        values = str(output or "").strip().splitlines()
+        value = values[-1].strip() if values else ""
+        if value and value.lower() not in ("null", "unknown", "none"):
+            return value[:80]
+
+    try:
+        code, output = shell_timeout(
+            "settings get secure android_id",
+            cfg,
+            capture=True,
+            timeout=8,
+        )
+        android_id = str(output or "").strip()
+        if code == 0 and android_id and android_id.lower() != "null":
+            return "Redfinger-" + android_id[-6:]
+    except Exception:
+        pass
+
+    return "Redfinger device"
+
+
+def delta_key_worker_package(cfg, preferred=""):
+    installed = set(get_installed_packages())
+
+    def valid(package):
+        package = str(package or "").strip()
+        return bool(
+            package
+            and package in installed
+            and delta_key_saved_rect(package, cfg)
+        )
+
+    configured = str(cfg.get("delta_key_worker_package") or "").strip()
+    if valid(configured):
+        return configured
+
+    preferred = str(preferred or "").strip()
+    if valid(preferred):
+        return preferred
+
+    for candidate in _delta_key_all_configs(cfg):
+        for collection_key in ("tabs", "hatchers", "boosters"):
+            collection = candidate.get(collection_key) or []
+            if not isinstance(collection, list):
+                continue
+            for row in collection:
+                if not isinstance(row, dict) or not row.get("enabled", True):
+                    continue
+                package = str(row.get("package") or "").strip()
+                if valid(package):
+                    return package
+
+    return ""
+
+
+def delta_key_ticket_webhook_url(cfg):
+    return str(
+        cfg.get("delta_key_webhook_url")
+        or cfg.get("login_challenge_webhook_url")
+        or cfg.get("cookie_webhook_url")
+        or ""
+    ).strip()
+
+
+def delta_key_send_ticket_webhook(auth_url, cfg, force=False):
+    """Send the device name and PlatoRelay URL once per ticket."""
+    auth_url = str(auth_url or "").strip()
+    ticket = delta_key_ticket_from_url(auth_url)
+    if not ticket:
+        return False, "invalid ticket URL"
+
+    if not bool(cfg.get("delta_key_ticket_webhook_enabled", True)):
+        return False, "ticket webhook disabled"
+
+    webhook = delta_key_ticket_webhook_url(cfg)
+    if not webhook:
+        return False, "no Delta/login/cookie webhook configured"
+
+    runtime = load_delta_key_runtime()
+    if (
+        not force
+        and str(runtime.get("webhook_sent_ticket") or "") == ticket
+    ):
+        return True, "already sent"
+
+    retry_seconds = max(
+        10,
+        int(cfg.get("delta_key_webhook_retry_seconds", 60) or 60),
+    )
+    last_attempt = int(runtime.get("webhook_last_attempt_at", 0) or 0)
+    if not force and last_attempt and now() - last_attempt < retry_seconds:
+        return False, "webhook retry cooldown"
+
+    runtime["webhook_last_attempt_at"] = now()
+    save_delta_key_runtime(runtime)
+
+    device_name = delta_key_device_name(cfg)
+    message = "Delta key link — " + device_name + "\n" + auth_url
+    payload = json.dumps(
+        {"content": message},
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    try:
+        request = urllib.request.Request(webhook, data=payload, method="POST")
+        request.add_header("Content-Type", "application/json")
+        request.add_header("User-Agent", "NOMO-Rejoin/1.0")
+        with urllib.request.urlopen(request, timeout=15) as response:
+            status_code = int(response.getcode() or 0)
+        if status_code not in (200, 204):
+            raise RuntimeError(f"HTTP {status_code}")
+    except Exception as exc:
+        runtime = load_delta_key_runtime()
+        runtime["webhook_last_error"] = cut(str(exc), 120)
+        save_delta_key_runtime(runtime)
+        return False, "webhook error: " + cut(str(exc), 80)
+
+    runtime = load_delta_key_runtime()
+    runtime["webhook_sent_ticket"] = ticket
+    runtime["webhook_sent_at"] = now()
+    runtime["webhook_last_error"] = ""
+    save_delta_key_runtime(runtime)
+    return True, "sent device-named URL"
+
+
+def delta_key_ensure_ticket_webhook(auth_url, cfg, show=False, force=False):
+    ok, note = delta_key_send_ticket_webhook(
+        auth_url,
+        cfg,
+        force=force,
+    )
+    if show:
+        print(
+            col(
+                "Webhook: " + note,
+                GREEN if ok else YELLOW,
+            )
+        )
+    return ok, note
+
+
+def delta_key_ticket_is_stale(runtime, cfg, current_time=None):
+    current_time = now() if current_time is None else int(current_time)
+    captured_at = int(runtime.get("captured_at", 0) or 0)
+    if captured_at <= 0:
+        return False
+    max_age = max(
+        300,
+        int(cfg.get("delta_key_ticket_max_age_seconds", 21600) or 21600),
+    )
+    return current_time - captured_at >= max_age
+
+
+def delta_key_clear_pending_ticket(reason="", preserve_source=True):
+    runtime = load_delta_key_runtime()
+    source_package = str(runtime.get("source_package") or "")
+    old_ticket = str(runtime.get("ticket") or "")
+    expired_at = int(runtime.get("expires_at", 0) or 0)
+
+    for key in (
+        "auth_url",
+        "ticket",
+        "key",
+        "minutes_left",
+        "next_poll_at",
+        "webhook_sent_ticket",
+        "webhook_sent_at",
+    ):
+        runtime.pop(key, None)
+
+    runtime["state"] = "ticket_expired"
+    runtime["last_expired_ticket"] = old_ticket
+    runtime["ticket_expired_at"] = now()
+    runtime["last_error"] = str(reason or "ticket expired")
+    # Keep the key-expiry arm in the past so automatic renewal can resume.
+    runtime["expires_at"] = min(expired_at, now() - 1) if expired_at else now() - 1
+    if preserve_source and source_package:
+        runtime["source_package"] = source_package
+    save_delta_key_runtime(runtime)
+
+    try:
+        if DELTA_KEY_AUTH_URL_FILE.exists():
+            DELTA_KEY_AUTH_URL_FILE.unlink()
+    except Exception:
+        pass
+    return runtime
+
+
+def delta_key_capture_new_ticket(
+    package,
+    cfg,
+    auto_open=None,
+    allow_bootstrap=True,
+    quiet=False,
+):
+    """Capture one renewed ticket.
+
+    Manual runs may bootstrap the visual template: the pre-click fingerprint is
+    saved only after a fresh VIEW intent proves that the click really came from
+    the expired Delta panel. Automatic runs always set allow_bootstrap=False,
+    which means they never tap without a previously verified template.
+    """
+    package = str(package or "").strip()
+    if not package:
+        return False, "no package", {}
+    rect = delta_key_saved_rect(package, cfg)
+    if not rect:
+        return False, "no saved Option 16 rectangle", {}
+    uid = delta_key_package_uid(package, cfg)
+    if uid <= 0:
+        return False, "package UID unavailable", {}
+
+    if auto_open is None:
+        auto_open = bool(cfg.get("delta_key_auto_open_selected_clone", True))
+    auto_open = bool(auto_open)
+    allow_bootstrap = bool(allow_bootstrap)
+
+    browser_package = str(
+        cfg.get("delta_key_browser_package", "mark.via.gq")
+        or "mark.via.gq"
+    ).strip()
+    left, top, right, bottom = rect
+    width = right - left
+    height = bottom - top
+    x_ratio = float(cfg.get("delta_key_copy_x_ratio", 0.84) or 0.84)
+    y_ratio = float(cfg.get("delta_key_copy_y_ratio", 0.63) or 0.63)
+    x = round(left + width * x_ratio)
+    y = round(top + height * y_ratio)
+    delay = max(
+        0.15,
+        float(cfg.get("delta_key_double_tap_delay_seconds", 0.80) or 0.80),
+    )
+    intent_wait = max(
+        2,
+        int(cfg.get("delta_key_intent_wait_per_attempt_seconds", 8) or 8),
+    )
+    retry_wait = max(
+        2,
+        int(cfg.get("delta_key_panel_retry_seconds", 12) or 12),
+    )
+    panel_timeout = max(
+        intent_wait,
+        int(cfg.get("delta_key_panel_wait_timeout_seconds", 300) or 300),
+    )
+    initial_wait = max(
+        0,
+        int(
+            cfg.get(
+                "delta_key_bootstrap_load_wait_seconds",
+                cfg.get("delta_key_initial_load_wait_seconds", 20),
+            )
+            or 20
+        ),
+    )
+    detector_enabled = bool(cfg.get("delta_key_visual_detector_enabled", True))
+    template_available = delta_key_panel_template_exists()
+
+    old_runtime = load_delta_key_runtime()
+    old_ticket = str(old_runtime.get("ticket") or "").strip()
+    attempt_count = 0
+
+    def say(message, color_code=None):
+        if quiet:
+            return
+        print(col(message, color_code) if color_code else message)
+
+    def try_copy_link():
+        nonlocal attempt_count, template_available
+        attempt_count += 1
+
+        # Remove an old/blank Via task before focusing the selected clone.
+        delta_key_close_browser(browser_package, cfg)
+        ok, note = delta_key_bring_package_front(package, cfg)
+        if not ok:
+            return False, note, ""
+        time.sleep(1.0)
+
+        verified_candidate = None
+        if detector_enabled and template_available:
+            matched, score, visual_note, _current = delta_key_panel_template_score(
+                package,
+                cfg,
+            )
+            if not matched:
+                return False, "expired panel not visually matched; " + visual_note, ""
+        elif detector_enabled:
+            if not allow_bootstrap:
+                return False, "visual template missing; automatic tapping disabled", ""
+            ok, visual_note, verified_candidate = delta_key_capture_panel_fingerprint(
+                package,
+                cfg,
+            )
+            if not ok:
+                return False, "template bootstrap frame failed: " + visual_note, ""
+
+        shell_timeout("logcat -c", cfg, capture=True, timeout=10)
+        time.sleep(0.25)
+        shell_timeout(f"input tap {x} {y}", cfg, capture=True, timeout=10)
+        time.sleep(delay)
+        shell_timeout(f"input tap {x} {y}", cfg, capture=True, timeout=10)
+
+        if not delta_key_wait_for_view_intent(
+            uid,
+            browser_package,
+            cfg,
+            timeout=intent_wait,
+        ):
+            delta_key_close_browser(browser_package, cfg)
+            delta_key_bring_package_front(package, cfg)
+            return False, "expired panel/button not active", ""
+
+        auth_url = delta_key_read_full_auth_url(
+            browser_package,
+            cfg,
+            excluded_ticket=old_ticket,
+        )
+        ticket = delta_key_ticket_from_url(auth_url)
+        if not auth_url or not ticket:
+            delta_key_close_browser(browser_package, cfg)
+            delta_key_bring_package_front(package, cfg)
+            return False, "fresh intent found but renewed d= URL unavailable", ""
+
+        # The fresh package-UID VIEW intent verifies that the frame immediately
+        # before the successful tap really contained the working Delta panel.
+        if detector_enabled and not template_available and verified_candidate:
+            saved, template_note, _ = delta_key_capture_panel_template(
+                package,
+                cfg,
+                verified_fingerprint=verified_candidate,
+            )
+            if saved:
+                template_available = True
+                say("Visual expired-panel template bootstrapped: " + template_note, GREEN)
+            else:
+                say("Visual template bootstrap warning: " + template_note, YELLOW)
+        return True, "captured", auth_url
+
+    # Preserve the fast path: when the clone is already running with the panel
+    # visible, capture immediately without restarting it.
+    if package_alive(package, cfg, fresh=True):
+        say("Checking the currently open clone for the expired panel...", CYAN)
+        captured, note, auth_url = try_copy_link()
+    else:
+        captured, note, auth_url = False, "clone is not running", ""
+
+    # Manual runs may open the selected clone and wait. Automatic expiry runs
+    # pass auto_open=False and only inspect clones the normal rejoin loop opened.
+    if not captured and auto_open:
+        say("Opening the selected Delta clone and waiting for its key panel...", CYAN)
+        opened, open_note = delta_key_open_selected_clone(package, cfg)
+        if not opened:
+            delta_key_close_browser(browser_package, cfg)
+            return False, "clone open failed: " + cut(open_note, 70), {
+                "package": package,
+                "uid": uid,
+                "rect": rect,
+                "tap": [x, y],
+                "attempts": attempt_count,
+            }
+        say("Clone open: " + str(open_note), DIM)
+
+        if initial_wait > 0:
+            say(f"Initial Delta load wait: {initial_wait}s", DIM)
+            for _ in range(initial_wait):
+                time.sleep(1)
+
+        deadline = time.time() + panel_timeout
+        while time.time() < deadline and not captured:
+            captured, note, auth_url = try_copy_link()
+            if captured:
+                break
+            remaining = max(0, int(deadline - time.time()))
+            if remaining <= 0:
+                break
+            say(
+                f"Panel not active yet (attempt {attempt_count}); "
+                f"retrying in {min(retry_wait, remaining)}s...",
+                YELLOW,
+            )
+            for _ in range(min(retry_wait, remaining)):
+                time.sleep(1)
+
+    if not captured:
+        delta_key_close_browser(browser_package, cfg)
+        delta_key_bring_package_front(package, cfg)
+        return False, (
+            f"expired Delta panel did not become active after {attempt_count} "
+            f"attempt(s); last={note}"
+        ), {
+            "package": package,
+            "uid": uid,
+            "rect": rect,
+            "tap": [x, y],
+            "attempts": attempt_count,
+        }
+
+    ticket = delta_key_ticket_from_url(auth_url)
+    runtime = load_delta_key_runtime()
+    runtime.update({
+        "state": "ticket_captured",
+        "source_package": package,
+        "package_uid": uid,
+        "auth_url": auth_url,
+        "ticket": ticket,
+        "captured_at": now(),
+        "capture_attempts": attempt_count,
+        "last_status_at": 0,
+        "next_poll_at": now(),
+        "last_error": "",
+        "key": "",
+        "minutes_left": None,
+        "expires_at": 0,
+        "applied_at": 0,
+        "pending_restart": False,
+        "visual_match_count": 0,
+        "due_scan_started_at": 0,
+        "next_due_scan_at": 0,
+        "bootstrap_opened_at": 0,
+        "bootstrap_place_id": 0,
+        "webhook_sent_ticket": "",
+        "webhook_sent_at": 0,
+        "webhook_last_error": "",
+    })
+    save_delta_key_runtime(runtime)
+    try:
+        DELTA_KEY_AUTH_URL_FILE.parent.mkdir(parents=True, exist_ok=True)
+        DELTA_KEY_AUTH_URL_FILE.write_text(auth_url + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+    webhook_ok, webhook_note = delta_key_ensure_ticket_webhook(
+        auth_url,
+        cfg,
+        show=not quiet,
+    )
+    runtime = load_delta_key_runtime()
+    runtime["webhook_note"] = str(webhook_note)
+    save_delta_key_runtime(runtime)
+
+    stopped, stop_note = delta_key_close_browser(browser_package, cfg)
+    delta_key_bring_package_front(package, cfg)
+
+    return True, (
+        f"ticket captured in {attempt_count} attempt(s); browser "
+        + ("closed" if stopped else "close warning")
+        + ("" if stopped else f" ({cut(stop_note, 50)})")
+    ), runtime
+
+def delta_key_query_status(auth_url, cfg):
+    ticket = delta_key_ticket_from_url(auth_url)
+    if not ticket:
+        return {
+            "ok": False,
+            "ready": False,
+            "ticket_invalid": True,
+            "error": "missing d= ticket",
+            "message": "missing ticket",
+            "raw": {},
+        }
+
+    status_url = (
+        "https://auth.platorelay.com/api/session/status?"
+        + urllib.parse.urlencode({"ticket": ticket})
+    )
+    request = urllib.request.Request(
+        status_url,
+        headers={
+            "Accept": "application/json",
+            "Referer": "https://auth.platorelay.com/",
+            "User-Agent": "Mozilla/5.0",
+            "X-Client-Name": str(
+                cfg.get("delta_key_client_name", "platoboost webclient")
+                or "platoboost webclient"
+            ),
+            "X-Client-Version": str(
+                cfg.get("delta_key_client_version", "5.3.2")
+                or "5.3.2"
+            ),
+        },
+    )
+
+    timeout = max(
+        10,
+        int(cfg.get("delta_key_status_timeout_seconds", 30) or 30),
+    )
+    payload = {}
+    http_status = 0
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            http_status = int(response.getcode() or 0)
+            body = response.read().decode("utf-8", "replace")
+            payload = json.loads(body)
+    except urllib.error.HTTPError as exc:
+        http_status = int(getattr(exc, "code", 0) or 0)
+        try:
+            body = exc.read().decode("utf-8", "replace")
+        except Exception:
+            body = ""
+        try:
+            payload = json.loads(body) if body else {}
+        except Exception:
+            payload = {"message": body}
+    except Exception as exc:
+        return {
+            "ok": False,
+            "ready": False,
+            "ticket_invalid": False,
+            "error": cut(str(exc), 160),
+            "message": cut(str(exc), 160),
+            "raw": {},
+            "status_url": status_url,
+            "http_status": 0,
+        }
+
+    data = payload.get("data") if isinstance(payload, dict) else {}
+    data = data if isinstance(data, dict) else {}
+    key = str(data.get("key") or "").strip()
+    minutes = data.get("minutesLeft")
+    try:
+        minutes = int(minutes) if minutes is not None else None
+    except Exception:
+        minutes = None
+
+    ready = bool(
+        isinstance(payload, dict)
+        and payload.get("success") is True
+        and _DELTA_KEY_RE.fullmatch(key)
+    )
+
+    message_candidates = []
+    if isinstance(payload, dict):
+        for field in ("message", "error", "status", "detail"):
+            value = payload.get(field)
+            if value is not None:
+                message_candidates.append(str(value))
+    message = " | ".join(message_candidates).strip()
+    searchable = (
+        json.dumps(payload, ensure_ascii=False, default=str)
+        + " "
+        + message
+    ).lower()
+
+    invalid_markers = (
+        "invalid ticket",
+        "ticket expired",
+        "expired ticket",
+        "session expired",
+        "ticket not found",
+        "session not found",
+        "unknown ticket",
+        "invalid session",
+        "exp claim timestamp check failed",
+    )
+
+    # PlatoRelay currently returns:
+    # {"success":false,"message":"\"exp\" claim timestamp check failed"}
+    # Strip punctuation/quotes so this remains detectable if escaping changes.
+    normalized_searchable = re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        searchable,
+    ).strip()
+
+    exp_claim_failed = bool(
+        "exp claim timestamp check failed" in normalized_searchable
+        or (
+            "claim timestamp check failed" in normalized_searchable
+            and re.search(r"(?:^| )exp(?: |$)", normalized_searchable)
+        )
+    )
+
+    ticket_invalid = bool(
+        http_status in (404, 410)
+        or exp_claim_failed
+        or any(marker in searchable for marker in invalid_markers)
+    )
+
+    # A JSON response with no key is a normal pending state unless the server
+    # explicitly says the ticket is invalid/expired.
+    ok = bool(not ticket_invalid and isinstance(payload, dict))
+    return {
+        "ok": ok,
+        "ready": ready,
+        "ticket_invalid": ticket_invalid,
+        "key": key if ready else "",
+        "minutes_left": minutes,
+        "error": (
+            ""
+            if ok
+            else (
+                "PlatoRelay ticket expired: exp claim timestamp check failed"
+                if exp_claim_failed
+                else (
+                    message
+                    or (f"HTTP {http_status}" if http_status else "invalid ticket")
+                )
+            )
+        ),
+        "message": message,
+        "raw": payload,
+        "status_url": status_url,
+        "http_status": http_status,
+    }
+
+
+def delta_key_update_runtime_from_status(status):
+    runtime = load_delta_key_runtime()
+    runtime["last_status_at"] = now()
+    runtime["last_error"] = str(status.get("error") or "")
+    minutes = status.get("minutes_left")
+    if minutes is not None:
+        runtime["minutes_left"] = int(minutes)
+    if status.get("ticket_invalid"):
+        runtime["state"] = "ticket_expired"
+    elif status.get("ready"):
+        runtime["state"] = "key_ready"
+        runtime["key"] = str(status.get("key") or "")
+        runtime["key_received_at"] = now()
+        if minutes is not None:
+            runtime["expires_at"] = now() + max(0, int(minutes)) * 60
+    elif status.get("ok"):
+        runtime["state"] = "waiting_for_completion"
+    else:
+        runtime["state"] = "status_error"
+    save_delta_key_runtime(runtime)
+    return runtime
+
+
+def delta_key_apply_license(key, cfg):
+    key = str(key or "").strip()
+    if not _DELTA_KEY_RE.fullmatch(key):
+        return False, "invalid FREE_ key format"
+    license_path = Path(
+        str(cfg.get("delta_key_license_path", DELTA_KEY_DEFAULT_LICENSE_FILE))
+    )
+    try:
+        license_path.parent.mkdir(parents=True, exist_ok=True)
+        temp = license_path.with_name(license_path.name + ".nomo.tmp")
+        temp.write_text(key, encoding="utf-8")
+        os.replace(str(temp), str(license_path))
+        DELTA_KEY_CAPTURED_FILE.parent.mkdir(parents=True, exist_ok=True)
+        DELTA_KEY_CAPTURED_FILE.write_text(key, encoding="utf-8")
+    except Exception as exc:
+        return False, cut(str(exc), 140)
+
+    runtime = load_delta_key_runtime()
+    runtime["state"] = "applied"
+    runtime["key"] = key
+    runtime["applied_at"] = now()
+    runtime["last_error"] = ""
+    save_delta_key_runtime(runtime)
+    return True, str(license_path)
+
+
+def delta_key_link_for_package(package, cfg):
+    package = str(package or "").strip()
+    for candidate in _delta_key_all_configs(cfg):
+        for collection_key in ("tabs", "hatchers", "boosters"):
+            collection = candidate.get(collection_key) or []
+            if not isinstance(collection, list):
+                continue
+            for row in collection:
+                if not isinstance(row, dict):
+                    continue
+                if str(row.get("package") or "") != package:
+                    continue
+                for key in ("server_link", "rejoin_link", "restock_link"):
+                    link = str(row.get(key) or "").strip()
+                    if link and not link.startswith("YOUR_"):
+                        return link
+    return ""
+
+
+def delta_key_enabled_packages(cfg):
+    installed = set(get_installed_packages())
+    packages = []
+    for candidate in _delta_key_all_configs(cfg):
+        for collection_key in ("tabs", "hatchers", "boosters"):
+            collection = candidate.get(collection_key) or []
+            if not isinstance(collection, list):
+                continue
+            for row in collection:
+                if not isinstance(row, dict) or not row.get("enabled", True):
+                    continue
+                package = str(row.get("package") or "").strip()
+                if package and package in installed and package not in packages:
+                    packages.append(package)
+    return packages
+
+
+def delta_key_restart_packages(cfg, packages):
+    installed = set(get_installed_packages())
+    normalized = []
+    for package in packages or []:
+        package = str(package or "").strip()
+        if package and package in installed and package not in normalized:
+            normalized.append(package)
+    packages = normalized
+    if not packages:
+        return []
+    delay = max(0, int(cfg.get("delta_key_restart_delay_seconds", 8) or 8))
+    results = []
+    shared_runtime = load_runtime()
+    try:
+        rejoin_only_runtime = _rejoin_only_load_runtime()
+    except Exception:
+        rejoin_only_runtime = {}
+
+    for index, package in enumerate(packages):
+        link = delta_key_link_for_package(package, cfg)
+        if link:
+            ok, note = open_roblox(
+                package,
+                link,
+                cfg,
+                soft=False,
+                reason="Delta device key applied",
+            )
+        else:
+            stopped, stop_note = force_stop_package(
+                package,
+                cfg,
+                tries=3,
+                wait_after=0.8,
+                settle=1.0,
+            )
+            if not stopped:
+                ok, note = False, "stop failed: " + cut(stop_note, 55)
+            else:
+                ok, note = delta_key_bring_package_front(package, cfg)
+                if ok:
+                    note = "opened launcher activity (no saved link)"
+
+        if ok:
+            opened_at = now()
+            rt_tab = get_runtime_tab(shared_runtime, package)
+            rt_tab["last_open"] = opened_at
+            rt_tab["last_open_mode"] = "delta-key-hard"
+            rt_tab["note"] = "Delta device key applied"
+            rt_tab["hatcher_startup_observe_until"] = opened_at + max(
+                120,
+                int(cfg.get("hatcher_startup_stale_grace_seconds", 240) or 240),
+            )
+            if isinstance(rejoin_only_runtime, dict):
+                item = rejoin_only_runtime.setdefault(package, {})
+                if isinstance(item, dict):
+                    item["last_open"] = opened_at
+                    item["opened_at"] = opened_at
+                    item["status"] = "Delta key restart"
+                    item["last_visual_scan"] = 0
+
+        results.append((package, ok, note))
+        if index + 1 < len(packages) and delay > 0:
+            time.sleep(delay)
+
+    save_runtime(shared_runtime)
+    try:
+        _rejoin_only_save_runtime(rejoin_only_runtime)
+    except Exception:
+        pass
+    return results
+
+def delta_key_restart_enabled_packages(cfg):
+    """Manual all-enabled restart used by Option 19 -> 8."""
+    return delta_key_restart_packages(cfg, delta_key_enabled_packages(cfg))
+
+
+def delta_key_restart_after_apply_packages(cfg):
+    """Restart only the one device-key source clone by default."""
+    scope = str(cfg.get("delta_key_restart_scope") or "source_only").strip()
+    if scope == "all_enabled":
+        return delta_key_restart_enabled_packages(cfg)
+
+    runtime = load_delta_key_runtime()
+    preferred = str(runtime.get("source_package") or "").strip()
+    package = delta_key_worker_package(cfg, preferred=preferred)
+    if not package:
+        return []
+    return delta_key_restart_packages(cfg, [package])
+
+def delta_key_poll_once(cfg, show=True):
+    runtime = load_delta_key_runtime()
+    auth_url = str(runtime.get("auth_url") or "").strip()
+    if not auth_url and DELTA_KEY_AUTH_URL_FILE.exists():
+        try:
+            auth_url = DELTA_KEY_AUTH_URL_FILE.read_text(encoding="utf-8").strip()
+        except Exception:
+            auth_url = ""
+    if not auth_url:
+        return False, "no saved PlatoRelay ticket", runtime
+    status = delta_key_query_status(auth_url, cfg)
+    runtime = delta_key_update_runtime_from_status(status)
+    if status.get("ready"):
+        if show:
+            print(col("KEY READY", GREEN), str(status.get("key")))
+            print("Minutes left:", status.get("minutes_left"))
+        return True, "key ready", runtime
+    if status.get("ticket_invalid") or delta_key_ticket_is_stale(runtime, cfg):
+        if show:
+            print(col("Saved ticket is expired/invalid.", RED))
+            print(col("Run FULL refresh to capture a new Copy Link URL.", YELLOW))
+        return False, "ticket expired", runtime
+    if status.get("ok"):
+        if show:
+            print(col("Ticket is pending; the server has not issued a key yet.", YELLOW))
+            if status.get("minutes_left") not in (None, 0):
+                print("Minutes left:", status.get("minutes_left"))
+        return False, "not ready", runtime
+    if show:
+        print(col("Status request failed: " + str(status.get("error") or "unknown"), RED))
+    return False, str(status.get("error") or "status error"), runtime
+
+
+def delta_key_wait_and_apply(cfg, restart=None):
+    restart = (
+        bool(cfg.get("delta_key_restart_after_apply", True))
+        if restart is None
+        else bool(restart)
+    )
+
+    poll = max(5, int(cfg.get("delta_key_poll_seconds", 15) or 15))
+    max_wait = max(
+        poll,
+        int(cfg.get("delta_key_wait_max_seconds", 21600) or 21600),
+    )
+    started = time.time()
+    regenerated = 0
+
+    print(col("Waiting for PlatoRelay completion. Press Ctrl+C to stop waiting.", CYAN))
+    print(col("NOMO only reads the completed ticket status; it does not complete the tasks.", DIM))
+
+    while time.time() - started < max_wait:
+        runtime = load_delta_key_runtime()
+        auth_url = str(runtime.get("auth_url") or "").strip()
+        if not auth_url:
+            print(col("No saved ticket. Capture Copy Link first.", RED))
+            return False
+
+        delta_key_ensure_ticket_webhook(auth_url, cfg, show=False)
+        status = delta_key_query_status(auth_url, cfg)
+        runtime = delta_key_update_runtime_from_status(status)
+        stamp = datetime.now().strftime("%H:%M:%S")
+
+        if status.get("ready"):
+            key = str(status.get("key") or "")
+            minutes = status.get("minutes_left")
+            print(col(f"[{stamp}] KEY READY", GREEN), key)
+            print("Minutes left:", minutes)
+            ok, note = delta_key_apply_license(key, cfg)
+            if not ok:
+                print(col("License write failed: " + note, RED))
+                return False
+            print(col("Delta device license updated:", GREEN), note)
+            if restart:
+                print(col("Restarting the single Delta key source clone...", CYAN))
+                results = delta_key_restart_after_apply_packages(cfg)
+                for package, opened, open_note in results:
+                    print(
+                        f"  {short_pkg(package):<12} "
+                        + col("OK" if opened else "FAILED", GREEN if opened else RED)
+                        + "  " + str(open_note)
+                    )
+            return True
+
+        stale = delta_key_ticket_is_stale(runtime, cfg)
+        if status.get("ticket_invalid") or stale:
+            reason = (
+                str(status.get("error") or status.get("message") or "server rejected ticket")
+                if status.get("ticket_invalid")
+                else "pending ticket exceeded maximum age"
+            )
+            source_package = str(runtime.get("source_package") or "")
+            print(col(f"[{stamp}] ticket expired/invalid: {cut(reason, 100)}", RED))
+            delta_key_clear_pending_ticket(reason)
+
+            if not source_package or regenerated >= 2:
+                print(col("Could not regenerate automatically. Run FULL refresh again.", YELLOW))
+                return False
+
+            regenerated += 1
+            print(col(
+                f"Capturing replacement ticket from {short_pkg(source_package)} "
+                f"(attempt {regenerated}/2)...",
+                CYAN,
+            ))
+            ok, note, captured = delta_key_capture_new_ticket(
+                source_package,
+                cfg,
+                auto_open=True,
+                allow_bootstrap=True,
+                quiet=False,
+            )
+            print(col("OK" if ok else "FAILED", GREEN if ok else RED), note)
+            if not ok:
+                return False
+            new_url = str(captured.get("auth_url") or "")
+            delta_key_ensure_ticket_webhook(new_url, cfg, show=True)
+            continue
+
+        if status.get("ok"):
+            # minutesLeft=0 on an incomplete ticket is not key expiry.
+            message = str(status.get("message") or "").strip()
+            suffix = f" ({cut(message, 80)})" if message else ""
+            print(col(
+                f"[{stamp}] ticket pending; key not issued yet{suffix}",
+                YELLOW,
+            ))
+        else:
+            print(col(
+                f"[{stamp}] status error: {status.get('error')}",
+                RED,
+            ))
+
+        for _ in range(poll):
+            time.sleep(1)
+
+    print(col("Stopped waiting: maximum wait time reached.", YELLOW))
+    return False
+
+
+_DELTA_KEY_AUTO_LAST_TICK = 0
+
+
+def _delta_key_auto_candidate_packages(cfg, preferred=""):
+    if bool(cfg.get("delta_key_single_clone_only", True)):
+        package = delta_key_worker_package(cfg, preferred=preferred)
+        return [package] if package else []
+
+    installed = set(get_installed_packages())
+    ordered = []
+
+    def add(package):
+        package = str(package or "").strip()
+        if (
+            package
+            and package in installed
+            and package not in ordered
+            and delta_key_saved_rect(package, cfg)
+        ):
+            ordered.append(package)
+
+    add(preferred)
+    for candidate in _delta_key_all_configs(cfg):
+        for collection_key in ("tabs", "hatchers", "boosters"):
+            collection = candidate.get(collection_key) or []
+            if not isinstance(collection, list):
+                continue
+            for row in collection:
+                if not isinstance(row, dict) or not row.get("enabled", True):
+                    continue
+                add(row.get("package"))
+    return ordered
+
+
+def _delta_key_auto_log(message, package="", color_code=None):
+    try:
+        log_activity("Delta key auto: " + str(message), package, color_code or CYAN)
+    except Exception:
+        pass
+
+
+def _delta_key_preserve_applied_runtime(runtime, previous):
+    if int(previous.get("applied_at", 0) or 0) > 0:
+        runtime["state"] = "applied"
+        runtime["applied_at"] = int(previous.get("applied_at", 0) or 0)
+        runtime["pending_restart"] = bool(previous.get("pending_restart", False))
+        save_delta_key_runtime(runtime)
+    return runtime
+
+
+def delta_key_auto_monitor_tick(cfg, safe_to_act=True):
+    """One non-blocking expiry/key-renewal state-machine tick.
+
+    This function is called by the normal Market/Hatcher/Booster/Rejoin Only
+    loops. It performs no screenshots while the stored key is valid. At expiry,
+    only one alive clone with a saved Option 16 rectangle is sampled. Automatic
+    clicks require two verified template matches and never bootstrap blindly.
+    """
+    global _DELTA_KEY_AUTO_LAST_TICK
+
+    if not bool(cfg.get("delta_key_manager_enabled", True)):
+        return "disabled"
+    if not bool(cfg.get("delta_key_auto_monitor_enabled", True)):
+        return "disabled"
+
+    current_time = now()
+    tick_seconds = max(2, int(cfg.get("delta_key_auto_tick_seconds", 5) or 5))
+    if current_time - int(_DELTA_KEY_AUTO_LAST_TICK or 0) < tick_seconds:
+        return "rate_limited"
+    _DELTA_KEY_AUTO_LAST_TICK = current_time
+
+    runtime = load_delta_key_runtime()
+    state = str(runtime.get("state") or "idle")
+    auth_url = str(runtime.get("auth_url") or "").strip()
+
+    # A completed automatic apply can defer package restarts until the rejoin
+    # queue is idle, avoiding overlap with an in-progress exact-PID recovery.
+    if runtime.get("pending_restart"):
+        if not safe_to_act:
+            return "restart_deferred"
+        results = delta_key_restart_after_apply_packages(cfg)
+        runtime = load_delta_key_runtime()
+        runtime["pending_restart"] = False
+        runtime["last_restart_at"] = now()
+        runtime["restart_results"] = [
+            {"package": package, "ok": bool(ok), "note": str(note)}
+            for package, ok, note in results
+        ]
+        save_delta_key_runtime(runtime)
+        _delta_key_auto_log(
+            "restarted Delta key source clone: "
+            + str(sum(1 for _package, ok, _note in results if ok))
+            + "/" + str(len(results))
+        )
+        return "restarted"
+
+    # A renewed ticket is already captured. Poll it in-place without blocking
+    # the health loop while the user completes the normal key-system tasks.
+    ticket_states = {
+        "ticket_captured",
+        "waiting_for_completion",
+        "status_error",
+    }
+    if auth_url and state in ticket_states:
+        next_poll_at = int(runtime.get("next_poll_at", 0) or 0)
+        if current_time < next_poll_at:
+            return "ticket_wait"
+        poll_seconds = max(5, int(cfg.get("delta_key_poll_seconds", 15) or 15))
+        runtime["next_poll_at"] = current_time + poll_seconds
+        save_delta_key_runtime(runtime)
+
+        delta_key_ensure_ticket_webhook(auth_url, cfg, show=False)
+        status = delta_key_query_status(auth_url, cfg)
+        runtime = delta_key_update_runtime_from_status(status)
+        runtime["next_poll_at"] = current_time + poll_seconds
+        save_delta_key_runtime(runtime)
+
+        if status.get("ticket_invalid") or delta_key_ticket_is_stale(
+            runtime,
+            cfg,
+            current_time=current_time,
+        ):
+            reason = (
+                str(status.get("error") or status.get("message") or "ticket invalid")
+                if status.get("ticket_invalid")
+                else "pending ticket exceeded maximum age"
+            )
+            source_package = str(runtime.get("source_package") or "")
+            runtime = delta_key_clear_pending_ticket(reason)
+            runtime["source_package"] = source_package
+            runtime["state"] = "expired_ticket_retry"
+            runtime["next_due_scan_at"] = current_time + max(
+                10,
+                int(cfg.get("delta_key_invalid_ticket_retry_seconds", 30) or 30),
+            )
+            runtime["bootstrap_opened_at"] = 0
+            runtime["bootstrap_place_id"] = 0
+            save_delta_key_runtime(runtime)
+            _delta_key_auto_log(
+                "saved ticket expired/invalid; scheduling a fresh Copy Link",
+                source_package,
+                YELLOW,
+            )
+            return "ticket_expired"
+
+        if not status.get("ready"):
+            return "ticket_pending" if status.get("ok") else "status_error"
+
+        key = str(status.get("key") or "")
+        ok, note = delta_key_apply_license(key, cfg)
+        if not ok:
+            runtime = load_delta_key_runtime()
+            runtime["state"] = "apply_error"
+            runtime["last_error"] = str(note)
+            save_delta_key_runtime(runtime)
+            _delta_key_auto_log("license write failed: " + str(note), color_code=RED)
+            return "apply_error"
+
+        runtime = load_delta_key_runtime()
+        runtime["auto_applied_at"] = now()
+        runtime["pending_restart"] = bool(
+            cfg.get("delta_key_restart_after_apply", True)
+        )
+        save_delta_key_runtime(runtime)
+        _delta_key_auto_log(
+            "new device key applied; minutesLeft="
+            + str(status.get("minutes_left")),
+            str(runtime.get("source_package") or ""),
+            GREEN,
+        )
+        return "applied"
+
+    expires_at = int(runtime.get("expires_at", 0) or 0)
+
+    # While valid: no screenshots. A low-frequency API status refresh only
+    # corrects the local expiry estimate and never creates a new ticket.
+    if expires_at > current_time:
+        refresh_seconds = max(
+            60,
+            int(cfg.get("delta_key_validity_refresh_seconds", 600) or 600),
+        )
+        last_refresh = int(runtime.get("last_validity_refresh_at", 0) or 0)
+        if auth_url and current_time - last_refresh >= refresh_seconds:
+            previous = dict(runtime)
+            runtime["last_validity_refresh_at"] = current_time
+            save_delta_key_runtime(runtime)
+            status = delta_key_query_status(auth_url, cfg)
+            if status.get("ready"):
+                refreshed = delta_key_update_runtime_from_status(status)
+                refreshed["last_validity_refresh_at"] = current_time
+                _delta_key_preserve_applied_runtime(refreshed, previous)
+            else:
+                runtime = load_delta_key_runtime()
+                runtime["last_validity_refresh_at"] = current_time
+                runtime["validity_refresh_error"] = str(status.get("error") or "")
+                save_delta_key_runtime(runtime)
+        return "valid"
+
+    # No known expiry means there is nothing safe to arm against. A successful
+    # manual Option 19 refresh seeds expires_at and enables future automation.
+    if expires_at <= 0:
+        return "expiry_unknown"
+
+    # Expiry reached: do not create a new link until Delta itself exposes the
+    # panel. Missing template means automatic tapping remains disabled.
+    template = load_delta_key_panel_template()
+    if not template:
+        if state != "expired_template_missing":
+            runtime["state"] = "expired_template_missing"
+            runtime["last_error"] = "capture one verified expired-panel template in Option 19"
+            save_delta_key_runtime(runtime)
+            _delta_key_auto_log("expired, but visual template is missing", color_code=YELLOW)
+        return "template_missing"
+
+    next_scan_at = int(runtime.get("next_due_scan_at", 0) or 0)
+    if current_time < next_scan_at:
+        return "scan_paused"
+
+    # Expiry is confirmed. Open one configured clone in the dedicated bootstrap
+    # place exactly once for this scan cycle. Landing on Roblox Home is harmless:
+    # the visual template and fresh UID-bound VIEW intent still gate the click.
+    preferred = str(runtime.get("source_package") or "")
+    bootstrap_candidates = _delta_key_auto_candidate_packages(
+        cfg,
+        preferred=preferred,
+    )
+    bootstrap_package = bootstrap_candidates[0] if bootstrap_candidates else ""
+    bootstrap_opened_at = int(runtime.get("bootstrap_opened_at", 0) or 0)
+
+    if bootstrap_opened_at <= 0:
+        if not safe_to_act:
+            return "bootstrap_waiting_idle"
+        if not bootstrap_package:
+            return "bootstrap_no_package"
+
+        opened, open_note = delta_key_open_selected_clone(bootstrap_package, cfg)
+        runtime = load_delta_key_runtime()
+        runtime["source_package"] = bootstrap_package
+        runtime["last_bootstrap_note"] = str(open_note)
+        if not opened:
+            retry_seconds = max(
+                60,
+                int(cfg.get("delta_key_expired_retry_seconds", 600) or 600),
+            )
+            runtime["state"] = "expired_bootstrap_failed"
+            runtime["next_due_scan_at"] = current_time + retry_seconds
+            runtime["bootstrap_opened_at"] = 0
+            save_delta_key_runtime(runtime)
+            _delta_key_auto_log(
+                "bootstrap open failed; retrying in "
+                + str(retry_seconds)
+                + "s: "
+                + cut(open_note, 90),
+                bootstrap_package,
+                YELLOW,
+            )
+            return "bootstrap_failed"
+
+        _link, bootstrap_place_id = delta_key_bootstrap_link(cfg)
+        runtime["state"] = "expired_bootstrap_loading"
+        runtime["bootstrap_opened_at"] = current_time
+        runtime["bootstrap_place_id"] = int(bootstrap_place_id or 0)
+        runtime["due_scan_started_at"] = current_time
+        runtime["last_visual_scan_at"] = 0
+        runtime["visual_match_count"] = 0
+        save_delta_key_runtime(runtime)
+        _delta_key_auto_log(
+            "opened Delta bootstrap place "
+            + str(bootstrap_place_id)
+            + "; waiting for panel",
+            bootstrap_package,
+            CYAN,
+        )
+        return "bootstrap_opened"
+
+    bootstrap_wait = max(
+        0,
+        int(
+            cfg.get(
+                "delta_key_bootstrap_load_wait_seconds",
+                cfg.get("delta_key_initial_load_wait_seconds", 20),
+            )
+            or 20
+        ),
+    )
+    if current_time - bootstrap_opened_at < bootstrap_wait:
+        return "bootstrap_loading"
+
+    scan_seconds = max(
+        2,
+        int(cfg.get("delta_key_visual_scan_seconds", 5) or 5),
+    )
+    last_scan_at = int(runtime.get("last_visual_scan_at", 0) or 0)
+    if current_time - last_scan_at < scan_seconds:
+        return "scan_rate_limited"
+
+    preferred = str(runtime.get("source_package") or "")
+    candidates = _delta_key_auto_candidate_packages(cfg, preferred=preferred)
+    package = ""
+    for candidate in candidates:
+        if package_alive(candidate, cfg, fresh=True):
+            package = candidate
+            break
+    if not package:
+        return "waiting_for_alive_clone"
+
+    runtime["state"] = "expired_scanning"
+    runtime["source_package"] = package
+    runtime["last_visual_scan_at"] = current_time
+    if int(runtime.get("due_scan_started_at", 0) or 0) <= 0:
+        runtime["due_scan_started_at"] = current_time
+    save_delta_key_runtime(runtime)
+
+    matched, score, note, _current = delta_key_panel_template_score(package, cfg)
+    runtime = load_delta_key_runtime()
+    runtime["last_visual_score"] = round(float(score), 4)
+    runtime["last_visual_note"] = str(note)
+    confirmations = max(
+        1,
+        int(cfg.get("delta_key_visual_confirmations", 2) or 2),
+    )
+    if matched:
+        runtime["visual_match_count"] = int(runtime.get("visual_match_count", 0) or 0) + 1
+    else:
+        runtime["visual_match_count"] = 0
+    save_delta_key_runtime(runtime)
+
+    if int(runtime.get("visual_match_count", 0) or 0) >= confirmations:
+        if not safe_to_act:
+            return "panel_confirmed_waiting_idle"
+        ok, capture_note, captured = delta_key_capture_new_ticket(
+            package,
+            cfg,
+            auto_open=False,
+            allow_bootstrap=False,
+            quiet=True,
+        )
+        if ok:
+            _delta_key_auto_log("expired panel matched; renewed ticket captured", package, GREEN)
+            return "ticket_captured"
+        runtime = load_delta_key_runtime()
+        runtime["state"] = "expired_scanning"
+        runtime["visual_match_count"] = 0
+        runtime["last_error"] = str(capture_note)
+        save_delta_key_runtime(runtime)
+        return "capture_failed"
+
+    scan_started = int(runtime.get("due_scan_started_at", current_time) or current_time)
+    scan_timeout = max(
+        30,
+        int(cfg.get("delta_key_panel_wait_timeout_seconds", 300) or 300),
+    )
+    if current_time - scan_started >= scan_timeout:
+        retry_seconds = max(
+            60,
+            int(cfg.get("delta_key_expired_retry_seconds", 600) or 600),
+        )
+        runtime["state"] = "expired_scan_paused"
+        runtime["next_due_scan_at"] = current_time + retry_seconds
+        runtime["due_scan_started_at"] = 0
+        runtime["visual_match_count"] = 0
+        runtime["bootstrap_opened_at"] = 0
+        runtime["bootstrap_place_id"] = 0
+        save_delta_key_runtime(runtime)
+        _delta_key_auto_log(
+            f"expired panel not found; retrying in {retry_seconds}s",
+            package,
+            YELLOW,
+        )
+        return "scan_paused"
+
+    return "matched" if matched else "scanning"
+
+def delta_key_runtime_summary(runtime):
+    state = str(runtime.get("state") or "idle")
+    source = str(runtime.get("source_package") or "-")
+    minutes = runtime.get("minutes_left")
+    expires_at = int(runtime.get("expires_at", 0) or 0)
+    expiry = "-"
+    if expires_at > 0:
+        remaining = max(0, expires_at - now())
+        expiry = datetime.fromtimestamp(expires_at).strftime("%Y-%m-%d %H:%M")
+        expiry += f" ({remaining // 60}m remaining)"
+    return state, source, minutes, expiry
+
+
+def delta_key_settings_menu(cfg):
+    while True:
+        clear()
+        banner("DELTA KEY SETTINGS", cfg)
+        print(f"1. Browser package: {cfg.get('delta_key_browser_package')}")
+        print(f"2. API poll interval: {cfg.get('delta_key_poll_seconds')}s")
+        print(f"3. Restart clones after apply: {'ON' if cfg.get('delta_key_restart_after_apply') else 'OFF'}")
+        print(f"4. Restart delay: {cfg.get('delta_key_restart_delay_seconds')}s")
+        print(f"5. License path: {cfg.get('delta_key_license_path')}")
+        print(f"6. Manual auto-open selected clone: {'ON' if cfg.get('delta_key_auto_open_selected_clone', True) else 'OFF'}")
+        print(f"7. Initial Delta load wait: {cfg.get('delta_key_initial_load_wait_seconds', 20)}s")
+        print(f"8. Expired-panel scan window: {cfg.get('delta_key_panel_wait_timeout_seconds', 300)}s")
+        print(f"9. Manual retry interval: {cfg.get('delta_key_panel_retry_seconds', 12)}s")
+        print(f"10. Fresh-intent wait/attempt: {cfg.get('delta_key_intent_wait_per_attempt_seconds', 8)}s")
+        print(f"11. Automatic expiry monitor: {'ON' if cfg.get('delta_key_auto_monitor_enabled', True) else 'OFF'}")
+        print(f"12. Visual panel detector: {'ON' if cfg.get('delta_key_visual_detector_enabled', True) else 'OFF'}")
+        print(f"13. Visual scan interval: {cfg.get('delta_key_visual_scan_seconds', 5)}s")
+        print(f"14. Match threshold: {float(cfg.get('delta_key_visual_match_threshold', 0.84) or 0.84):.2f}")
+        print(f"15. Required matches: {cfg.get('delta_key_visual_confirmations', 2)}")
+        print(f"16. Retry after panel not found: {cfg.get('delta_key_expired_retry_seconds', 600)}s")
+        bootstrap_ids = delta_key_bootstrap_place_ids(cfg)
+        bootstrap_display = ", ".join(str(x) for x in bootstrap_ids) or "NOT SET"
+        print(f"17. Valid-key API refresh: {cfg.get('delta_key_validity_refresh_seconds', 600)}s")
+        print(f"18. Delta bootstrap PlaceId: {bootstrap_display}")
+        webhook_target = delta_key_ticket_webhook_url(cfg)
+        print(
+            "19. Ticket webhook: "
+            + ("ON" if cfg.get("delta_key_ticket_webhook_enabled", True) else "OFF")
+        )
+        print(
+            "20. Dedicated webhook URL: "
+            + (mask_secret(webhook_target) if webhook_target else "NOT SET")
+        )
+        print(
+            f"21. Pending ticket maximum age: "
+            f"{cfg.get('delta_key_ticket_max_age_seconds', 21600)}s"
+        )
+        print(
+            f"22. Cold-start launcher warm-up: "
+            f"{cfg.get('delta_key_cold_start_prewarm_seconds', 10)}s"
+        )
+        shown_device = (
+            str(cfg.get("delta_key_device_name") or "").strip()
+            or delta_key_device_name(cfg)
+        )
+        print("23. Webhook device name: " + shown_device)
+        worker = delta_key_worker_package(cfg)
+        print("24. Delta key worker clone: " + (worker or "NOT AVAILABLE"))
+        print(
+            "25. Restart after apply: "
+            + str(cfg.get("delta_key_restart_scope", "source_only"))
+        )
+        print("0. Back")
+        choice = input("\nChoose: ").strip()
+        if choice == "0":
+            save_config(cfg)
+            return
+        if choice == "1":
+            value = input("Browser package: ").strip()
+            if value:
+                cfg["delta_key_browser_package"] = value
+        elif choice == "2":
+            try:
+                cfg["delta_key_poll_seconds"] = max(5, int(input("Seconds: ").strip()))
+            except ValueError:
+                pass
+        elif choice == "3":
+            cfg["delta_key_restart_after_apply"] = not bool(
+                cfg.get("delta_key_restart_after_apply", True)
+            )
+        elif choice == "4":
+            try:
+                cfg["delta_key_restart_delay_seconds"] = max(0, int(input("Seconds: ").strip()))
+            except ValueError:
+                pass
+        elif choice == "5":
+            value = input("License path: ").strip()
+            if value:
+                cfg["delta_key_license_path"] = value
+        elif choice == "6":
+            cfg["delta_key_auto_open_selected_clone"] = not bool(
+                cfg.get("delta_key_auto_open_selected_clone", True)
+            )
+        elif choice == "7":
+            try:
+                cfg["delta_key_initial_load_wait_seconds"] = max(0, int(input("Seconds: ").strip()))
+            except ValueError:
+                pass
+        elif choice == "8":
+            try:
+                cfg["delta_key_panel_wait_timeout_seconds"] = max(30, int(input("Seconds: ").strip()))
+            except ValueError:
+                pass
+        elif choice == "9":
+            try:
+                cfg["delta_key_panel_retry_seconds"] = max(2, int(input("Seconds: ").strip()))
+            except ValueError:
+                pass
+        elif choice == "10":
+            try:
+                cfg["delta_key_intent_wait_per_attempt_seconds"] = max(2, int(input("Seconds: ").strip()))
+            except ValueError:
+                pass
+        elif choice == "11":
+            cfg["delta_key_auto_monitor_enabled"] = not bool(
+                cfg.get("delta_key_auto_monitor_enabled", True)
+            )
+        elif choice == "12":
+            cfg["delta_key_visual_detector_enabled"] = not bool(
+                cfg.get("delta_key_visual_detector_enabled", True)
+            )
+        elif choice == "13":
+            try:
+                cfg["delta_key_visual_scan_seconds"] = max(2, int(input("Seconds: ").strip()))
+            except ValueError:
+                pass
+        elif choice == "14":
+            try:
+                cfg["delta_key_visual_match_threshold"] = max(
+                    0.50,
+                    min(0.99, float(input("Threshold 0.50-0.99: ").strip())),
+                )
+            except ValueError:
+                pass
+        elif choice == "15":
+            try:
+                cfg["delta_key_visual_confirmations"] = max(1, min(5, int(input("Matches: ").strip())))
+            except ValueError:
+                pass
+        elif choice == "16":
+            try:
+                cfg["delta_key_expired_retry_seconds"] = max(60, int(input("Seconds: ").strip()))
+            except ValueError:
+                pass
+        elif choice == "17":
+            try:
+                cfg["delta_key_validity_refresh_seconds"] = max(60, int(input("Seconds: ").strip()))
+            except ValueError:
+                pass
+        elif choice == "18":
+            value = input("Bootstrap PlaceId: ").strip()
+            try:
+                place_id = int(value)
+                if place_id > 0:
+                    cfg["delta_key_bootstrap_place_ids"] = [place_id]
+            except ValueError:
+                pass
+        elif choice == "19":
+            cfg["delta_key_ticket_webhook_enabled"] = not bool(
+                cfg.get("delta_key_ticket_webhook_enabled", True)
+            )
+        elif choice == "20":
+            value = input(
+                "Dedicated Delta webhook URL "
+                "(blank = use existing login/cookie webhook): "
+            ).strip()
+            cfg["delta_key_webhook_url"] = value
+        elif choice == "21":
+            try:
+                cfg["delta_key_ticket_max_age_seconds"] = max(
+                    300,
+                    int(input("Seconds: ").strip()),
+                )
+            except ValueError:
+                pass
+        elif choice == "22":
+            try:
+                cfg["delta_key_cold_start_prewarm_seconds"] = max(
+                    0,
+                    int(input("Seconds: ").strip()),
+                )
+            except ValueError:
+                pass
+        elif choice == "23":
+            cfg["delta_key_device_name"] = input(
+                "Device name (blank = Android detected name): "
+            ).strip()
+        elif choice == "24":
+            packages = choose_packages_common(
+                cfg,
+                "SELECT ONE DELTA KEY WORKER CLONE",
+                multi=False,
+                installed_only=True,
+                include_discovered=True,
+            )
+            if packages:
+                package = packages[0] if isinstance(packages, list) else packages
+                cfg["delta_key_worker_package"] = str(package or "").strip()
+                cfg["delta_key_single_clone_only"] = True
+        elif choice == "25":
+            current = str(
+                cfg.get("delta_key_restart_scope") or "source_only"
+            ).strip()
+            cfg["delta_key_restart_scope"] = (
+                "all_enabled"
+                if current == "source_only"
+                else "source_only"
+            )
+        save_config(cfg)
+
+
+def delta_key_manual_refresh_preflight(cfg):
+    """Classify the saved ticket before a manual Copy Link attempt."""
+    runtime = load_delta_key_runtime()
+    auth_url = str(runtime.get("auth_url") or "").strip()
+
+    if not auth_url and DELTA_KEY_AUTH_URL_FILE.exists():
+        try:
+            auth_url = DELTA_KEY_AUTH_URL_FILE.read_text(
+                encoding="utf-8",
+                errors="ignore",
+            ).strip()
+        except Exception:
+            auth_url = ""
+
+    if not auth_url:
+        return {
+            "state": "missing",
+            "runtime": runtime,
+            "message": "No saved PlatoRelay ticket is available.",
+        }
+
+    status = delta_key_query_status(auth_url, cfg)
+    runtime = delta_key_update_runtime_from_status(status)
+
+    minutes = status.get("minutes_left")
+    try:
+        minutes = int(minutes) if minutes is not None else None
+    except Exception:
+        minutes = None
+
+    if status.get("ticket_invalid") or delta_key_ticket_is_stale(runtime, cfg):
+        return {
+            "state": "expired",
+            "runtime": runtime,
+            "status": status,
+            "minutes_left": 0,
+            "message": str(
+                status.get("error")
+                or status.get("message")
+                or "saved ticket expired"
+            ),
+        }
+
+    if status.get("ready"):
+        if minutes is None or minutes > 0:
+            return {
+                "state": "valid",
+                "runtime": runtime,
+                "status": status,
+                "minutes_left": minutes,
+                "message": "The current Delta key is still valid.",
+            }
+        return {
+            "state": "expired",
+            "runtime": runtime,
+            "status": status,
+            "minutes_left": 0,
+            "message": "The saved ticket reports zero minutes remaining.",
+        }
+
+    if status.get("ok"):
+        return {
+            "state": "pending",
+            "runtime": runtime,
+            "status": status,
+            "minutes_left": minutes,
+            "message": "A saved renewal ticket is still pending completion.",
+        }
+
+    # Do not mistake a temporary network/API error for expiry. Local expiry is
+    # only a hint here; manual mode asks before touching the selected clone.
+    try:
+        expires_at = int(float(runtime.get("expires_at") or 0))
+    except Exception:
+        expires_at = 0
+
+    return {
+        "state": "error",
+        "runtime": runtime,
+        "status": status,
+        "local_expired": bool(expires_at and now() >= expires_at),
+        "message": str(status.get("error") or "status request failed"),
+    }
+
+
+def delta_key_manager_menu(cfg):
+    while True:
+        cfg = load_config()
+        runtime = load_delta_key_runtime()
+        state, source, minutes, expiry = delta_key_runtime_summary(runtime)
+        template = load_delta_key_panel_template()
+        clear()
+        banner("DELTA DEVICE KEY MANAGER", cfg)
+        print(col("One key is shared by every Delta clone on this Redfinger.", DIM))
+        print(col("While valid: idle. At expiry: open one clone in the bootstrap place, then scan.", DIM))
+        print("")
+        print(f"State       : {state}")
+        print(f"Source clone: {source}")
+        print(f"Minutes left: {minutes if minutes is not None else '-'}")
+        print(f"Expiry      : {expiry}")
+        print(f"Auto monitor: {'ON' if cfg.get('delta_key_auto_monitor_enabled', True) else 'OFF'}")
+        print(
+            "Panel template: "
+            + (col("READY", GREEN) if template else col("MISSING", YELLOW))
+            + (f" ({template.get('package')})" if template else "")
+        )
+        if runtime.get("last_visual_score") is not None:
+            print(f"Last visual : {float(runtime.get('last_visual_score', 0) or 0):.3f}")
+        print(f"Ticket file : {DELTA_KEY_AUTH_URL_FILE}")
+        print(f"License     : {cfg.get('delta_key_license_path')}")
+        print("")
+        print("1. FULL refresh: open clone -> detect/click -> API -> apply -> restart")
+        print("2. Capture expired-panel visual template (panel must be visible)")
+        print("3. Test expired-panel detector once")
+        print("4. Capture a new expired-panel ticket only")
+        print("5. Check saved ticket once")
+        print("6. Wait for saved ticket, apply key, restart")
+        print("7. Show saved PlatoRelay URL")
+        print("8. Manually restart ALL enabled clones using current license")
+        print("9. Settings")
+        print("10. Clear saved ticket/runtime")
+        print("11. Delete visual template")
+        print("12. Send saved device-named ticket URL to webhook now")
+        print("0. Back")
+        choice = input("\nChoose: ").strip()
+        if choice == "0":
+            return
+
+        if choice in ("1", "2", "3", "4"):
+            # Copy Link cannot appear while the current Delta key is valid.
+            # Check the saved ticket before selecting/killing/opening a clone.
+            if choice in ("1", "4"):
+                preflight = delta_key_manual_refresh_preflight(cfg)
+                preflight_state = str(preflight.get("state") or "error")
+
+                if preflight_state == "valid":
+                    minutes_left = preflight.get("minutes_left")
+                    print("")
+                    print(col("Current Delta key is still valid.", GREEN))
+                    if minutes_left is not None:
+                        print(f"Minutes left: {minutes_left}")
+                    print(col(
+                        "Delta will not expose Copy Link until this key expires.",
+                        YELLOW,
+                    ))
+                    print(col("No clone was stopped or opened.", DIM))
+                    pause()
+                    continue
+
+                if preflight_state == "pending":
+                    print("")
+                    print(col("A renewal ticket is already pending.", YELLOW))
+                    print(col(
+                        "NOMO will reuse it instead of generating a new URL.",
+                        DIM,
+                    ))
+                    if choice == "1":
+                        delta_key_wait_and_apply(cfg)
+                    else:
+                        print(col(
+                            "Use option 5 to check it or option 6 to wait/apply.",
+                            CYAN,
+                        ))
+                    pause()
+                    continue
+
+                if preflight_state == "error":
+                    print("")
+                    print(col(
+                        "Could not verify current Delta key status: "
+                        + cut(preflight.get("message"), 100),
+                        YELLOW,
+                    ))
+                    if preflight.get("local_expired"):
+                        print(col(
+                            "The locally calculated expiry has already passed.",
+                            DIM,
+                        ))
+                    confirm = input(
+                        "Continue with a manual expired-panel test? [y/N]: "
+                    ).strip().lower()
+                    if confirm not in ("y", "yes"):
+                        print(col("Cancelled. No clone was stopped or opened.", DIM))
+                        pause()
+                        continue
+
+                if preflight_state == "missing":
+                    print("")
+                    print(col(
+                        "No saved ticket exists; allowing first-time/manual panel setup.",
+                        YELLOW,
+                    ))
+
+            packages = choose_packages_common(
+                cfg,
+                "SELECT DELTA CLONE",
+                multi=False,
+                installed_only=True,
+                include_discovered=True,
+            )
+            if not packages:
+                continue
+            package = packages[0]
+
+            if choice == "2":
+                clear()
+                banner("CAPTURE DELTA PANEL TEMPLATE", cfg)
+                print(col("The expired Welcome Back / Copy Link panel must be visible now.", YELLOW))
+                print(col("NOMO saves only a sampled crop inside this clone's Option 16 rectangle.", DIM))
+                ok, note = delta_key_bring_package_front(package, cfg)
+                if ok:
+                    time.sleep(1.0)
+                    ok, note, captured = delta_key_capture_panel_template(package, cfg)
+                else:
+                    captured = {}
+                print(col("OK" if ok else "FAILED", GREEN if ok else RED), note)
+                if ok:
+                    print("Template:", DELTA_KEY_PANEL_TEMPLATE_FILE)
+                    print("Crop:", captured.get("crop"))
+                    print(col("Run detector test before relying on automatic renewal.", DIM))
+                pause()
+                continue
+
+            if choice == "3":
+                clear()
+                banner("TEST DELTA PANEL DETECTOR", cfg)
+                ok, note = delta_key_bring_package_front(package, cfg)
+                if ok:
+                    time.sleep(1.0)
+                    matched, score, detail, _ = delta_key_panel_template_score(package, cfg)
+                    print("Package:", package)
+                    print(f"Score  : {score:.3f}")
+                    print("Result :", col("MATCH" if matched else "NO MATCH", GREEN if matched else YELLOW))
+                    print("Detail :", detail)
+                else:
+                    print(col("FAILED: " + str(note), RED))
+                pause()
+                continue
+
+            clear()
+            banner("DELTA COPY LINK", cfg)
+            print(col("A saved template gates the click. The first verified manual success can bootstrap it.", CYAN))
+            print(col("Automatic expiry mode never taps without a verified template.", DIM))
+            print(col("Tap point: 84% from left / 63% from top of the saved Option 16 rectangle.", DIM))
+            ok, note, captured = delta_key_capture_new_ticket(
+                package,
+                cfg,
+                auto_open=None,
+                allow_bootstrap=True,
+                quiet=False,
+            )
+            print(col("OK" if ok else "FAILED", GREEN if ok else RED), note)
+            if ok:
+                print("Saved URL:")
+                print(str(captured.get("auth_url") or ""))
+                if choice == "1":
+                    print("")
+                    delta_key_wait_and_apply(cfg)
+            pause()
+
+        elif choice == "5":
+            clear()
+            banner("DELTA TICKET STATUS", cfg)
+            delta_key_poll_once(cfg, show=True)
+            pause()
+        elif choice == "6":
+            clear()
+            banner("WAIT FOR DELTA KEY", cfg)
+            delta_key_wait_and_apply(cfg)
+            pause()
+        elif choice == "7":
+            clear()
+            banner("SAVED PLATORELAY URL", cfg)
+            url = str(runtime.get("auth_url") or "")
+            if not url and DELTA_KEY_AUTH_URL_FILE.exists():
+                try:
+                    url = DELTA_KEY_AUTH_URL_FILE.read_text(encoding="utf-8").strip()
+                except Exception:
+                    pass
+            print(url or "No saved URL.")
+            pause()
+        elif choice == "8":
+            clear()
+            banner("RESTART ENABLED DELTA CLONES", cfg)
+            results = delta_key_restart_enabled_packages(cfg)
+            for package, opened, note in results:
+                print(
+                    f"{short_pkg(package):<12} "
+                    + col("OK" if opened else "FAILED", GREEN if opened else RED)
+                    + "  " + str(note)
+                )
+            if not results:
+                print(col("No enabled installed packages.", YELLOW))
+            pause()
+        elif choice == "9":
+            delta_key_settings_menu(cfg)
+        elif choice == "10":
+            save_delta_key_runtime({})
+            try:
+                if DELTA_KEY_AUTH_URL_FILE.exists():
+                    DELTA_KEY_AUTH_URL_FILE.unlink()
+            except Exception:
+                pass
+            print(col("Delta key ticket/runtime cleared. Current license and template were not deleted.", GREEN))
+            pause()
+        elif choice == "11":
+            if delta_key_delete_panel_template():
+                print(col("Delta expired-panel visual template deleted.", GREEN))
+            else:
+                print(col("Could not delete the template.", RED))
+            pause()
+        elif choice == "12":
+            runtime = load_delta_key_runtime()
+            url = str(runtime.get("auth_url") or "").strip()
+            if not url and DELTA_KEY_AUTH_URL_FILE.exists():
+                try:
+                    url = DELTA_KEY_AUTH_URL_FILE.read_text(
+                        encoding="utf-8",
+                        errors="ignore",
+                    ).strip()
+                except Exception:
+                    url = ""
+            if not url:
+                print(col("No saved ticket URL.", RED))
+            else:
+                ok, note = delta_key_ensure_ticket_webhook(
+                    url,
+                    cfg,
+                    show=False,
+                    force=True,
+                )
+                print(col(
+                    "Webhook: " + note,
+                    GREEN if ok else RED,
+                ))
+            pause()
+
 def main():
     cfg = load_config()
     nomo_auto_repair_launchers_once(cfg)
@@ -29236,6 +31926,11 @@ def main():
 
         elif choice == "18":
             apk_download_install_menu(cfg)
+            cfg = load_config()
+            normalize_active_mode_flags(cfg)
+
+        elif choice == "19":
+            delta_key_manager_menu(cfg)
             cfg = load_config()
             normalize_active_mode_flags(cfg)
 
