@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.60.4-dev-quick-list"
+__version__ = "V4.61.0-dev-compact-menu"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -4801,16 +4801,11 @@ MAIN_MENU_ITEMS = [
     ("6",  "Force restart active tabs"),
     ("7",  "Export cookies"),
     ("8",  "Login via Cookie"),
-    ("9",  "Recovery tools"),
-    ("10", "Captcha Solver"),
+    ("9",  "Advanced tools"),
     ("11", "Cloudflare / config"),
     ("12", "AutoExec manager"),
     ("13", "New Redfinger setup wizard"),
-    ("14", "Export diagnostics ZIP"),
     ("15", "NOMO update manager"),
-    ("16", "Layout / visual CAPTCHA"),
-    ("17", "Workspace ZIP tools"),
-    ("18", "APK download / install"),
     ("19", "Delta device key manager"),
     ("20", "Executor storage / paths"),
     ("21", "Doctor / health"),
@@ -33007,6 +33002,45 @@ def delta_key_manager_menu(cfg):
                 ))
             pause()
 
+
+def advanced_tools_menu(cfg):
+    """Less-used tools moved out of the daily main menu."""
+    while True:
+        cfg = load_config()
+        clear()
+        banner("ADVANCED TOOLS", cfg)
+        print(col("Less common tools. Core rejoin controls stay on the main menu.", DIM))
+        print("")
+        rows = [
+            ("1", "Recovery tools", CYAN, WHITE),
+            ("2", "Captcha Solver", CYAN, WHITE),
+            ("3", "Export diagnostics ZIP", CYAN, WHITE),
+            ("4", "Layout / visual CAPTCHA", CYAN, WHITE),
+            ("5", "Workspace ZIP tools", CYAN, WHITE),
+            ("6", "APK download / install", CYAN, WHITE),
+            ("0", "Back", RED, WHITE),
+        ]
+        draw_boxed_menu(rows, cfg)
+
+        drain_stdin()
+        choice = read_menu_choice("\nAdvanced: ", {"0", "1", "2", "3", "4", "5", "6", "q", "b", "back"})
+        if choice in {"0", "q", "b", "back", None}:
+            return
+
+        if choice == "1":
+            recovery_menu(cfg)
+        elif choice == "2":
+            solver_menu(cfg)
+        elif choice == "3":
+            export_diagnostics_zip(cfg)
+        elif choice == "4":
+            layout_visual_menu(cfg)
+        elif choice == "5":
+            workspace_zip_tools_menu(cfg)
+        elif choice == "6":
+            apk_download_install_menu(cfg)
+
+
 def main():
     cfg = load_config()
     nomo_auto_repair_launchers_once(cfg)
@@ -33095,7 +33129,7 @@ def main():
                 save_config(cfg)
 
         elif choice == "9":
-            recovery_menu(cfg)
+            advanced_tools_menu(cfg)
             cfg = load_config()
             normalize_active_mode_flags(cfg)
 
