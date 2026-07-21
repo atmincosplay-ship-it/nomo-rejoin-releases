@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.62.2-dev-hatcher-open-fallback"
+__version__ = "V4.62.3-dev-hatcher-no-state-recover"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1385,6 +1385,11 @@ DEFAULT_CONFIG = {
     # readable state file before the table stops showing "waiting" and surfaces
     # an actionable "check Lua/username" note. Short so it never looks stuck.
     "hatcher_startup_grace_seconds": 75,
+    # If a Hatcher clone is alive but still has no readable/fresh state after
+    # this long, exact-PID restart that clone once. This catches fresh installs
+    # where Roblox opened but AutoExec/counter never started.
+    "hatcher_alive_no_state_hard_seconds": 90,
+    "hatcher_alive_no_state_hard_cooldown_seconds": 300,
     # When NOMO is started while Roblox clones are already opening, their old
     # state files remain visible until AutoExec reaches the game. Do not treat
     # those old files as proof that the live clone is stuck.
@@ -16172,27 +16177,62 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                         rt_tab["hatcher_no_state_since"] = now()
                         no_state_since = rt_tab["hatcher_no_state_since"]
                     no_state_for = max(0, now() - int(no_state_since))
-                    hard_added, hard_note, hard_action = queue_hatcher_alive_old_state_hard(
-                        open_queue, tab, rt_tab, hcfg, cfg, no_state_for, "hatcher alive no state hard"
+                    try:
+                        no_state_hard_after = int(hcfg.get(
+                            "hatcher_alive_no_state_hard_seconds",
+                            cfg.get("hatcher_alive_no_state_hard_seconds", 90),
+                        ) or 90)
+                    except Exception:
+                        no_state_hard_after = 90
+                    try:
+                        no_state_cooldown = int(hcfg.get(
+                            "hatcher_alive_no_state_hard_cooldown_seconds",
+                            cfg.get("hatcher_alive_no_state_hard_cooldown_seconds", 300),
+                        ) or 300)
+                    except Exception:
+                        no_state_cooldown = 300
+                    no_state_hard_after = max(45, no_state_hard_after)
+                    no_state_cooldown = max(120, no_state_cooldown)
+
+                    last_no_state_hard = int(rt_tab.get("hatcher_alive_no_state_hard_last", 0) or 0)
+                    no_state_cooldown_left = (
+                        max(0, no_state_cooldown - (now() - last_no_state_hard))
+                        if last_no_state_hard > 0 else 0
                     )
-                    if hard_action:
-                        note = hard_note
-                        status = "Queued" if hard_added else "No state"
-                    elif str(hard_note).startswith("invalid old state ignored"):
-                        note = hard_note
-                        status = "No state"
-                    elif rt_tab.get("last_open") and in_post_open_grace(rt_tab, cfg):
+
+                    if rt_tab.get("last_open") and in_post_open_grace(rt_tab, cfg):
                         status = "Loading"
                         note = f"waiting for {expected_state_name(tab)}"
+                    elif (
+                        no_state_for >= no_state_hard_after
+                        and no_state_cooldown_left <= 0
+                        and cfg.get("rejoin_if_crash", True)
+                    ):
+                        added, _ = queue_open(
+                            open_queue, tab, "hatcher",
+                            f"hatcher alive no state {no_state_for}s",
+                            force=True, mode="hard_force",
+                            metadata={
+                                "bypass_recheck": True,
+                                "pid_only_recovery": True,
+                                "recovery_must_open_once": True,
+                            },
+                        )
+                        if added:
+                            rt_tab["hatcher_alive_no_state_hard_last"] = now()
+                        note = "no-state PID hard queued" if added else "already queued"
+                        status = "Queued" if added else "No state"
+                    elif no_state_for >= no_state_hard_after and no_state_cooldown_left > 0:
+                        status = "No state"
+                        note = f"no-state cooldown {format_age(no_state_cooldown_left)}"
                     elif hcfg.get("hatcher_rejoin_alive_stale", False) and cfg.get("rejoin_if_crash", True):
                         added, _ = queue_open(open_queue, tab, "hatcher", "hatcher no state", mode="soft")
                         note = "no state queued" if added else "no state wait"
                         status = "Queued" if added else "No state"
                     else:
-                        # In-game but no readable state past grace: almost always
-                        # the Lua isn't running here, or its username != config.
                         status = "No state"
-                        note = f"ingame,no {expected_state_name(tab)}? chk Lua"
+                        left = max(1, no_state_hard_after - no_state_for)
+                        note = f"no state {format_age(no_state_for)}; rejoin in {format_age(left)}"
                 else:
                     rt_tab["hatcher_no_state_since"] = 0
                     rt_tab["hatcher_startup_observe_until"] = 0
