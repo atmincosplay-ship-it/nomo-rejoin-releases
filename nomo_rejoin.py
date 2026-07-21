@@ -1,5 +1,26 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.58.50 — DELTA REJOIN TAKEOVER FIX
+# - The normal Market/Hatcher/Booster/Rejoin Only loops now pause their queued
+#   package recoveries while a device-key renewal is active.
+# - This removes the deadlock where the rejoin queue stayed non-empty forever,
+#   so the Delta worker clone was never allowed to open/click Copy Link.
+# - The valid-key API refresh now handles PlatoRelay ticket rejection even when
+#   the locally calculated expires_at is still in the future.
+# - The old 10-minute validity refresh default is migrated to 60 seconds.
+# - One worker clone still performs the key flow; normal rejoin resumes only
+#   after the shared license is applied and that worker clone is restored.
+#
+# V4.58.49 — COOKIE IMPORT MODE LOCK
+# - Cookie import no longer uses Market tabs/usernames while Hatcher mode is
+#   active. Hatcher mode uses enabled Hatcher profiles and hatcher_name order.
+# - Booster mode uses enabled Booster profiles and booster_name order.
+# - The active rejoin mode is snapshotted before cookie injection and restored
+#   in a finally block, so import/first-launch/config reload cannot turn
+#   Hatcher/Booster/Rejoin Only back into Market.
+# - Cookie injection still changes only the selected app cookie DB and local
+#   cookie_cache.json; routing/server/role configuration is not rewritten.
+#
 # V4.58.48 — OPTION 13 AUTH VALIDATION + UPDATER FIX
 # - Restores the required '# NOMO REJOIN' marker at the top of the file.
 # - Option 13 validates the secret against authenticated /accounts, not only
@@ -729,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.58.48"
+__version__ = "V4.58.50"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -1202,7 +1223,8 @@ DEFAULT_CONFIG = {
     "delta_key_visual_confirmations": 2,
     "delta_key_visual_scan_seconds": 5,
     "delta_key_auto_tick_seconds": 5,
-    "delta_key_validity_refresh_seconds": 600,
+    "delta_key_validity_refresh_seconds": 60,
+    "delta_key_pause_rejoin_during_renewal": True,
     "delta_key_expired_retry_seconds": 600,
     "delta_key_bootstrap_template_from_manual_success": True,
 
@@ -2746,6 +2768,22 @@ def load_config():
         "all_enabled",
     ):
         cfg["delta_key_restart_scope"] = "source_only"
+        changed = True
+
+    # V4.58.50: the previous default waited ten minutes before discovering
+    # that PlatoRelay had rejected the old ticket. Migrate only that old
+    # default; preserve unrelated custom intervals.
+    try:
+        delta_validity_refresh = int(
+            cfg.get("delta_key_validity_refresh_seconds", 60) or 60
+        )
+    except Exception:
+        delta_validity_refresh = 60
+    if delta_validity_refresh == 600:
+        cfg["delta_key_validity_refresh_seconds"] = 60
+        changed = True
+    if "delta_key_pause_rejoin_during_renewal" not in cfg:
+        cfg["delta_key_pause_rejoin_during_renewal"] = True
         changed = True
 
 
@@ -11910,10 +11948,21 @@ def _nomo_start_market_rejoin_original(cfg):
         # Device-wide Delta key watcher is idle while the key is valid. At the
         # stored expiry it visually checks one alive clone only, and acts only
         # while this rejoin queue is idle.
+        delta_key_result = ""
         try:
-            delta_key_auto_monitor_tick(cfg, safe_to_act=not bool(open_queue))
+            delta_key_result = delta_key_auto_monitor_tick(
+                cfg,
+                safe_to_act=not bool(open_queue),
+            )
         except Exception as exc:
             log_activity(f"Delta key auto tick failed: {cut(exc, 90)}", "", YELLOW)
+
+        if delta_key_auto_should_pause_rejoin(delta_key_result, cfg):
+            if open_queue:
+                open_queue.clear()
+            if not wait_seconds(5, rt):
+                return
+            continue
 
         if open_queue and cfg.get("smart_open_queue", True):
             if not wait_seconds(2, rt):
@@ -16052,10 +16101,21 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
             GREEN,
         ))
 
+        delta_key_result = ""
         try:
-            delta_key_auto_monitor_tick(cfg, safe_to_act=not bool(open_queue))
+            delta_key_result = delta_key_auto_monitor_tick(
+                cfg,
+                safe_to_act=not bool(open_queue),
+            )
         except Exception as exc:
             log_activity(f"Delta key auto tick failed: {cut(exc, 90)}", "", YELLOW)
+
+        if delta_key_auto_should_pause_rejoin(delta_key_result, cfg):
+            if open_queue:
+                open_queue.clear()
+            if not wait_seconds(5, rt):
+                return
+            continue
 
         if open_queue and cfg.get("smart_open_queue", True):
             if not wait_seconds(2, rt):
@@ -24752,8 +24812,116 @@ def inject_cookie(package, cookie):
 
     return False, "; ".join(errors[:3]) or "cookie injection failed"
 
-def import_cookie_menu(cfg):
-    """Login via one pasted cookie or a local TXT chosen from BASE_DIR/cookies."""
+def cookie_import_mode_entries(cfg, mode=None):
+    """Return enabled package/name rows from the active role configuration."""
+    mode = str(mode or active_rejoin_mode(cfg) or "market").strip().lower()
+    installed = set(get_installed_packages())
+    rows = []
+    seen = set()
+
+    def add(package, username, enabled=True):
+        package = str(package or "").strip()
+        if (
+            not package
+            or package in seen
+            or not bool(enabled)
+            or package not in installed
+        ):
+            return
+        seen.add(package)
+        rows.append({
+            "package": package,
+            "username": str(username or package).strip() or package,
+        })
+
+    if mode == "hatcher":
+        hcfg = load_hatcher_config()
+        for profile in hatcher_profiles(hcfg, enabled_only=True):
+            add(
+                profile.get("package"),
+                profile.get("hatcher_name"),
+                profile.get("enabled", True),
+            )
+    elif mode == "booster":
+        bcfg = load_booster_config()
+        for profile in booster_profiles(bcfg, enabled_only=True):
+            add(
+                profile.get("package"),
+                profile.get("booster_name")
+                or profile.get("hatcher_name")
+                or profile.get("user_name"),
+                profile.get("enabled", True),
+            )
+    else:
+        for tab in cfg.get("tabs", []):
+            if not isinstance(tab, dict):
+                continue
+            add(
+                tab.get("package"),
+                tab.get("user_name") or tab.get("username"),
+                tab.get("enabled", True),
+            )
+
+    return rows
+
+
+def choose_cookie_package_for_mode(cfg, mode):
+    entries = cookie_import_mode_entries(cfg, mode)
+    if not entries:
+        print(col(
+            f"No enabled installed packages found for {str(mode).upper()} mode.",
+            RED,
+        ))
+        return ""
+
+    clear()
+    banner(f"LOGIN COOKIE: {str(mode).upper()} PACKAGE", cfg)
+    rows = []
+    for index, item in enumerate(entries, 1):
+        rows.append([
+            (str(index), CYAN),
+            (short_pkg(item["package"]), WHITE),
+            (item["username"], WHITE),
+        ])
+    draw_table(
+        ["No", "Package", "Configured account"],
+        rows,
+        [3, 13, 22],
+        cfg,
+    )
+    print("")
+    print(col(
+        "This selector follows the active role, not the Market tab list.",
+        DIM,
+    ))
+    drain_stdin()
+
+    while True:
+        raw = clean_terminal_input(input("\nChoose one (0 = back): "))
+        if raw.lower() in {"", "0", "q", "back"}:
+            return ""
+        try:
+            index = int(raw) - 1
+        except ValueError:
+            index = -1
+        if 0 <= index < len(entries):
+            return entries[index]["package"]
+        by_package = {
+            item["package"].lower(): item["package"]
+            for item in entries
+        }
+        by_short = {
+            short_pkg(item["package"]).lower(): item["package"]
+            for item in entries
+        }
+        package = by_package.get(raw.lower()) or by_short.get(raw.lower())
+        if package:
+            return package
+        print(col("Invalid package selection.", RED))
+
+
+def _import_cookie_menu_impl(cfg, locked_mode):
+    """Mode-locked cookie login implementation."""
 
     def save_imported_cookie(cache, pkg, cookie, username=None, password=None):
         current = cache.get(pkg) if isinstance(cache.get(pkg), dict) else {}
@@ -24947,18 +25115,10 @@ def import_cookie_menu(cfg):
             return
 
         if ch == "1":
-            selected = choose_packages_common(
-                cfg,
-                "LOGIN COOKIE: SELECT PACKAGE",
-                multi=False,
-                enabled_only=True,
-                include_discovered=False,
-                configured_only=True,
-            )
-            if not selected:
+            pkg = choose_cookie_package_for_mode(cfg, locked_mode)
+            if not pkg:
                 continue
 
-            pkg = selected[0]
             print(col(f"[+] Selected: {pkg}", GREEN))
             cookie_input = input("Enter cookie: ").strip()
             if not cookie_input:
@@ -24988,13 +25148,13 @@ def import_cookie_menu(cfg):
             continue
 
         if ch == "2":
-            packages = [
-                tab.get("package")
-                for tab in cfg.get("tabs", [])
-                if tab.get("enabled", True) and tab.get("package")
-            ]
+            mode_entries = cookie_import_mode_entries(cfg, locked_mode)
+            packages = [item["package"] for item in mode_entries]
             if not packages:
-                print(col("No enabled packages found.", RED))
+                print(col(
+                    f"No enabled packages found for {locked_mode.upper()} mode.",
+                    RED,
+                ))
                 pause()
                 continue
 
@@ -25015,7 +25175,7 @@ def import_cookie_menu(cfg):
                 continue
 
             print(f"\nUsing: {path.name}")
-            print(col("Raw cookie lines are matched to enabled packages in config order.", DIM))
+            print(col(f"Raw cookie lines follow {locked_mode.upper()} profile order.", DIM))
             for index, pkg in enumerate(packages, 1):
                 print(f"  {index}. {pkg}")
 
@@ -25024,11 +25184,12 @@ def import_cookie_menu(cfg):
             failed = 0
             pkg_index = 0
             user_to_pkg = {}
-            for tab in cfg.get("tabs", []):
-                pkg = tab.get("package")
-                username = tab.get("user_name") or tab.get("username") or ""
+            for item in mode_entries:
+                pkg = str(item.get("package") or "").strip()
+                username = str(item.get("username") or "").strip()
                 if pkg:
                     user_to_pkg[pkg.lower()] = pkg
+                    user_to_pkg[short_pkg(pkg).lower()] = pkg
                 if username and pkg:
                     user_to_pkg[username.lower()] = pkg
 
@@ -25065,6 +25226,35 @@ def import_cookie_menu(cfg):
         print("Invalid choice.")
         time.sleep(1)
 
+
+
+def import_cookie_menu(cfg):
+    """Preserve the selected role across every cookie-import exit path."""
+    fresh = load_config()
+    locked_mode = active_rejoin_mode(fresh)
+    expected_flags = {
+        "market_mode_enabled": locked_mode == "market",
+        "hatcher_mode_enabled": locked_mode == "hatcher",
+        "booster_mode_enabled": locked_mode == "booster",
+        "rejoin_only_mode_enabled": locked_mode == "rejoin_only",
+    }
+
+    try:
+        return _import_cookie_menu_impl(fresh, locked_mode)
+    finally:
+        current = load_config()
+        mode_changed = active_rejoin_mode(current) != locked_mode
+        flag_changed = any(
+            bool(current.get(key, False)) != bool(value)
+            for key, value in expected_flags.items()
+        )
+
+        if mode_changed or flag_changed:
+            set_active_rejoin_mode(locked_mode, current)
+            print(col(
+                f"Cookie import mode guard restored {locked_mode.upper()} mode.",
+                YELLOW,
+            ))
 
 
 def parse_solver_url(full_url):
@@ -29200,10 +29390,22 @@ def start_rejoin_only(cfg):
         _rejoin_only_print_dashboard(rows, cfg)
         _rejoin_only_save_runtime(runtime)
 
+        delta_key_result = ""
         try:
-            delta_key_auto_monitor_tick(cfg, safe_to_act=not bool(actions))
+            delta_key_result = delta_key_auto_monitor_tick(
+                cfg,
+                safe_to_act=not bool(actions),
+            )
         except Exception as exc:
             log_activity(f"Delta key auto tick failed: {cut(exc, 90)}", "", YELLOW)
+
+        if delta_key_auto_should_pause_rejoin(delta_key_result, cfg):
+            if actions:
+                actions.clear()
+            first_cycle = False
+            if not _rejoin_only_sleep(5):
+                return
+            continue
 
         # One package at a time. Recheck health immediately before acting.
         if actions:
@@ -31189,6 +31391,31 @@ def delta_key_auto_monitor_tick(cfg, safe_to_act=True):
             runtime["last_validity_refresh_at"] = current_time
             save_delta_key_runtime(runtime)
             status = delta_key_query_status(auth_url, cfg)
+
+            if status.get("ticket_invalid"):
+                reason = str(
+                    status.get("error")
+                    or status.get("message")
+                    or "saved ticket expired"
+                )
+                source_package = str(previous.get("source_package") or "")
+                runtime = delta_key_clear_pending_ticket(reason)
+                runtime["source_package"] = source_package
+                runtime["state"] = "expired_ticket_retry"
+                runtime["expires_at"] = current_time - 1
+                runtime["next_due_scan_at"] = current_time
+                runtime["bootstrap_opened_at"] = 0
+                runtime["bootstrap_place_id"] = 0
+                runtime["last_validity_refresh_at"] = current_time
+                save_delta_key_runtime(runtime)
+                _delta_key_auto_log(
+                    "PlatoRelay rejected the old ticket; "
+                    "taking over the rejoin loop for renewal",
+                    source_package,
+                    YELLOW,
+                )
+                return "ticket_expired"
+
             if status.get("ready"):
                 refreshed = delta_key_update_runtime_from_status(status)
                 refreshed["last_validity_refresh_at"] = current_time
@@ -31374,6 +31601,61 @@ def delta_key_auto_monitor_tick(cfg, safe_to_act=True):
         return "scan_paused"
 
     return "matched" if matched else "scanning"
+
+def delta_key_auto_should_pause_rejoin(result, cfg=None):
+    """Keep normal rejoin actions from fighting the device-key state machine."""
+    if isinstance(cfg, dict) and not bool(
+        cfg.get("delta_key_pause_rejoin_during_renewal", True)
+    ):
+        return False
+
+    result = str(result or "")
+    direct_hold_results = {
+        "restart_deferred",
+        "restarted",
+        "ticket_wait",
+        "ticket_pending",
+        "status_error",
+        "ticket_expired",
+        "bootstrap_waiting_idle",
+        "bootstrap_opened",
+        "bootstrap_loading",
+        "bootstrap_failed",
+        "scan_paused",
+        "scan_rate_limited",
+        "waiting_for_alive_clone",
+        "panel_confirmed_waiting_idle",
+        "ticket_captured",
+        "capture_failed",
+        "matched",
+        "scanning",
+        "applied",
+        "apply_error",
+    }
+    if result in direct_hold_results:
+        return True
+
+    runtime = load_delta_key_runtime()
+    if bool(runtime.get("pending_restart")):
+        return True
+
+    state = str(runtime.get("state") or "")
+    active_states = {
+        "ticket_captured",
+        "waiting_for_completion",
+        "status_error",
+        "ticket_expired",
+        "expired_ticket_retry",
+        "expired_bootstrap_loading",
+        "expired_bootstrap_failed",
+        "expired_scanning",
+        "expired_scan_paused",
+        "expired_panel_detected",
+        "key_ready",
+        "apply_error",
+    }
+    return state in active_states
+
 
 def delta_key_runtime_summary(runtime):
     state = str(runtime.get("state") or "idle")
@@ -32010,7 +32292,8 @@ def main():
         elif choice == "8":
             import_cookie_menu(cfg)
             cfg = load_config()
-            normalize_active_mode_flags(cfg)
+            if normalize_active_mode_flags(cfg):
+                save_config(cfg)
 
         elif choice == "9":
             recovery_menu(cfg)
