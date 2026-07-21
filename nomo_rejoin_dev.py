@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.61.0-dev-compact-menu"
+__version__ = "V4.62.0-dev-rejoin-core-step1"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -6400,6 +6400,7 @@ def manual_restart_tabs_via_queue(
     """Option 6 restart path using the same one-generation solver gate."""
     rt = load_runtime()
     open_queue = []
+    core = RejoinCore(open_queue, cfg, rt)
     tabs = list(tabs or [])
 
     for tab in tabs:
@@ -6411,8 +6412,7 @@ def manual_restart_tabs_via_queue(
             if callable(target_for_tab)
             else str(target_for_tab or "market")
         )
-        added, note = queue_open(
-            open_queue,
+        added, note = core.queue(
             tab,
             target,
             reason,
@@ -6438,7 +6438,7 @@ def manual_restart_tabs_via_queue(
         if stop_requested():
             save_runtime(rt)
             return False
-        process_open_queue(open_queue, cfg, rt)
+        core.process()
         if open_queue and not wait_seconds(1, rt):
             return False
 
@@ -8511,6 +8511,54 @@ def queue_open(open_queue, tab, target, reason, force=False, skip_if_alive=False
 
     log_activity(f"queued {mode} -> {target}: {reason}", pkg)
     return True, "queued"
+
+
+class RejoinCore:
+    """Thin facade over the existing shared rejoin queue/open engine.
+
+    Step 1 keeps behavior identical while giving future modes one obvious
+    object to reuse instead of calling queue helpers directly everywhere.
+    """
+
+    def __init__(self, open_queue, cfg, rt):
+        self.open_queue = open_queue
+        self.cfg = cfg
+        self.rt = rt
+
+    def queue(self, tab, target, reason, **kwargs):
+        return queue_open(
+            self.open_queue,
+            tab,
+            target,
+            reason,
+            **kwargs,
+        )
+
+    def process(self, session_start=None, loops=0):
+        return process_open_queue(
+            self.open_queue,
+            self.cfg,
+            self.rt,
+            session_start,
+            loops,
+        )
+
+    def has(self, package):
+        return queue_has(self.open_queue, package)
+
+    def position(self, package):
+        return queue_position(self.open_queue, package)
+
+    def self_heal(self):
+        return queue_stuck_self_heal(self.open_queue, self.cfg, self.rt)
+
+    def watchdog(self, enabled_tabs=None):
+        return runtime_stuck_watchdog(
+            self.open_queue,
+            self.cfg,
+            self.rt,
+            enabled_tabs,
+        )
 
 
 def queue_stuck_self_heal(open_queue, cfg, rt):
