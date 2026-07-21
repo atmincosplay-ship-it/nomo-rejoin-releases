@@ -17,6 +17,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -30,11 +31,12 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-VERSION = "V1.6 DEV RAW KEY STOP"
+VERSION = "V1.7 DEV SOURCE CONTROLS"
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_clean")
 CONFIG_FILE = BASE_DIR / "config.json"
 RUNTIME_FILE = BASE_DIR / "runtime.json"
 WATCH_STOP_FILE = BASE_DIR / "watch.stop"
+WATCH_PID_FILE = BASE_DIR / "watch.pid"
 DELTA_STATE_DIR = Path("/storage/emulated/0/Delta/Workspace/nomo_rejoiner")
 STATE_DIR = DELTA_STATE_DIR
 
@@ -144,6 +146,35 @@ def out(line: Any = "") -> None:
     sys.stdout.flush()
 
 
+def reset_terminal() -> None:
+    """Restore Termux if raw input or su leaves it in a strange state."""
+    try:
+        subprocess.run(
+            ["stty", "sane"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+        subprocess.run(
+            ["stty", "onlcr"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+    except Exception:
+        pass
+
+
+def drain_stdin() -> None:
+    try:
+        import select
+
+        while select.select([sys.stdin], [], [], 0)[0]:
+            os.read(sys.stdin.fileno(), 1024)
+    except Exception:
+        pass
+
+
 @contextlib.contextmanager
 def single_key_terminal():
     """Let watch mode read q/Ctrl+C without needing Enter."""
@@ -183,6 +214,8 @@ def single_key_terminal():
                     stderr=subprocess.DEVNULL,
                     timeout=2,
                 )
+            reset_terminal()
+            drain_stdin()
     except Exception:
         try:
             yield
@@ -194,6 +227,8 @@ def single_key_terminal():
                     stderr=subprocess.DEVNULL,
                     timeout=2,
                 )
+            reset_terminal()
+            drain_stdin()
 
 
 def stop_key_pressed() -> bool:
@@ -1058,6 +1093,34 @@ def cut_text(value: Any, width: int) -> str:
     return text[: width - 1] + "~"
 
 
+BRACKETED_PASTE_RE = re.compile(r"\x1b\[(?:200|201)~")
+ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def clean_terminal_input(value: Any) -> str:
+    text = str(value or "")
+    text = BRACKETED_PASTE_RE.sub("", text)
+    text = ANSI_RE.sub("", text)
+    text = "".join(ch for ch in text if ch in "\t\n\r" or ord(ch) >= 32)
+    return text.strip()
+
+
+def normalize_menu_choice(value: Any) -> str:
+    text = clean_terminal_input(value).lower()
+    text = re.sub(r"^(?:option|opt|choice|choose|select)\s*[:#-]?\s*", "", text)
+    match = re.fullmatch(r"(\d+)\s*[.)]?", text)
+    return match.group(1) if match else text
+
+
+def read_menu_choice(prompt: str, valid: Optional[Iterable[str]] = None) -> Optional[str]:
+    reset_terminal()
+    drain_stdin()
+    choice = normalize_menu_choice(input(prompt))
+    if valid is not None and choice not in set(valid):
+        return None
+    return choice
+
+
 def short_package(pkg: str) -> str:
     pkg = str(pkg or "")
     for prefix in ("premium.", "free.", "com."):
@@ -1458,6 +1521,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
     print(f"NOMO Rejoin Clean {VERSION}")
     print("watch mode: " + ("APPLY actions" if apply_actions else "DRY RUN observe only"))
     print("press q to stop, Ctrl+C backup")
+    write_watch_pid(apply_actions)
     try:
         with single_key_terminal():
             while True:
@@ -1483,6 +1547,10 @@ def cmd_watch(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print("")
         return 130
+    finally:
+        remove_file_quiet(WATCH_PID_FILE)
+        reset_terminal()
+        drain_stdin()
 
 
 
@@ -1503,10 +1571,58 @@ def watch_stop_requested(clear: bool = True) -> bool:
     return True
 
 
+def write_watch_pid(apply_actions: bool) -> None:
+    WATCH_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "pid": os.getpid(),
+        "apply": bool(apply_actions),
+        "started_at": now(),
+        "version": VERSION,
+    }
+    tmp = WATCH_PID_FILE.with_suffix(WATCH_PID_FILE.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+    tmp.replace(WATCH_PID_FILE)
+
+
+def read_proc_cmdline(pid: int) -> str:
+    try:
+        raw = Path(f"/proc/{int(pid)}/cmdline").read_bytes()
+        return raw.replace(b"\x00", b" ").decode("utf-8", "replace").strip()
+    except Exception:
+        return ""
+
+
+def stop_watch_pid_from_file() -> Tuple[bool, str]:
+    data = read_json(WATCH_PID_FILE)
+    if not isinstance(data, dict):
+        return False, "no watch pid"
+    try:
+        pid = int(data.get("pid") or 0)
+    except Exception:
+        pid = 0
+    if pid <= 1:
+        return False, "bad watch pid"
+    cmdline = read_proc_cmdline(pid)
+    if "nomo_rejoin_dev.py" not in cmdline or "watch" not in cmdline:
+        return False, "watch pid not matched"
+    try:
+        os.kill(pid, signal.SIGTERM)
+        return True, f"sent TERM to watch pid {pid}"
+    except ProcessLookupError:
+        return True, "watch already exited"
+    except Exception as exc:
+        return False, f"pid stop failed: {exc}"
+
+
 def cmd_stop_watch(args: argparse.Namespace) -> int:
     WATCH_STOP_FILE.parent.mkdir(parents=True, exist_ok=True)
     WATCH_STOP_FILE.write_text(str(now()), encoding="utf-8")
+    ok, note = stop_watch_pid_from_file()
     out(f"watch stop requested: {WATCH_STOP_FILE}")
+    if ok:
+        out(note)
+    elif str(note) != "no watch pid":
+        out(note)
     return 0
 
 def cmd_stop(args: argparse.Namespace) -> int:
@@ -1607,7 +1723,7 @@ def menu_choose_target(cfg: Dict[str, Any], allow_all: bool = False) -> Optional
     for idx, target in enumerate(targets, start=1):
         status = "on" if target.enabled else "off"
         print(f"{idx}. {target.name}  {target.package}  {target.mode}  {status}")
-    choice = input("Target: ").strip()
+    choice = clean_terminal_input(input("Target: "))
     if allow_all and choice in {"0", "all"}:
         return "all"
     if choice.isdigit():
@@ -1620,6 +1736,8 @@ def menu_choose_target(cfg: Dict[str, Any], allow_all: bool = False) -> Optional
 
 
 def pause_menu() -> None:
+    reset_terminal()
+    drain_stdin()
     input("\nPress Enter...")
 
 
@@ -1640,10 +1758,11 @@ def cmd_menu(args: argparse.Namespace) -> int:
         print("9. Watch once (dry-run)")
         print("10. Run monitor loop (apply actions)")
         print("11. Test rejoin one clone")
-        print("12. Exit")
+        print("12. Stop watch loop")
+        print("13. Exit")
         print("")
         print(f"Detected clones: {len(targets)}")
-        choice = input("> ").strip().lower()
+        choice = read_menu_choice("> ")
 
         try:
             if choice in {"", "1", "list"}:
@@ -1708,7 +1827,10 @@ def cmd_menu(args: argparse.Namespace) -> int:
                     else:
                         print("Cancelled.")
                 pause_menu()
-            elif choice in {"12", "q", "quit", "exit"}:
+            elif choice in {"12", "stop-watch", "stopwatch"}:
+                cmd_stop_watch(argparse.Namespace(config=config_path))
+                pause_menu()
+            elif choice in {"13", "q", "quit", "exit"}:
                 return 0
             else:
                 print("Unknown option.")

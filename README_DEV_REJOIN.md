@@ -106,6 +106,9 @@ fleet cooldown. After any clone is opened or restarted, the whole fleet waits
 opening every package at once when several clones are stale.
 While watch is running, press `q` once to stop it. No Enter needed. Ctrl+C is
 still available as a backup.
+The dev monitor also writes its own watch PID. `nomo-dev stop-watch` writes the
+stop file and, if needed, sends TERM only to that verified Python watch process.
+It never stops Roblox packages.
 After a clone is opened, the monitor waits 180 seconds for fresh Lua state.
 If the state is still stale, it retries only that same clone.
 If a clone is alive but its state is already stale for 180 seconds, it also
