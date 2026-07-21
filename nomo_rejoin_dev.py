@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-VERSION = "V0.5 DEV COMPACT CARDS"
+VERSION = "V0.6 DEV TINY OUTPUT"
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_clean")
 CONFIG_FILE = BASE_DIR / "config.json"
 RUNTIME_FILE = BASE_DIR / "runtime.json"
@@ -957,14 +957,14 @@ def short_reason(reason: str) -> str:
 
 
 def print_target_table(rows: List[Dict[str, Any]]) -> None:
-    for row in rows:
-        print(f"{cut_text(row.get('name'), 8)}  {cut_text(row.get('identity'), 18)}")
-        print(
-            f"  {cut_text(row.get('package'), 8)} {cut_text(row.get('mode'), 5)} "
-            f"{cut_text(row.get('alive'), 4)}/{cut_text(row.get('fresh'), 2)} "
-            f"pets={int(row.get('pets') or 0)}"
-        )
-        print(f"  -> {cut_text(row.get('route'), 26)}")
+    for index, row in enumerate(rows, start=1):
+        print(f"{index}. {cut_text(row.get('name'), 10)}")
+        print(f"user {cut_text(row.get('identity'), 14)}")
+        print(f"pkg  {cut_text(row.get('package'), 10)}")
+        print(f"run  {cut_text(row.get('alive'), 4)} {cut_text(row.get('fresh'), 2)}")
+        print(f"pets {int(row.get('pets') or 0)}")
+        print(f"to   {cut_text(row.get('route'), 20)}")
+        print("")
 
 
 def format_age_short(age: int, has_state: bool) -> str:
@@ -1180,13 +1180,12 @@ def watch_once(
         if row.get("note"):
             action_text = f"{action_text}:{row.get('note')}"
         print(f"{row.get('time')} {cut_text(row.get('name'), 8)}")
-        print(
-            f"  {cut_text(row.get('run'), 4)}/{cut_text(row.get('state'), 2)} "
-            f"pets={int(row.get('pets') or 0)} age={cut_text(row.get('age'), 4)}"
-        )
-        print(f"  -> {cut_text(row.get('route'), 26)}")
+        print(f"run  {cut_text(row.get('run'), 4)} {cut_text(row.get('state'), 2)}")
+        print(f"pets {int(row.get('pets') or 0)} age {cut_text(row.get('age'), 4)}")
+        print(f"to   {cut_text(row.get('route'), 20)}")
         if action_text != "-":
-            print(f"  act {cut_text(action_text, 26)}")
+            print(f"act  {cut_text(action_text, 20)}")
+        print("")
 
 
 def cmd_watch(args: argparse.Namespace) -> int:
