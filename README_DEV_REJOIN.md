@@ -3,7 +3,7 @@ NOMO Rejoin Dev
 
 This dev channel now uses the full source UI/menu/table from the working
 rejoin source, with dev paths so stable `nomo` is not overwritten.
-V4.62.0 starts the system-based migration with a RejoinCore facade for shared queue/open logic.
+V4.62.1 moves the Market watch loop queue/process calls onto RejoinCore without behavior changes.
 
 Install / Update
 ----------------

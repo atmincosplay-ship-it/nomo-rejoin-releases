@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.62.0-dev-rejoin-core-step1"
+__version__ = "V4.62.1-dev-market-core"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -11867,12 +11867,13 @@ def _nomo_start_market_rejoin_original(cfg):
     session_start = now()
     loops = 0
     open_queue = []
+    core = RejoinCore(open_queue, cfg, rt)
 
     enabled_tabs = [t for t in cfg["tabs"] if t.get("enabled", True)]
 
     # Clean stale queued/loading runtime
-    queue_stuck_self_heal(open_queue, cfg, rt)
-    runtime_stuck_watchdog(open_queue, cfg, rt, enabled_tabs)
+    core.self_heal()
+    core.watchdog(enabled_tabs)
 
     if cfg.get("workspace_sync_enabled", False) and cfg.get("workspace_sync_on_start", True) and workspace_sync_allowed_for_mode(cfg):
         workspace_sync_screen(cfg, "start rejoin")
@@ -11914,8 +11915,7 @@ def _nomo_start_market_rejoin_original(cfg):
                     tab, start_mode, start_skip_if_alive = entry, "hard", cfg.get("open_only_closed_on_start", True)
                 rt_tab = get_runtime_tab(rt, tab["package"])
                 target = rt_tab.get("target", "market")
-                queue_open(
-                    open_queue,
+                core.queue(
                     tab,
                     target,
                     "start",
@@ -11928,7 +11928,7 @@ def _nomo_start_market_rejoin_original(cfg):
                 if stop_requested():
                     save_runtime(rt)
                     return
-                process_open_queue(open_queue, cfg, rt, session_start, loops)
+                core.process(session_start, loops)
                 if open_queue:
                     if not wait_seconds(int(cfg.get("delay_between_open", 45)), rt):
                         return
@@ -11943,8 +11943,8 @@ def _nomo_start_market_rejoin_original(cfg):
 
         loops += 1
 
-        queue_stuck_self_heal(open_queue, cfg, rt)
-        runtime_stuck_watchdog(open_queue, cfg, rt, enabled_tabs)
+        core.self_heal()
+        core.watchdog(enabled_tabs)
         poll_solver_jobs(cfg, rt, open_queue)
 
         if cfg.get("workspace_sync_enabled", False) and cfg.get("workspace_sync_periodic_enabled", False) and workspace_sync_allowed_for_mode(cfg):
@@ -12023,8 +12023,7 @@ def _nomo_start_market_rejoin_original(cfg):
                     )
                     note = f"{booster_name}; hold {hold_text}"
                 elif target == "booster" and hold_expired:
-                    added, _ = queue_open(
-                        open_queue,
+                    added, _ = core.queue(
                         tab,
                         "market",
                         "manual Booster hold ended",
@@ -12048,16 +12047,16 @@ def _nomo_start_market_rejoin_original(cfg):
                     idle_no_gain = now() - int(rt_tab.get("last_gain_ts", now()))
 
                     if pets < int(cfg["restock_below"]) and target != "restock":
-                        added, _ = queue_open(
-                            open_queue, tab, "restock", f"pets<{cfg['restock_below']}",
+                        added, _ = core.queue(
+                            tab, "restock", f"pets<{cfg['restock_below']}",
                             mode="route",
                             metadata={"skip_solver_once": True, "skip_solver_probe": True},
                         )
                         note = "restock queued" if added else "already queued"
                         status = "Queued" if added else status
                     elif pets >= int(cfg["ready_market_at"]) and target != "market":
-                        added, _ = queue_open(
-                            open_queue, tab, "market", f"pets>={cfg['ready_market_at']}",
+                        added, _ = core.queue(
+                            tab, "market", f"pets>={cfg['ready_market_at']}",
                             mode="route",
                             metadata={"skip_solver_once": True, "skip_solver_probe": True},
                         )
@@ -12065,8 +12064,8 @@ def _nomo_start_market_rejoin_original(cfg):
                         status = "Queued" if added else status
                     elif (target == "restock" and pets >= int(cfg["idle_min_pet_to_market"])
                           and idle_no_gain >= int(cfg["idle_no_gain_seconds"])):
-                        added, _ = queue_open(
-                            open_queue, tab, "market", "idle no gain",
+                        added, _ = core.queue(
+                            tab, "market", "idle no gain",
                             mode="route",
                             metadata={"skip_solver_once": True, "skip_solver_probe": True},
                         )
@@ -12077,7 +12076,7 @@ def _nomo_start_market_rejoin_original(cfg):
                     if (
                         cfg.get("scheduled_hop_enabled", False)
                         and cfg.get("soft_hop_enabled", True)
-                        and not queue_has(open_queue, pkg)
+                        and not core.has(pkg)
                         and scheduled_hop_due(rt_tab, cfg)
                     ):
                         delay_needed, delay_left = should_delay_hop_for_selling(rt_tab, cfg)
@@ -12086,16 +12085,16 @@ def _nomo_start_market_rejoin_original(cfg):
                             if note in ["ok", ""]:
                                 note = f"hop delay {delay_left}s"
                         else:
-                            added, _ = queue_open(open_queue, tab, target, "scheduled soft hop", mode="soft")
+                            added, _ = core.queue(tab, target, "scheduled soft hop", mode="soft")
                             schedule_next_soft_hop(rt_tab, cfg)
                             if added and note in ["ok", ""]:
                                 note = "hop queued"
 
             due_refresh, refresh_left = periodic_hard_refresh_due(rt_tab, cfg)
-            if due_refresh and not rj_handled and not open_queue and not queue_has(open_queue, pkg) and not solver_job_running(pkg):
+            if due_refresh and not rj_handled and not open_queue and not core.has(pkg) and not solver_job_running(pkg):
                 if (not manual_login_blocked(rt_tab, cfg)) or cfg.get("periodic_hard_refresh_include_manual", True):
-                    added, _ = queue_open(
-                        open_queue, tab, target, "periodic hard refresh",
+                    added, _ = core.queue(
+                        tab, target, "periodic hard refresh",
                         force=True, mode="hard_force", bypass_manual=True
                     )
                     if added:
@@ -12108,7 +12107,7 @@ def _nomo_start_market_rejoin_original(cfg):
             # V3.88: two disconnected packages may legitimately be queued at
             # once, but single-flight still processes only one. Show FIFO position
             # instead of making both look actively reopening.
-            qpos = queue_position(open_queue, pkg)
+            qpos = core.position(pkg)
             if qpos > 0:
                 if qpos == 1:
                     status = "Next"
@@ -12160,7 +12159,7 @@ def _nomo_start_market_rejoin_original(cfg):
         if open_queue and cfg.get("smart_open_queue", True):
             if not wait_seconds(2, rt):
                 return
-            process_open_queue(open_queue, cfg, rt, session_start, loops)
+            core.process(session_start, loops)
             continue
 
         if not wait_seconds(int(cfg.get("check_interval", 10)), rt):
