@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-VERSION = "V0.4 DEV WATCH LOOP"
+VERSION = "V0.5 DEV COMPACT CARDS"
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_clean")
 CONFIG_FILE = BASE_DIR / "config.json"
 RUNTIME_FILE = BASE_DIR / "runtime.json"
@@ -957,19 +957,14 @@ def short_reason(reason: str) -> str:
 
 
 def print_target_table(rows: List[Dict[str, Any]]) -> None:
-    print("CLONE  USER          PKG     MODE   RUN   ST  PETS  ROUTE")
-    print("-----  ------------  ------  -----  ----  --  ----  ----------------")
     for row in rows:
+        print(f"{cut_text(row.get('name'), 8)}  {cut_text(row.get('identity'), 18)}")
         print(
-            f"{cut_text(row.get('name'), 5):5}  "
-            f"{cut_text(row.get('identity'), 12):12}  "
-            f"{cut_text(row.get('package'), 6):6}  "
-            f"{cut_text(row.get('mode'), 5):5}  "
-            f"{cut_text(row.get('alive'), 4):4}  "
-            f"{cut_text(row.get('fresh'), 2):2}  "
-            f"{int(row.get('pets') or 0):4}  "
-            f"{cut_text(row.get('route'), 16)}"
+            f"  {cut_text(row.get('package'), 8)} {cut_text(row.get('mode'), 5)} "
+            f"{cut_text(row.get('alive'), 4)}/{cut_text(row.get('fresh'), 2)} "
+            f"pets={int(row.get('pets') or 0)}"
         )
+        print(f"  -> {cut_text(row.get('route'), 26)}")
 
 
 def format_age_short(age: int, has_state: bool) -> str:
@@ -1180,22 +1175,18 @@ def watch_once(
             }
         )
 
-    print("TIME     CLONE  RUN   ST  PETS  AGE   ROUTE             ACTION")
-    print("-------  -----  ----  --  ----  ----  ----------------  ------------")
     for row in rows:
         action_text = row.get("action") or "-"
         if row.get("note"):
             action_text = f"{action_text}:{row.get('note')}"
+        print(f"{row.get('time')} {cut_text(row.get('name'), 8)}")
         print(
-            f"{row.get('time'):7}  "
-            f"{cut_text(row.get('name'), 5):5}  "
-            f"{cut_text(row.get('run'), 4):4}  "
-            f"{cut_text(row.get('state'), 2):2}  "
-            f"{int(row.get('pets') or 0):4}  "
-            f"{cut_text(row.get('age'), 4):4}  "
-            f"{cut_text(row.get('route'), 16):16}  "
-            f"{cut_text(action_text, 12)}"
+            f"  {cut_text(row.get('run'), 4)}/{cut_text(row.get('state'), 2)} "
+            f"pets={int(row.get('pets') or 0)} age={cut_text(row.get('age'), 4)}"
         )
+        print(f"  -> {cut_text(row.get('route'), 26)}")
+        if action_text != "-":
+            print(f"  act {cut_text(action_text, 26)}")
 
 
 def cmd_watch(args: argparse.Namespace) -> int:
