@@ -1,0 +1,68 @@
+NOMO Rejoin Dev
+================
+
+This is the clean/system rewrite test channel. It does not replace stable
+`nomo` yet.
+
+Install / Update
+----------------
+
+Run this in Termux:
+
+```sh
+curl -L https://raw.githubusercontent.com/atmincosplay-ship-it/nomo-rejoin-releases/main/install_dev.sh | sh
+```
+
+After that:
+
+```sh
+nomo-dev update
+```
+
+Safe First Tests
+----------------
+
+These should not stop or open Roblox:
+
+```sh
+nomo-dev doctor
+nomo-dev init
+nomo-dev list
+```
+
+Expected:
+
+- `doctor` says forbidden stop commands are `none`.
+- `init` creates `/storage/emulated/0/Download/nomo_rejoin_clean/config.json`.
+- `list` shows detected Roblox/Noka packages, alive/dead, state freshness,
+  pet count, and the route decision.
+
+One Clone Stop/Open Test
+------------------------
+
+Only do this after `list` shows the clone name/package you expect.
+
+```sh
+nomo-dev stop clone1
+nomo-dev restart clone1
+```
+
+Hard rule: the dev script uses exact PID stop only. It must not use broad
+package stop commands.
+
+Fleet Routing Test
+------------------
+
+This is still a dev skeleton. Only test after config and state look correct:
+
+```sh
+nomo-dev route clone1
+```
+
+Stable stays separate:
+
+```sh
+nomo
+nomo update
+```
+
