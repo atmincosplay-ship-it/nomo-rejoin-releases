@@ -30,7 +30,7 @@ download_dev() {
     exit 1
   fi
   chmod 755 "$APP"
-  grep -m1 '^VERSION' "$APP" 2>/dev/null || true
+  grep -m1 -E '^(__version__|VERSION)' "$APP" 2>/dev/null || true
 }
 
 download_dev
@@ -65,7 +65,7 @@ if [ "${1:-}" = "update" ]; then
   fi
   chmod 755 "$APP"
   echo "NOMO dev updated: $APP"
-  grep -m1 '^VERSION' "$APP" 2>/dev/null || true
+  grep -m1 -E '^(__version__|VERSION)' "$APP" 2>/dev/null || true
   exit 0
 fi
 
@@ -88,7 +88,6 @@ echo "NOMO dev installed."
 echo "Command: nomo-dev"
 echo ""
 echo "First tests:"
-echo "  nomo-dev doctor"
-echo "  nomo-dev init"
-echo "  nomo-dev list"
-echo "  nomo-dev        # open menu"
+echo "  nomo-dev version"
+echo "  nomo-dev        # open source-style menu"
+echo "  Choose option 1 to start the rejoin loop"

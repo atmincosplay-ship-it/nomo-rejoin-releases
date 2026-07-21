@@ -1,124 +1,51 @@
 NOMO Rejoin Dev
 ================
 
-This is the clean/system rewrite test channel. It does not replace stable
-`nomo` yet.
+This dev channel now uses the full source UI/menu/table from the working
+rejoin source, with dev paths so stable `nomo` is not overwritten.
 
 Install / Update
 ----------------
 
-Run this in Termux:
+Run once in Termux:
 
 ```sh
-curl -L https://raw.githubusercontent.com/atmincosplay-ship-it/nomo-rejoin-releases/main/install_dev.sh | sh
+curl -L -H "Accept: application/vnd.github.raw" -H "User-Agent: nomo-dev-installer" "https://api.github.com/repos/atmincosplay-ship-it/nomo-rejoin-releases/contents/install_dev.sh?ref=main" | sh
 ```
 
-After that:
+Update:
 
 ```sh
 nomo-dev update
 ```
 
-Open the dev menu:
+Open:
 
 ```sh
 nomo-dev
 ```
 
-Safe First Tests
-----------------
+Test Flow
+---------
 
-These should not stop or open Roblox:
+1. Run `nomo-dev version`.
+2. Run `nomo-dev`.
+3. Choose option `1` to start the source-style rejoin loop.
+4. Use the source stop behavior: `Q + Enter` / Ctrl+C.
 
-```sh
-  nomo-dev doctor
-  nomo-dev init
-  nomo-dev list
-  nomo-dev menu
-```
+Dev Isolation
+-------------
 
-Expected:
-
-- `doctor` says forbidden stop commands are `none`.
-- `init` creates `/storage/emulated/0/Download/nomo_rejoin_clean/config.json`.
-- `list` shows detected Roblox/Noka packages, alive/dead, state freshness,
-  pet count, and the route decision.
-
-If usernames are stale after account/cookie changes:
+The dev source stores its own files under:
 
 ```sh
-nomo-dev list --refresh-api
+/storage/emulated/0/Download/nomo_rejoin_dev_source
 ```
 
-This reads each package cookie, asks Roblox's authenticated user API for the
-username, and saves only username/user ID metadata locally. It does not write or
-change cookies.
-
-One Clone Stop/Open Test
-------------------------
-
-Only do this after `list` shows the clone name/package you expect.
+On first run it copies existing stable source config from:
 
 ```sh
-nomo-dev test-rejoin clone1
-nomo-dev stop clone1
-nomo-dev restart clone1
+/storage/emulated/0/Download/nomo_rejoin
 ```
 
-Hard rule: the dev script uses exact PID stop only. It must not use broad
-package stop commands.
-
-Fleet Routing Test
-------------------
-
-This is still a dev skeleton. Only test after config and state look correct:
-
-```sh
-nomo-dev route clone1
-```
-
-Watch Loop Test
----------------
-
-Dry-run first. This prints what the controller would do, but does not restart
-or route anything:
-
-```sh
-nomo-dev watch --once
-nomo-dev watch
-```
-
-Only after the dry-run output looks correct:
-
-```sh
-nomo-dev watch --apply
-```
-
-Stop a running watch from another Termux window:
-
-```sh
-nomo-dev stop-watch
-```
-
-The watch loop keeps exact-PID stop only and applies per-clone cooldowns plus a
-fleet cooldown. After any clone is opened or restarted, the whole fleet waits
-180 seconds before another real action. This prevents the controller from
-opening every package at once when several clones are stale.
-While watch is running, press `q` once to stop it. No Enter needed. Ctrl+C is
-still available as a backup.
-The dev monitor also writes its own watch PID. `nomo-dev stop-watch` writes the
-stop file and, if needed, sends TERM only to that verified Python watch process.
-It never stops Roblox packages.
-After a clone is opened, the monitor waits 180 seconds for fresh Lua state.
-If the state is still stale, it retries only that same clone.
-If a clone is alive but its state is already stale for 180 seconds, it also
-retries that clone. The monitor performs at most one real action per cycle.
-Pending opens are mode-neutral: every mode gets the same opened -> verify fresh
-state -> retry same clone flow.
-
-Stable stays separate:
-
-```sh
-nomo
-nomo update
-```
+Only missing files are copied. Stable files are not deleted or overwritten.
