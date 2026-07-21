@@ -37,6 +37,16 @@ Expected:
 - `list` shows detected Roblox/Noka packages, alive/dead, state freshness,
   pet count, and the route decision.
 
+If usernames are stale after account/cookie changes:
+
+```sh
+nomo-dev list --refresh-api
+```
+
+This reads each package cookie, asks Roblox's authenticated user API for the
+username, and saves only username/user ID metadata locally. It does not write or
+change cookies.
+
 One Clone Stop/Open Test
 ------------------------
 
@@ -65,4 +75,3 @@ Stable stays separate:
 nomo
 nomo update
 ```
-

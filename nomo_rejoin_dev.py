@@ -29,10 +29,11 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-VERSION = "V0.1 CLEAN SKELETON"
+VERSION = "V0.2 DEV DELTA STATE"
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_clean")
 CONFIG_FILE = BASE_DIR / "config.json"
-STATE_DIR = Path("/storage/emulated/0/Download/nomo_rejoiner")
+DELTA_STATE_DIR = Path("/storage/emulated/0/Delta/Workspace/nomo_rejoiner")
+STATE_DIR = DELTA_STATE_DIR
 
 PACKAGE_RE = re.compile(r"^[A-Za-z0-9_.]+$")
 DEFAULT_PACKAGE_REGEX = r"^(free\.noka|premium\.noka|com\.roblox)"
@@ -43,6 +44,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "active_mode": "market",
     "package_regex": DEFAULT_PACKAGE_REGEX,
     "state_dir": str(STATE_DIR),
+    "state_dir_candidates": [
+        "/storage/emulated/0/Delta/Workspace/nomo_rejoiner",
+        "/storage/emulated/0/Download/nomo_rejoin/nomo_rejoiner",
+        "/storage/emulated/0/Download/nomo_rejoiner",
+    ],
     "identity_api_enabled": True,
     "identity_cache_seconds": 86400,
     "identity_cache": {},
@@ -704,6 +710,40 @@ def read_json(path: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
+def state_dirs(cfg: Dict[str, Any]) -> List[Path]:
+    raw: List[str] = []
+    raw.append(str(cfg.get("state_dir") or STATE_DIR))
+    for item in cfg.get("state_dir_candidates", []) or []:
+        raw.append(str(item or ""))
+
+    # Executor/workspace fallbacks from the stable rejoin source.
+    raw.extend(
+        [
+            "/storage/emulated/0/Delta/Workspace/nomo_rejoiner",
+            "/storage/emulated/0/Download/nomo_rejoin/nomo_rejoiner",
+            "/storage/emulated/0/Download/nomo_rejoiner",
+        ]
+    )
+
+    for index in range(1, 13):
+        raw.append(
+            f"/storage/emulated/0/RobloxClone{index:03d}/Arceus X/Workspace/nomo_rejoiner"
+        )
+        raw.append(
+            f"/storage/emulated/0/RobloxClone{index:03d}/Delta/Workspace/nomo_rejoiner"
+        )
+
+    out: List[Path] = []
+    seen = set()
+    for value in raw:
+        value = str(value or "").strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        out.append(Path(value))
+    return out
+
+
 def newest_state_file(state_dir: Path) -> Optional[Path]:
     best: Optional[Path] = None
     best_ts = -1
@@ -717,26 +757,28 @@ def newest_state_file(state_dir: Path) -> Optional[Path]:
 
 
 def state_for_username(username: str, cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    state_dir = Path(str(cfg.get("state_dir") or STATE_DIR))
     username = str(username or "").strip()
     if not username:
         return None
 
-    direct = state_dir / f"{sanitize_state_name(username)}_state.json"
-    data = read_json(direct)
-    if data is not None:
-        return data
+    safe_name = sanitize_state_name(username)
+    for folder in state_dirs(cfg):
+        direct = folder / f"{safe_name}_state.json"
+        data = read_json(direct)
+        if data is not None:
+            return data
 
     # Fallback for older counters or case differences.
     want = username.lower()
-    try:
-        for path in state_dir.glob("*_state.json"):
-            item = read_json(path) or {}
-            found = str(item.get("username") or item.get("user_name") or "").strip().lower()
-            if found == want:
-                return item
-    except Exception:
-        pass
+    for folder in state_dirs(cfg):
+        try:
+            for path in folder.glob("*_state.json"):
+                item = read_json(path) or {}
+                found = str(item.get("username") or item.get("user_name") or "").strip().lower()
+                if found == want:
+                    return item
+        except Exception:
+            pass
 
     return None
 
@@ -957,9 +999,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     text = Path(__file__).read_text(encoding="utf-8")
     banned = ["am " + "force-stop", "p" + "kill", "kill" + "all"]
     found = [word for word in banned if word in text]
+    cfg = load_config(args.config)
     print(f"NOMO Rejoin Clean {VERSION}")
     print(f"config: {args.config}")
     print("forbidden stop commands: " + ("FOUND " + ", ".join(found) if found else "none"))
+    print("state folders:")
+    for folder in state_dirs(cfg)[:8]:
+        status = "OK" if folder.exists() else "-"
+        print(f"  {status} {folder}")
     return 1 if found else 0
 
 
