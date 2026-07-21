@@ -3,7 +3,7 @@ NOMO Rejoin Dev
 
 This dev channel now uses the full source UI/menu/table from the working
 rejoin source, with dev paths so stable `nomo` is not overwritten.
-V4.59.4 adds a main-menu executor storage/path changer.
+V4.59.5 locks shared global executor state to exact per-username files and prevents duplicate selected usernames.
 
 Install / Update
 ----------------

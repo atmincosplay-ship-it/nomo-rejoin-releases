@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.59.4-dev-storage-menu"
+__version__ = "V4.59.5-dev-global-state-lock"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -4055,6 +4055,21 @@ def is_delta_global_tab(tab):
     )
 
 
+def is_shared_global_executor_tab(tab):
+    if not isinstance(tab, dict):
+        return False
+    storage = str(tab.get("executor_storage", "") or "").lower()
+    if storage in ("arceus_global", "custom_global"):
+        return True
+    state_path = str(tab.get("stat_file") or tab.get("state_file") or "")
+    autoexec_path = str(tab.get("autoexec_path") or "")
+    return (
+        _path_is_under(state_path, ARCEUS_GLOBAL_STATE_DIR)
+        or _path_is_under(state_path, ARCEUS_GLOBAL_WORKSPACE_DIR)
+        or _path_is_under(autoexec_path, ARCEUS_GLOBAL_AUTOEXEC_DIR)
+    )
+
+
 def _delta_username_key(value):
     value = _usable_detected_username(value)
     return _sanitize_state_name(value).lower() if value else ""
@@ -4398,6 +4413,11 @@ def resolve_state_path(tab):
         exact = delta_global_state_path(user)
         return exact if exact is not None else configured
 
+    if is_shared_global_executor_tab(tab):
+        if user:
+            return configured.parent / f"{_sanitize_state_name(user)}_state.json"
+        return configured
+
     folders = _state_folder_candidates(configured.parent)
     per_user_candidates = []
     if user:
@@ -4512,7 +4532,7 @@ def read_state(tab):
     try:
         data = json.loads(path.read_text())
 
-        if is_delta_global_tab(tab):
+        if is_delta_global_tab(tab) or is_shared_global_executor_tab(tab):
             expected = _usable_detected_username(
                 tab.get("user_name") or tab.get("username")
             )
@@ -4520,11 +4540,12 @@ def read_state(tab):
             if (
                 expected
                 and actual
-                and _delta_username_key(expected)
-                != _delta_username_key(actual)
+                and _sanitize_state_name(expected).lower()
+                != _sanitize_state_name(actual).lower()
             ):
+                label = "Delta" if is_delta_global_tab(tab) else "Executor"
                 return None, (
-                    f"Delta username mismatch: expected {expected}, "
+                    f"{label} username mismatch: expected {expected}, "
                     f"found {actual}"
                 )
 
@@ -19021,6 +19042,7 @@ def _configure_global_executor_storage(cfg, packages, mode_name, autoexec_dir, w
     results = []
     hcfg = load_hatcher_config()
     bcfg = load_booster_config()
+    used_username_keys = set()
 
     for tab in cfg.get("tabs", []):
         pkg = str(tab.get("package") or "")
@@ -19033,12 +19055,24 @@ def _configure_global_executor_storage(cfg, packages, mode_name, autoexec_dir, w
         except Exception:
             api_username = ""
 
-        username = (
-            _usable_detected_username(api_username)
-            or _usable_detected_username(tab.get("user_name"))
-            or pkg
-        )
-        source_name = "cookie/API" if api_username else "existing config"
+        username = ""
+        source_name = ""
+        candidates = [
+            (tab.get("user_name"), "existing config"),
+            (api_username, "cookie/API"),
+            (pkg, "package fallback"),
+        ]
+        for raw_name, raw_source in candidates:
+            candidate = _usable_detected_username(raw_name)
+            key = _sanitize_state_name(candidate).lower() if candidate else ""
+            if candidate and key not in used_username_keys:
+                username = candidate
+                source_name = raw_source
+                break
+        if not username:
+            username = pkg
+            source_name = "package duplicate fallback"
+        used_username_keys.add(_sanitize_state_name(username).lower())
         exact = global_executor_state_path(workspace_dir, username)
 
         tab["user_name"] = username
