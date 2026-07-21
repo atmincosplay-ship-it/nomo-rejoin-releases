@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-VERSION = "V1.8 DEV NARROW WATCH"
+VERSION = "V1.9 DEV OPEN VERIFY"
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_clean")
 CONFIG_FILE = BASE_DIR / "config.json"
 RUNTIME_FILE = BASE_DIR / "runtime.json"
@@ -1175,6 +1175,7 @@ def short_action(action: str, dry_run: bool) -> str:
         "recover_disconnected": "recover",
         "soft_open_stale": "soft",
         "retry_stuck_open": "retry-open",
+        "verify_open": "verify",
         "retry_alive_stale": "retry-stale",
         "route_restock": "restock",
         "report_worker": "report",
@@ -1304,12 +1305,19 @@ def _mark_action(
     if pending_open:
         item["pending_open_at"] = int(time.time())
         item["pending_open_action"] = str(action)
+        item["pending_open_note"] = str(note)
+        item["pending_open_version"] = VERSION
 
 
-def _clear_pending_open(runtime: Dict[str, Any], target: PackageTarget) -> None:
+def _clear_pending_open(runtime: Dict[str, Any], target: PackageTarget, note: str = "") -> None:
     item = _runtime_target(runtime, target)
+    if note:
+        item["last_verify_note"] = note
+        item["last_verified_at"] = int(time.time())
     item.pop("pending_open_at", None)
     item.pop("pending_open_action", None)
+    item.pop("pending_open_note", None)
+    item.pop("pending_open_version", None)
 
 
 def watch_once(
@@ -1351,14 +1359,17 @@ def watch_once(
         pending_open_at = int(runtime_item.get("pending_open_at", 0) or 0)
         pending_age = max(0, now() - pending_open_at) if pending_open_at else 0
         if pending_open_at and not stale:
-            _clear_pending_open(runtime, target)
+            _clear_pending_open(runtime, target, "fresh state ok")
             pending_open_at = 0
             pending_age = 0
 
         action = ""
         action_note = ""
         blocked_note = f"fleet {fleet_wait_left}s" if not can_fleet_act else f"cooldown {wait_left}s"
-        if not alive and bool(watch_cfg.get("restart_dead_packages", True)):
+        if pending_open_at and stale and pending_age < open_verify_seconds:
+            action = "verify_open"
+            action_note = f"wait {open_verify_seconds - pending_age}s"
+        elif not alive and bool(watch_cfg.get("restart_dead_packages", True)):
             action = "restart_dead"
             if apply_actions and acted_this_cycle:
                 action_note = "next cycle"
