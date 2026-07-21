@@ -3,7 +3,7 @@ NOMO Rejoin Dev
 
 This dev channel now uses the full source UI/menu/table from the working
 rejoin source, with dev paths so stable `nomo` is not overwritten.
-V4.60.0 adds `nomo-dev why` for read-only route decisions and cleans visible Cloudflare wording.
+V4.60.1 polishes `nomo-dev why` wording with Mode / Next route columns.
 
 Install / Update
 ----------------

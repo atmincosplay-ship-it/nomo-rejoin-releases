@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.60.0-dev-route-explain"
+__version__ = "V4.60.1-dev-route-wording"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -19331,13 +19331,14 @@ def explain_market_route_for_tab(tab, cfg, rt):
     user = str(tab.get("user_name") or tab.get("username") or pkg)
     rt_tab = get_runtime_tab(rt, pkg)
     target = str(rt_tab.get("target") or "market")
+    display_target = "restock" if target == "hatcher" else target
     state, err = read_state(tab)
 
     if not state:
         return {
             "user": user,
             "pkg": pkg,
-            "target": target,
+            "target": display_target,
             "pets": "-",
             "age": "-",
             "action": "recover",
@@ -19372,7 +19373,7 @@ def explain_market_route_for_tab(tab, cfg, rt):
     return {
         "user": user,
         "pkg": pkg,
-        "target": target,
+        "target": display_target,
         "pets": pets,
         "age": age,
         "action": action,
@@ -19393,7 +19394,7 @@ def route_explain_menu(cfg, pause_at_end=True):
 
     clear()
     banner("ROUTE EXPLAIN", cfg)
-    print(col("Read-only. Shows why NOMO would stay, restock, market, or recover.", DIM))
+    print(col("Read-only. Shows current route mode and what NOMO would do next.", DIM))
     print("")
 
     if not tabs:
@@ -19423,7 +19424,7 @@ def route_explain_menu(cfg, pause_at_end=True):
         ])
 
     draw_table(
-        ["User", "Pkg", "Now", "Pets", "Age", "Action", "Reason"],
+        ["User", "Pkg", "Mode", "Pets", "Age", "Next", "Reason"],
         rows,
         [12, 8, 8, 6, 7, 8, 28],
         cfg,
