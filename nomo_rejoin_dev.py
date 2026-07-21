@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.62.3-dev-hatcher-no-state-recover"
+__version__ = "V4.62.4-dev-no-launcher-fallback"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -3872,7 +3872,7 @@ def open_package_launcher(pkg, cfg):
     return False, cut(output or f"launcher returned {code}", 80)
 
 
-def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop=True, skip_force_stop=False):
+def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop=True, skip_force_stop=False, allow_launcher_fallback=False):
     if not link or str(link).startswith("PUT_"):
         return False, "no link"
 
@@ -3907,7 +3907,8 @@ def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop
 
     if (
         not soft
-        and cfg.get("fallback_launcher_after_hard_open_fail", True)
+        and allow_launcher_fallback
+        and cfg.get("fallback_launcher_after_hard_open_fail", False)
     ):
         log_activity(f"deep-link open failed, trying launcher: {cut(out, 60)}", pkg, YELLOW)
         launcher_ok, launcher_note = open_package_launcher(pkg, cfg)
