@@ -931,11 +931,79 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def cut_text(value: Any, width: int) -> str:
+    text = str(value or "")
+    if len(text) <= width:
+        return text
+    if width <= 1:
+        return text[:width]
+    return text[: width - 1] + "~"
+
+
+def short_package(pkg: str) -> str:
+    pkg = str(pkg or "")
+    for prefix in ("premium.", "free.", "com."):
+        if pkg.startswith(prefix):
+            return pkg[len(prefix):]
+    return pkg
+
+
+def short_reason(reason: str) -> str:
+    text = str(reason or "")
+    text = text.replace(">=", ">=").replace("disconnect recovery", "disc")
+    text = text.replace("local recovery only", "local")
+    text = text.replace("no ready restock server", "no restock")
+    return cut_text(text, 16)
+
+
+def print_target_table(rows: List[Dict[str, Any]]) -> None:
+    print("CLONE  USER          PKG     MODE   RUN   ST  PETS  ROUTE")
+    print("-----  ------------  ------  -----  ----  --  ----  ----------------")
+    for row in rows:
+        print(
+            f"{cut_text(row.get('name'), 5):5}  "
+            f"{cut_text(row.get('identity'), 12):12}  "
+            f"{cut_text(row.get('package'), 6):6}  "
+            f"{cut_text(row.get('mode'), 5):5}  "
+            f"{cut_text(row.get('alive'), 4):4}  "
+            f"{cut_text(row.get('fresh'), 2):2}  "
+            f"{int(row.get('pets') or 0):4}  "
+            f"{cut_text(row.get('route'), 16)}"
+        )
+
+
+def format_age_short(age: int, has_state: bool) -> str:
+    if not has_state or age >= 900000:
+        return "-"
+    if age < 60:
+        return f"{age}s"
+    minutes = age // 60
+    if minutes < 100:
+        return f"{minutes}m"
+    return "99m+"
+
+
+def short_action(action: str, dry_run: bool) -> str:
+    if not action:
+        return "-"
+    labels = {
+        "restart_dead": "restart",
+        "recover_disconnected": "recover",
+        "soft_open_stale": "soft",
+        "route_restock": "restock",
+        "report_worker": "report",
+    }
+    text = labels.get(action, action)
+    return ("would-" + text) if dry_run else text
+
+
 def cmd_list(args: argparse.Namespace) -> int:
     cfg = bootstrap_packages(load_config(args.config))
     backend = BackendClient(cfg)
     targets = configured_targets(cfg)
     changed = False
+    rows: List[Dict[str, Any]] = []
+    identity_notes: List[str] = []
     for target in targets:
         username, user_id, source, did_change = resolve_target_identity(
             target,
@@ -948,13 +1016,25 @@ def cmd_list(args: argparse.Namespace) -> int:
         alive = "alive" if package_alive(target.package) else "dead"
         decision = decide_route(target, snapshot, cfg, backend)
         identity = username or snapshot.username or target.name
-        uid_note = f"/{user_id}" if user_id else ""
-        print(
-            f"{target.name:8} {identity + uid_note:18} {target.package:26} {target.mode:8} "
-            f"{alive:5} {fresh:5} pets={snapshot.pet_count:<4} -> {decision.target} ({decision.reason})"
+        rows.append(
+            {
+                "name": target.name,
+                "identity": identity,
+                "package": short_package(target.package),
+                "mode": target.mode,
+                "alive": "live" if alive == "alive" else "dead",
+                "fresh": "ok" if fresh == "fresh" else "old",
+                "pets": snapshot.pet_count,
+                "route": f"{decision.target}:{short_reason(decision.reason)}",
+            }
         )
         if source not in {"cache", "target name"}:
-            print(f"  identity: {source}")
+            identity_notes.append(f"{target.name}: {source}")
+    print_target_table(rows)
+    if identity_notes:
+        print("")
+        for note in identity_notes:
+            print(f"identity {note}")
     if changed:
         save_config(cfg, args.config)
         log("identity cache updated")
@@ -1027,6 +1107,7 @@ def watch_once(
     cooldown = int(watch_cfg.get("action_cooldown_seconds", 180) or 180)
     stale_seconds = int(watch_cfg.get("state_stale_seconds", 180) or 180)
     report_workers = bool(watch_cfg.get("report_workers", True))
+    rows: List[Dict[str, Any]] = []
 
     for target in configured_targets(cfg):
         if not target.enabled:
@@ -1038,14 +1119,6 @@ def watch_once(
         stale = (not has_state) or snapshot.age > stale_seconds
         decision = decide_route(target, snapshot, cfg, backend)
         can_act, wait_left = _can_act(runtime, target, cooldown)
-
-        status_bits = [
-            "alive" if alive else "dead",
-            "stale" if stale else "fresh",
-            f"pets={snapshot.pet_count}",
-            f"age={snapshot.age if has_state else '-'}",
-            f"route={decision.target}:{decision.reason}",
-        ]
 
         action = ""
         action_note = ""
@@ -1093,12 +1166,36 @@ def watch_once(
             elif apply_actions:
                 action_note = f"cooldown {wait_left}s"
 
-        if action:
-            status_bits.append(("would " if not apply_actions else "") + action)
-        if action_note:
-            status_bits.append(action_note)
+        rows.append(
+            {
+                "time": time.strftime("%H:%M:%S"),
+                "name": target.name,
+                "run": "live" if alive else "dead",
+                "state": "old" if stale else "ok",
+                "pets": snapshot.pet_count,
+                "age": format_age_short(snapshot.age, has_state),
+                "route": f"{decision.target}:{short_reason(decision.reason)}",
+                "action": short_action(action, dry_run=not apply_actions),
+                "note": cut_text(action_note, 12) if action_note else "",
+            }
+        )
 
-        print(f"{time.strftime('%H:%M:%S')} {target.name:8} " + " | ".join(status_bits))
+    print("TIME     CLONE  RUN   ST  PETS  AGE   ROUTE             ACTION")
+    print("-------  -----  ----  --  ----  ----  ----------------  ------------")
+    for row in rows:
+        action_text = row.get("action") or "-"
+        if row.get("note"):
+            action_text = f"{action_text}:{row.get('note')}"
+        print(
+            f"{row.get('time'):7}  "
+            f"{cut_text(row.get('name'), 5):5}  "
+            f"{cut_text(row.get('run'), 4):4}  "
+            f"{cut_text(row.get('state'), 2):2}  "
+            f"{int(row.get('pets') or 0):4}  "
+            f"{cut_text(row.get('age'), 4):4}  "
+            f"{cut_text(row.get('route'), 16):16}  "
+            f"{cut_text(action_text, 12)}"
+        )
 
 
 def cmd_watch(args: argparse.Namespace) -> int:
