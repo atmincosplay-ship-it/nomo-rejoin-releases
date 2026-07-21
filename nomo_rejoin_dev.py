@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.59.3-dev-executor-storage"
+__version__ = "V4.59.4-dev-storage-menu"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -4759,6 +4759,7 @@ MAIN_MENU_ITEMS = [
     ("17", "Workspace ZIP tools"),
     ("18", "APK download / install"),
     ("19", "Delta device key manager"),
+    ("20", "Executor storage / paths"),
     ("0",  "Exit"),
 ]
 
@@ -19106,6 +19107,94 @@ def _prepare_arceus_per_clone_storage(cfg, packages):
     save_config(cfg)
 
 
+def executor_storage_paths_menu(cfg):
+    """Manually change executor storage paths for selected packages."""
+    selected = choose_packages_common(
+        cfg,
+        "EXECUTOR STORAGE: SELECT PACKAGES",
+        multi=True,
+        include_discovered=False,
+        configured_only=True,
+    )
+    if not selected:
+        return
+
+    executor_storage = _setup_choose_executor_storage(cfg)
+    if executor_storage is None:
+        print(col("Cancelled.", YELLOW))
+        pause()
+        return
+
+    custom_storage = executor_storage if isinstance(executor_storage, dict) else None
+    executor_mode = (
+        str(custom_storage.get("mode") or "")
+        if custom_storage
+        else str(executor_storage or "")
+    )
+
+    clear()
+    banner("EXECUTOR STORAGE: APPLY", cfg)
+    if executor_mode == "delta_global":
+        print(col("Switching selected packages to Delta GLOBAL.", GREEN))
+        print(f"AutoExec : {DELTA_GLOBAL_AUTOEXEC_DIR}")
+        print(f"Workspace: {DELTA_GLOBAL_WORKSPACE_DIR}")
+        mapping_results = _configure_delta_global_storage(cfg, selected)
+    elif executor_mode == "arceus_global":
+        print(col("Switching selected packages to Arceus X GLOBAL.", GREEN))
+        print(f"AutoExec : {ARCEUS_GLOBAL_AUTOEXEC_DIR}")
+        print(f"Workspace: {ARCEUS_GLOBAL_WORKSPACE_DIR}")
+        mapping_results = _configure_global_executor_storage(
+            cfg,
+            selected,
+            "arceus_global",
+            ARCEUS_GLOBAL_AUTOEXEC_DIR,
+            ARCEUS_GLOBAL_WORKSPACE_DIR,
+        )
+    elif executor_mode == "custom_global":
+        autoexec_dir = Path(custom_storage.get("autoexec") or "")
+        workspace_dir = Path(custom_storage.get("workspace") or "")
+        print(col("Switching selected packages to CUSTOM GLOBAL executor storage.", GREEN))
+        print(f"AutoExec : {autoexec_dir}")
+        print(f"Workspace: {workspace_dir}")
+        cfg["custom_executor_root"] = str(custom_storage.get("root") or "")
+        cfg["custom_executor_autoexec"] = str(autoexec_dir)
+        cfg["custom_executor_workspace"] = str(workspace_dir)
+        save_config(cfg)
+        mapping_results = _configure_global_executor_storage(
+            cfg,
+            selected,
+            "custom_global",
+            autoexec_dir,
+            workspace_dir,
+        )
+    else:
+        print(col("Switching selected packages to Arceus X PER-CLONE.", GREEN))
+        _prepare_arceus_per_clone_storage(cfg, selected)
+        cfg = load_config()
+        mapping_results = auto_map_packages_to_clone_workspaces(
+            cfg, selected, resolve_api=True, persist=True, verbose=True
+        )
+
+    cfg = load_config()
+    hcfg = load_hatcher_config()
+    sync_hatcher_profiles_with_tabs(cfg, hcfg)
+    save_hatcher_config(hcfg)
+    bcfg = load_booster_config()
+    sync_booster_profiles_with_tabs(cfg, bcfg)
+
+    print("")
+    print(col("Resolved paths:", BOLD))
+    for item in mapping_results or []:
+        pkg = str(item.get("package") or "")
+        print(col(f"{short_pkg(pkg)} -> {item.get('username') or pkg}", CYAN))
+        print(f"  state   : {item.get('state_file')}")
+        print(f"  autoexec: {item.get('autoexec_path')}")
+
+    print("")
+    print(col("After this, use AutoExec manager to install/update the counter loader.", DIM))
+    pause()
+
+
 def _new_tab_for_package(pkg, position=0):
     hint = _package_clone_number_hint(pkg)
     idx = max(0, int(hint - 1 if hint else (position or 0)))
@@ -32640,6 +32729,11 @@ def main():
 
         elif choice == "19":
             delta_key_manager_menu(cfg)
+            cfg = load_config()
+            normalize_active_mode_flags(cfg)
+
+        elif choice == "20":
+            executor_storage_paths_menu(cfg)
             cfg = load_config()
             normalize_active_mode_flags(cfg)
 
