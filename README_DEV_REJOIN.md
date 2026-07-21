@@ -60,6 +60,7 @@ One Clone Stop/Open Test
 Only do this after `list` shows the clone name/package you expect.
 
 ```sh
+nomo-dev test-rejoin clone1
 nomo-dev stop clone1
 nomo-dev restart clone1
 ```

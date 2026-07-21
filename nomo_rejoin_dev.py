@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-VERSION = "V0.8 DEV STATUS POLISH"
+VERSION = "V0.9 DEV REJOIN TEST"
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_clean")
 CONFIG_FILE = BASE_DIR / "config.json"
 RUNTIME_FILE = BASE_DIR / "runtime.json"
@@ -1256,6 +1256,42 @@ def cmd_restart(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_test_rejoin(args: argparse.Namespace) -> int:
+    cfg = bootstrap_packages(load_config(args.config))
+    engine = RejoinEngine(cfg)
+    targets = filter_targets(configured_targets(cfg), args.target)
+    if len(targets) != 1:
+        log("test-rejoin needs exactly one clone target")
+        return 1
+
+    target = targets[0]
+    before_pids = package_pids(target.package)
+    before_snapshot = snapshot_for_target(target, cfg)
+    out(f"TEST REJOIN {target.name}")
+    out(f"pkg  {target.package}")
+    out(f"pids before {','.join(map(str, before_pids)) or '-'}")
+    out(f"pets before {before_snapshot.pet_count}")
+    out(f"state age {format_age_short(before_snapshot.age, bool(before_snapshot.raw))}")
+    out("")
+
+    ok, note = engine.restart(target, soft=bool(args.soft))
+    out(f"restart {ok} {note}")
+    if not ok:
+        return 1
+
+    wait_seconds = max(3, int(getattr(args, "wait", 12) or 12))
+    out(f"waiting {wait_seconds}s...")
+    time.sleep(wait_seconds)
+
+    after_pids = package_pids(target.package)
+    after_snapshot = snapshot_for_target(target, cfg)
+    out(f"pids after {','.join(map(str, after_pids)) or '-'}")
+    out(f"pets after {after_snapshot.pet_count}")
+    out(f"state age {format_age_short(after_snapshot.age, bool(after_snapshot.raw))}")
+    out("done")
+    return 0
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     text = Path(__file__).read_text(encoding="utf-8")
     banned = ["am " + "force-stop", "p" + "kill", "kill" + "all"]
@@ -1323,7 +1359,8 @@ def cmd_menu(args: argparse.Namespace) -> int:
         print("8. Report workers to backend")
         print("9. Watch once (dry-run)")
         print("10. Run monitor loop (apply actions)")
-        print("11. Exit")
+        print("11. Test rejoin one clone")
+        print("12. Exit")
         print("")
         print(f"Detected clones: {len(targets)}")
         choice = input("> ").strip().lower()
@@ -1375,7 +1412,23 @@ def cmd_menu(args: argparse.Namespace) -> int:
                 else:
                     print("Cancelled.")
                     pause_menu()
-            elif choice in {"11", "q", "quit", "exit"}:
+            elif choice in {"11", "test"}:
+                target = menu_choose_target(cfg, allow_all=False)
+                if target:
+                    confirm = input(f"Test rejoin {target}? type yes: ").strip().lower()
+                    if confirm == "yes":
+                        cmd_test_rejoin(
+                            argparse.Namespace(
+                                config=config_path,
+                                target=target,
+                                soft=False,
+                                wait=12,
+                            )
+                        )
+                    else:
+                        print("Cancelled.")
+                pause_menu()
+            elif choice in {"12", "q", "quit", "exit"}:
                 return 0
             else:
                 print("Unknown option.")
@@ -1436,6 +1489,12 @@ def build_parser() -> argparse.ArgumentParser:
     restart.add_argument("target", nargs="?", default="all")
     restart.add_argument("--soft", action="store_true")
     restart.set_defaults(func=cmd_restart)
+
+    test_rejoin = sub.add_parser("test-rejoin")
+    test_rejoin.add_argument("target")
+    test_rejoin.add_argument("--soft", action="store_true")
+    test_rejoin.add_argument("--wait", type=int, default=12)
+    test_rejoin.set_defaults(func=cmd_test_rejoin)
 
     return parser
 
