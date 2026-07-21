@@ -3,7 +3,7 @@ NOMO Rejoin Dev
 
 This dev channel now uses the full source UI/menu/table from the working
 rejoin source, with dev paths so stable `nomo` is not overwritten.
-V4.59.9 adds suggested fixes to the read-only doctor diagnostics.
+V4.59.10 adds `nomo-dev doctor` for quick read-only state/path checks.
 
 Install / Update
 ----------------

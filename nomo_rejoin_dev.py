@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.59.9-dev-doctor-hints"
+__version__ = "V4.59.10-dev-cli-doctor"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -19265,7 +19265,7 @@ def executor_storage_paths_menu(cfg):
     pause()
 
 
-def executor_storage_doctor_menu(cfg):
+def executor_storage_doctor_menu(cfg, pause_at_end=True):
     """Read-only package/executor/state diagnostic screen."""
     cfg = load_config()
     tabs = [
@@ -19354,7 +19354,8 @@ def executor_storage_doctor_menu(cfg):
 
     print("")
     print(col("If State is missing/old: install/update AutoExec counter, then enter the game and wait 10-20s.", DIM))
-    pause()
+    if pause_at_end:
+        pause()
 
 
 def _new_tab_for_package(pkg, position=0):
@@ -28518,8 +28519,8 @@ def handle_nomo_cli_command():
     if len(sys.argv) < 2:
         return False
     command = clean_terminal_input(sys.argv[1]).lower()
-    if command not in {"update", "install", "version", "rollback", "source", "repo", "repair"}:
-        print("Usage: nomo [update|version|rollback|source|repair]")
+    if command not in {"update", "install", "version", "rollback", "source", "repo", "repair", "doctor", "diag", "status"}:
+        print("Usage: nomo [update|version|rollback|source|repair|doctor]")
         return True
 
     cfg = load_config()
@@ -28535,6 +28536,8 @@ def handle_nomo_cli_command():
             nomo_cmd, gag_cmd = nomo_repair_launchers()
             print(f"Repaired: {nomo_cmd}")
             print(f"Alias:    {gag_cmd}")
+        elif command in {"doctor", "diag", "status"}:
+            executor_storage_doctor_menu(cfg, pause_at_end=False)
         elif command == "rollback":
             backups = _nomo_list_backups()
             if not backups:
