@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.59.0-dev1-source-core"
+__version__ = "V4.59.1-dev-core-rejoin"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -3881,6 +3881,63 @@ def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop
     return False, cut(out, 60)
 
 
+def core_rejoin_package(
+    pkg,
+    link,
+    cfg,
+    *,
+    soft=False,
+    rt_tab=None,
+    reason="",
+    mode="",
+    target="",
+    require_stop=True,
+    skip_force_stop=False,
+):
+    """Shared mode-neutral package rejoin path.
+
+    The actual Android open/stop safety stays inside open_roblox(). This wrapper
+    only records common state so Market, Hatcher, Booster, Rejoin-only, and
+    future modes can be observed and verified the same way.
+    """
+    pkg = str(pkg or "").strip()
+    reason = str(reason or "").strip()
+    mode = str(mode or "").strip()
+    target = str(target or "").strip()
+    opened_at = now()
+
+    if rt_tab is not None:
+        rt_tab["core_last_rejoin_attempt_at"] = opened_at
+        rt_tab["core_last_rejoin_reason"] = reason
+        rt_tab["core_last_rejoin_mode"] = mode
+        rt_tab["core_last_rejoin_target"] = target
+        rt_tab["core_last_rejoin_soft"] = bool(soft)
+        rt_tab["core_pending_open_at"] = opened_at
+        rt_tab["core_pending_open_reason"] = reason
+        rt_tab["core_pending_open_target"] = target
+
+    ok, note = open_roblox(
+        pkg,
+        link,
+        cfg,
+        soft=soft,
+        rt_tab=rt_tab,
+        reason=reason,
+        require_stop=require_stop,
+        skip_force_stop=skip_force_stop,
+    )
+
+    if rt_tab is not None:
+        rt_tab["core_last_rejoin_ok"] = bool(ok)
+        rt_tab["core_last_rejoin_note"] = str(note or "")
+        if ok:
+            rt_tab["core_last_rejoin_opened_at"] = opened_at
+        else:
+            rt_tab["core_pending_open_failed_at"] = now()
+
+    return ok, note
+
+
 # ============================================================
 # STATE
 # ============================================================
@@ -6232,7 +6289,16 @@ def manual_force_restart_tab(tab, rt_tab, cfg, target, reason, rt=None):
         rt_tab["note"] = "no link"
         return False, "no link"
 
-    ok, note = open_roblox(tab["package"], link, cfg, soft=False, rt_tab=rt_tab, reason=reason)
+    ok, note = core_rejoin_package(
+        tab["package"],
+        link,
+        cfg,
+        soft=False,
+        rt_tab=rt_tab,
+        reason=reason,
+        mode="manual-hard",
+        target=target,
+    )
 
     rt_tab["target"] = target
     rt_tab["last_open"] = now()
@@ -8238,7 +8304,17 @@ def open_target(tab, rt_tab, cfg, target, reason, force=False, rt=None, mode="ha
         soft = False
         hard_force = True
         require_stop = True
-        ok, note = open_roblox(tab["package"], link, cfg, soft=False, rt_tab=rt_tab, reason=reason, require_stop=True)
+        ok, note = core_rejoin_package(
+            tab["package"],
+            link,
+            cfg,
+            soft=False,
+            rt_tab=rt_tab,
+            reason=reason,
+            mode="hard",
+            target=target,
+            require_stop=True,
+        )
         rt_tab["target"] = target
         rt_tab["last_open"] = now()
         rt_tab["last_open_mode"] = "hard"
@@ -8271,7 +8347,17 @@ def open_target(tab, rt_tab, cfg, target, reason, force=False, rt=None, mode="ha
             return False, "alive skip hard"
     require_stop = not soft
 
-    ok, note = open_roblox(tab["package"], link, cfg, soft=soft, rt_tab=rt_tab, reason=reason, require_stop=require_stop)
+    ok, note = core_rejoin_package(
+        tab["package"],
+        link,
+        cfg,
+        soft=soft,
+        rt_tab=rt_tab,
+        reason=reason,
+        mode="route" if (intentional_route and soft) else ("soft" if soft else "hard"),
+        target=target,
+        require_stop=require_stop,
+    )
 
     rt_tab["target"] = target
     rt_tab["last_open"] = now()
@@ -29157,10 +29243,13 @@ def _rejoin_only_open(tab, cfg, reason, hard=True):
     # already-running clone sends the saved link without killing its process.
     use_soft = alive_now and not manual_force
     try:
-        return open_roblox(
+        return core_rejoin_package(
             pkg, link, cfg,
             soft=use_soft,
+            rt_tab=None,
             reason=reason,
+            mode="rejoin-only-soft" if use_soft else "rejoin-only-hard",
+            target="rejoin-only",
             require_stop=not use_soft,
             skip_force_stop=use_soft,
         )
@@ -30995,12 +31084,15 @@ def delta_key_restart_packages(cfg, packages):
     for index, package in enumerate(packages):
         link = delta_key_link_for_package(package, cfg)
         if link:
-            ok, note = open_roblox(
+            ok, note = core_rejoin_package(
                 package,
                 link,
                 cfg,
                 soft=False,
+                rt_tab=get_runtime_tab(shared_runtime, package),
                 reason="Delta device key applied",
+                mode="delta-key-hard",
+                target="delta-key",
             )
         else:
             stopped, stop_note = force_stop_package(
