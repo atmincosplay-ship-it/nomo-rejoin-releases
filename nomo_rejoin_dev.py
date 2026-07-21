@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.59.5-dev-global-state-lock"
+__version__ = "V4.59.6-dev-version-display"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -27941,7 +27941,7 @@ def export_diagnostics_zip(cfg):
 # ============================================================
 
 _UPDATE_VERSION_RE = re.compile(
-    r'(?m)^__version__\s*=\s*["\'](V\d+(?:\.\d+)+)["\']'
+    r'(?m)^__version__\s*=\s*["\']([^"\']+)["\']'
 )
 
 
