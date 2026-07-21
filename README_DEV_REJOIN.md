@@ -104,6 +104,8 @@ The watch loop keeps exact-PID stop only and applies per-clone cooldowns plus a
 fleet cooldown. After any clone is opened or restarted, the whole fleet waits
 180 seconds before another real action. This prevents the controller from
 opening every package at once when several clones are stale.
+While watch is running, press `q` once to stop it. No Enter needed. Ctrl+C is
+still available as a backup.
 After a clone is opened, the monitor waits 180 seconds for fresh Lua state.
 If the state is still stale, it retries only that same clone.
 If a clone is alive but its state is already stale for 180 seconds, it also

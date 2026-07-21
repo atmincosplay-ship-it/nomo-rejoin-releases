@@ -21,6 +21,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import contextlib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -29,7 +30,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-VERSION = "V1.4 DEV WATCH CONTROL"
+VERSION = "V1.5 DEV SINGLE KEY STOP"
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_clean")
 CONFIG_FILE = BASE_DIR / "config.json"
 RUNTIME_FILE = BASE_DIR / "runtime.json"
@@ -141,6 +142,40 @@ def fix_terminal_newlines() -> None:
 def out(line: Any = "") -> None:
     sys.stdout.write(str(line) + "\r\n")
     sys.stdout.flush()
+
+
+@contextlib.contextmanager
+def single_key_terminal():
+    """Let watch mode read q/Ctrl+C without needing Enter."""
+    if not sys.stdin.isatty():
+        yield
+        return
+    try:
+        import termios
+        import tty
+
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+        try:
+            yield
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    except Exception:
+        yield
+
+
+def stop_key_pressed() -> bool:
+    try:
+        import select
+
+        ready, _w, _e = select.select([sys.stdin], [], [], 0)
+        if not ready:
+            return False
+        char = os.read(sys.stdin.fileno(), 1).decode("utf-8", "ignore").lower()
+        return char in {"q", "\x03", "\x04", "\x1b", "0"}
+    except Exception:
+        return False
 
 
 def now() -> int:
@@ -1391,19 +1426,29 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
     print(f"NOMO Rejoin Clean {VERSION}")
     print("watch mode: " + ("APPLY actions" if apply_actions else "DRY RUN observe only"))
-    print("q + Enter, Ctrl+C, or nomo-dev stop-watch to stop")
+    print("press q to stop, Ctrl+C backup")
     try:
-        while True:
-            stopped = watch_once(cfg, runtime, apply_actions=apply_actions)
-            save_runtime(runtime)
-            if stopped:
-                out("watch stopped")
-                return 0
-            if once:
-                return 0
-            if wait_for_watch_stop(max(5, interval)):
-                out("watch stopped")
-                return 0
+        with single_key_terminal():
+            while True:
+                if not once:
+                    os.system("clear")
+                    out(f"NOMO Rejoin Clean {VERSION}")
+                    out("watch mode: " + ("APPLY actions" if apply_actions else "DRY RUN observe only"))
+                    out("press q to stop | Ctrl+C backup")
+                    out("")
+                if stop_key_pressed() or watch_stop_requested():
+                    out("watch stopped")
+                    return 0
+                stopped = watch_once(cfg, runtime, apply_actions=apply_actions)
+                save_runtime(runtime)
+                if stopped:
+                    out("watch stopped")
+                    return 0
+                if once:
+                    return 0
+                if wait_for_watch_stop(max(5, interval)):
+                    out("watch stopped")
+                    return 0
     except KeyboardInterrupt:
         print("")
         return 130
@@ -1413,19 +1458,9 @@ def cmd_watch(args: argparse.Namespace) -> int:
 def wait_for_watch_stop(seconds: int) -> bool:
     deadline = time.time() + max(1, int(seconds))
     while time.time() < deadline:
-        if watch_stop_requested():
+        if watch_stop_requested() or stop_key_pressed():
             return True
-        try:
-            import select
-
-            ready, _w, _e = select.select([sys.stdin], [], [], 0)
-            if ready:
-                text = sys.stdin.readline().strip().lower()
-                if text in {"q", "quit", "exit", "stop", "0"}:
-                    return True
-        except Exception:
-            pass
-        time.sleep(0.5)
+        time.sleep(0.1)
     return False
 
 
