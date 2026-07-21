@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.59.10-dev-cli-doctor"
+__version__ = "V4.60.0-dev-route-explain"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -4803,7 +4803,7 @@ MAIN_MENU_ITEMS = [
     ("8",  "Login via Cookie"),
     ("9",  "Recovery tools"),
     ("10", "Captcha Solver"),
-    ("11", "Global config"),
+    ("11", "Cloudflare / config"),
     ("12", "AutoExec manager"),
     ("13", "New Redfinger setup wizard"),
     ("14", "Export diagnostics ZIP"),
@@ -4813,7 +4813,7 @@ MAIN_MENU_ITEMS = [
     ("18", "APK download / install"),
     ("19", "Delta device key manager"),
     ("20", "Executor storage / paths"),
-    ("21", "Doctor / state paths"),
+    ("21", "Doctor / paths"),
     ("0",  "Exit"),
 ]
 
@@ -6990,24 +6990,21 @@ def d1_admin_menu(cfg):
 
 def global_backend_settings(cfg):
     """Shared backend settings for Market + Hatcher."""
+    cfg["backend_provider"] = "cloudflare"
     items = [
-        ("backend_provider", "provider"),
-        ("jsonbin_hatchers_enabled", "enabled"),
+        ("jsonbin_hatchers_enabled", "cloudflare_enabled"),
         ("cloudflare_worker_url", "cf_worker_url"),
         ("cloudflare_secret", "cf_secret"),
         ("cloudflare_timeout_seconds", "cf_timeout"),
-        ("jsonbin_bin_id", "jsonbin_bin_id"),
-        ("jsonbin_api_key", "jsonbin_api_key"),
-        ("jsonbin_key_header", "jsonbin_key_header"),
-        ("jsonbin_stale_seconds", "stale_seconds"),
-        ("jsonbin_cache_seconds", "cache_seconds"),
+        ("jsonbin_stale_seconds", "record_stale_seconds"),
+        ("jsonbin_cache_seconds", "read_cache_seconds"),
     ]
 
     while True:
         clear()
-        banner("GLOBAL BACKEND", cfg)
-        print(col("Shared by Market + Hatcher. Provider can be jsonbin or cloudflare.", DIM))
-        print(col("Cloudflare uses worker URL + secret. JSONBin stays as fallback.", DIM))
+        banner("CLOUDFLARE / D1 BACKEND", cfg)
+        print(col("Shared by Market + Hatcher. Cloudflare/D1 is the active backend.", DIM))
+        print(col("Old JSONBin config keys are kept internally only for compatibility.", DIM))
         print("")
         for i, (key, label) in enumerate(items, 1):
             print(f"{i}. {pad(label, 28, CYAN)} = {show_config_value(key, cfg.get(key))}")
@@ -7018,7 +7015,7 @@ def global_backend_settings(cfg):
         print("H. Health check backend")
         print("A. D1 admin tools")
         print("0. Back")
-        print(col("Tip: choose true/false and press ENTER to toggle. Provider toggles jsonbin/cloudflare on blank ENTER.", DIM))
+        print(col("Tip: choose true/false settings and press ENTER to toggle.", DIM))
 
         drain_stdin()
         ch = input("\nChoose: ").strip().lower()
@@ -7074,19 +7071,6 @@ def global_backend_settings(cfg):
                 "jsonbin_no_hatcher_action": "stay_market",
             }, indent=2))
             print("JSON")
-            print("")
-            print("JSONBin template example:")
-            print(json.dumps({
-                "backend_provider": "jsonbin",
-                "jsonbin_hatchers_enabled": True,
-                "jsonbin_bin_id": "PASTE_PRIVATE_BIN_ID_HERE",
-                "jsonbin_api_key": "PASTE_MASTER_KEY_HERE",
-                "jsonbin_key_header": "X-Master-Key",
-                "jsonbin_stale_seconds": 7200,
-                "jsonbin_cache_seconds": 600,
-                "jsonbin_timeout_seconds": 8,
-                "jsonbin_no_hatcher_action": "stay_market",
-            }, indent=2))
             pause()
             continue
 
@@ -7102,21 +7086,7 @@ def global_backend_settings(cfg):
         current = cfg.get(key)
         val = input(f"New value for {key} [{current}] (blank ENTER toggles bool/provider): ").strip()
 
-        if key == "backend_provider":
-            if not val:
-                cur = str(current or "jsonbin").strip().lower()
-                cfg[key] = "cloudflare" if cur != "cloudflare" else "jsonbin"
-            else:
-                v = val.strip().lower()
-                if v in ["cf", "cloudflare", "worker"]:
-                    cfg[key] = "cloudflare"
-                elif v in ["jb", "jsonbin", "json"]:
-                    cfg[key] = "jsonbin"
-                else:
-                    print("Use jsonbin or cloudflare.")
-                    time.sleep(1)
-                    continue
-        elif isinstance(current, bool):
+        if isinstance(current, bool):
             if not val:
                 cfg[key] = not current
             else:
@@ -7191,14 +7161,11 @@ def config_settings(cfg):
             "GLOBAL BACKEND",
             [
                 ("backend_provider", "provider"),
-                ("jsonbin_hatchers_enabled", "enabled"),
+                ("jsonbin_hatchers_enabled", "cloudflare_enabled"),
                 ("cloudflare_worker_url", "cf_worker_url"),
                 ("cloudflare_secret", "cf_secret"),
-                ("jsonbin_bin_id", "jsonbin_bin_id"),
-                ("jsonbin_api_key", "jsonbin_api_key"),
-                ("jsonbin_key_header", "jsonbin_key_header"),
-                ("jsonbin_stale_seconds", "stale_seconds"),
-                ("jsonbin_cache_seconds", "cache_seconds"),
+                ("jsonbin_stale_seconds", "record_stale_seconds"),
+                ("jsonbin_cache_seconds", "read_cache_seconds"),
             ],
         ),
         "5": (
@@ -7261,7 +7228,7 @@ def config_settings(cfg):
         print("1. Core timing")
         print("2. Rejoin / stale recovery")
         print("3. Startup / smart open queue")
-        print("4. Global JSONBin / backend")
+        print("4. Cloudflare / backend")
         print("5. Soft / scheduled hop")
         print("6. Cache cleanup")
         print("7. Config template tools")
@@ -19358,6 +19325,115 @@ def executor_storage_doctor_menu(cfg, pause_at_end=True):
         pause()
 
 
+def explain_market_route_for_tab(tab, cfg, rt):
+    """Return the read-only route decision currently implied by state/runtime."""
+    pkg = str(tab.get("package") or "")
+    user = str(tab.get("user_name") or tab.get("username") or pkg)
+    rt_tab = get_runtime_tab(rt, pkg)
+    target = str(rt_tab.get("target") or "market")
+    state, err = read_state(tab)
+
+    if not state:
+        return {
+            "user": user,
+            "pkg": pkg,
+            "target": target,
+            "pets": "-",
+            "age": "-",
+            "action": "recover",
+            "reason": f"state {err or 'missing'}",
+        }
+
+    pets = int(state.get("pet_count", 0) or 0)
+    age = int(state.get("age", 999999) or 999999)
+    stale_after = int(cfg.get("state_stale_seconds", 180) or 180)
+    restock_below = int(cfg.get("restock_below", 50) or 50)
+    ready_market_at = int(cfg.get("ready_market_at", 200) or 200)
+    idle_min = int(cfg.get("idle_min_pet_to_market", 1) or 1)
+    idle_seconds = int(cfg.get("idle_no_gain_seconds", 900) or 900)
+    idle_no_gain = now() - int(rt_tab.get("last_gain_ts", now()) or now())
+
+    if age > stale_after:
+        action = "recover"
+        reason = f"state old {format_age(age)} > {format_age(stale_after)}"
+    elif pets < restock_below and target != "restock":
+        action = "restock"
+        reason = f"pets {pets} < {restock_below}"
+    elif pets >= ready_market_at and target != "market":
+        action = "market"
+        reason = f"pets {pets} >= {ready_market_at}"
+    elif target == "restock" and pets >= idle_min and idle_no_gain >= idle_seconds:
+        action = "market"
+        reason = f"restock idle {format_age(idle_no_gain)} >= {format_age(idle_seconds)}"
+    else:
+        action = "stay"
+        reason = f"target {target}"
+
+    return {
+        "user": user,
+        "pkg": pkg,
+        "target": target,
+        "pets": pets,
+        "age": age,
+        "action": action,
+        "reason": reason,
+    }
+
+
+def route_explain_menu(cfg, pause_at_end=True):
+    """Read-only route decision explanation for Market mode."""
+    cfg = load_config()
+    rt = load_runtime()
+    tabs = [
+        tab for tab in cfg.get("tabs", [])
+        if isinstance(tab, dict)
+        and str(tab.get("package") or "").strip()
+        and tab.get("enabled", True)
+    ]
+
+    clear()
+    banner("ROUTE EXPLAIN", cfg)
+    print(col("Read-only. Shows why NOMO would stay, restock, market, or recover.", DIM))
+    print("")
+
+    if not tabs:
+        print(col("No enabled packages found.", RED))
+        if pause_at_end:
+            pause()
+        return
+
+    rows = []
+    for tab in tabs:
+        info = explain_market_route_for_tab(tab, cfg, rt)
+        action = str(info.get("action") or "")
+        action_color = {
+            "stay": GREEN,
+            "market": CYAN,
+            "restock": YELLOW,
+            "recover": RED,
+        }.get(action, WHITE)
+        rows.append([
+            (cut(info.get("user"), 12), CYAN),
+            (short_pkg(info.get("pkg")), WHITE),
+            (cut(info.get("target"), 8), WHITE),
+            (str(info.get("pets")), pet_color(info.get("pets"), cfg), True),
+            (format_age(info.get("age")), DIM),
+            (action, action_color),
+            (cut(info.get("reason"), 28), WHITE),
+        ])
+
+    draw_table(
+        ["User", "Pkg", "Now", "Pets", "Age", "Action", "Reason"],
+        rows,
+        [12, 8, 8, 6, 7, 8, 28],
+        cfg,
+    )
+    print("")
+    print(col(f"Rules: <{cfg.get('restock_below', 50)} restock | >={cfg.get('ready_market_at', 200)} market | old state recovers.", DIM))
+    if pause_at_end:
+        pause()
+
+
 def _new_tab_for_package(pkg, position=0):
     hint = _package_clone_number_hint(pkg)
     idx = max(0, int(hint - 1 if hint else (position or 0)))
@@ -28519,8 +28595,8 @@ def handle_nomo_cli_command():
     if len(sys.argv) < 2:
         return False
     command = clean_terminal_input(sys.argv[1]).lower()
-    if command not in {"update", "install", "version", "rollback", "source", "repo", "repair", "doctor", "diag", "status"}:
-        print("Usage: nomo [update|version|rollback|source|repair|doctor]")
+    if command not in {"update", "install", "version", "rollback", "source", "repo", "repair", "doctor", "diag", "status", "why", "route", "routes"}:
+        print("Usage: nomo [update|version|rollback|source|repair|doctor|why]")
         return True
 
     cfg = load_config()
@@ -28538,6 +28614,8 @@ def handle_nomo_cli_command():
             print(f"Alias:    {gag_cmd}")
         elif command in {"doctor", "diag", "status"}:
             executor_storage_doctor_menu(cfg, pause_at_end=False)
+        elif command in {"why", "route", "routes"}:
+            route_explain_menu(cfg, pause_at_end=False)
         elif command == "rollback":
             backups = _nomo_list_backups()
             if not backups:
