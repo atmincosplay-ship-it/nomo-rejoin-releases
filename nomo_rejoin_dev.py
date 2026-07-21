@@ -17,6 +17,7 @@ import json
 import os
 import re
 import shlex
+import sqlite3
 import subprocess
 import sys
 import time
@@ -42,6 +43,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "active_mode": "market",
     "package_regex": DEFAULT_PACKAGE_REGEX,
     "state_dir": str(STATE_DIR),
+    "identity_api_enabled": True,
+    "identity_cache_seconds": 86400,
+    "identity_cache": {},
     "open_cooldown_seconds": 8,
     "backend": {
         "provider": "cloudflare",
@@ -112,6 +116,12 @@ def safe_package(pkg: str) -> str:
     return pkg
 
 
+def sanitize_state_name(value: str) -> str:
+    value = str(value or "")
+    value = re.sub(r"[^0-9A-Za-z_]", "_", value)
+    return value or "unknown"
+
+
 def run_cmd(args: List[str], timeout: int = 10) -> Tuple[int, str]:
     try:
         proc = subprocess.run(
@@ -130,6 +140,13 @@ def run_cmd(args: List[str], timeout: int = 10) -> Tuple[int, str]:
 
 def run_root(script: str, timeout: int = 10) -> Tuple[int, str]:
     return run_cmd(["su", "-c", script], timeout=timeout)
+
+
+def remove_file_quiet(path: Path) -> None:
+    try:
+        path.unlink()
+    except Exception:
+        pass
 
 
 def load_config(path: Path = CONFIG_FILE) -> Dict[str, Any]:
@@ -432,6 +449,135 @@ def bootstrap_packages(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ============================================================
+# Identity
+# ============================================================
+
+
+def get_cookie_from_package(pkg: str) -> Optional[str]:
+    """Read this package's Roblox WebView cookie without mutating login state."""
+    pkg = safe_package(pkg)
+    candidates = [
+        f"/data/data/{pkg}/app_webview/Default/Cookies",
+        f"/data/user/0/{pkg}/app_webview/Default/Cookies",
+        f"/data/data/{pkg}/app_webview/Cookies",
+        f"/data/user/0/{pkg}/app_webview/Cookies",
+    ]
+    tmp = Path(f"/sdcard/Download/tmp_nomo_cookie_{re.sub(r'[^A-Za-z0-9_.-]', '_', pkg)}_{os.getpid()}.db")
+
+    try:
+        for src in candidates:
+            remove_file_quiet(tmp)
+            code, _out = run_root(f"cp {shlex.quote(src)} {shlex.quote(str(tmp))}", timeout=15)
+            if code != 0 or not tmp.exists():
+                continue
+            try:
+                conn = sqlite3.connect(str(tmp), timeout=2)
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT value FROM cookies "
+                    "WHERE host_key LIKE '%.roblox.com' AND name='.ROBLOSECURITY' "
+                    "ORDER BY rowid DESC LIMIT 1"
+                )
+                row = cur.fetchone()
+                conn.close()
+                if row and row[0]:
+                    return str(row[0])
+            except Exception:
+                continue
+    finally:
+        remove_file_quiet(tmp)
+
+    return None
+
+
+def get_username_from_cookie(cookie: str, timeout: int = 10) -> Tuple[str, str]:
+    if not cookie:
+        return "", ""
+    url = "https://users.roblox.com/v1/users/authenticated"
+    headers = {
+        "Cookie": f".ROBLOSECURITY={cookie}",
+        "User-Agent": "nomo-rejoin-clean/identity",
+    }
+    try:
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        username = str(data.get("name") or "").strip()
+        user_id = str(data.get("id") or "").strip()
+        return username, user_id
+    except Exception:
+        return "", ""
+
+
+def resolve_username_from_package(pkg: str) -> Tuple[str, str, str]:
+    cookie = get_cookie_from_package(pkg)
+    if not cookie:
+        return "", "", "no package cookie"
+    username, user_id = get_username_from_cookie(cookie, timeout=12)
+    if username:
+        return username, user_id, "cookie/API"
+    return "", "", "cookie API failed"
+
+
+def cached_identity(cfg: Dict[str, Any], pkg: str) -> Tuple[str, str]:
+    cache = cfg.get("identity_cache", {}) or {}
+    item = cache.get(pkg) if isinstance(cache, dict) else None
+    if not isinstance(item, dict):
+        return "", ""
+    max_age = int(cfg.get("identity_cache_seconds", 86400) or 86400)
+    ts = int(item.get("ts", 0) or 0)
+    if max_age > 0 and ts > 0 and now() - ts > max_age:
+        return "", ""
+    return str(item.get("username") or ""), str(item.get("user_id") or "")
+
+
+def remember_identity(cfg: Dict[str, Any], pkg: str, username: str, user_id: str, source: str) -> bool:
+    username = str(username or "").strip()
+    if not username:
+        return False
+    cache = cfg.setdefault("identity_cache", {})
+    old = cache.get(pkg) if isinstance(cache, dict) else None
+    new_item = {
+        "username": username,
+        "user_id": str(user_id or ""),
+        "source": str(source or "unknown"),
+        "ts": now(),
+    }
+    if old == new_item:
+        return False
+    cache[pkg] = new_item
+    return True
+
+
+def resolve_target_identity(target: PackageTarget, cfg: Dict[str, Any], refresh_api: bool = False) -> Tuple[str, str, str, bool]:
+    username = str(target.name or "").strip()
+    user_id = ""
+    source = "target name"
+    changed = False
+
+    if username.lower().startswith("clone") or username == target.package:
+        username = ""
+
+    if not refresh_api:
+        cached_name, cached_id = cached_identity(cfg, target.package)
+        if cached_name:
+            return cached_name, cached_id, "cache", False
+
+    if cfg.get("identity_api_enabled", True):
+        api_name, api_id, api_source = resolve_username_from_package(target.package)
+        if api_name:
+            changed = remember_identity(cfg, target.package, api_name, api_id, api_source)
+            return api_name, api_id, api_source, changed
+        source = api_source
+
+    if username:
+        changed = remember_identity(cfg, target.package, username, user_id, source)
+        return username, user_id, source, changed
+
+    return "", "", source, changed
+
+
+# ============================================================
 # Exact PID Android Control
 # ============================================================
 
@@ -570,20 +716,45 @@ def newest_state_file(state_dir: Path) -> Optional[Path]:
     return best
 
 
-def state_for_target(target: PackageTarget, cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def state_for_username(username: str, cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     state_dir = Path(str(cfg.get("state_dir") or STATE_DIR))
+    username = str(username or "").strip()
+    if not username:
+        return None
+
+    direct = state_dir / f"{sanitize_state_name(username)}_state.json"
+    data = read_json(direct)
+    if data is not None:
+        return data
+
+    # Fallback for older counters or case differences.
+    want = username.lower()
+    try:
+        for path in state_dir.glob("*_state.json"):
+            item = read_json(path) or {}
+            found = str(item.get("username") or item.get("user_name") or "").strip().lower()
+            if found == want:
+                return item
+    except Exception:
+        pass
+
+    return None
+
+
+def state_for_target(target: PackageTarget, cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if target.state_file:
         data = read_json(Path(target.state_file))
         if data is not None:
             return data
-    newest = newest_state_file(state_dir)
-    return read_json(newest) if newest else None
+    username, _user_id, _source, _changed = resolve_target_identity(target, cfg)
+    return state_for_username(username, cfg)
 
 
 def snapshot_for_target(target: PackageTarget, cfg: Dict[str, Any]) -> StateSnapshot:
     data = state_for_target(target, cfg) or {}
+    username, _user_id, _source, _changed = resolve_target_identity(target, cfg)
     return StateSnapshot(
-        username=str(data.get("username") or data.get("user_name") or target.name),
+        username=str(data.get("username") or data.get("user_name") or username or target.name),
         pet_count=int(data.get("pet_count", 0) or 0),
         egg_total=int(data.get("egg_total", 0) or 0),
         age=int(data.get("age", 999999) or 999999),
@@ -697,15 +868,29 @@ def cmd_list(args: argparse.Namespace) -> int:
     cfg = bootstrap_packages(load_config(args.config))
     backend = BackendClient(cfg)
     targets = configured_targets(cfg)
+    changed = False
     for target in targets:
+        username, user_id, source, did_change = resolve_target_identity(
+            target,
+            cfg,
+            refresh_api=bool(getattr(args, "refresh_api", False)),
+        )
+        changed = changed or did_change
         snapshot = snapshot_for_target(target, cfg)
         fresh = "fresh" if snapshot.raw and snapshot.age < 180 else "stale"
         alive = "alive" if package_alive(target.package) else "dead"
         decision = decide_route(target, snapshot, cfg, backend)
+        identity = username or snapshot.username or target.name
+        uid_note = f"/{user_id}" if user_id else ""
         print(
-            f"{target.name:12} {target.package:32} {target.mode:12} "
+            f"{target.name:8} {identity + uid_note:18} {target.package:26} {target.mode:8} "
             f"{alive:5} {fresh:5} pets={snapshot.pet_count:<4} -> {decision.target} ({decision.reason})"
         )
+        if source not in {"cache", "target name"}:
+            print(f"  identity: {source}")
+    if changed:
+        save_config(cfg, args.config)
+        log("identity cache updated")
     return 0
 
 
@@ -798,7 +983,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("init").set_defaults(func=cmd_init)
-    sub.add_parser("list").set_defaults(func=cmd_list)
+    list_cmd = sub.add_parser("list")
+    list_cmd.add_argument("--refresh-api", action="store_true")
+    list_cmd.set_defaults(func=cmd_list)
     sub.add_parser("doctor").set_defaults(func=cmd_doctor)
 
     report = sub.add_parser("report")
