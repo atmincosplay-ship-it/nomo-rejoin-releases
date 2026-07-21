@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-VERSION = "V0.7 DEV TERMINAL FIX"
+VERSION = "V0.8 DEV STATUS POLISH"
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_clean")
 CONFIG_FILE = BASE_DIR / "config.json"
 RUNTIME_FILE = BASE_DIR / "runtime.json"
@@ -981,7 +981,7 @@ def print_target_table(rows: List[Dict[str, Any]]) -> None:
         out(f"{index}. {cut_text(row.get('name'), 10)}")
         out(f"user {cut_text(row.get('identity'), 14)}")
         out(f"pkg  {cut_text(row.get('package'), 10)}")
-        out(f"run  {cut_text(row.get('alive'), 4)} {cut_text(row.get('fresh'), 2)}")
+        out(f"run  {cut_text(row.get('alive'), 4)} {cut_text(row.get('fresh'), 5)}")
         out(f"pets {int(row.get('pets') or 0)}")
         out(f"to   {cut_text(row.get('route'), 20)}")
         out("")
@@ -1200,7 +1200,7 @@ def watch_once(
         if row.get("note"):
             action_text = f"{action_text}:{row.get('note')}"
         out(f"{row.get('time')} {cut_text(row.get('name'), 8)}")
-        out(f"run  {cut_text(row.get('run'), 4)} {cut_text(row.get('state'), 2)}")
+        out(f"run  {cut_text(row.get('run'), 4)} {cut_text(row.get('state'), 5)}")
         out(f"pets {int(row.get('pets') or 0)} age {cut_text(row.get('age'), 4)}")
         out(f"to   {cut_text(row.get('route'), 20)}")
         if action_text != "-":
