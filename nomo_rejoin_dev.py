@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.59.7-dev-setup-health"
+__version__ = "V4.59.8-dev-doctor"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -4813,6 +4813,7 @@ MAIN_MENU_ITEMS = [
     ("18", "APK download / install"),
     ("19", "Delta device key manager"),
     ("20", "Executor storage / paths"),
+    ("21", "Doctor / state paths"),
     ("0",  "Exit"),
 ]
 
@@ -19264,6 +19265,85 @@ def executor_storage_paths_menu(cfg):
     pause()
 
 
+def executor_storage_doctor_menu(cfg):
+    """Read-only package/executor/state diagnostic screen."""
+    cfg = load_config()
+    tabs = [
+        tab
+        for tab in cfg.get("tabs", [])
+        if isinstance(tab, dict) and str(tab.get("package") or "").strip()
+    ]
+    enabled = [tab for tab in tabs if tab.get("enabled", True)]
+    shown_tabs = enabled or tabs
+
+    clear()
+    banner("DOCTOR: EXECUTOR / STATE PATHS", cfg)
+    print(col("Read-only. No package is opened, stopped, or modified.", DIM))
+    print("")
+
+    if not shown_tabs:
+        print(col("No configured packages found.", RED))
+        pause()
+        return
+
+    rows = []
+    detail_lines = []
+    for tab in shown_tabs:
+        pkg = str(tab.get("package") or "")
+        user = str(tab.get("user_name") or tab.get("username") or "")
+        storage = str(tab.get("executor_storage") or cfg.get("executor_storage_mode") or "auto")
+        state_path = resolve_state_path(tab)
+        state, err = read_state(tab)
+        if state:
+            age = int(state.get("age", 999999) or 999999)
+            age_text = format_age(age) if age < 999999 else "old"
+            state_color = GREEN if age <= 20 else (YELLOW if age <= 180 else RED)
+            status_text = f"OK {age_text}"
+            state_user = str(state.get("username") or "")
+        else:
+            state_color = YELLOW if err == "missing" else RED
+            status_text = str(err or "no state")
+            state_user = "-"
+
+        auto_dirs = autoexec_dirs_for_tab(tab, "1")
+        auto_path = auto_dirs[0][1] if auto_dirs else None
+        auto_ok = bool(auto_path and Path(auto_path).exists())
+        auto_text = "OK" if auto_ok else "missing"
+        auto_color = GREEN if auto_ok else YELLOW
+
+        rows.append([
+            (short_pkg(pkg), CYAN),
+            (cut(user, 12), WHITE),
+            (cut(storage, 13), WHITE),
+            (status_text, state_color),
+            (auto_text, auto_color),
+        ])
+        detail_lines.append((pkg, user, state_user, state_path, auto_path, err))
+
+    draw_table(
+        ["Package", "ConfigUser", "Storage", "State", "AutoExec"],
+        rows,
+        [12, 12, 13, 18, 9],
+        cfg,
+    )
+
+    print("")
+    print(col("Details:", BOLD))
+    for pkg, user, state_user, state_path, auto_path, err in detail_lines:
+        print(col(f"{short_pkg(pkg)}", CYAN))
+        print(col(f"  config user : {user or '-'}", DIM))
+        print(col(f"  state user  : {state_user or '-'}", DIM))
+        print(col(f"  expected    : {expected_state_name({'user_name': user, 'stat_file': str(state_path or '')})}", DIM))
+        print(col(f"  state path  : {state_path or '-'}", DIM))
+        print(col(f"  autoexec    : {auto_path or '-'}", DIM))
+        if err and err != "missing":
+            print(col(f"  warning     : {err}", RED))
+
+    print("")
+    print(col("If State is missing/old: install/update AutoExec counter, then enter the game and wait 10-20s.", DIM))
+    pause()
+
+
 def _new_tab_for_package(pkg, position=0):
     hint = _package_clone_number_hint(pkg)
     idx = max(0, int(hint - 1 if hint else (position or 0)))
@@ -32819,6 +32899,11 @@ def main():
 
         elif choice == "20":
             executor_storage_paths_menu(cfg)
+            cfg = load_config()
+            normalize_active_mode_flags(cfg)
+
+        elif choice == "21":
+            executor_storage_doctor_menu(cfg)
             cfg = load_config()
             normalize_active_mode_flags(cfg)
 

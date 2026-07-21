@@ -3,7 +3,7 @@ NOMO Rejoin Dev
 
 This dev channel now uses the full source UI/menu/table from the working
 rejoin source, with dev paths so stable `nomo` is not overwritten.
-V4.59.7 adds setup/path state-health summaries for fresh Redfinger debugging.
+V4.59.8 adds a read-only doctor screen for executor/state path diagnostics.
 
 Install / Update
 ----------------
