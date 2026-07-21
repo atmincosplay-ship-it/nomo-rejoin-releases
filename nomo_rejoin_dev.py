@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.59.8-dev-doctor"
+__version__ = "V4.59.9-dev-doctor-hints"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -19294,22 +19294,33 @@ def executor_storage_doctor_menu(cfg):
         storage = str(tab.get("executor_storage") or cfg.get("executor_storage_mode") or "auto")
         state_path = resolve_state_path(tab)
         state, err = read_state(tab)
+        fix_hint = ""
         if state:
             age = int(state.get("age", 999999) or 999999)
             age_text = format_age(age) if age < 999999 else "old"
             state_color = GREEN if age <= 20 else (YELLOW if age <= 180 else RED)
             status_text = f"OK {age_text}"
             state_user = str(state.get("username") or "")
+            if age > 180:
+                fix_hint = "Counter is stale: open clone, ensure AutoExec ran, wait 10-20s."
         else:
             state_color = YELLOW if err == "missing" else RED
             status_text = str(err or "no state")
             state_user = "-"
+            if err == "missing":
+                fix_hint = "State missing: install/update AutoExec counter, then enter game."
+            elif "username mismatch" in str(err or "").lower():
+                fix_hint = "Username mismatch: run option 20 or refresh usernames after the correct clone writes state."
+            else:
+                fix_hint = "State read failed: check expected path and executor storage mode."
 
         auto_dirs = autoexec_dirs_for_tab(tab, "1")
         auto_path = auto_dirs[0][1] if auto_dirs else None
         auto_ok = bool(auto_path and Path(auto_path).exists())
         auto_text = "OK" if auto_ok else "missing"
         auto_color = GREEN if auto_ok else YELLOW
+        if not auto_ok:
+            fix_hint = "AutoExec folder missing: choose the correct executor storage path with option 20."
 
         rows.append([
             (short_pkg(pkg), CYAN),
@@ -19318,7 +19329,7 @@ def executor_storage_doctor_menu(cfg):
             (status_text, state_color),
             (auto_text, auto_color),
         ])
-        detail_lines.append((pkg, user, state_user, state_path, auto_path, err))
+        detail_lines.append((pkg, user, state_user, state_path, auto_path, err, fix_hint))
 
     draw_table(
         ["Package", "ConfigUser", "Storage", "State", "AutoExec"],
@@ -19329,7 +19340,7 @@ def executor_storage_doctor_menu(cfg):
 
     print("")
     print(col("Details:", BOLD))
-    for pkg, user, state_user, state_path, auto_path, err in detail_lines:
+    for pkg, user, state_user, state_path, auto_path, err, fix_hint in detail_lines:
         print(col(f"{short_pkg(pkg)}", CYAN))
         print(col(f"  config user : {user or '-'}", DIM))
         print(col(f"  state user  : {state_user or '-'}", DIM))
@@ -19338,6 +19349,8 @@ def executor_storage_doctor_menu(cfg):
         print(col(f"  autoexec    : {auto_path or '-'}", DIM))
         if err and err != "missing":
             print(col(f"  warning     : {err}", RED))
+        if fix_hint:
+            print(col(f"  fix         : {fix_hint}", YELLOW))
 
     print("")
     print(col("If State is missing/old: install/update AutoExec counter, then enter the game and wait 10-20s.", DIM))
