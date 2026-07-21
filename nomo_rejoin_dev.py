@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-VERSION = "V1.9 DEV OPEN VERIFY"
+VERSION = "V1.10 DEV VERIFY DISPLAY"
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_clean")
 CONFIG_FILE = BASE_DIR / "config.json"
 RUNTIME_FILE = BASE_DIR / "runtime.json"
@@ -1320,6 +1320,11 @@ def _clear_pending_open(runtime: Dict[str, Any], target: PackageTarget, note: st
     item.pop("pending_open_version", None)
 
 
+def _pending_verify_note(pending_age: int, open_verify_seconds: int) -> str:
+    remaining = max(0, int(open_verify_seconds - pending_age))
+    return f"wait {remaining}s" if remaining > 0 else "retry due"
+
+
 def watch_once(
     cfg: Dict[str, Any],
     runtime: Dict[str, Any],
@@ -1368,7 +1373,7 @@ def watch_once(
         blocked_note = f"fleet {fleet_wait_left}s" if not can_fleet_act else f"cooldown {wait_left}s"
         if pending_open_at and stale and pending_age < open_verify_seconds:
             action = "verify_open"
-            action_note = f"wait {open_verify_seconds - pending_age}s"
+            action_note = _pending_verify_note(pending_age, open_verify_seconds)
         elif not alive and bool(watch_cfg.get("restart_dead_packages", True)):
             action = "restart_dead"
             if apply_actions and acted_this_cycle:
@@ -1383,6 +1388,9 @@ def watch_once(
                     return True
                 acted_this_cycle = acted_this_cycle or ok
                 _mark_action(runtime, target, action, action_note, pending_open=ok)
+                if ok:
+                    action = "verify_open"
+                    action_note = "started"
             elif apply_actions:
                 action_note = blocked_note
         elif snapshot.disconnected and bool(watch_cfg.get("recover_disconnected", True)):
@@ -1399,6 +1407,9 @@ def watch_once(
                     return True
                 acted_this_cycle = acted_this_cycle or ok
                 _mark_action(runtime, target, action, action_note, pending_open=ok)
+                if ok:
+                    action = "verify_open"
+                    action_note = "started"
             elif apply_actions:
                 action_note = blocked_note
         elif (
@@ -1420,6 +1431,9 @@ def watch_once(
                     return True
                 acted_this_cycle = acted_this_cycle or ok
                 _mark_action(runtime, target, action, action_note, pending_open=ok)
+                if ok:
+                    action = "verify_open"
+                    action_note = "started"
             elif apply_actions:
                 action_note = f"wait {max(action_wait_left, open_verify_seconds - pending_age)}s"
         elif (
@@ -1441,6 +1455,9 @@ def watch_once(
                     return True
                 acted_this_cycle = acted_this_cycle or ok
                 _mark_action(runtime, target, action, action_note, pending_open=ok)
+                if ok:
+                    action = "verify_open"
+                    action_note = "started"
             elif apply_actions:
                 action_note = blocked_note
         elif stale and alive and bool(watch_cfg.get("soft_open_alive_stale", False)):
@@ -1457,6 +1474,9 @@ def watch_once(
                     return True
                 acted_this_cycle = acted_this_cycle or ok
                 _mark_action(runtime, target, action, action_note, pending_open=ok)
+                if ok:
+                    action = "verify_open"
+                    action_note = "started"
             elif apply_actions:
                 action_note = blocked_note
         elif (
@@ -1476,6 +1496,9 @@ def watch_once(
                     return True
                 acted_this_cycle = acted_this_cycle or ok
                 _mark_action(runtime, target, action, action_note, pending_open=ok)
+                if ok:
+                    action = "verify_open"
+                    action_note = "started"
             elif apply_actions:
                 action_note = blocked_note
         elif decision.report_backend and report_workers and backend.enabled():
