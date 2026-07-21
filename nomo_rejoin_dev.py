@@ -29,9 +29,10 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-VERSION = "V0.3 DEV MENU"
+VERSION = "V0.4 DEV WATCH LOOP"
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_clean")
 CONFIG_FILE = BASE_DIR / "config.json"
+RUNTIME_FILE = BASE_DIR / "runtime.json"
 DELTA_STATE_DIR = Path("/storage/emulated/0/Delta/Workspace/nomo_rejoiner")
 STATE_DIR = DELTA_STATE_DIR
 
@@ -53,6 +54,16 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "identity_cache_seconds": 86400,
     "identity_cache": {},
     "open_cooldown_seconds": 8,
+    "watch": {
+        "interval_seconds": 20,
+        "action_cooldown_seconds": 180,
+        "state_stale_seconds": 180,
+        "restart_dead_packages": True,
+        "recover_disconnected": True,
+        "soft_open_alive_stale": False,
+        "route_market_restock": True,
+        "report_workers": True,
+    },
     "backend": {
         "provider": "cloudflare",
         "worker_url": "https://nomo-rejoin.atmincosplay.workers.dev",
@@ -170,6 +181,20 @@ def save_config(cfg: Dict[str, Any], path: Path = CONFIG_FILE) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(cfg, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(path)
+
+
+def load_runtime(path: Path = RUNTIME_FILE) -> Dict[str, Any]:
+    data = read_json(path)
+    if isinstance(data, dict):
+        return data
+    return {}
+
+
+def save_runtime(data: Dict[str, Any], path: Path = RUNTIME_FILE) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
     tmp.replace(path)
 
 
@@ -971,6 +996,135 @@ def cmd_route(args: argparse.Namespace) -> int:
     return 0 if ok_all else 1
 
 
+def _runtime_target(runtime: Dict[str, Any], target: PackageTarget) -> Dict[str, Any]:
+    targets = runtime.setdefault("targets", {})
+    return targets.setdefault(target.package, {})
+
+
+def _can_act(runtime: Dict[str, Any], target: PackageTarget, cooldown: int) -> Tuple[bool, int]:
+    item = _runtime_target(runtime, target)
+    last = int(item.get("last_action_at", 0) or 0)
+    remaining = max(0, int(last + cooldown - time.time()))
+    return remaining <= 0, remaining
+
+
+def _mark_action(runtime: Dict[str, Any], target: PackageTarget, action: str, note: str) -> None:
+    item = _runtime_target(runtime, target)
+    item["last_action_at"] = int(time.time())
+    item["last_action"] = str(action)
+    item["last_note"] = str(note)
+
+
+def watch_once(
+    cfg: Dict[str, Any],
+    runtime: Dict[str, Any],
+    apply_actions: bool = False,
+) -> None:
+    cfg = bootstrap_packages(cfg)
+    backend = BackendClient(cfg)
+    engine = RejoinEngine(cfg)
+    watch_cfg = cfg.get("watch", {}) or {}
+    cooldown = int(watch_cfg.get("action_cooldown_seconds", 180) or 180)
+    stale_seconds = int(watch_cfg.get("state_stale_seconds", 180) or 180)
+    report_workers = bool(watch_cfg.get("report_workers", True))
+
+    for target in configured_targets(cfg):
+        if not target.enabled:
+            continue
+
+        snapshot = snapshot_for_target(target, cfg)
+        alive = package_alive(target.package)
+        has_state = bool(snapshot.raw)
+        stale = (not has_state) or snapshot.age > stale_seconds
+        decision = decide_route(target, snapshot, cfg, backend)
+        can_act, wait_left = _can_act(runtime, target, cooldown)
+
+        status_bits = [
+            "alive" if alive else "dead",
+            "stale" if stale else "fresh",
+            f"pets={snapshot.pet_count}",
+            f"age={snapshot.age if has_state else '-'}",
+            f"route={decision.target}:{decision.reason}",
+        ]
+
+        action = ""
+        action_note = ""
+        if not alive and bool(watch_cfg.get("restart_dead_packages", True)):
+            action = "restart_dead"
+            if apply_actions and can_act:
+                ok, action_note = engine.restart(target, soft=False)
+                _mark_action(runtime, target, action, action_note)
+            elif apply_actions:
+                action_note = f"cooldown {wait_left}s"
+        elif snapshot.disconnected and bool(watch_cfg.get("recover_disconnected", True)):
+            action = "recover_disconnected"
+            if apply_actions and can_act:
+                ok, action_note = engine.apply_decision(target, decision)
+                _mark_action(runtime, target, action, action_note)
+            elif apply_actions:
+                action_note = f"cooldown {wait_left}s"
+        elif stale and alive and bool(watch_cfg.get("soft_open_alive_stale", False)):
+            action = "soft_open_stale"
+            if apply_actions and can_act:
+                ok, action_note = engine.restart(target, soft=True)
+                _mark_action(runtime, target, action, action_note)
+            elif apply_actions:
+                action_note = f"cooldown {wait_left}s"
+        elif (
+            decision.target == "restock"
+            and bool(watch_cfg.get("route_market_restock", True))
+        ):
+            action = "route_restock"
+            if apply_actions and can_act:
+                ok, action_note = engine.apply_decision(target, decision)
+                _mark_action(runtime, target, action, action_note)
+            elif apply_actions:
+                action_note = f"cooldown {wait_left}s"
+        elif decision.report_backend and report_workers and backend.enabled():
+            action = "report_worker"
+            if apply_actions and can_act:
+                ok, action_note = backend.update_worker(
+                    target.name,
+                    target.mode,
+                    snapshot,
+                    target.link,
+                )
+                _mark_action(runtime, target, action, action_note)
+            elif apply_actions:
+                action_note = f"cooldown {wait_left}s"
+
+        if action:
+            status_bits.append(("would " if not apply_actions else "") + action)
+        if action_note:
+            status_bits.append(action_note)
+
+        print(f"{time.strftime('%H:%M:%S')} {target.name:8} " + " | ".join(status_bits))
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    cfg = bootstrap_packages(load_config(args.config))
+    save_config(cfg, args.config)
+    runtime = load_runtime()
+    watch_cfg = cfg.get("watch", {}) or {}
+    interval = int(getattr(args, "interval", 0) or watch_cfg.get("interval_seconds", 20) or 20)
+    apply_actions = bool(getattr(args, "apply", False))
+    once = bool(getattr(args, "once", False))
+
+    print(f"NOMO Rejoin Clean {VERSION}")
+    print("watch mode: " + ("APPLY actions" if apply_actions else "DRY RUN observe only"))
+    print("Q/Ctrl+C to stop")
+    try:
+        while True:
+            watch_once(cfg, runtime, apply_actions=apply_actions)
+            save_runtime(runtime)
+            if once:
+                return 0
+            time.sleep(max(5, interval))
+    except KeyboardInterrupt:
+        print("")
+        return 130
+
+
 def cmd_stop(args: argparse.Namespace) -> int:
     cfg = bootstrap_packages(load_config(args.config))
     targets = filter_targets(configured_targets(cfg), args.target)
@@ -1060,7 +1214,9 @@ def cmd_menu(args: argparse.Namespace) -> int:
         print("6. Stop one clone")
         print("7. Init / refresh detected packages")
         print("8. Report workers to backend")
-        print("9. Exit")
+        print("9. Watch once (dry-run)")
+        print("10. Run monitor loop (apply actions)")
+        print("11. Exit")
         print("")
         print(f"Detected clones: {len(targets)}")
         choice = input("> ").strip().lower()
@@ -1102,7 +1258,17 @@ def cmd_menu(args: argparse.Namespace) -> int:
                 if target:
                     cmd_report(argparse.Namespace(config=config_path, target=target))
                 pause_menu()
-            elif choice in {"9", "q", "quit", "exit"}:
+            elif choice in {"9", "watch"}:
+                cmd_watch(argparse.Namespace(config=config_path, interval=0, apply=False, once=True))
+                pause_menu()
+            elif choice in {"10", "run"}:
+                confirm = input("Run monitor with real actions? type yes: ").strip().lower()
+                if confirm == "yes":
+                    cmd_watch(argparse.Namespace(config=config_path, interval=0, apply=True, once=False))
+                else:
+                    print("Cancelled.")
+                    pause_menu()
+            elif choice in {"11", "q", "quit", "exit"}:
                 return 0
             else:
                 print("Unknown option.")
@@ -1144,6 +1310,12 @@ def build_parser() -> argparse.ArgumentParser:
     report = sub.add_parser("report")
     report.add_argument("target", nargs="?", default="all")
     report.set_defaults(func=cmd_report)
+
+    watch = sub.add_parser("watch")
+    watch.add_argument("--apply", action="store_true")
+    watch.add_argument("--once", action="store_true")
+    watch.add_argument("--interval", type=int, default=0)
+    watch.set_defaults(func=cmd_watch)
 
     route = sub.add_parser("route")
     route.add_argument("target", nargs="?", default="all")

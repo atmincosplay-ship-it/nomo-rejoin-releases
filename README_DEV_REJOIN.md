@@ -76,6 +76,25 @@ This is still a dev skeleton. Only test after config and state look correct:
 nomo-dev route clone1
 ```
 
+Watch Loop Test
+---------------
+
+Dry-run first. This prints what the controller would do, but does not restart
+or route anything:
+
+```sh
+nomo-dev watch --once
+nomo-dev watch
+```
+
+Only after the dry-run output looks correct:
+
+```sh
+nomo-dev watch --apply
+```
+
+The watch loop keeps exact-PID stop only and applies per-clone cooldowns.
+
 Stable stays separate:
 
 ```sh
