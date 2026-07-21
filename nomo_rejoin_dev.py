@@ -18,6 +18,7 @@ import os
 import re
 import shlex
 import signal
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -31,7 +32,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-VERSION = "V1.7 DEV SOURCE CONTROLS"
+VERSION = "V1.8 DEV NARROW WATCH"
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_clean")
 CONFIG_FILE = BASE_DIR / "config.json"
 RUNTIME_FILE = BASE_DIR / "runtime.json"
@@ -1093,6 +1094,13 @@ def cut_text(value: Any, width: int) -> str:
     return text[: width - 1] + "~"
 
 
+def term_width(default: int = 72) -> int:
+    try:
+        return max(40, min(120, shutil.get_terminal_size((default, 24)).columns))
+    except Exception:
+        return default
+
+
 BRACKETED_PASTE_RE = re.compile(r"\x1b\[(?:200|201)~")
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
@@ -1270,6 +1278,14 @@ def _can_fleet_act(runtime: Dict[str, Any], cooldown: int) -> Tuple[bool, int]:
     last = int(runtime.get("last_fleet_action_at", 0) or 0)
     remaining = max(0, int(last + cooldown - time.time()))
     return remaining <= 0, remaining
+
+
+def fleet_status_text(runtime: Dict[str, Any], cooldown: int) -> str:
+    _ok, remaining = _can_fleet_act(runtime, cooldown)
+    last = str(runtime.get("last_fleet_action") or "-")
+    if remaining > 0:
+        return f"fleet wait {remaining}s | last {cut_text(last, 18)}"
+    return f"fleet ready | last {cut_text(last, 18)}"
 
 
 def _mark_action(
@@ -1487,22 +1503,38 @@ def watch_once(
             }
         )
 
-    out("TIME     CLONE    RUN  ST   PETS AGE   ROUTE                 ACTION")
-    out("-------  -------  ---  ---  ---- ----  --------------------  ----------------")
+    width = term_width()
+    if width < 78:
+        out("CLONE    RUN/ST PETS AGE   ROUTE/ACTION")
+        out("-------  ------ ---- ----  ----------------------------")
+    else:
+        out("TIME     CLONE    RUN ST PETS AGE   ROUTE            ACTION")
+        out("-------  -------  --- -- ---- ----  ---------------  ------------")
     for row in rows:
         action_text = row.get("action") or "-"
         if row.get("note"):
             action_text = f"{action_text}:{row.get('note')}"
-        out(
-            f"{cut_text(row.get('time'), 7):<7}  "
-            f"{cut_text(row.get('name'), 7):<7}  "
-            f"{cut_text(row.get('run'), 3):<3}  "
-            f"{cut_text(row.get('state'), 3):<3}  "
-            f"{int(row.get('pets') or 0):>4} "
-            f"{cut_text(row.get('age'), 4):<4}  "
-            f"{cut_text(row.get('route'), 20):<20}  "
-            f"{cut_text(action_text, 16):<16}"
-        )
+        if width < 78:
+            out(
+                f"{cut_text(row.get('name'), 7):<7}  "
+                f"{cut_text(row.get('run'), 3):<3}/{cut_text(row.get('state'), 3):<3} "
+                f"{int(row.get('pets') or 0):>4} "
+                f"{cut_text(row.get('age'), 4):<4}  "
+                f"{cut_text(row.get('route'), 13):<13} {cut_text(action_text, 12):<12}"
+            )
+        else:
+            out(
+                f"{cut_text(row.get('time'), 7):<7}  "
+                f"{cut_text(row.get('name'), 7):<7}  "
+                f"{cut_text(row.get('run'), 3):<3} "
+                f"{cut_text(row.get('state'), 2):<2} "
+                f"{int(row.get('pets') or 0):>4} "
+                f"{cut_text(row.get('age'), 4):<4}  "
+                f"{cut_text(row.get('route'), 15):<15}  "
+                f"{cut_text(action_text, 12):<12}"
+            )
+    out("")
+    out(fleet_status_text(runtime, fleet_cooldown))
     out("")
 
     return False
@@ -1527,9 +1559,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
             while True:
                 if not once:
                     os.system("clear")
-                    out(f"NOMO Rejoin Clean {VERSION}")
-                    out("watch mode: " + ("APPLY actions" if apply_actions else "DRY RUN observe only"))
-                    out("press q to stop | Ctrl+C backup")
+                    out(f"NOMO {VERSION}")
+                    out(("APPLY" if apply_actions else "DRY") + " | q stop | Ctrl+C backup")
                     out("")
                 if stop_key_pressed() or watch_stop_requested():
                     out("watch stopped")
