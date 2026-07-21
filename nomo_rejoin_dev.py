@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.60.3-dev-doctor-verdicts"
+__version__ = "V4.60.4-dev-quick-list"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -19474,6 +19474,94 @@ def route_explain_menu(cfg, pause_at_end=True):
         pause()
 
 
+def quick_list_menu(cfg, pause_at_end=False):
+    """One-shot read-only clone status for CLI/mobile checks."""
+    cfg = load_config()
+    rt = load_runtime()
+    tabs = [
+        tab for tab in cfg.get("tabs", [])
+        if isinstance(tab, dict)
+        and str(tab.get("package") or "").strip()
+        and tab.get("enabled", True)
+    ]
+
+    clear()
+    banner("QUICK LIST", cfg)
+    print(col("Read-only. Current clone state, no rejoin actions.", DIM))
+    print("")
+
+    if not tabs:
+        print(col("No enabled packages found.", RED))
+        if pause_at_end:
+            pause()
+        return
+
+    refresh_process_list(cfg, force=True)
+    rows = []
+    fresh_count = 0
+    stale_count = 0
+    dead_count = 0
+    for tab in tabs:
+        pkg = str(tab.get("package") or "")
+        user = str(tab.get("user_name") or tab.get("username") or pkg)
+        rt_tab = get_runtime_tab(rt, pkg)
+        target = str(rt_tab.get("target") or "market")
+        mode = "restock" if target == "hatcher" else target
+        alive = package_alive(pkg, cfg)
+        state, err = read_state(tab)
+
+        if state:
+            pets = int(state.get("pet_count", 0) or 0)
+            eggs = int(state.get("egg_total", 0) or 0)
+            age = int(state.get("age", 999999) or 999999)
+            age_text = format_age(age)
+            if age <= 20:
+                state_text = "fresh"
+                state_color = GREEN
+                fresh_count += 1
+            else:
+                state_text = "stale"
+                state_color = YELLOW if alive else RED
+                stale_count += 1
+        else:
+            pets = "-"
+            eggs = "-"
+            age_text = "-"
+            state_text = cut(str(err or "missing"), 12)
+            state_color = RED
+            if not alive:
+                dead_count += 1
+
+        rows.append([
+            (short_pkg(pkg), CYAN),
+            (cut(user, 12), WHITE),
+            (cut(mode, 8), BLUE if mode == "restock" else MAGENTA if mode == "market" else WHITE),
+            ("alive" if alive else "dead", GREEN if alive else RED),
+            (str(pets), pet_color(pets, cfg), True),
+            (str(eggs), WHITE, True),
+            (age_text, DIM),
+            (state_text, state_color),
+        ])
+
+    draw_table(
+        ["Pkg", "User", "Mode", "Proc", "Pet", "Egg", "Age", "State"],
+        rows,
+        [8, 12, 8, 6, 5, 5, 7, 12],
+        cfg,
+    )
+
+    print("")
+    print(
+        col("Summary: ", BOLD)
+        + col(f"{len(tabs)} tabs", WHITE)
+        + col(f" | {fresh_count} fresh", GREEN)
+        + col(f" | {stale_count} stale", YELLOW)
+        + col(f" | {dead_count} dead/no-state", RED if dead_count else DIM)
+    )
+    if pause_at_end:
+        pause()
+
+
 def doctor_health_menu(cfg):
     """Small hub for read-only diagnostics."""
     while True:
@@ -19483,19 +19571,22 @@ def doctor_health_menu(cfg):
         print(col("Read-only diagnostics. No package is opened, stopped, or modified.", DIM))
         print("")
         rows = [
-            ("1", "Route explain", CYAN, WHITE),
-            ("2", "Executor / state paths", CYAN, WHITE),
+            ("1", "Quick list", CYAN, WHITE),
+            ("2", "Route explain", CYAN, WHITE),
+            ("3", "Executor / state paths", CYAN, WHITE),
             ("0", "Back", RED, WHITE),
         ]
         draw_boxed_menu(rows, cfg)
 
         drain_stdin()
-        ch = read_menu_choice("\nDoctor: ", {"0", "1", "2", "q", "b", "back"})
+        ch = read_menu_choice("\nDoctor: ", {"0", "1", "2", "3", "q", "b", "back"})
         if ch in {"0", "q", "b", "back", None}:
             return
         if ch == "1":
-            route_explain_menu(cfg)
+            quick_list_menu(cfg, pause_at_end=True)
         elif ch == "2":
+            route_explain_menu(cfg)
+        elif ch == "3":
             executor_storage_doctor_menu(cfg)
 
 
@@ -28660,8 +28751,8 @@ def handle_nomo_cli_command():
     if len(sys.argv) < 2:
         return False
     command = clean_terminal_input(sys.argv[1]).lower()
-    if command not in {"update", "install", "version", "rollback", "source", "repo", "repair", "doctor", "diag", "status", "why", "route", "routes"}:
-        print("Usage: nomo [update|version|rollback|source|repair|doctor|why]")
+    if command not in {"update", "install", "version", "rollback", "source", "repo", "repair", "doctor", "diag", "status", "why", "route", "routes", "list", "ls"}:
+        print("Usage: nomo [update|version|rollback|source|repair|doctor|why|list]")
         return True
 
     cfg = load_config()
@@ -28681,6 +28772,8 @@ def handle_nomo_cli_command():
             executor_storage_doctor_menu(cfg, pause_at_end=False)
         elif command in {"why", "route", "routes"}:
             route_explain_menu(cfg, pause_at_end=False)
+        elif command in {"list", "ls"}:
+            quick_list_menu(cfg, pause_at_end=False)
         elif command == "rollback":
             backups = _nomo_list_backups()
             if not backups:
