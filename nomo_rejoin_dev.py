@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.59.1-dev-core-rejoin"
+__version__ = "V4.59.2-dev-core-verify"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -3936,6 +3936,25 @@ def core_rejoin_package(
             rt_tab["core_pending_open_failed_at"] = now()
 
     return ok, note
+
+
+def core_finish_rejoin(rt_tab, *, verified=False, note="", state_ts=0):
+    """Complete the shared rejoin attempt bookkeeping after state verification."""
+    if rt_tab is None:
+        return
+    finished_at = now()
+    rt_tab["core_last_verify_at"] = finished_at
+    rt_tab["core_last_verify_ok"] = bool(verified)
+    rt_tab["core_last_verify_note"] = str(note or "")
+    if state_ts:
+        rt_tab["core_last_verify_state_ts"] = int(state_ts or 0)
+    if verified:
+        rt_tab["core_last_verified_open_at"] = int(
+            rt_tab.get("core_pending_open_at", 0) or 0
+        )
+        rt_tab["core_pending_open_at"] = 0
+        rt_tab["core_pending_open_reason"] = ""
+        rt_tab["core_pending_open_target"] = ""
 
 
 # ============================================================
@@ -11516,6 +11535,11 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
             rt_tab["note"] = "route " + fresh_msg
         else:
             rt_tab["note"] = fresh_msg
+        core_finish_rejoin(
+            rt_tab,
+            verified=bool(fresh_ok),
+            note=fresh_msg,
+        )
         save_runtime(rt)
 
         if fresh_msg == "solver result":
@@ -11654,6 +11678,11 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                 queue_open(open_queue, tab, target, "soft fallback hard", force=True, mode="hard_force", front=True)
     else:
         rt_tab["note"] = msg
+        core_finish_rejoin(
+            rt_tab,
+            verified=False,
+            note=msg,
+        )
         save_runtime(rt)
 
         if mode in ("soft", "route") and cfg.get("soft_hop_fallback_hard", True):

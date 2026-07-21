@@ -3,7 +3,7 @@ NOMO Rejoin Dev
 
 This dev channel now uses the full source UI/menu/table from the working
 rejoin source, with dev paths so stable `nomo` is not overwritten.
-V4.59.1 adds a shared core rejoin wrapper used by the queued mode opens.
+V4.59.2 adds shared core rejoin open + verification bookkeeping for queued mode opens.
 
 Install / Update
 ----------------
