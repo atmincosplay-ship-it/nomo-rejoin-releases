@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.60.1-dev-route-wording"
+__version__ = "V4.60.2-dev-doctor-menu"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -4813,7 +4813,7 @@ MAIN_MENU_ITEMS = [
     ("18", "APK download / install"),
     ("19", "Delta device key manager"),
     ("20", "Executor storage / paths"),
-    ("21", "Doctor / paths"),
+    ("21", "Doctor / health"),
     ("0",  "Exit"),
 ]
 
@@ -6582,7 +6582,7 @@ def market_only_settings(cfg):
             ],
         ),
         "2": (
-            "MARKET JSONBIN HATCHER PICKER",
+            "MARKET RESTOCK SOURCE PICKER",
             [
                 ("jsonbin_min_hatcher_pets", "min_hatcher_pets_to_use"),
                 ("jsonbin_no_hatcher_action", "if_no_valid_hatcher"),
@@ -6597,7 +6597,7 @@ def market_only_settings(cfg):
         print(col("Global/shared stuff stays in main menu option 11.", DIM))
         print("")
         print("1. Pet routing / restock")
-        print("2. JSONBin hatcher picker")
+        print("2. Restock source picker")
         print("3. Booster pool / manual safe join")
         print("0. Save/back")
         print(col("Tip: on true/false settings, choose it and press ENTER to toggle.", DIM))
@@ -6641,7 +6641,7 @@ def config_template_menu(cfg):
                     print(f"  {key}: {show_config_value(key, tpl.get(key))}")
             print("")
         print("1. Apply template to current config now")
-        print("2. Save current JSONBin/backend settings as template")
+        print("2. Save current Cloudflare/backend settings as template")
         print("3. Show Termux edit command")
         print("0. Back")
 
@@ -19433,6 +19433,31 @@ def route_explain_menu(cfg, pause_at_end=True):
     print(col(f"Rules: <{cfg.get('restock_below', 50)} restock | >={cfg.get('ready_market_at', 200)} market | old state recovers.", DIM))
     if pause_at_end:
         pause()
+
+
+def doctor_health_menu(cfg):
+    """Small hub for read-only diagnostics."""
+    while True:
+        cfg = load_config()
+        clear()
+        banner("DOCTOR / HEALTH", cfg)
+        print(col("Read-only diagnostics. No package is opened, stopped, or modified.", DIM))
+        print("")
+        rows = [
+            ("1", "Route explain", CYAN, WHITE),
+            ("2", "Executor / state paths", CYAN, WHITE),
+            ("0", "Back", RED, WHITE),
+        ]
+        draw_boxed_menu(rows, cfg)
+
+        drain_stdin()
+        ch = read_menu_choice("\nDoctor: ", {"0", "1", "2", "q", "b", "back"})
+        if ch in {"0", "q", "b", "back", None}:
+            return
+        if ch == "1":
+            route_explain_menu(cfg)
+        elif ch == "2":
+            executor_storage_doctor_menu(cfg)
 
 
 def _new_tab_for_package(pkg, position=0):
@@ -32998,7 +33023,7 @@ def main():
             normalize_active_mode_flags(cfg)
 
         elif choice == "21":
-            executor_storage_doctor_menu(cfg)
+            doctor_health_menu(cfg)
             cfg = load_config()
             normalize_active_mode_flags(cfg)
 
