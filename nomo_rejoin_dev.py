@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.60.2-dev-doctor-menu"
+__version__ = "V4.60.3-dev-doctor-verdicts"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -19253,30 +19253,56 @@ def executor_storage_doctor_menu(cfg, pause_at_end=True):
         pause()
         return
 
+    refresh_process_list(cfg, force=True)
+    summary = {
+        "fresh": 0,
+        "stale": 0,
+        "broken": 0,
+        "mismatch": 0,
+    }
     rows = []
     detail_lines = []
     for tab in shown_tabs:
         pkg = str(tab.get("package") or "")
         user = str(tab.get("user_name") or tab.get("username") or "")
         storage = str(tab.get("executor_storage") or cfg.get("executor_storage_mode") or "auto")
+        alive = package_alive(pkg, cfg)
+        proc_text = "alive" if alive else "dead"
+        proc_color = GREEN if alive else RED
         state_path = resolve_state_path(tab)
         state, err = read_state(tab)
         fix_hint = ""
         if state:
             age = int(state.get("age", 999999) or 999999)
-            age_text = format_age(age) if age < 999999 else "old"
-            state_color = GREEN if age <= 20 else (YELLOW if age <= 180 else RED)
-            status_text = f"OK {age_text}"
+            age_text = format_age(age) if age < 999999 else "unknown"
+            if age <= 20:
+                verdict = "FRESH"
+                state_color = GREEN
+                summary["fresh"] += 1
+            else:
+                verdict = "STALE"
+                state_color = YELLOW if alive else RED
+                summary["stale"] += 1
+            status_text = f"{verdict} {age_text}"
             state_user = str(state.get("username") or "")
-            if age > 180:
-                fix_hint = "Counter is stale: open clone, ensure AutoExec ran, wait 10-20s."
+            if age > 20:
+                if alive:
+                    fix_hint = "Counter is stale but app is alive: ensure AutoExec ran, then wait 10-20s."
+                else:
+                    fix_hint = "Counter is stale and app looks dead: rejoin/reopen this clone."
         else:
+            err_text = str(err or "no state")
+            is_mismatch = "mismatch" in err_text.lower()
+            if is_mismatch:
+                summary["mismatch"] += 1
+            else:
+                summary["broken"] += 1
             state_color = YELLOW if err == "missing" else RED
-            status_text = str(err or "no state")
+            status_text = ("MISMATCH" if is_mismatch else "BROKEN") + f" {cut(err_text, 18)}"
             state_user = "-"
             if err == "missing":
                 fix_hint = "State missing: install/update AutoExec counter, then enter game."
-            elif "username mismatch" in str(err or "").lower():
+            elif is_mismatch:
                 fix_hint = "Username mismatch: run option 20 or refresh usernames after the correct clone writes state."
             else:
                 fix_hint = "State read failed: check expected path and executor storage mode."
@@ -19293,24 +19319,37 @@ def executor_storage_doctor_menu(cfg, pause_at_end=True):
             (short_pkg(pkg), CYAN),
             (cut(user, 12), WHITE),
             (cut(storage, 13), WHITE),
+            (proc_text, proc_color),
             (status_text, state_color),
             (auto_text, auto_color),
         ])
-        detail_lines.append((pkg, user, state_user, state_path, auto_path, err, fix_hint))
+        detail_lines.append((pkg, user, state_user, state_path, auto_path, err, fix_hint, proc_text))
 
     draw_table(
-        ["Package", "ConfigUser", "Storage", "State", "AutoExec"],
+        ["Package", "ConfigUser", "Storage", "Proc", "State", "AutoExec"],
         rows,
-        [12, 12, 13, 18, 9],
+        [12, 12, 13, 6, 18, 9],
         cfg,
     )
 
     print("")
+    total = len(shown_tabs)
+    print(
+        col("Summary: ", BOLD)
+        + col(f"{total} packages", WHITE)
+        + col(f" | {summary['fresh']} fresh", GREEN)
+        + col(f" | {summary['stale']} stale", YELLOW)
+        + col(f" | {summary['mismatch']} mismatch", RED if summary["mismatch"] else DIM)
+        + col(f" | {summary['broken']} broken", RED if summary["broken"] else DIM)
+    )
+
+    print("")
     print(col("Details:", BOLD))
-    for pkg, user, state_user, state_path, auto_path, err, fix_hint in detail_lines:
+    for pkg, user, state_user, state_path, auto_path, err, fix_hint, proc_text in detail_lines:
         print(col(f"{short_pkg(pkg)}", CYAN))
         print(col(f"  config user : {user or '-'}", DIM))
         print(col(f"  state user  : {state_user or '-'}", DIM))
+        print(col(f"  process     : {proc_text}", DIM))
         print(col(f"  expected    : {expected_state_name({'user_name': user, 'stat_file': str(state_path or '')})}", DIM))
         print(col(f"  state path  : {state_path or '-'}", DIM))
         print(col(f"  autoexec    : {auto_path or '-'}", DIM))

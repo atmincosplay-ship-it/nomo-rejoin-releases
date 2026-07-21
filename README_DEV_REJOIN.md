@@ -3,7 +3,7 @@ NOMO Rejoin Dev
 
 This dev channel now uses the full source UI/menu/table from the working
 rejoin source, with dev paths so stable `nomo` is not overwritten.
-V4.60.2 turns menu 21 into a read-only Doctor hub and cleans old backend labels.
+V4.60.3 adds Doctor verdicts, exact state age, process state, and summary counts.
 
 Install / Update
 ----------------
