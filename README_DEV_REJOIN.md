@@ -95,6 +95,8 @@ nomo-dev watch --apply
 ```
 
 The watch loop keeps exact-PID stop only and applies per-clone cooldowns.
+After a clone is opened, the monitor waits 180 seconds for fresh Lua state.
+If the state is still stale, it retries only that same clone.
 
 Stable stays separate:
 

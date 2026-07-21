@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-VERSION = "V0.9 DEV REJOIN TEST"
+VERSION = "V1.0 DEV OPEN VERIFY"
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_clean")
 CONFIG_FILE = BASE_DIR / "config.json"
 RUNTIME_FILE = BASE_DIR / "runtime.json"
@@ -58,7 +58,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "interval_seconds": 20,
         "action_cooldown_seconds": 180,
         "state_stale_seconds": 180,
+        "open_verify_seconds": 180,
         "restart_dead_packages": True,
+        "retry_stuck_open": True,
         "recover_disconnected": True,
         "soft_open_alive_stale": False,
         "route_market_restock": True,
@@ -837,6 +839,32 @@ def state_for_target(target: PackageTarget, cfg: Dict[str, Any]) -> Optional[Dic
     return state_for_username(username, cfg)
 
 
+def state_age_seconds(data: Dict[str, Any]) -> int:
+    if not data:
+        return 999999
+    for key in ("age", "state_age", "state_age_seconds"):
+        if key not in data:
+            continue
+        try:
+            value = int(data.get(key))
+            if 0 <= value < 900000:
+                return value
+        except Exception:
+            pass
+    for key in ("ts", "timestamp", "updated_at", "last_update", "written_at"):
+        if key not in data:
+            continue
+        try:
+            value = int(float(data.get(key)))
+            if value > 9999999999:
+                value = value // 1000
+            if value > 0:
+                return max(0, now() - value)
+        except Exception:
+            pass
+    return 999999
+
+
 def snapshot_for_target(target: PackageTarget, cfg: Dict[str, Any]) -> StateSnapshot:
     data = state_for_target(target, cfg) or {}
     username, _user_id, _source, _changed = resolve_target_identity(target, cfg)
@@ -844,7 +872,7 @@ def snapshot_for_target(target: PackageTarget, cfg: Dict[str, Any]) -> StateSnap
         username=str(data.get("username") or data.get("user_name") or username or target.name),
         pet_count=int(data.get("pet_count", 0) or 0),
         egg_total=int(data.get("egg_total", 0) or 0),
-        age=int(data.get("age", 999999) or 999999),
+        age=state_age_seconds(data),
         place_id=str(data.get("place_id") or ""),
         job_id=str(data.get("job_id") or ""),
         server_link=str(data.get("server_link") or data.get("rejoin_link") or ""),
@@ -1005,6 +1033,7 @@ def short_action(action: str, dry_run: bool) -> str:
         "restart_dead": "restart",
         "recover_disconnected": "recover",
         "soft_open_stale": "soft",
+        "retry_stuck_open": "retry-open",
         "route_restock": "restock",
         "report_worker": "report",
     }
@@ -1103,11 +1132,26 @@ def _can_act(runtime: Dict[str, Any], target: PackageTarget, cooldown: int) -> T
     return remaining <= 0, remaining
 
 
-def _mark_action(runtime: Dict[str, Any], target: PackageTarget, action: str, note: str) -> None:
+def _mark_action(
+    runtime: Dict[str, Any],
+    target: PackageTarget,
+    action: str,
+    note: str,
+    pending_open: bool = False,
+) -> None:
     item = _runtime_target(runtime, target)
     item["last_action_at"] = int(time.time())
     item["last_action"] = str(action)
     item["last_note"] = str(note)
+    if pending_open:
+        item["pending_open_at"] = int(time.time())
+        item["pending_open_action"] = str(action)
+
+
+def _clear_pending_open(runtime: Dict[str, Any], target: PackageTarget) -> None:
+    item = _runtime_target(runtime, target)
+    item.pop("pending_open_at", None)
+    item.pop("pending_open_action", None)
 
 
 def watch_once(
@@ -1121,6 +1165,7 @@ def watch_once(
     watch_cfg = cfg.get("watch", {}) or {}
     cooldown = int(watch_cfg.get("action_cooldown_seconds", 180) or 180)
     stale_seconds = int(watch_cfg.get("state_stale_seconds", 180) or 180)
+    open_verify_seconds = int(watch_cfg.get("open_verify_seconds", 180) or 180)
     report_workers = bool(watch_cfg.get("report_workers", True))
     rows: List[Dict[str, Any]] = []
 
@@ -1134,6 +1179,13 @@ def watch_once(
         stale = (not has_state) or snapshot.age > stale_seconds
         decision = decide_route(target, snapshot, cfg, backend)
         can_act, wait_left = _can_act(runtime, target, cooldown)
+        runtime_item = _runtime_target(runtime, target)
+        pending_open_at = int(runtime_item.get("pending_open_at", 0) or 0)
+        pending_age = max(0, now() - pending_open_at) if pending_open_at else 0
+        if pending_open_at and not stale:
+            _clear_pending_open(runtime, target)
+            pending_open_at = 0
+            pending_age = 0
 
         action = ""
         action_note = ""
@@ -1141,21 +1193,33 @@ def watch_once(
             action = "restart_dead"
             if apply_actions and can_act:
                 ok, action_note = engine.restart(target, soft=False)
-                _mark_action(runtime, target, action, action_note)
+                _mark_action(runtime, target, action, action_note, pending_open=ok)
             elif apply_actions:
                 action_note = f"cooldown {wait_left}s"
         elif snapshot.disconnected and bool(watch_cfg.get("recover_disconnected", True)):
             action = "recover_disconnected"
             if apply_actions and can_act:
                 ok, action_note = engine.apply_decision(target, decision)
-                _mark_action(runtime, target, action, action_note)
+                _mark_action(runtime, target, action, action_note, pending_open=ok)
             elif apply_actions:
                 action_note = f"cooldown {wait_left}s"
+        elif (
+            pending_open_at
+            and stale
+            and pending_age >= open_verify_seconds
+            and bool(watch_cfg.get("retry_stuck_open", True))
+        ):
+            action = "retry_stuck_open"
+            if apply_actions and can_act:
+                ok, action_note = engine.restart(target, soft=False)
+                _mark_action(runtime, target, action, action_note, pending_open=ok)
+            elif apply_actions:
+                action_note = f"wait {max(wait_left, open_verify_seconds - pending_age)}s"
         elif stale and alive and bool(watch_cfg.get("soft_open_alive_stale", False)):
             action = "soft_open_stale"
             if apply_actions and can_act:
                 ok, action_note = engine.restart(target, soft=True)
-                _mark_action(runtime, target, action, action_note)
+                _mark_action(runtime, target, action, action_note, pending_open=ok)
             elif apply_actions:
                 action_note = f"cooldown {wait_left}s"
         elif (
@@ -1165,7 +1229,7 @@ def watch_once(
             action = "route_restock"
             if apply_actions and can_act:
                 ok, action_note = engine.apply_decision(target, decision)
-                _mark_action(runtime, target, action, action_note)
+                _mark_action(runtime, target, action, action_note, pending_open=ok)
             elif apply_actions:
                 action_note = f"cooldown {wait_left}s"
         elif decision.report_backend and report_workers and backend.enabled():
@@ -1258,6 +1322,7 @@ def cmd_restart(args: argparse.Namespace) -> int:
 
 def cmd_test_rejoin(args: argparse.Namespace) -> int:
     cfg = bootstrap_packages(load_config(args.config))
+    runtime = load_runtime()
     engine = RejoinEngine(cfg)
     targets = filter_targets(configured_targets(cfg), args.target)
     if len(targets) != 1:
@@ -1278,6 +1343,8 @@ def cmd_test_rejoin(args: argparse.Namespace) -> int:
     out(f"restart {ok} {note}")
     if not ok:
         return 1
+    _mark_action(runtime, target, "test_rejoin", note, pending_open=True)
+    save_runtime(runtime)
 
     wait_seconds = max(3, int(getattr(args, "wait", 12) or 12))
     out(f"waiting {wait_seconds}s...")
