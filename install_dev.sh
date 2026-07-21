@@ -7,16 +7,24 @@ APP="$BASE_DIR/nomo_rejoin_dev.py"
 PREFIX_DIR="${PREFIX:-/data/data/com.termux/files/usr}"
 BIN_DIR="$PREFIX_DIR/bin"
 CMD="$BIN_DIR/nomo-dev"
-RAW_BASE="https://raw.githubusercontent.com/atmincosplay-ship-it/nomo-rejoin-releases/main/nomo_rejoin_dev.py"
+RAW_BASE="https://api.github.com/repos/atmincosplay-ship-it/nomo-rejoin-releases/contents/nomo_rejoin_dev.py?ref=main"
 
 mkdir -p "$BASE_DIR" "$BIN_DIR"
 
 download_dev() {
-  RAW_URL="$RAW_BASE?nocache=$(date +%s)"
+  RAW_URL="$RAW_BASE&nocache=$(date +%s)"
   if command -v curl >/dev/null 2>&1; then
-    curl -L --fail --silent --show-error -H "Cache-Control: no-cache" "$RAW_URL" -o "$APP"
+    curl -L --fail --silent --show-error \
+      -H "Accept: application/vnd.github.raw" \
+      -H "User-Agent: nomo-dev-updater" \
+      -H "Cache-Control: no-cache" \
+      "$RAW_URL" -o "$APP"
   elif command -v wget >/dev/null 2>&1; then
-    wget -q -O "$APP" "$RAW_URL"
+    wget -q \
+      --header="Accept: application/vnd.github.raw" \
+      --header="User-Agent: nomo-dev-updater" \
+      --header="Cache-Control: no-cache" \
+      -O "$APP" "$RAW_URL"
   else
     echo "Missing curl/wget. Install curl first: pkg install -y curl"
     exit 1
@@ -34,15 +42,23 @@ stty onlcr 2>/dev/null || true
 
 BASE_DIR="/storage/emulated/0/Download/nomo_rejoin_dev"
 APP="$BASE_DIR/nomo_rejoin_dev.py"
-RAW_BASE="https://raw.githubusercontent.com/atmincosplay-ship-it/nomo-rejoin-releases/main/nomo_rejoin_dev.py"
+RAW_BASE="https://api.github.com/repos/atmincosplay-ship-it/nomo-rejoin-releases/contents/nomo_rejoin_dev.py?ref=main"
 
 if [ "${1:-}" = "update" ]; then
   mkdir -p "$BASE_DIR"
-  RAW_URL="$RAW_BASE?nocache=$(date +%s)"
+  RAW_URL="$RAW_BASE&nocache=$(date +%s)"
   if command -v curl >/dev/null 2>&1; then
-    curl -L --fail --silent --show-error -H "Cache-Control: no-cache" "$RAW_URL" -o "$APP"
+    curl -L --fail --silent --show-error \
+      -H "Accept: application/vnd.github.raw" \
+      -H "User-Agent: nomo-dev-updater" \
+      -H "Cache-Control: no-cache" \
+      "$RAW_URL" -o "$APP"
   elif command -v wget >/dev/null 2>&1; then
-    wget -q -O "$APP" "$RAW_URL"
+    wget -q \
+      --header="Accept: application/vnd.github.raw" \
+      --header="User-Agent: nomo-dev-updater" \
+      --header="Cache-Control: no-cache" \
+      -O "$APP" "$RAW_URL"
   else
     echo "Missing curl/wget. Install curl first: pkg install -y curl"
     exit 1

@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-VERSION = "V1.5 DEV SINGLE KEY STOP"
+VERSION = "V1.6 DEV RAW KEY STOP"
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_clean")
 CONFIG_FILE = BASE_DIR / "config.json"
 RUNTIME_FILE = BASE_DIR / "runtime.json"
@@ -150,7 +150,22 @@ def single_key_terminal():
     if not sys.stdin.isatty():
         yield
         return
+    old_stty = ""
     try:
+        proc = subprocess.run(
+            ["stty", "-g"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+        )
+        old_stty = (proc.stdout or "").strip()
+        subprocess.run(
+            ["stty", "-icanon", "-echo", "min", "0", "time", "0"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
         import termios
         import tty
 
@@ -161,8 +176,24 @@ def single_key_terminal():
             yield
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            if old_stty:
+                subprocess.run(
+                    ["stty", old_stty],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=2,
+                )
     except Exception:
-        yield
+        try:
+            yield
+        finally:
+            if old_stty:
+                subprocess.run(
+                    ["stty", old_stty],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=2,
+                )
 
 
 def stop_key_pressed() -> bool:
