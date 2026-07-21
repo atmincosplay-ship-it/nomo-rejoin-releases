@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-VERSION = "V1.3 DEV FLEET COOLDOWN"
+VERSION = "V1.4 DEV WATCH CONTROL"
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_clean")
 CONFIG_FILE = BASE_DIR / "config.json"
 RUNTIME_FILE = BASE_DIR / "runtime.json"
@@ -1186,9 +1186,8 @@ def watch_once(
     acted_this_cycle = False
 
     for target in configured_targets(cfg):
-        if WATCH_STOP_FILE.exists():
-            remove_file_quiet(WATCH_STOP_FILE)
-            out("watch stop requested")
+        if watch_stop_requested():
+            out("STOP requested before scan")
             return True
 
         if not target.enabled:
@@ -1219,7 +1218,13 @@ def watch_once(
             if apply_actions and acted_this_cycle:
                 action_note = "next cycle"
             elif apply_actions and can_do_action:
+                if watch_stop_requested():
+                    out("STOP requested before action")
+                    return True
                 ok, action_note = engine.restart(target, soft=False)
+                if watch_stop_requested():
+                    out("STOP requested after action")
+                    return True
                 acted_this_cycle = acted_this_cycle or ok
                 _mark_action(runtime, target, action, action_note, pending_open=ok)
             elif apply_actions:
@@ -1229,7 +1234,13 @@ def watch_once(
             if apply_actions and acted_this_cycle:
                 action_note = "next cycle"
             elif apply_actions and can_do_action:
+                if watch_stop_requested():
+                    out("STOP requested before action")
+                    return True
                 ok, action_note = engine.apply_decision(target, decision)
+                if watch_stop_requested():
+                    out("STOP requested after action")
+                    return True
                 acted_this_cycle = acted_this_cycle or ok
                 _mark_action(runtime, target, action, action_note, pending_open=ok)
             elif apply_actions:
@@ -1244,7 +1255,13 @@ def watch_once(
             if apply_actions and acted_this_cycle:
                 action_note = "next cycle"
             elif apply_actions and can_do_action:
+                if watch_stop_requested():
+                    out("STOP requested before action")
+                    return True
                 ok, action_note = engine.restart(target, soft=False)
+                if watch_stop_requested():
+                    out("STOP requested after action")
+                    return True
                 acted_this_cycle = acted_this_cycle or ok
                 _mark_action(runtime, target, action, action_note, pending_open=ok)
             elif apply_actions:
@@ -1259,7 +1276,13 @@ def watch_once(
             if apply_actions and acted_this_cycle:
                 action_note = "next cycle"
             elif apply_actions and can_do_action:
+                if watch_stop_requested():
+                    out("STOP requested before action")
+                    return True
                 ok, action_note = engine.restart(target, soft=False)
+                if watch_stop_requested():
+                    out("STOP requested after action")
+                    return True
                 acted_this_cycle = acted_this_cycle or ok
                 _mark_action(runtime, target, action, action_note, pending_open=ok)
             elif apply_actions:
@@ -1269,7 +1292,13 @@ def watch_once(
             if apply_actions and acted_this_cycle:
                 action_note = "next cycle"
             elif apply_actions and can_do_action:
+                if watch_stop_requested():
+                    out("STOP requested before action")
+                    return True
                 ok, action_note = engine.restart(target, soft=True)
+                if watch_stop_requested():
+                    out("STOP requested after action")
+                    return True
                 acted_this_cycle = acted_this_cycle or ok
                 _mark_action(runtime, target, action, action_note, pending_open=ok)
             elif apply_actions:
@@ -1282,7 +1311,13 @@ def watch_once(
             if apply_actions and acted_this_cycle:
                 action_note = "next cycle"
             elif apply_actions and can_do_action:
+                if watch_stop_requested():
+                    out("STOP requested before action")
+                    return True
                 ok, action_note = engine.apply_decision(target, decision)
+                if watch_stop_requested():
+                    out("STOP requested after action")
+                    return True
                 acted_this_cycle = acted_this_cycle or ok
                 _mark_action(runtime, target, action, action_note, pending_open=ok)
             elif apply_actions:
@@ -1292,12 +1327,18 @@ def watch_once(
             if apply_actions and acted_this_cycle:
                 action_note = "next cycle"
             elif apply_actions and can_do_action:
+                if watch_stop_requested():
+                    out("STOP requested before action")
+                    return True
                 ok, action_note = backend.update_worker(
                     target.name,
                     target.mode,
                     snapshot,
                     target.link,
                 )
+                if watch_stop_requested():
+                    out("STOP requested after action")
+                    return True
                 acted_this_cycle = acted_this_cycle or ok
                 _mark_action(runtime, target, action, action_note)
             elif apply_actions:
@@ -1317,17 +1358,23 @@ def watch_once(
             }
         )
 
+    out("TIME     CLONE    RUN  ST   PETS AGE   ROUTE                 ACTION")
+    out("-------  -------  ---  ---  ---- ----  --------------------  ----------------")
     for row in rows:
         action_text = row.get("action") or "-"
         if row.get("note"):
             action_text = f"{action_text}:{row.get('note')}"
-        out(f"{row.get('time')} {cut_text(row.get('name'), 8)}")
-        out(f"run  {cut_text(row.get('run'), 4)} {cut_text(row.get('state'), 5)}")
-        out(f"pets {int(row.get('pets') or 0)} age {cut_text(row.get('age'), 4)}")
-        out(f"to   {cut_text(row.get('route'), 20)}")
-        if action_text != "-":
-            out(f"act  {cut_text(action_text, 20)}")
-        out("")
+        out(
+            f"{cut_text(row.get('time'), 7):<7}  "
+            f"{cut_text(row.get('name'), 7):<7}  "
+            f"{cut_text(row.get('run'), 3):<3}  "
+            f"{cut_text(row.get('state'), 3):<3}  "
+            f"{int(row.get('pets') or 0):>4} "
+            f"{cut_text(row.get('age'), 4):<4}  "
+            f"{cut_text(row.get('route'), 20):<20}  "
+            f"{cut_text(action_text, 16):<16}"
+        )
+    out("")
 
     return False
 
@@ -1366,8 +1413,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
 def wait_for_watch_stop(seconds: int) -> bool:
     deadline = time.time() + max(1, int(seconds))
     while time.time() < deadline:
-        if WATCH_STOP_FILE.exists():
-            remove_file_quiet(WATCH_STOP_FILE)
+        if watch_stop_requested():
             return True
         try:
             import select
@@ -1381,6 +1427,14 @@ def wait_for_watch_stop(seconds: int) -> bool:
             pass
         time.sleep(0.5)
     return False
+
+
+def watch_stop_requested(clear: bool = True) -> bool:
+    if not WATCH_STOP_FILE.exists():
+        return False
+    if clear:
+        remove_file_quiet(WATCH_STOP_FILE)
+    return True
 
 
 def cmd_stop_watch(args: argparse.Namespace) -> int:
