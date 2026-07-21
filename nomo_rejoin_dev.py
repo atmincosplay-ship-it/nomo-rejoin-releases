@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-VERSION = "V1.2 DEV WATCH STOP"
+VERSION = "V1.3 DEV FLEET COOLDOWN"
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_clean")
 CONFIG_FILE = BASE_DIR / "config.json"
 RUNTIME_FILE = BASE_DIR / "runtime.json"
@@ -58,6 +58,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "watch": {
         "interval_seconds": 20,
         "action_cooldown_seconds": 180,
+        "fleet_action_cooldown_seconds": 180,
         "state_stale_seconds": 180,
         "open_verify_seconds": 180,
         "alive_stale_retry_seconds": 180,
@@ -1136,6 +1137,12 @@ def _can_act(runtime: Dict[str, Any], target: PackageTarget, cooldown: int) -> T
     return remaining <= 0, remaining
 
 
+def _can_fleet_act(runtime: Dict[str, Any], cooldown: int) -> Tuple[bool, int]:
+    last = int(runtime.get("last_fleet_action_at", 0) or 0)
+    remaining = max(0, int(last + cooldown - time.time()))
+    return remaining <= 0, remaining
+
+
 def _mark_action(
     runtime: Dict[str, Any],
     target: PackageTarget,
@@ -1147,6 +1154,8 @@ def _mark_action(
     item["last_action_at"] = int(time.time())
     item["last_action"] = str(action)
     item["last_note"] = str(note)
+    runtime["last_fleet_action_at"] = int(time.time())
+    runtime["last_fleet_action"] = f"{target.name}:{action}"
     if pending_open:
         item["pending_open_at"] = int(time.time())
         item["pending_open_action"] = str(action)
@@ -1162,12 +1171,13 @@ def watch_once(
     cfg: Dict[str, Any],
     runtime: Dict[str, Any],
     apply_actions: bool = False,
-) -> None:
+) -> bool:
     cfg = bootstrap_packages(cfg)
     backend = BackendClient(cfg)
     engine = RejoinEngine(cfg)
     watch_cfg = cfg.get("watch", {}) or {}
     cooldown = int(watch_cfg.get("action_cooldown_seconds", 180) or 180)
+    fleet_cooldown = int(watch_cfg.get("fleet_action_cooldown_seconds", 180) or 180)
     stale_seconds = int(watch_cfg.get("state_stale_seconds", 180) or 180)
     open_verify_seconds = int(watch_cfg.get("open_verify_seconds", 180) or 180)
     alive_stale_retry_seconds = int(watch_cfg.get("alive_stale_retry_seconds", 180) or 180)
@@ -1176,6 +1186,11 @@ def watch_once(
     acted_this_cycle = False
 
     for target in configured_targets(cfg):
+        if WATCH_STOP_FILE.exists():
+            remove_file_quiet(WATCH_STOP_FILE)
+            out("watch stop requested")
+            return True
+
         if not target.enabled:
             continue
 
@@ -1185,6 +1200,9 @@ def watch_once(
         stale = (not has_state) or snapshot.age > stale_seconds
         decision = decide_route(target, snapshot, cfg, backend)
         can_act, wait_left = _can_act(runtime, target, cooldown)
+        can_fleet_act, fleet_wait_left = _can_fleet_act(runtime, fleet_cooldown)
+        can_do_action = can_act and can_fleet_act
+        action_wait_left = max(wait_left, fleet_wait_left)
         runtime_item = _runtime_target(runtime, target)
         pending_open_at = int(runtime_item.get("pending_open_at", 0) or 0)
         pending_age = max(0, now() - pending_open_at) if pending_open_at else 0
@@ -1195,26 +1213,27 @@ def watch_once(
 
         action = ""
         action_note = ""
+        blocked_note = f"fleet {fleet_wait_left}s" if not can_fleet_act else f"cooldown {wait_left}s"
         if not alive and bool(watch_cfg.get("restart_dead_packages", True)):
             action = "restart_dead"
             if apply_actions and acted_this_cycle:
                 action_note = "next cycle"
-            elif apply_actions and can_act:
+            elif apply_actions and can_do_action:
                 ok, action_note = engine.restart(target, soft=False)
                 acted_this_cycle = acted_this_cycle or ok
                 _mark_action(runtime, target, action, action_note, pending_open=ok)
             elif apply_actions:
-                action_note = f"cooldown {wait_left}s"
+                action_note = blocked_note
         elif snapshot.disconnected and bool(watch_cfg.get("recover_disconnected", True)):
             action = "recover_disconnected"
             if apply_actions and acted_this_cycle:
                 action_note = "next cycle"
-            elif apply_actions and can_act:
+            elif apply_actions and can_do_action:
                 ok, action_note = engine.apply_decision(target, decision)
                 acted_this_cycle = acted_this_cycle or ok
                 _mark_action(runtime, target, action, action_note, pending_open=ok)
             elif apply_actions:
-                action_note = f"cooldown {wait_left}s"
+                action_note = blocked_note
         elif (
             pending_open_at
             and stale
@@ -1224,12 +1243,12 @@ def watch_once(
             action = "retry_stuck_open"
             if apply_actions and acted_this_cycle:
                 action_note = "next cycle"
-            elif apply_actions and can_act:
+            elif apply_actions and can_do_action:
                 ok, action_note = engine.restart(target, soft=False)
                 acted_this_cycle = acted_this_cycle or ok
                 _mark_action(runtime, target, action, action_note, pending_open=ok)
             elif apply_actions:
-                action_note = f"wait {max(wait_left, open_verify_seconds - pending_age)}s"
+                action_note = f"wait {max(action_wait_left, open_verify_seconds - pending_age)}s"
         elif (
             stale
             and alive
@@ -1239,22 +1258,22 @@ def watch_once(
             action = "retry_alive_stale"
             if apply_actions and acted_this_cycle:
                 action_note = "next cycle"
-            elif apply_actions and can_act:
+            elif apply_actions and can_do_action:
                 ok, action_note = engine.restart(target, soft=False)
                 acted_this_cycle = acted_this_cycle or ok
                 _mark_action(runtime, target, action, action_note, pending_open=ok)
             elif apply_actions:
-                action_note = f"cooldown {wait_left}s"
+                action_note = blocked_note
         elif stale and alive and bool(watch_cfg.get("soft_open_alive_stale", False)):
             action = "soft_open_stale"
             if apply_actions and acted_this_cycle:
                 action_note = "next cycle"
-            elif apply_actions and can_act:
+            elif apply_actions and can_do_action:
                 ok, action_note = engine.restart(target, soft=True)
                 acted_this_cycle = acted_this_cycle or ok
                 _mark_action(runtime, target, action, action_note, pending_open=ok)
             elif apply_actions:
-                action_note = f"cooldown {wait_left}s"
+                action_note = blocked_note
         elif (
             decision.target == "restock"
             and bool(watch_cfg.get("route_market_restock", True))
@@ -1262,17 +1281,17 @@ def watch_once(
             action = "route_restock"
             if apply_actions and acted_this_cycle:
                 action_note = "next cycle"
-            elif apply_actions and can_act:
+            elif apply_actions and can_do_action:
                 ok, action_note = engine.apply_decision(target, decision)
                 acted_this_cycle = acted_this_cycle or ok
                 _mark_action(runtime, target, action, action_note, pending_open=ok)
             elif apply_actions:
-                action_note = f"cooldown {wait_left}s"
+                action_note = blocked_note
         elif decision.report_backend and report_workers and backend.enabled():
             action = "report_worker"
             if apply_actions and acted_this_cycle:
                 action_note = "next cycle"
-            elif apply_actions and can_act:
+            elif apply_actions and can_do_action:
                 ok, action_note = backend.update_worker(
                     target.name,
                     target.mode,
@@ -1282,7 +1301,7 @@ def watch_once(
                 acted_this_cycle = acted_this_cycle or ok
                 _mark_action(runtime, target, action, action_note)
             elif apply_actions:
-                action_note = f"cooldown {wait_left}s"
+                action_note = blocked_note
 
         rows.append(
             {
@@ -1310,6 +1329,8 @@ def watch_once(
             out(f"act  {cut_text(action_text, 20)}")
         out("")
 
+    return False
+
 
 def cmd_watch(args: argparse.Namespace) -> int:
     cfg = bootstrap_packages(load_config(args.config))
@@ -1326,8 +1347,11 @@ def cmd_watch(args: argparse.Namespace) -> int:
     print("q + Enter, Ctrl+C, or nomo-dev stop-watch to stop")
     try:
         while True:
-            watch_once(cfg, runtime, apply_actions=apply_actions)
+            stopped = watch_once(cfg, runtime, apply_actions=apply_actions)
             save_runtime(runtime)
+            if stopped:
+                out("watch stopped")
+                return 0
             if once:
                 return 0
             if wait_for_watch_stop(max(5, interval)):
