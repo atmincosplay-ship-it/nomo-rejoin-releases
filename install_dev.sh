@@ -1,5 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/sh
 set -eu
+stty onlcr 2>/dev/null || true
 
 BASE_DIR="/storage/emulated/0/Download/nomo_rejoin_dev"
 APP="$BASE_DIR/nomo_rejoin_dev.py"
@@ -29,6 +30,7 @@ download_dev
 cat > "$CMD" <<'EOF'
 #!/data/data/com.termux/files/usr/bin/sh
 set -eu
+stty onlcr 2>/dev/null || true
 
 BASE_DIR="/storage/emulated/0/Download/nomo_rejoin_dev"
 APP="$BASE_DIR/nomo_rejoin_dev.py"

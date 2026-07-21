@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-VERSION = "V0.6 DEV TINY OUTPUT"
+VERSION = "V0.7 DEV TERMINAL FIX"
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_clean")
 CONFIG_FILE = BASE_DIR / "config.json"
 RUNTIME_FILE = BASE_DIR / "runtime.json"
@@ -115,6 +115,26 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 # ============================================================
 # Core
 # ============================================================
+
+
+def fix_terminal_newlines() -> None:
+    """Repair Termux sessions where LF no longer returns to column 0."""
+    if not sys.stdout.isatty():
+        return
+    try:
+        subprocess.run(
+            ["stty", "onlcr"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+    except Exception:
+        pass
+
+
+def out(line: Any = "") -> None:
+    sys.stdout.write(str(line) + "\r\n")
+    sys.stdout.flush()
 
 
 def now() -> int:
@@ -958,13 +978,13 @@ def short_reason(reason: str) -> str:
 
 def print_target_table(rows: List[Dict[str, Any]]) -> None:
     for index, row in enumerate(rows, start=1):
-        print(f"{index}. {cut_text(row.get('name'), 10)}")
-        print(f"user {cut_text(row.get('identity'), 14)}")
-        print(f"pkg  {cut_text(row.get('package'), 10)}")
-        print(f"run  {cut_text(row.get('alive'), 4)} {cut_text(row.get('fresh'), 2)}")
-        print(f"pets {int(row.get('pets') or 0)}")
-        print(f"to   {cut_text(row.get('route'), 20)}")
-        print("")
+        out(f"{index}. {cut_text(row.get('name'), 10)}")
+        out(f"user {cut_text(row.get('identity'), 14)}")
+        out(f"pkg  {cut_text(row.get('package'), 10)}")
+        out(f"run  {cut_text(row.get('alive'), 4)} {cut_text(row.get('fresh'), 2)}")
+        out(f"pets {int(row.get('pets') or 0)}")
+        out(f"to   {cut_text(row.get('route'), 20)}")
+        out("")
 
 
 def format_age_short(age: int, has_state: bool) -> str:
@@ -1027,9 +1047,9 @@ def cmd_list(args: argparse.Namespace) -> int:
             identity_notes.append(f"{target.name}: {source}")
     print_target_table(rows)
     if identity_notes:
-        print("")
+        out("")
         for note in identity_notes:
-            print(f"identity {note}")
+            out(f"identity {note}")
     if changed:
         save_config(cfg, args.config)
         log("identity cache updated")
@@ -1179,13 +1199,13 @@ def watch_once(
         action_text = row.get("action") or "-"
         if row.get("note"):
             action_text = f"{action_text}:{row.get('note')}"
-        print(f"{row.get('time')} {cut_text(row.get('name'), 8)}")
-        print(f"run  {cut_text(row.get('run'), 4)} {cut_text(row.get('state'), 2)}")
-        print(f"pets {int(row.get('pets') or 0)} age {cut_text(row.get('age'), 4)}")
-        print(f"to   {cut_text(row.get('route'), 20)}")
+        out(f"{row.get('time')} {cut_text(row.get('name'), 8)}")
+        out(f"run  {cut_text(row.get('run'), 4)} {cut_text(row.get('state'), 2)}")
+        out(f"pets {int(row.get('pets') or 0)} age {cut_text(row.get('age'), 4)}")
+        out(f"to   {cut_text(row.get('route'), 20)}")
         if action_text != "-":
-            print(f"act  {cut_text(action_text, 20)}")
-        print("")
+            out(f"act  {cut_text(action_text, 20)}")
+        out("")
 
 
 def cmd_watch(args: argparse.Namespace) -> int:
@@ -1421,6 +1441,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    fix_terminal_newlines()
     args = build_parser().parse_args(argv)
     if not getattr(args, "cmd", None):
         return cmd_menu(args)
