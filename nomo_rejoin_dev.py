@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-VERSION = "V1.0 DEV OPEN VERIFY"
+VERSION = "V1.1 DEV ALIVE STALE RETRY"
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_clean")
 CONFIG_FILE = BASE_DIR / "config.json"
 RUNTIME_FILE = BASE_DIR / "runtime.json"
@@ -59,8 +59,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "action_cooldown_seconds": 180,
         "state_stale_seconds": 180,
         "open_verify_seconds": 180,
+        "alive_stale_retry_seconds": 180,
         "restart_dead_packages": True,
         "retry_stuck_open": True,
+        "retry_alive_stale": True,
         "recover_disconnected": True,
         "soft_open_alive_stale": False,
         "route_market_restock": True,
@@ -1034,6 +1036,7 @@ def short_action(action: str, dry_run: bool) -> str:
         "recover_disconnected": "recover",
         "soft_open_stale": "soft",
         "retry_stuck_open": "retry-open",
+        "retry_alive_stale": "retry-stale",
         "route_restock": "restock",
         "report_worker": "report",
     }
@@ -1166,8 +1169,10 @@ def watch_once(
     cooldown = int(watch_cfg.get("action_cooldown_seconds", 180) or 180)
     stale_seconds = int(watch_cfg.get("state_stale_seconds", 180) or 180)
     open_verify_seconds = int(watch_cfg.get("open_verify_seconds", 180) or 180)
+    alive_stale_retry_seconds = int(watch_cfg.get("alive_stale_retry_seconds", 180) or 180)
     report_workers = bool(watch_cfg.get("report_workers", True))
     rows: List[Dict[str, Any]] = []
+    acted_this_cycle = False
 
     for target in configured_targets(cfg):
         if not target.enabled:
@@ -1191,15 +1196,21 @@ def watch_once(
         action_note = ""
         if not alive and bool(watch_cfg.get("restart_dead_packages", True)):
             action = "restart_dead"
-            if apply_actions and can_act:
+            if apply_actions and acted_this_cycle:
+                action_note = "next cycle"
+            elif apply_actions and can_act:
                 ok, action_note = engine.restart(target, soft=False)
+                acted_this_cycle = acted_this_cycle or ok
                 _mark_action(runtime, target, action, action_note, pending_open=ok)
             elif apply_actions:
                 action_note = f"cooldown {wait_left}s"
         elif snapshot.disconnected and bool(watch_cfg.get("recover_disconnected", True)):
             action = "recover_disconnected"
-            if apply_actions and can_act:
+            if apply_actions and acted_this_cycle:
+                action_note = "next cycle"
+            elif apply_actions and can_act:
                 ok, action_note = engine.apply_decision(target, decision)
+                acted_this_cycle = acted_this_cycle or ok
                 _mark_action(runtime, target, action, action_note, pending_open=ok)
             elif apply_actions:
                 action_note = f"cooldown {wait_left}s"
@@ -1210,15 +1221,36 @@ def watch_once(
             and bool(watch_cfg.get("retry_stuck_open", True))
         ):
             action = "retry_stuck_open"
-            if apply_actions and can_act:
+            if apply_actions and acted_this_cycle:
+                action_note = "next cycle"
+            elif apply_actions and can_act:
                 ok, action_note = engine.restart(target, soft=False)
+                acted_this_cycle = acted_this_cycle or ok
                 _mark_action(runtime, target, action, action_note, pending_open=ok)
             elif apply_actions:
                 action_note = f"wait {max(wait_left, open_verify_seconds - pending_age)}s"
+        elif (
+            stale
+            and alive
+            and snapshot.age >= alive_stale_retry_seconds
+            and bool(watch_cfg.get("retry_alive_stale", True))
+        ):
+            action = "retry_alive_stale"
+            if apply_actions and acted_this_cycle:
+                action_note = "next cycle"
+            elif apply_actions and can_act:
+                ok, action_note = engine.restart(target, soft=False)
+                acted_this_cycle = acted_this_cycle or ok
+                _mark_action(runtime, target, action, action_note, pending_open=ok)
+            elif apply_actions:
+                action_note = f"cooldown {wait_left}s"
         elif stale and alive and bool(watch_cfg.get("soft_open_alive_stale", False)):
             action = "soft_open_stale"
-            if apply_actions and can_act:
+            if apply_actions and acted_this_cycle:
+                action_note = "next cycle"
+            elif apply_actions and can_act:
                 ok, action_note = engine.restart(target, soft=True)
+                acted_this_cycle = acted_this_cycle or ok
                 _mark_action(runtime, target, action, action_note, pending_open=ok)
             elif apply_actions:
                 action_note = f"cooldown {wait_left}s"
@@ -1227,20 +1259,26 @@ def watch_once(
             and bool(watch_cfg.get("route_market_restock", True))
         ):
             action = "route_restock"
-            if apply_actions and can_act:
+            if apply_actions and acted_this_cycle:
+                action_note = "next cycle"
+            elif apply_actions and can_act:
                 ok, action_note = engine.apply_decision(target, decision)
+                acted_this_cycle = acted_this_cycle or ok
                 _mark_action(runtime, target, action, action_note, pending_open=ok)
             elif apply_actions:
                 action_note = f"cooldown {wait_left}s"
         elif decision.report_backend and report_workers and backend.enabled():
             action = "report_worker"
-            if apply_actions and can_act:
+            if apply_actions and acted_this_cycle:
+                action_note = "next cycle"
+            elif apply_actions and can_act:
                 ok, action_note = backend.update_worker(
                     target.name,
                     target.mode,
                     snapshot,
                     target.link,
                 )
+                acted_this_cycle = acted_this_cycle or ok
                 _mark_action(runtime, target, action, action_note)
             elif apply_actions:
                 action_note = f"cooldown {wait_left}s"
