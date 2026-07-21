@@ -29,10 +29,11 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-VERSION = "V1.1 DEV ALIVE STALE RETRY"
+VERSION = "V1.2 DEV WATCH STOP"
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_clean")
 CONFIG_FILE = BASE_DIR / "config.json"
 RUNTIME_FILE = BASE_DIR / "runtime.json"
+WATCH_STOP_FILE = BASE_DIR / "watch.stop"
 DELTA_STATE_DIR = Path("/storage/emulated/0/Delta/Workspace/nomo_rejoiner")
 STATE_DIR = DELTA_STATE_DIR
 
@@ -1318,21 +1319,51 @@ def cmd_watch(args: argparse.Namespace) -> int:
     interval = int(getattr(args, "interval", 0) or watch_cfg.get("interval_seconds", 20) or 20)
     apply_actions = bool(getattr(args, "apply", False))
     once = bool(getattr(args, "once", False))
+    remove_file_quiet(WATCH_STOP_FILE)
 
     print(f"NOMO Rejoin Clean {VERSION}")
     print("watch mode: " + ("APPLY actions" if apply_actions else "DRY RUN observe only"))
-    print("Q/Ctrl+C to stop")
+    print("q + Enter, Ctrl+C, or nomo-dev stop-watch to stop")
     try:
         while True:
             watch_once(cfg, runtime, apply_actions=apply_actions)
             save_runtime(runtime)
             if once:
                 return 0
-            time.sleep(max(5, interval))
+            if wait_for_watch_stop(max(5, interval)):
+                out("watch stopped")
+                return 0
     except KeyboardInterrupt:
         print("")
         return 130
 
+
+
+def wait_for_watch_stop(seconds: int) -> bool:
+    deadline = time.time() + max(1, int(seconds))
+    while time.time() < deadline:
+        if WATCH_STOP_FILE.exists():
+            remove_file_quiet(WATCH_STOP_FILE)
+            return True
+        try:
+            import select
+
+            ready, _w, _e = select.select([sys.stdin], [], [], 0)
+            if ready:
+                text = sys.stdin.readline().strip().lower()
+                if text in {"q", "quit", "exit", "stop", "0"}:
+                    return True
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return False
+
+
+def cmd_stop_watch(args: argparse.Namespace) -> int:
+    WATCH_STOP_FILE.parent.mkdir(parents=True, exist_ok=True)
+    WATCH_STOP_FILE.write_text(str(now()), encoding="utf-8")
+    out(f"watch stop requested: {WATCH_STOP_FILE}")
+    return 0
 
 def cmd_stop(args: argparse.Namespace) -> int:
     cfg = bootstrap_packages(load_config(args.config))
@@ -1571,6 +1602,7 @@ def build_parser() -> argparse.ArgumentParser:
     list_cmd.add_argument("--refresh-api", action="store_true")
     list_cmd.set_defaults(func=cmd_list)
     sub.add_parser("doctor").set_defaults(func=cmd_doctor)
+    sub.add_parser("stop-watch").set_defaults(func=cmd_stop_watch)
 
     report = sub.add_parser("report")
     report.add_argument("target", nargs="?", default="all")
