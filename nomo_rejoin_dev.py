@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.59.2-dev-core-verify"
+__version__ = "V4.59.3-dev-executor-storage"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -760,6 +760,10 @@ DELTA_GLOBAL_ROOT = Path("/storage/emulated/0/Delta")
 DELTA_GLOBAL_AUTOEXEC_DIR = DELTA_GLOBAL_ROOT / "Autoexecute"
 DELTA_GLOBAL_WORKSPACE_DIR = DELTA_GLOBAL_ROOT / "Workspace"
 DELTA_GLOBAL_STATE_DIR = DELTA_GLOBAL_WORKSPACE_DIR / "nomo_rejoiner"
+ARCEUS_GLOBAL_ROOT = Path("/storage/emulated/0/Arceus X")
+ARCEUS_GLOBAL_AUTOEXEC_DIR = ARCEUS_GLOBAL_ROOT / "Autoexec"
+ARCEUS_GLOBAL_WORKSPACE_DIR = ARCEUS_GLOBAL_ROOT / "Workspace"
+ARCEUS_GLOBAL_STATE_DIR = ARCEUS_GLOBAL_WORKSPACE_DIR / "nomo_rejoiner"
 DELTA_KEY_RUNTIME_FILE = BASE_DIR / "delta_key_runtime.json"
 DELTA_KEY_PANEL_TEMPLATE_FILE = BASE_DIR / "delta_key_panel_template.json"
 DELTA_KEY_AUTH_URL_FILE = Path("/storage/emulated/0/Download/delta_auth_url.txt")
@@ -4061,6 +4065,15 @@ def delta_global_state_path(username):
     if not username:
         return None
     return DELTA_GLOBAL_STATE_DIR / (
+        f"{_sanitize_state_name(username)}_state.json"
+    )
+
+
+def global_executor_state_path(workspace_dir, username):
+    username = _usable_detected_username(username)
+    if not username:
+        return None
+    return Path(workspace_dir) / STATE_FOLDER_NAME / (
         f"{_sanitize_state_name(username)}_state.json"
     )
 
@@ -18885,6 +18898,10 @@ def _setup_choose_executor_storage(cfg):
     delta_exists = DELTA_GLOBAL_ROOT.exists() or DELTA_GLOBAL_AUTOEXEC_DIR.exists()
 
     default_choice = "1" if saved == "delta_global" or (saved == "auto" and delta_exists) else "2"
+    if saved == "arceus_global":
+        default_choice = "3"
+    elif saved == "custom_global":
+        default_choice = "4"
 
     clear()
     banner("SETUP: EXECUTOR STORAGE", cfg)
@@ -18896,7 +18913,21 @@ def _setup_choose_executor_storage(cfg):
     print("   AutoExec : RobloxClone###/Arceus X/Autoexec")
     print("   Workspace: RobloxClone###/Arceus X/Workspace")
     print("")
-    print(f"ENTER = {'Delta Global' if default_choice == '1' else 'Arceus X per-clone'}")
+    print("3. Arceus X GLOBAL")
+    print(f"   AutoExec : {ARCEUS_GLOBAL_AUTOEXEC_DIR}")
+    print(f"   Workspace: {ARCEUS_GLOBAL_WORKSPACE_DIR}")
+    print("")
+    print("4. Custom executor root")
+    print("   Example  : /storage/emulated/0/Arceus X/")
+    print("   Detects  : <root>/Autoexec and <root>/Workspace")
+    print("")
+    labels = {
+        "1": "Delta Global",
+        "2": "Arceus X per-clone",
+        "3": "Arceus X global",
+        "4": "Custom executor root",
+    }
+    print(f"ENTER = {labels.get(default_choice, 'Arceus X per-clone')}")
     print("0. Cancel")
 
     drain_stdin()
@@ -18909,6 +18940,22 @@ def _setup_choose_executor_storage(cfg):
         return "delta_global"
     if raw == "2":
         return "arceus_per_clone"
+    if raw == "3":
+        return "arceus_global"
+    if raw == "4":
+        root_raw = clean_terminal_input(input("\nCustom executor root path:\n> "))
+        root_raw = root_raw.strip().strip('"').strip("'")
+        if not root_raw:
+            print(col("Custom root cannot be empty.", RED))
+            pause()
+            return None
+        root = Path(root_raw)
+        return {
+            "mode": "custom_global",
+            "root": str(root),
+            "autoexec": str(root / "Autoexec"),
+            "workspace": str(root / "Workspace"),
+        }
 
     print(col("Invalid choice.", RED))
     pause()
@@ -18958,6 +19005,89 @@ def _configure_delta_global_storage(cfg, packages):
     cfg["executor_storage_mode"] = "delta_global"
     normalize_delta_global_mappings(cfg)
     save_config(cfg)
+    return results
+
+
+def _configure_global_executor_storage(cfg, packages, mode_name, autoexec_dir, workspace_dir):
+    """Configure shared executor storage with per-username state files."""
+    autoexec_dir = Path(autoexec_dir)
+    workspace_dir = Path(workspace_dir)
+    state_dir = workspace_dir / STATE_FOLDER_NAME
+    autoexec_dir.mkdir(parents=True, exist_ok=True)
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+    wanted = set(packages or [])
+    results = []
+    hcfg = load_hatcher_config()
+    bcfg = load_booster_config()
+
+    for tab in cfg.get("tabs", []):
+        pkg = str(tab.get("package") or "")
+        if pkg not in wanted:
+            continue
+
+        api_username = ""
+        try:
+            api_username, _ = get_username_from_package_api(pkg)
+        except Exception:
+            api_username = ""
+
+        username = (
+            _usable_detected_username(api_username)
+            or _usable_detected_username(tab.get("user_name"))
+            or pkg
+        )
+        source_name = "cookie/API" if api_username else "existing config"
+        exact = global_executor_state_path(workspace_dir, username)
+
+        tab["user_name"] = username
+        tab["stat_file"] = str(exact)
+        tab["autoexec_path"] = str(autoexec_dir)
+        tab["executor_storage"] = mode_name
+        tab["executor_storage_source"] = source_name
+        tab["delta_mapping_locked"] = False
+        tab["delta_mapping_conflict"] = False
+
+        h_profile = next(
+            (
+                profile
+                for profile in hatcher_profiles(hcfg, enabled_only=False)
+                if str(profile.get("package") or "") == pkg
+            ),
+            None,
+        )
+        if h_profile is not None:
+            h_profile["hatcher_name"] = username
+            h_profile["state_file"] = str(exact)
+            h_profile["executor_storage"] = mode_name
+
+        b_profile = next(
+            (
+                profile
+                for profile in booster_profiles(bcfg)
+                if str(profile.get("package") or "") == pkg
+            ),
+            None,
+        )
+        if b_profile is not None:
+            b_profile["booster_name"] = username
+            b_profile["state_file"] = str(exact)
+            b_profile["executor_storage"] = mode_name
+
+        results.append({
+            "package": pkg,
+            "clone_no": 0,
+            "username": username,
+            "state_file": str(exact),
+            "autoexec_path": str(autoexec_dir),
+            "reason": f"{mode_name} ({source_name})",
+            "storage": mode_name,
+        })
+
+    cfg["executor_storage_mode"] = mode_name
+    save_config(cfg)
+    save_hatcher_config(hcfg)
+    save_booster_config(bcfg)
     return results
 
 
@@ -26710,13 +26840,31 @@ def new_redfinger_setup_wizard(cfg=None):
         pause()
         return
 
-    if executor_storage == "delta_global":
+    custom_storage = executor_storage if isinstance(executor_storage, dict) else None
+    executor_mode = (
+        str(custom_storage.get("mode") or "")
+        if custom_storage
+        else str(executor_storage or "")
+    )
+
+    if executor_mode == "delta_global":
         cfg["executor_storage_mode"] = "delta_global"
         selected_set = set(selected)
         for tab in cfg.get("tabs", []):
             if str(tab.get("package") or "") in selected_set:
                 tab["executor_storage"] = "delta_global"
                 tab["autoexec_path"] = str(DELTA_GLOBAL_AUTOEXEC_DIR)
+        save_config(cfg)
+        cfg = load_config()
+    elif executor_mode == "arceus_global":
+        cfg["executor_storage_mode"] = "arceus_global"
+        save_config(cfg)
+        cfg = load_config()
+    elif executor_mode == "custom_global":
+        cfg["executor_storage_mode"] = "custom_global"
+        cfg["custom_executor_root"] = str(custom_storage.get("root") or "")
+        cfg["custom_executor_autoexec"] = str(custom_storage.get("autoexec") or "")
+        cfg["custom_executor_workspace"] = str(custom_storage.get("workspace") or "")
         save_config(cfg)
         cfg = load_config()
 
@@ -26727,11 +26875,35 @@ def new_redfinger_setup_wizard(cfg=None):
 
     clear()
     banner("SETUP: PACKAGE / WORKSPACE MAPPING", cfg)
-    if executor_storage == "delta_global":
+    if executor_mode == "delta_global":
         print(col("Using Delta GLOBAL storage for every selected package.", GREEN))
         print(f"AutoExec : {DELTA_GLOBAL_AUTOEXEC_DIR}")
         print(f"Workspace: {DELTA_GLOBAL_WORKSPACE_DIR}")
         mapping_results = _configure_delta_global_storage(cfg, selected)
+    elif executor_mode == "arceus_global":
+        print(col("Using Arceus X GLOBAL storage for every selected package.", GREEN))
+        print(f"AutoExec : {ARCEUS_GLOBAL_AUTOEXEC_DIR}")
+        print(f"Workspace: {ARCEUS_GLOBAL_WORKSPACE_DIR}")
+        mapping_results = _configure_global_executor_storage(
+            cfg,
+            selected,
+            "arceus_global",
+            ARCEUS_GLOBAL_AUTOEXEC_DIR,
+            ARCEUS_GLOBAL_WORKSPACE_DIR,
+        )
+    elif executor_mode == "custom_global":
+        autoexec_dir = Path(custom_storage.get("autoexec") or cfg.get("custom_executor_autoexec") or "")
+        workspace_dir = Path(custom_storage.get("workspace") or cfg.get("custom_executor_workspace") or "")
+        print(col("Using CUSTOM GLOBAL executor storage for every selected package.", GREEN))
+        print(f"AutoExec : {autoexec_dir}")
+        print(f"Workspace: {workspace_dir}")
+        mapping_results = _configure_global_executor_storage(
+            cfg,
+            selected,
+            "custom_global",
+            autoexec_dir,
+            workspace_dir,
+        )
     else:
         print(col("Using Arceus X per-clone storage.", GREEN))
         print(col("Mapping packages from real state usernames first; package suffix is fallback.", DIM))
