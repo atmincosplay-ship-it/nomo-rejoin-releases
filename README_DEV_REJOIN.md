@@ -19,15 +19,22 @@ After that:
 nomo-dev update
 ```
 
+Open the dev menu:
+
+```sh
+nomo-dev
+```
+
 Safe First Tests
 ----------------
 
 These should not stop or open Roblox:
 
 ```sh
-nomo-dev doctor
-nomo-dev init
-nomo-dev list
+  nomo-dev doctor
+  nomo-dev init
+  nomo-dev list
+  nomo-dev menu
 ```
 
 Expected:

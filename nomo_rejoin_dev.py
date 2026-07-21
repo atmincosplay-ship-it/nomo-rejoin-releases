@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-VERSION = "V0.2 DEV DELTA STATE"
+VERSION = "V0.3 DEV MENU"
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_clean")
 CONFIG_FILE = BASE_DIR / "config.json"
 DELTA_STATE_DIR = Path("/storage/emulated/0/Delta/Workspace/nomo_rejoiner")
@@ -1010,6 +1010,111 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 1 if found else 0
 
 
+def print_menu_header(cfg: Dict[str, Any]) -> None:
+    os.system("clear")
+    print(f"NOMO Rejoin Clean {VERSION}")
+    print(f"config: {CONFIG_FILE}")
+    print(f"mode: {cfg.get('active_mode', 'market')}")
+    print("")
+
+
+def menu_choose_target(cfg: Dict[str, Any], allow_all: bool = False) -> Optional[str]:
+    targets = configured_targets(cfg)
+    if not targets:
+        print("No targets found. Run init first.")
+        return None
+
+    print("")
+    if allow_all:
+        print("0. all enabled clones")
+    for idx, target in enumerate(targets, start=1):
+        status = "on" if target.enabled else "off"
+        print(f"{idx}. {target.name}  {target.package}  {target.mode}  {status}")
+    choice = input("Target: ").strip()
+    if allow_all and choice in {"0", "all"}:
+        return "all"
+    if choice.isdigit():
+        index = int(choice)
+        if 1 <= index <= len(targets):
+            return targets[index - 1].name
+    if choice:
+        return choice
+    return None
+
+
+def pause_menu() -> None:
+    input("\nPress Enter...")
+
+
+def cmd_menu(args: argparse.Namespace) -> int:
+    config_path = getattr(args, "config", CONFIG_FILE)
+    while True:
+        cfg = bootstrap_packages(load_config(config_path))
+        targets = configured_targets(cfg)
+        print_menu_header(cfg)
+        print("1. List clones")
+        print("2. List clones + refresh usernames")
+        print("3. Doctor")
+        print("4. Route one clone")
+        print("5. Restart one clone")
+        print("6. Stop one clone")
+        print("7. Init / refresh detected packages")
+        print("8. Report workers to backend")
+        print("9. Exit")
+        print("")
+        print(f"Detected clones: {len(targets)}")
+        choice = input("> ").strip().lower()
+
+        try:
+            if choice in {"", "1", "list"}:
+                cmd_list(argparse.Namespace(config=config_path, refresh_api=False))
+                pause_menu()
+            elif choice in {"2", "refresh"}:
+                cmd_list(argparse.Namespace(config=config_path, refresh_api=True))
+                pause_menu()
+            elif choice in {"3", "doctor"}:
+                cmd_doctor(argparse.Namespace(config=config_path))
+                pause_menu()
+            elif choice in {"4", "route"}:
+                target = menu_choose_target(cfg, allow_all=False)
+                if target:
+                    cmd_route(argparse.Namespace(config=config_path, target=target))
+                pause_menu()
+            elif choice in {"5", "restart"}:
+                target = menu_choose_target(cfg, allow_all=False)
+                if target:
+                    cmd_restart(argparse.Namespace(config=config_path, target=target, soft=False))
+                pause_menu()
+            elif choice in {"6", "stop"}:
+                target = menu_choose_target(cfg, allow_all=False)
+                if target:
+                    confirm = input(f"Stop {target} exact PID only? type yes: ").strip().lower()
+                    if confirm == "yes":
+                        cmd_stop(argparse.Namespace(config=config_path, target=target))
+                    else:
+                        print("Cancelled.")
+                pause_menu()
+            elif choice in {"7", "init"}:
+                cmd_init(argparse.Namespace(config=config_path))
+                pause_menu()
+            elif choice in {"8", "report"}:
+                target = menu_choose_target(cfg, allow_all=True)
+                if target:
+                    cmd_report(argparse.Namespace(config=config_path, target=target))
+                pause_menu()
+            elif choice in {"9", "q", "quit", "exit"}:
+                return 0
+            else:
+                print("Unknown option.")
+                pause_menu()
+        except KeyboardInterrupt:
+            print("")
+            return 130
+        except Exception as exc:
+            print(f"ERROR: {exc}")
+            pause_menu()
+
+
 def filter_targets(targets: List[PackageTarget], selector: str) -> List[PackageTarget]:
     selector = str(selector or "all").strip()
     if selector == "all":
@@ -1027,8 +1132,9 @@ def filter_targets(targets: List[PackageTarget], selector: str) -> List[PackageT
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=f"NOMO Rejoin Clean {VERSION}")
     parser.add_argument("--config", type=Path, default=CONFIG_FILE)
-    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub = parser.add_subparsers(dest="cmd")
 
+    sub.add_parser("menu").set_defaults(func=cmd_menu)
     sub.add_parser("init").set_defaults(func=cmd_init)
     list_cmd = sub.add_parser("list")
     list_cmd.add_argument("--refresh-api", action="store_true")
@@ -1057,6 +1163,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+    if not getattr(args, "cmd", None):
+        return cmd_menu(args)
     return int(args.func(args) or 0)
 
 
