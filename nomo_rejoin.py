@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+# NOMO REJOIN
+# V4.58.48 — OPTION 13 AUTH VALIDATION + UPDATER FIX
+# - Restores the required '# NOMO REJOIN' marker at the top of the file.
+# - Option 13 validates the secret against authenticated /accounts, not only
+#   the public /health endpoint.
+# - Explicit 401 auth rejection clears only cloudflare_secret and reprompts.
+# - D1 account failures are normalized to [] to prevent NoneType crashes.
+# - CAPTCHA solver settings remain untouched.
+#
 # V4.58.47 — OPTION 13 INVALID-SECRET REPROMPT
 # - Option 13 validates saved Cloudflare/D1 credentials before automatically
 #   reusing them.
@@ -720,7 +729,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.58.47"
+__version__ = "V4.58.48"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/gag_lite_rejoiner")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -23214,12 +23223,26 @@ def auto_fetch_private_servers(
         market_registry_err = "specific-user allowlisting disabled"
         print(col("D1 Market allowlisting: SKIPPED (local-only setup)", CYAN))
     elif backend_provider(registry_cfg) == "cloudflare":
-        market_accounts, market_registry_err = cloudflare_read_accounts(registry_cfg, role="market")
+        market_accounts, market_registry_err = cloudflare_read_accounts(
+            registry_cfg,
+            role="market",
+        )
+        if not isinstance(market_accounts, list):
+            market_accounts = []
         if market_registry_err:
-            print(col(f"D1 Market registry unavailable: {market_registry_err}", YELLOW))
+            print(col(
+                f"D1 Market registry unavailable: {market_registry_err}",
+                YELLOW,
+            ))
         else:
-            market_registry_hash, _market_registry_ids = market_allowlist_fingerprint(market_accounts)
-            print(col(f"D1 Market accounts ready for permission sync: {len(market_accounts)}", GREEN if market_accounts else YELLOW))
+            market_registry_hash, _market_registry_ids = (
+                market_allowlist_fingerprint(market_accounts)
+            )
+            print(col(
+                f"D1 Market accounts ready for permission sync: "
+                f"{len(market_accounts)}",
+                GREEN if market_accounts else YELLOW,
+            ))
     else:
         market_registry_err = "Cloudflare backend not enabled"
         print(col("D1 Market registry not configured; Friends Allowed only.", YELLOW))
@@ -25433,6 +25456,22 @@ def _setup_cloudflare_auth_error(message):
     return any(marker in value for marker in markers)
 
 
+def _setup_validate_cloudflare_credentials(cfg):
+    """Validate Worker reachability and the supplied NOMO secret."""
+    health_ok, health_msg = backend_health_check(cfg)
+    if not health_ok:
+        return False, health_msg, False
+
+    accounts, accounts_err = cloudflare_read_accounts(cfg, role="market")
+    if accounts_err:
+        return False, accounts_err, _setup_cloudflare_auth_error(accounts_err)
+
+    if not isinstance(accounts, list):
+        return False, "authenticated accounts endpoint returned invalid data", False
+
+    return True, f"{health_msg}; authenticated accounts={len(accounts)}", False
+
+
 def _setup_configure_cloudflare(cfg, automatic=False):
     """Configure Cloudflare/D1; fresh devices only need NOMO_SECRET.
 
@@ -25470,33 +25509,30 @@ def _setup_configure_cloudflare(cfg, automatic=False):
             probe_cfg["cloudflare_worker_url"] = saved_url
             probe_cfg["cloudflare_secret"] = saved_secret
 
-            probe_ok, probe_msg = backend_health_check(probe_cfg)
+            probe_ok, probe_msg, probe_auth_rejected = (
+                _setup_validate_cloudflare_credentials(probe_cfg)
+            )
             if probe_ok:
                 reuse_saved = True
                 print(col("Saved backend credentials verified: OK", GREEN))
-            elif _setup_cloudflare_auth_error(probe_msg):
+            elif probe_auth_rejected or _setup_cloudflare_auth_error(probe_msg):
                 saved_auth_rejected = True
                 print(col(
-                    "Saved NOMO secret was rejected by the backend.",
+                    "Saved NOMO secret was rejected by the authenticated backend endpoint.",
                     RED,
                 ))
                 print(col(
                     "A replacement secret is required.",
                     YELLOW,
                 ))
-
-                # Clear only the rejected backend secret in both config files.
-                # Do not rebuild either config and do not touch solver_* keys.
                 cfg["cloudflare_secret"] = ""
                 hcfg["cloudflare_secret"] = ""
                 save_config(cfg)
                 save_hatcher_config(hcfg)
             else:
-                # Do not destroy credentials due to a temporary outage, DNS
-                # failure, timeout, or Worker-side 5xx response.
                 reuse_saved = True
                 print(col(
-                    "Could not validate saved credentials right now; "
+                    "Could not fully validate saved credentials right now; "
                     "reusing them because the error was not an auth rejection.",
                     YELLOW,
                 ))
@@ -25549,10 +25585,10 @@ def _setup_configure_cloudflare(cfg, automatic=False):
     save_config(cfg)
     save_hatcher_config(hcfg)
 
-    ok, msg = backend_health_check(cfg)
+    ok, msg, auth_rejected = _setup_validate_cloudflare_credentials(cfg)
     if ok:
-        print(col("D1 backend health: OK", GREEN))
-    elif _setup_cloudflare_auth_error(msg):
+        print(col("D1 backend authentication: OK", GREEN))
+    elif auth_rejected or _setup_cloudflare_auth_error(msg):
         print(col(f"NOMO secret rejected: {msg}", RED))
         print(col(
             "The rejected secret was not kept. Run Option 13 again and "
@@ -25564,7 +25600,10 @@ def _setup_configure_cloudflare(cfg, automatic=False):
         save_config(cfg)
         save_hatcher_config(hcfg)
     else:
-        print(col(f"Backend saved, but health check failed: {msg}", YELLOW))
+        print(col(
+            f"Backend saved, but authenticated validation failed: {msg}",
+            YELLOW,
+        ))
     return cfg, hcfg, bool(ok)
 
 
@@ -27365,7 +27404,7 @@ def _nomo_fetch_remote_source(cfg):
     beginning = text.lstrip()[:300].lower()
     if "text/html" in content_type or beginning.startswith("<!doctype html") or beginning.startswith("<html"):
         raise RuntimeError("remote server returned HTML instead of Python")
-    source_head = text[:3000].lower()
+    source_head = text[:12000].lower()
     if "# nomo rejoin" not in source_head:
         raise RuntimeError(
             "remote file is missing the required '# NOMO REJOIN' header"
