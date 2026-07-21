@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.59.6-dev-version-display"
+__version__ = "V4.59.7-dev-setup-health"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -4610,6 +4610,38 @@ def expected_state_name(tab):
         return f"{_sanitize_state_name(user)}_state.json"
     raw = str(tab.get("stat_file", "") or "")
     return Path(raw).name if raw else "state.json"
+
+
+def print_executor_state_health(cfg, packages, title="State health"):
+    tabs = {
+        str(tab.get("package") or ""): tab
+        for tab in (cfg or {}).get("tabs", [])
+        if isinstance(tab, dict)
+    }
+    print(col(title + ":", BOLD))
+    for pkg in packages or []:
+        tab = tabs.get(str(pkg or ""))
+        if tab is None:
+            print(col(f"  {short_pkg(pkg):<10} not configured", RED))
+            continue
+        path = resolve_state_path(tab)
+        state, err = read_state(tab)
+        if state:
+            age = int(state.get("age", 999999) or 999999)
+            age_text = format_age(age) if age < 999999 else "old"
+            color = GREEN if age <= 20 else (YELLOW if age <= 180 else RED)
+            username = str(state.get("username") or tab.get("user_name") or "")
+            print(col(
+                f"  {short_pkg(pkg):<10} OK age={age_text} user={username}",
+                color,
+            ))
+        else:
+            print(col(
+                f"  {short_pkg(pkg):<10} WAIT {err or 'no state'}",
+                YELLOW if err == "missing" else RED,
+            ))
+        print(col(f"    expected: {expected_state_name(tab)}", DIM))
+        print(col(f"    path    : {path or '-'}", DIM))
 
 
 def auto_find_state_files():
@@ -19225,6 +19257,9 @@ def executor_storage_paths_menu(cfg):
         print(f"  autoexec: {item.get('autoexec_path')}")
 
     print("")
+    print_executor_state_health(cfg, selected, title="Current state health")
+
+    print("")
     print(col("After this, use AutoExec manager to install/update the counter loader.", DIM))
     pause()
 
@@ -27380,10 +27415,18 @@ def new_redfinger_setup_wizard(cfg=None):
 
     print("")
     print(col("Executor storage:", BOLD))
-    if executor_storage == "delta_global":
+    if executor_mode == "delta_global":
         print(f"  Mode       : {col('Delta GLOBAL', GREEN)}")
         print(f"  AutoExec   : {DELTA_GLOBAL_AUTOEXEC_DIR}")
         print(f"  Workspace  : {DELTA_GLOBAL_WORKSPACE_DIR}")
+    elif executor_mode == "arceus_global":
+        print(f"  Mode       : {col('Arceus X GLOBAL', GREEN)}")
+        print(f"  AutoExec   : {ARCEUS_GLOBAL_AUTOEXEC_DIR}")
+        print(f"  Workspace  : {ARCEUS_GLOBAL_WORKSPACE_DIR}")
+    elif executor_mode == "custom_global":
+        print(f"  Mode       : {col('Custom GLOBAL', GREEN)}")
+        print(f"  AutoExec   : {cfg.get('custom_executor_autoexec', '')}")
+        print(f"  Workspace  : {cfg.get('custom_executor_workspace', '')}")
     else:
         print(f"  Mode       : {col('Arceus X per-clone', GREEN)}")
 
@@ -27395,11 +27438,19 @@ def new_redfinger_setup_wizard(cfg=None):
                 f"  {short_pkg(item['package']):<10} Delta global  "
                 f"{item['username']} -> {item['state_file']}"
             )
+        elif item.get("storage") in ("arceus_global", "custom_global"):
+            print(
+                f"  {short_pkg(item['package']):<10} Global  "
+                f"{item['username']} -> {item['state_file']}"
+            )
         else:
             print(
                 f"  {short_pkg(item['package']):<10} RobloxClone{item['clone_no']:03d}  "
                 f"{item['username']}"
             )
+
+    print("")
+    print_executor_state_health(load_config(), selected, title="State health now")
 
     print("")
     cleanup_disabled_count = sum(
