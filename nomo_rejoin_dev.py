@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.64.7-dev-open-policy-core"
+__version__ = "V4.64.8-dev-resolve-open-policy"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8443,6 +8443,58 @@ def classify_open_mode(mode):
     }
 
 
+def resolve_open_policy(cfg, reason, pkg_alive, mode):
+    """Resolve the target-open request into one reusable core decision."""
+    open_mode = classify_open_mode(mode)
+    intentional_route = open_mode["intentional_route"]
+    soft = open_mode["soft"]
+    hard_force = open_mode["hard_force"]
+
+    alive_soft_recovery = _alive_recovery_soft_allowed(reason, pkg_alive, cfg)
+    if cfg.get("disable_soft_rejoin", True) and not alive_soft_recovery and not intentional_route:
+        return {
+            "immediate_hard": True,
+            "soft": False,
+            "hard_force": True,
+            "require_stop": True,
+            "core_mode": "hard",
+            "record_mode": "hard",
+            "skip_note": None,
+        }
+
+    if alive_soft_recovery:
+        soft = True
+        hard_force = False
+
+    # A route can reuse a task only while the selected package is alive.
+    # If it is genuinely dead, fall back to the ordinary exact-PID hard open.
+    if soft and not pkg_alive:
+        soft = False
+        if intentional_route:
+            hard_force = True
+
+    skip_note = None
+    if (not soft) and pkg_alive and cfg.get("no_force_stop_alive", True) and not hard_force:
+        alive_mode = str(cfg.get("alive_open_mode", "soft") or "soft").lower()
+        if alive_mode == "skip":
+            skip_note = "alive skip hard"
+        elif alive_mode == "soft" and cfg.get("soft_hop_enabled", True):
+            soft = True
+        elif alive_mode != "hard":
+            skip_note = "alive skip hard"
+
+    record_mode = "route" if (intentional_route and soft) else ("soft" if soft else "hard")
+    return {
+        "immediate_hard": False,
+        "soft": soft,
+        "hard_force": hard_force,
+        "require_stop": not soft,
+        "core_mode": record_mode,
+        "record_mode": record_mode,
+        "skip_note": skip_note,
+    }
+
+
 
 def open_target(tab, rt_tab, cfg, target, reason, force=False, rt=None, mode="hard"):
     if not force and not can_open(rt_tab, cfg):
@@ -8454,12 +8506,8 @@ def open_target(tab, rt_tab, cfg, target, reason, force=False, rt=None, mode="ha
         rt_tab["note"] = "no restock link" if target == "restock" else "no link"
         return False, rt_tab["note"]
 
-    open_mode = classify_open_mode(mode)
-    mode_s = open_mode["mode"]
-    intentional_route = open_mode["intentional_route"]
-    soft = open_mode["soft"]
-    hard_force = open_mode["hard_force"]
     pkg_alive = package_alive(tab["package"], cfg, fresh=True)
+    open_policy = resolve_open_policy(cfg, reason, pkg_alive, mode)
 
     # V4.15: `disable_soft_rejoin` still disables ordinary/scheduled soft hops,
     # but it must not turn every ALIVE recovery into an immediate PID kill. On
@@ -8467,11 +8515,7 @@ def open_target(tab, rt_tab, cfg, target, reason, force=False, rt=None, mode="ha
     # windows even though sibling processes remain alive. First send the deep
     # link to the target without stopping it; _do_open_cycle() owns one hard
     # fallback if the target still cannot produce fresh state.
-    alive_soft_recovery = _alive_recovery_soft_allowed(reason, pkg_alive, cfg)
-    if cfg.get("disable_soft_rejoin", True) and not alive_soft_recovery and not intentional_route:
-        soft = False
-        hard_force = True
-        require_stop = True
+    if open_policy["immediate_hard"]:
         ok, note = core_rejoin_package(
             tab["package"],
             link,
@@ -8485,51 +8529,31 @@ def open_target(tab, rt_tab, cfg, target, reason, force=False, rt=None, mode="ha
         )
         rt_tab["target"] = target
         rt_tab["last_open"] = now()
-        rt_tab["last_open_mode"] = "hard"
+        rt_tab["last_open_mode"] = open_policy["record_mode"]
         rt_tab["note"] = reason
         if target == "restock":
             rt_tab["last_gain_ts"] = now()
         return ok, note
 
-    if alive_soft_recovery:
-        soft = True
-        hard_force = False
-
-    # A route can reuse a task only while the selected package is alive.
-    # If it is genuinely dead, fall back to the ordinary exact-PID hard open.
-    if soft and not pkg_alive:
-        soft = False
-        if intentional_route:
-            hard_force = True
-
-    # Safety mode: do not force-stop a clone that is still alive.
-    if (not soft) and pkg_alive and cfg.get("no_force_stop_alive", True) and not hard_force:
-        alive_mode = str(cfg.get("alive_open_mode", "soft") or "soft").lower()
-        if alive_mode == "skip":
-            rt_tab["note"] = "alive skip hard"
-            return False, "alive skip hard"
-        if alive_mode == "soft" and cfg.get("soft_hop_enabled", True):
-            soft = True
-        elif alive_mode != "hard":
-            rt_tab["note"] = "alive skip hard"
-            return False, "alive skip hard"
-    require_stop = not soft
+    if open_policy["skip_note"]:
+        rt_tab["note"] = open_policy["skip_note"]
+        return False, open_policy["skip_note"]
 
     ok, note = core_rejoin_package(
         tab["package"],
         link,
         cfg,
-        soft=soft,
+        soft=open_policy["soft"],
         rt_tab=rt_tab,
         reason=reason,
-        mode="route" if (intentional_route and soft) else ("soft" if soft else "hard"),
+        mode=open_policy["core_mode"],
         target=target,
-        require_stop=require_stop,
+        require_stop=open_policy["require_stop"],
     )
 
     rt_tab["target"] = target
     rt_tab["last_open"] = now()
-    rt_tab["last_open_mode"] = "route" if (intentional_route and soft) else ("soft" if soft else "hard")
+    rt_tab["last_open_mode"] = open_policy["record_mode"]
     rt_tab["note"] = reason
 
     if target == "restock":
