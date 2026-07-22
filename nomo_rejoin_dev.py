@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.63.5-dev-market-hatcher-freshness"
+__version__ = "V4.63.6-dev-hatcher-route-note"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8290,7 +8290,13 @@ def resolve_restock_link(tab, rt_tab, cfg, rt=None):
             rt_tab["last_hatcher_pets"] = hatcher.get("pets") if hatcher else ""
             rt_tab["last_hatcher_age"] = hatcher.get("age") if hatcher else ""
             rt_tab["jsonbin_last_error"] = ""
-            return link, f"jsonbin:{rt_tab['last_hatcher']}"
+            route_note = f"jsonbin:{rt_tab['last_hatcher']}"
+            if hatcher:
+                route_note += (
+                    f" age={format_age(hatcher.get('age', 0))}"
+                    f" pets={hatcher.get('pets', '')}"
+                )
+            return link, route_note
 
         rt_tab["jsonbin_last_error"] = err
 
