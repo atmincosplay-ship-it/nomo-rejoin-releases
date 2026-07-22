@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.62.5-dev-soft-no-state"
+__version__ = "V4.63.0-dev-hatcher-core-helpers"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8568,6 +8568,66 @@ class RejoinCore:
             **kwargs,
         )
 
+    def queue_exact_pid_recovery(
+        self,
+        tab,
+        target,
+        reason,
+        *,
+        skip_if_alive=False,
+        front=False,
+        bypass_manual=True,
+        metadata=None,
+    ):
+        """Queue one exact-PID hard recovery for a single clone package."""
+        merged = {
+            "bypass_recheck": True,
+            "pid_only_recovery": True,
+            "recovery_must_open_once": True,
+        }
+        if isinstance(metadata, dict):
+            merged.update(metadata)
+        return self.queue(
+            tab,
+            target,
+            reason,
+            force=True,
+            skip_if_alive=skip_if_alive,
+            mode="hard_force",
+            front=front,
+            bypass_manual=bypass_manual,
+            metadata=merged,
+        )
+
+    def queue_soft_recovery(
+        self,
+        tab,
+        target,
+        reason,
+        *,
+        no_hard_fallback=False,
+        skip_solver_probe=False,
+        metadata=None,
+    ):
+        """Queue a non-killing rejoin intent for an already-running clone."""
+        merged = {
+            "bypass_recheck": True,
+        }
+        if no_hard_fallback:
+            merged["no_hard_fallback"] = True
+        if skip_solver_probe:
+            merged["skip_solver_probe"] = True
+        if isinstance(metadata, dict):
+            merged.update(metadata)
+        return self.queue(
+            tab,
+            target,
+            reason,
+            force=True,
+            mode="soft",
+            metadata=merged,
+        )
+
     def process(self, session_start=None, loops=0):
         return process_open_queue(
             self.open_queue,
@@ -15174,6 +15234,7 @@ def start_hatcher_reporter(main_cfg=None):
     session_start = now()
     loops = 0
     open_queue = []
+    core = RejoinCore(open_queue, cfg, rt)
     last_msg = "not uploaded yet"
     last_report_at = 0
 
@@ -15959,14 +16020,12 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                 rt_tab["note"] = f"start alive -> grace {startup_grace}s"
                 continue
 
-            queue_open(
-                open_queue, tab, "hatcher", "hatcher start",
-                force=True, skip_if_alive=True, mode="hard_force", bypass_manual=True,
-                metadata={
-                    "pid_only_recovery": True,
-                    "recovery_must_open_once": True,
-                    "bypass_recheck": True,
-                },
+            core.queue_exact_pid_recovery(
+                tab,
+                "hatcher",
+                "hatcher start",
+                skip_if_alive=True,
+                bypass_manual=True,
             )
         save_runtime(rt)
 
@@ -15976,7 +16035,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
             return
 
         loops += 1
-        queue_stuck_self_heal(open_queue, cfg, rt)
+        core.self_heal()
         poll_solver_jobs(cfg, rt, open_queue)
         # Periodic auto username re-resolve (rate-limited inside the function).
         try:
@@ -16213,15 +16272,12 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                         and no_state_cooldown_left <= 0
                         and cfg.get("rejoin_if_crash", True)
                     ):
-                        added, _ = queue_open(
-                            open_queue, tab, "hatcher",
+                        added, _ = core.queue_soft_recovery(
+                            tab,
+                            "hatcher",
                             f"hatcher alive no state {no_state_for}s",
-                            force=True, mode="soft",
-                            metadata={
-                                "bypass_recheck": True,
-                                "no_hard_fallback": True,
-                                "skip_solver_probe": True,
-                            },
+                            no_hard_fallback=True,
+                            skip_solver_probe=True,
                         )
                         if added:
                             rt_tab["hatcher_alive_no_state_hard_last"] = now()
@@ -16266,14 +16322,12 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
             ):
                 if cfg.get("smart_open_queue", True) or cfg.get("solver_enabled", False):
                     dead_reason = "crash/dead"
-                    added, _ = queue_open(
-                        open_queue, tab, "hatcher", dead_reason,
-                        force=True, skip_if_alive=True, mode="hard_force", bypass_manual=True,
-                        metadata={
-                            "pid_only_recovery": True,
-                            "recovery_must_open_once": True,
-                            "bypass_recheck": True,
-                        },
+                    added, _ = core.queue_exact_pid_recovery(
+                        tab,
+                        "hatcher",
+                        dead_reason,
+                        skip_if_alive=True,
+                        bypass_manual=True,
                     )
                     note = "crash queued" if added else "already queued"
                     status = "Queued" if added else "Offline"
@@ -16385,7 +16439,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
         if open_queue and cfg.get("smart_open_queue", True):
             if not wait_seconds(2, rt):
                 return
-            process_open_queue(open_queue, cfg, rt, session_start, loops)
+            core.process(session_start, loops)
             continue
 
         if not wait_seconds(int(cfg.get("check_interval", 10)), rt):
