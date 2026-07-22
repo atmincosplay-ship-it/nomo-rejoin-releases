@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.63.7-dev-restock-force-fresh"
+__version__ = "V4.63.8-dev-loading-no-captcha-safe"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1337,7 +1337,7 @@ DEFAULT_CONFIG = {
     # repeatedly sending solved/NO_CAPTCHA cookies. Keep at least 10 minutes.
     "solver_retry_cooldown_seconds": 600,
     "solver_min_resubmit_seconds": 600,
-    "solver_probe_after_seconds": 45,
+    "solver_probe_after_seconds": 180,
     # If the package stays stale/no-state, re-run the provider/UI probe after
     # this cooldown. V3.82 accidentally made the startup probe a one-shot that
     # could also be skipped forever when opened_at was 0.
@@ -2406,8 +2406,8 @@ def apply_update_migrations(cfg):
         set_cfg("solver_retry_cooldown_seconds", 600)
     if _int_cfg(cfg.get("solver_min_resubmit_seconds"), 0) < 600:
         set_cfg("solver_min_resubmit_seconds", 600)
-    if _int_cfg(cfg.get("solver_probe_after_seconds"), 0) <= 0:
-        set_cfg("solver_probe_after_seconds", 45)
+    if _int_cfg(cfg.get("solver_probe_after_seconds"), 0) < 180:
+        set_cfg("solver_probe_after_seconds", 180)
     if _int_cfg(cfg.get("solver_probe_repeat_seconds"), 0) < 600:
         set_cfg("solver_probe_repeat_seconds", 600)
     set_cfg("solver_probe_once_per_open", True)
@@ -11041,7 +11041,7 @@ def wait_until_fresh_after_open(
 
         # V3.84: one provider check per actual open/rejoin. An old state file may
         # still exist, so use `not fresh` rather than only `not state`.
-        probe_after = max(10, int(cfg.get("solver_probe_after_seconds", 45) or 45))
+        probe_after = max(10, int(cfg.get("solver_probe_after_seconds", 180) or 180))
         if allow_solver_probe and not fresh and elapsed >= probe_after and not solver_job_running(pkg):
             started, probe_note = start_challenge_probe_job(
                 tab, cfg, rt, rt_tab,
@@ -25021,6 +25021,26 @@ def poll_solver_jobs(cfg, rt, open_queue):
         #   open ok -> solver NO_CAPTCHA -> queued hard force
         # CAPTCHA_SUCCESS still gets one recovery rejoin because reconnecting can
         # be required after the challenge is actually solved.
+        if no_captcha_result and str(job.get("phase", "")) == "probe" and not job.get("detected"):
+            detail = _solver_probe_detail(response)
+            clear_hold(pkg)
+            clear_manual_login_block(rt_tab)
+            clear_captcha_ui_runtime(rt_tab)
+            rt_tab["solver_busy_retry_pending"] = False
+            rt_tab["solver_busy_retry_at"] = 0
+            rt_tab["solver_state"] = "clear"
+            rt_tab["solver_last_success"] = now()
+            rt_tab["solver_last_error"] = ""
+            rt_tab["solver_last_probe"] = detail
+            rt_tab["note"] = "NO_CAPTCHA; still waiting for game load"
+            log_activity(
+                "solver NO_CAPTCHA during loading probe; no hard rejoin queued",
+                pkg,
+                GREEN,
+            )
+            changed = True
+            continue
+
         if no_captcha_result or solved_result:
             result_label = "NO_CAPTCHA" if no_captcha_result else "CAPTCHA_SUCCESS"
             detail = _solver_probe_detail(response)
@@ -26445,7 +26465,7 @@ def solver_menu(cfg):
         print(f"2. Endpoint + API key (paste full URL): {cfg.get('solver_endpoint', 'https://solver.wintercode.dev')}")
         print(f"   API key: {mask_secret(cfg.get('solver_api_key', ''))}")
         print(f"3. Default place ID: {cfg.get('solver_place_id', '126884695634066')}")
-        print(f"4. Timeout / min provider interval / probe delay: {cfg.get('solver_timeout_seconds', 180)}s / {cfg.get('solver_min_resubmit_seconds', 600)}s / {cfg.get('solver_probe_after_seconds', 45)}s")
+        print(f"4. Timeout / min provider interval / probe delay: {cfg.get('solver_timeout_seconds', 180)}s / {cfg.get('solver_min_resubmit_seconds', 600)}s / {cfg.get('solver_probe_after_seconds', 180)}s")
         print(f"   Once per actual rejoin: {cfg.get('solver_probe_once_per_open', True)}")
         print(f"   Cookie precheck required: {cfg.get('solver_require_cookie_precheck', True)}")
         print("5. Test solver with a package (uses cached cookie)")
@@ -26493,7 +26513,7 @@ def solver_menu(cfg):
             try:
                 timeout = int(input(f"Request timeout seconds [{cfg.get('solver_timeout_seconds', 180)}]: ").strip() or cfg.get("solver_timeout_seconds", 180))
                 cooldown = int(input(f"Minimum provider interval seconds [{cfg.get('solver_min_resubmit_seconds', 600)}]: ").strip() or cfg.get("solver_min_resubmit_seconds", 600))
-                probe = int(input(f"Post-rejoin no-fresh probe delay seconds [{cfg.get('solver_probe_after_seconds', 45)}]: ").strip() or cfg.get("solver_probe_after_seconds", 45))
+                probe = int(input(f"Post-rejoin no-fresh probe delay seconds [{cfg.get('solver_probe_after_seconds', 180)}]: ").strip() or cfg.get("solver_probe_after_seconds", 180))
                 cfg["solver_timeout_seconds"] = max(15, timeout)
                 cfg["solver_min_resubmit_seconds"] = max(600, cooldown)
                 cfg["solver_retry_cooldown_seconds"] = max(600, cooldown)
