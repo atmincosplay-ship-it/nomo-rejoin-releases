@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.66.8-dev-core-visible-ui"
+__version__ = "V4.66.9-dev-529-retry-polish"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -12113,6 +12113,7 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                 rt_tab["disconnect_ui_recovery_active"] = False
                 rt_tab["disconnect_ui_recovery_stage"] = "hold"
                 rt_tab["disconnect_ui_hold_until"] = now() + cooldown
+                rt_tab["last_disconnect_ui_open"] = 0
                 rt_tab["note"] = f"kick popup survived recovery; retry in {format_age(cooldown)}"
                 log_activity(
                     f"kick popup survived soft+hard recovery; package held {format_age(cooldown)}",
