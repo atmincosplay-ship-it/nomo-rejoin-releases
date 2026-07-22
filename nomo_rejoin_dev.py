@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.65.9-dev-core-finish-path"
+__version__ = "V4.66.0-dev-core-target-link"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8496,11 +8496,11 @@ def resolve_open_policy(cfg, reason, pkg_alive, mode):
 
 
 
-def open_target(tab, rt_tab, cfg, target, reason, force=False, rt=None, mode="hard"):
+def open_target(tab, rt_tab, cfg, target, reason, force=False, rt=None, mode="hard", core=None):
     if not force and not can_open(rt_tab, cfg):
         return False, "cooldown"
 
-    link = target_link(tab, cfg, target, rt_tab, rt)
+    link = core.target_link(tab, target, rt_tab) if core is not None else target_link(tab, cfg, target, rt_tab, rt)
 
     if not link:
         rt_tab["note"] = "no restock link" if target == "restock" else "no link"
@@ -8690,6 +8690,9 @@ class RejoinCore:
     def finish(self, rt_tab, **kwargs):
         return core_finish_rejoin(rt_tab, **kwargs)
 
+    def target_link(self, tab, target, rt_tab=None):
+        return target_link(tab, self.cfg, target, rt_tab, self.rt)
+
     def open(self, tab, rt_tab, target, reason, **kwargs):
         return open_target(
             tab,
@@ -8698,6 +8701,7 @@ class RejoinCore:
             target,
             reason,
             rt=self.rt,
+            core=self,
             **kwargs,
         )
 
