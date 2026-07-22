@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.62.4-dev-no-launcher-fallback"
+__version__ = "V4.62.5-dev-soft-no-state"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -11735,8 +11735,12 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                 return True
 
             allow_hard_fallback = cfg.get("homepage_stuck_hard_fallback_enabled", True)
+            if item.get("no_hard_fallback"):
+                allow_hard_fallback = False
             if actual_open_mode == "soft" and _alive_recovery_soft_allowed(reason, True, cfg):
                 allow_hard_fallback = bool(cfg.get("alive_recovery_hard_fallback", True))
+                if item.get("no_hard_fallback"):
+                    allow_hard_fallback = False
 
             if allow_hard_fallback and retries_done < max_retries:
                 added, _ = queue_open(
@@ -16212,16 +16216,16 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                         added, _ = queue_open(
                             open_queue, tab, "hatcher",
                             f"hatcher alive no state {no_state_for}s",
-                            force=True, mode="hard_force",
+                            force=True, mode="soft",
                             metadata={
                                 "bypass_recheck": True,
-                                "pid_only_recovery": True,
-                                "recovery_must_open_once": True,
+                                "no_hard_fallback": True,
+                                "skip_solver_probe": True,
                             },
                         )
                         if added:
                             rt_tab["hatcher_alive_no_state_hard_last"] = now()
-                        note = "no-state PID hard queued" if added else "already queued"
+                        note = "no-state soft rejoin queued" if added else "already queued"
                         status = "Queued" if added else "No state"
                     elif no_state_for >= no_state_hard_after and no_state_cooldown_left > 0:
                         status = "No state"
