@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.66.9-dev-529-retry-polish"
+__version__ = "V4.67.0-dev-529-api-precheck"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1549,6 +1549,8 @@ DEFAULT_CONFIG = {
     "disconnect_ui_retry_seconds": 20,
     "disconnect_ui_hard_after_seconds": 180,
     "disconnect_ui_soft_first_seconds": 0,
+    "disconnect_ui_api_precheck_enabled": True,
+    "disconnect_ui_api_precheck_cooldown_seconds": 120,
     "minimized_window_detection_enabled": True,
     "minimized_window_reopen_enabled": False,  # status-only; dumpsys is not package-safe enough
     "minimized_window_reopen_mode": "soft",
@@ -2601,6 +2603,10 @@ def apply_update_migrations(cfg):
         set_cfg("force_stop_alive_on_disconnect_popup", False)
     if "disconnect_ui_rejoin_enabled" not in cfg:
         set_cfg("disconnect_ui_rejoin_enabled", True)
+    if "disconnect_ui_api_precheck_enabled" not in cfg:
+        set_cfg("disconnect_ui_api_precheck_enabled", True)
+    if "disconnect_ui_api_precheck_cooldown_seconds" not in cfg:
+        set_cfg("disconnect_ui_api_precheck_cooldown_seconds", 120)
     if "disconnect_ui_retry_seconds" not in cfg:
         set_cfg("disconnect_ui_retry_seconds", 60)
     if "disconnect_ui_hard_after_seconds" not in cfg:
@@ -9302,6 +9308,66 @@ def clear_disconnect_ui_incident(rt_tab):
     return changed
 
 
+def disconnect_ui_api_precheck(tab, rt_tab, cfg, reason="kick popup"):
+    if not cfg.get("disconnect_ui_api_precheck_enabled", True):
+        return False, ""
+
+    pkg = str((tab or {}).get("package", "") or "")
+    if not pkg:
+        return False, ""
+
+    t = now()
+    cooldown = max(30, int(cfg.get("disconnect_ui_api_precheck_cooldown_seconds", 120) or 120))
+    last = int(rt_tab.get("disconnect_ui_api_last_check", 0) or 0)
+    if last and t - last < cooldown:
+        status = str(rt_tab.get("disconnect_ui_api_last_status", "") or "")
+        if status in ("challenge", "invalid"):
+            note = str(rt_tab.get("note", "") or f"{reason}; api {status} hold")
+            return True, note
+        return False, ""
+
+    rt_tab["disconnect_ui_api_last_check"] = t
+    cookie = cached_cookie_for_package(pkg)
+    if not cookie:
+        rt_tab["disconnect_ui_api_last_status"] = "no_cookie"
+        return False, ""
+
+    blocked, detail = roblox_cookie_detection(cookie)
+    detail = str(detail or "")
+
+    if blocked is False:
+        rt_tab["disconnect_ui_api_last_status"] = "valid"
+        clear_hold(pkg)
+        clear_manual_login_block(rt_tab)
+        return False, detail
+
+    if blocked is True:
+        rt_tab["disconnect_ui_api_last_status"] = "challenge"
+        rt_tab["manual_login_needed"] = True
+        rt_tab["manual_login_reason"] = "api challenge"
+        rt_tab["manual_login_detail"] = detail or f"{reason}; api challenge"
+        rt_tab["manual_login_detected_at"] = t
+        rt_tab["note"] = f"{reason}; api challenge hold"
+        set_hold(pkg, "api challenge")
+        log_activity(f"{reason}; API challenge before rejoin - package held", pkg, YELLOW)
+        return True, rt_tab["note"]
+
+    if "invalid" in detail.lower() or "expired" in detail.lower():
+        rt_tab["disconnect_ui_api_last_status"] = "invalid"
+        rt_tab["manual_login_needed"] = True
+        rt_tab["manual_login_reason"] = "api invalid/expired"
+        rt_tab["manual_login_detail"] = detail or f"{reason}; api invalid/expired"
+        rt_tab["manual_login_detected_at"] = t
+        rt_tab["note"] = f"{reason}; api invalid/expired hold"
+        set_hold(pkg, "api invalid/expired")
+        log_activity(f"{reason}; API invalid/expired before rejoin - package held", pkg, RED)
+        return True, rt_tab["note"]
+
+    rt_tab["disconnect_ui_api_last_status"] = "error"
+    rt_tab["disconnect_ui_api_last_detail"] = detail
+    return False, detail
+
+
 
 def queue_disconnect_ui_rejoin(open_queue, tab, target, rt_tab, cfg):
     if not cfg.get("disconnect_ui_rejoin_enabled", True):
@@ -9329,6 +9395,10 @@ def queue_disconnect_ui_rejoin(open_queue, tab, target, rt_tab, cfg):
         rt_tab["disconnect_ui_recovery_stage"] = ""
         rt_tab["last_disconnect_ui_open"] = 0
         log_activity("stale kick recovery lock cleared", pkg, YELLOW)
+
+    api_blocked, api_note = disconnect_ui_api_precheck(tab, rt_tab, cfg, "kick/error 529")
+    if api_blocked:
+        return False, api_note
 
     retry = int(cfg.get("disconnect_ui_retry_seconds", 60) or 60)
     if target == "hatcher":
