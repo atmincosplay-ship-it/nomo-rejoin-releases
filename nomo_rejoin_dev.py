@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.65.2-dev-core-health-actions"
+__version__ = "V4.65.3-dev-core-fallback-queues"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -12048,25 +12048,38 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
             )
 
             if allow_hard_fallback and alive_for_retry and join_fail_count < failures_before_hard:
-                added, _ = queue_open(
-                    open_queue,
-                    tab,
-                    target,
-                    f"join fail {join_fail_count}/{failures_before_hard}; route retry after {fresh_msg}",
-                    force=True,
-                    mode="route",
-                    front=False,
-                    metadata={
-                        "solver_preflight_done": True,
-                        "skip_solver_once": True,
-                        "skip_solver_probe": True,
-                        "solver_result": str(item.get("solver_result", "") or ""),
-                        "manual_booster_route": bool(item.get("manual_booster_route")),
-                        "manual_booster_second_intent_done": bool(
-                            item.get("manual_booster_second_intent_done")
-                        ),
-                    },
-                )
+                retry_meta = {
+                    "solver_preflight_done": True,
+                    "skip_solver_once": True,
+                    "skip_solver_probe": True,
+                    "solver_result": str(item.get("solver_result", "") or ""),
+                    "manual_booster_route": bool(item.get("manual_booster_route")),
+                    "manual_booster_second_intent_done": bool(
+                        item.get("manual_booster_second_intent_done")
+                    ),
+                }
+                retry_reason = f"join fail {join_fail_count}/{failures_before_hard}; route retry after {fresh_msg}"
+                if core is not None:
+                    added, _ = core.queue(
+                        tab,
+                        target,
+                        retry_reason,
+                        force=True,
+                        mode="route",
+                        front=False,
+                        metadata=retry_meta,
+                    )
+                else:
+                    added, _ = queue_open(
+                        open_queue,
+                        tab,
+                        target,
+                        retry_reason,
+                        force=True,
+                        mode="route",
+                        front=False,
+                        metadata=retry_meta,
+                    )
                 rt_tab["note"] = (
                     f"{fresh_msg}; join fail {join_fail_count}/{failures_before_hard}; "
                     + ("route retry queued" if added else "route retry already queued")
@@ -12083,40 +12096,52 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                 retry_reason = "homepage/no-state hard retry"
                 if fresh_msg in ("process never appeared", "died while loading"):
                     retry_reason = "loading crash hard retry"
-                added, _ = queue_open(
-                    open_queue,
-                    tab,
-                    target,
-                    f"{retry_reason} after {fresh_msg}",
-                    force=True,
-                    mode="hard_force",
-                    front=False,
-                    metadata={
-                        # This is stage two of the same recovery. The solver
-                        # already ran before the soft attempt, so never submit it
-                        # again merely because a target-only hard retry is needed.
-                        "solver_preflight_done": True,
-                        "skip_solver_once": True,
-                        "skip_solver_probe": True,
-                        "solver_result": str(item.get("solver_result", "") or ""),
-                        "disconnect_recovery": bool(
-                            item.get("disconnect_recovery")
-                        ),
-                        "disconnect_recovery_stage": (
-                            "hard_fallback"
-                            if item.get("disconnect_recovery")
-                            else ""
-                        ),
-                        "manual_booster_route": bool(
-                            item.get("manual_booster_route")
-                        ),
-                        "manual_booster_second_intent_done": bool(
-                            item.get(
-                                "manual_booster_second_intent_done"
-                            )
-                        ),
-                    },
-                )
+                hard_meta = {
+                    # This is stage two of the same recovery. The solver
+                    # already ran before the soft attempt, so never submit it
+                    # again merely because a target-only hard retry is needed.
+                    "solver_preflight_done": True,
+                    "skip_solver_once": True,
+                    "skip_solver_probe": True,
+                    "solver_result": str(item.get("solver_result", "") or ""),
+                    "disconnect_recovery": bool(
+                        item.get("disconnect_recovery")
+                    ),
+                    "disconnect_recovery_stage": (
+                        "hard_fallback"
+                        if item.get("disconnect_recovery")
+                        else ""
+                    ),
+                    "manual_booster_route": bool(
+                        item.get("manual_booster_route")
+                    ),
+                    "manual_booster_second_intent_done": bool(
+                        item.get(
+                            "manual_booster_second_intent_done"
+                        )
+                    ),
+                }
+                if core is not None:
+                    added, _ = core.queue(
+                        tab,
+                        target,
+                        f"{retry_reason} after {fresh_msg}",
+                        force=True,
+                        mode="hard_force",
+                        front=False,
+                        metadata=hard_meta,
+                    )
+                else:
+                    added, _ = queue_open(
+                        open_queue,
+                        tab,
+                        target,
+                        f"{retry_reason} after {fresh_msg}",
+                        force=True,
+                        mode="hard_force",
+                        front=False,
+                        metadata=hard_meta,
+                    )
                 if added:
                     retry_item = next(
                         (q for q in reversed(open_queue)
@@ -12136,7 +12161,10 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                     save_runtime(rt)
 
             elif actual_open_mode == "soft" and cfg.get("soft_hop_fallback_hard", True):
-                queue_open(open_queue, tab, target, "soft fallback hard", force=True, mode="hard_force", front=True)
+                if core is not None:
+                    core.queue(tab, target, "soft fallback hard", force=True, mode="hard_force", front=True)
+                else:
+                    queue_open(open_queue, tab, target, "soft fallback hard", force=True, mode="hard_force", front=True)
     else:
         rt_tab["note"] = msg
         core_finish_rejoin(
@@ -12148,7 +12176,10 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
 
         if mode in ("soft", "route") and cfg.get("soft_hop_fallback_hard", True):
             fallback_reason = "route failed hard" if mode == "route" else "soft failed hard"
-            queue_open(open_queue, tab, target, fallback_reason, force=True, mode="hard_force", front=True)
+            if core is not None:
+                core.queue(tab, target, fallback_reason, force=True, mode="hard_force", front=True)
+            else:
+                queue_open(open_queue, tab, target, fallback_reason, force=True, mode="hard_force", front=True)
 
     return True
 
@@ -16649,7 +16680,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
             # stale/dead/routing decision above. Remove only this package's queued
             # opens and solve/hold it without restarting the other clones.
             captcha_action = apply_visible_captcha_ui_action(
-                open_queue, tab, "hatcher", rt_tab, cfg, rt, health
+                open_queue, tab, "hatcher", rt_tab, cfg, rt, health, core
             )
             if captcha_action is not None:
                 status, note, _ = captcha_action
