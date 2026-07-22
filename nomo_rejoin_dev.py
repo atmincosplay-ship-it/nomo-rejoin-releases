@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.65.6-dev-core-legacy-health"
+__version__ = "V4.65.7-dev-core-runtime-tab"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8681,6 +8681,9 @@ class RejoinCore:
     def cancel(self, package):
         return cancel_queued_package(self.open_queue, package)
 
+    def runtime_tab(self, package):
+        return get_runtime_tab(self.rt, package)
+
     def open(self, tab, rt_tab, target, reason, **kwargs):
         return open_target(
             tab,
@@ -11571,7 +11574,7 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
     item = open_queue.pop(0)
     tab = item["tab"]
     pkg = tab["package"]
-    rt_tab = get_runtime_tab(rt, pkg)
+    rt_tab = core.runtime_tab(pkg) if core is not None else get_runtime_tab(rt, pkg)
     target = item.get("target", rt_tab.get("target", "market"))
     reason = item.get("reason", "queued open")
     mode = str(item.get("mode", "hard") or "hard").lower()
