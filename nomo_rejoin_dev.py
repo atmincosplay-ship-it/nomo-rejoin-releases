@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.63.9-dev-loading-alive-guard"
+__version__ = "V4.64.0-dev-slow-start-grace"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1423,7 +1423,7 @@ DEFAULT_CONFIG = {
     "open_wait_check_seconds": 5,
     # Redfinger/App Cloner can take well over 20 seconds before the new Roblox
     # process becomes visible in ps. Never hard-retry during this startup window.
-    "open_process_start_grace_seconds": 120,
+    "open_process_start_grace_seconds": 180,
     # Once the PID has been observed, require a sustained disappearance before
     # declaring that package dead. Brief process transitions are ignored.
     "open_process_dead_confirm_seconds": 45,
@@ -2368,8 +2368,8 @@ def apply_update_migrations(cfg):
     # stuck and cause unnecessary rejoin loops. Raise only known-aggressive values.
     if _int_cfg(cfg.get("open_wait_fresh_seconds"), 0) <= 120:
         set_cfg("open_wait_fresh_seconds", 300)
-    if _int_cfg(cfg.get("open_process_start_grace_seconds"), 0) < 60:
-        set_cfg("open_process_start_grace_seconds", 120)
+    if _int_cfg(cfg.get("open_process_start_grace_seconds"), 0) < 180:
+        set_cfg("open_process_start_grace_seconds", 180)
     if _int_cfg(cfg.get("open_process_dead_confirm_seconds"), 0) < 20:
         set_cfg("open_process_dead_confirm_seconds", 45)
     if _int_cfg(cfg.get("soft_hop_wait_fresh_seconds"), 0) <= 90:
@@ -11012,7 +11012,7 @@ def wait_until_fresh_after_open(
     rt_tab = get_runtime_tab(rt, pkg)
 
     process_start_grace = max(
-        30, int(cfg.get("open_process_start_grace_seconds", 120) or 120)
+        30, int(cfg.get("open_process_start_grace_seconds", 180) or 180)
     )
     process_dead_confirm = max(
         15, int(cfg.get("open_process_dead_confirm_seconds", 45) or 45)
