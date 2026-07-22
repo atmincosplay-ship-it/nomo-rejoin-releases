@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.67.0-dev-529-api-precheck"
+__version__ = "V4.67.1-dev-moderated-api-detect"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -9321,7 +9321,7 @@ def disconnect_ui_api_precheck(tab, rt_tab, cfg, reason="kick popup"):
     last = int(rt_tab.get("disconnect_ui_api_last_check", 0) or 0)
     if last and t - last < cooldown:
         status = str(rt_tab.get("disconnect_ui_api_last_status", "") or "")
-        if status in ("challenge", "invalid"):
+        if status in ("challenge", "invalid", "moderated"):
             note = str(rt_tab.get("note", "") or f"{reason}; api {status} hold")
             return True, note
         return False, ""
@@ -9352,15 +9352,17 @@ def disconnect_ui_api_precheck(tab, rt_tab, cfg, reason="kick popup"):
         log_activity(f"{reason}; API challenge before rejoin - package held", pkg, YELLOW)
         return True, rt_tab["note"]
 
-    if "invalid" in detail.lower() or "expired" in detail.lower():
-        rt_tab["disconnect_ui_api_last_status"] = "invalid"
+    detail_l = detail.lower()
+    if "invalid" in detail_l or "expired" in detail_l or "moderated" in detail_l:
+        api_status = "moderated" if "moderated" in detail_l else "invalid"
+        rt_tab["disconnect_ui_api_last_status"] = api_status
         rt_tab["manual_login_needed"] = True
-        rt_tab["manual_login_reason"] = "api invalid/expired"
-        rt_tab["manual_login_detail"] = detail or f"{reason}; api invalid/expired"
+        rt_tab["manual_login_reason"] = "api user moderated" if api_status == "moderated" else "api invalid/expired"
+        rt_tab["manual_login_detail"] = detail or f"{reason}; {rt_tab['manual_login_reason']}"
         rt_tab["manual_login_detected_at"] = t
-        rt_tab["note"] = f"{reason}; api invalid/expired hold"
-        set_hold(pkg, "api invalid/expired")
-        log_activity(f"{reason}; API invalid/expired before rejoin - package held", pkg, RED)
+        rt_tab["note"] = f"{reason}; {rt_tab['manual_login_reason']} hold"
+        set_hold(pkg, rt_tab["manual_login_reason"])
+        log_activity(f"{reason}; {rt_tab['manual_login_reason']} before rejoin - package held", pkg, RED)
         return True, rt_tab["note"]
 
     rt_tab["disconnect_ui_api_last_status"] = "error"
@@ -10208,6 +10210,10 @@ def roblox_cookie_detection(cookie):
     if status == "valid":
         info = get_roblox_user_info(cookie)
         username = info.get("username", "") if info else ""
+        user_id = info.get("userID") or info.get("id")
+        moderated = roblox_cookie_moderation_detection(cookie, user_id)
+        if moderated:
+            return None, moderated
         return False, f"api valid {username}".strip()
     elif status == "challenge":
         return True, "api challenge (captcha required)"
@@ -10216,6 +10222,31 @@ def roblox_cookie_detection(cookie):
         return None, "api invalid/expired"
     else:
         return None, f"api {status}"
+
+
+def roblox_cookie_moderation_detection(cookie, user_id):
+    if not cookie or not user_id:
+        return ""
+    url = f"https://friends.roblox.com/v1/users/{user_id}/friends?userSort=StatusFrequents"
+    headers = {
+        "Cookie": f".ROBLOSECURITY={cookie}",
+        "User-Agent": "NOMO-Rejoin/1.0",
+    }
+    try:
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return "" if resp.status == 200 else ""
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode(errors="ignore")
+        except Exception:
+            body = ""
+        if "user is moderated" in body.lower():
+            return "api user moderated"
+        return ""
+    except Exception:
+        return ""
 
 
 # One cached Android accessibility snapshot shared by every package check in a
