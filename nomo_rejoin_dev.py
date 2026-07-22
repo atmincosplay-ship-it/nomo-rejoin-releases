@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.66.7-dev-core-solver-poll"
+__version__ = "V4.66.8-dev-core-visible-ui"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8824,6 +8824,17 @@ class RejoinCore:
             metadata={"bypass_recheck": True},
         )
 
+    def queue_visible_verification_rejoin(self, tab, target):
+        return self.queue(
+            tab,
+            target,
+            "visible verification preflight rejoin",
+            force=True,
+            mode="hard_force",
+            bypass_manual=True,
+            metadata={"bypass_recheck": True},
+        )
+
     def process(self, session_start=None, loops=0):
         return process_open_queue(
             self.open_queue,
@@ -9907,17 +9918,14 @@ def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, he
         rt_tab["note"] = note
         return "Captcha", note, True
 
-    if queue_has(open_queue, pkg):
+    already_queued = core.has(pkg) if core is not None else queue_has(open_queue, pkg)
+    if already_queued:
         note = "verification UI; rejoin already queued"
         rt_tab["note"] = note
         return "Queued", note, True
 
     if core is not None:
-        added, _ = core.queue(
-            tab, target, "visible verification preflight rejoin",
-            force=True, mode="hard_force", bypass_manual=True,
-            metadata={"bypass_recheck": True},
-        )
+        added, _ = core.queue_visible_verification_rejoin(tab, target)
     else:
         added, _ = queue_open(
             open_queue, tab, target, "visible verification preflight rejoin",
