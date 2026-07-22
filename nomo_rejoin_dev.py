@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.63.2-dev-hatcher-core-soft"
+__version__ = "V4.63.3-dev-core-liveness-helper"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8628,6 +8628,35 @@ class RejoinCore:
             metadata=merged,
         )
 
+    def queue_by_liveness(
+        self,
+        tab,
+        target,
+        reason,
+        *,
+        alive=False,
+        skip_if_alive=True,
+        bypass_manual=True,
+        soft_metadata=None,
+        hard_metadata=None,
+    ):
+        """Soft-rejoin alive packages; exact-PID hard-open dead packages."""
+        if alive:
+            return self.queue_soft_recovery(
+                tab,
+                target,
+                reason,
+                metadata=soft_metadata,
+            )
+        return self.queue_exact_pid_recovery(
+            tab,
+            target,
+            reason,
+            skip_if_alive=skip_if_alive,
+            bypass_manual=bypass_manual,
+            metadata=hard_metadata,
+        )
+
     def process(self, session_start=None, loops=0):
         return process_open_queue(
             self.open_queue,
@@ -16125,20 +16154,14 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                 if problem_code:
                     should_q, wait_note = should_queue_hatcher_teleport_rejoin(rt_tab, hcfg, cfg, problem_code)
                     if should_q and cfg.get("rejoin_if_crash", True):
-                        if alive:
-                            added, _ = core.queue_soft_recovery(
-                                tab,
-                                "hatcher",
-                                problem_note,
-                            )
-                        else:
-                            added, _ = core.queue_exact_pid_recovery(
-                                tab,
-                                "hatcher",
-                                problem_note,
-                                skip_if_alive=True,
-                                bypass_manual=True,
-                            )
+                        added, _ = core.queue_by_liveness(
+                            tab,
+                            "hatcher",
+                            problem_note,
+                            alive=alive,
+                            skip_if_alive=True,
+                            bypass_manual=True,
+                        )
                         note = "private rejoin queued" if added else "already queued"
                         status = "Queued" if added else "Wrong server"
                     else:
