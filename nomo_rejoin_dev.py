@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.67.2-dev-hold-display"
+__version__ = "V4.68.0-dev-api-gate"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1551,6 +1551,8 @@ DEFAULT_CONFIG = {
     "disconnect_ui_soft_first_seconds": 0,
     "disconnect_ui_api_precheck_enabled": True,
     "disconnect_ui_api_precheck_cooldown_seconds": 120,
+    "api_precheck_before_rejoin_enabled": True,
+    "api_precheck_block_retry_seconds": 600,
     "minimized_window_detection_enabled": True,
     "minimized_window_reopen_enabled": False,  # status-only; dumpsys is not package-safe enough
     "minimized_window_reopen_mode": "soft",
@@ -2607,6 +2609,10 @@ def apply_update_migrations(cfg):
         set_cfg("disconnect_ui_api_precheck_enabled", True)
     if "disconnect_ui_api_precheck_cooldown_seconds" not in cfg:
         set_cfg("disconnect_ui_api_precheck_cooldown_seconds", 120)
+    if "api_precheck_before_rejoin_enabled" not in cfg:
+        set_cfg("api_precheck_before_rejoin_enabled", True)
+    if "api_precheck_block_retry_seconds" not in cfg:
+        set_cfg("api_precheck_block_retry_seconds", 600)
     if "disconnect_ui_retry_seconds" not in cfg:
         set_cfg("disconnect_ui_retry_seconds", 60)
     if "disconnect_ui_hard_after_seconds" not in cfg:
@@ -9308,8 +9314,8 @@ def clear_disconnect_ui_incident(rt_tab):
     return changed
 
 
-def disconnect_ui_api_precheck(tab, rt_tab, cfg, reason="kick popup"):
-    if not cfg.get("disconnect_ui_api_precheck_enabled", True):
+def disconnect_ui_api_precheck(tab, rt_tab, cfg, reason="kick popup", require_disconnect_toggle=True):
+    if require_disconnect_toggle and not cfg.get("disconnect_ui_api_precheck_enabled", True):
         return False, ""
 
     pkg = str((tab or {}).get("package", "") or "")
@@ -9318,13 +9324,19 @@ def disconnect_ui_api_precheck(tab, rt_tab, cfg, reason="kick popup"):
 
     t = now()
     cooldown = max(30, int(cfg.get("disconnect_ui_api_precheck_cooldown_seconds", 120) or 120))
+    block_cooldown = max(
+        cooldown,
+        int(cfg.get("api_precheck_block_retry_seconds", 600) or 600),
+    )
     last = int(rt_tab.get("disconnect_ui_api_last_check", 0) or 0)
-    if last and t - last < cooldown:
+    if last:
         status = str(rt_tab.get("disconnect_ui_api_last_status", "") or "")
-        if status in ("challenge", "invalid", "moderated"):
+        wait_for = block_cooldown if status in ("challenge", "invalid", "moderated") else cooldown
+        if t - last < wait_for and status in ("challenge", "invalid", "moderated"):
             note = str(rt_tab.get("note", "") or f"{reason}; api {status} hold")
             return True, note
-        return False, ""
+        if t - last < wait_for:
+            return False, ""
 
     rt_tab["disconnect_ui_api_last_check"] = t
     cookie = cached_cookie_for_package(pkg)
@@ -9368,6 +9380,18 @@ def disconnect_ui_api_precheck(tab, rt_tab, cfg, reason="kick popup"):
     rt_tab["disconnect_ui_api_last_status"] = "error"
     rt_tab["disconnect_ui_api_last_detail"] = detail
     return False, detail
+
+
+def api_precheck_before_rejoin(tab, rt_tab, cfg, reason="queued rejoin"):
+    """Light package-scoped API gate before opening Roblox.
+
+    This reuses the same cookie/API probe as 529 recovery, but can run for any
+    mode-neutral queued rejoin. API errors/no-cookie do not block; confirmed
+    challenge, moderated, or invalid cookies hold the package for manual action.
+    """
+    if not cfg.get("api_precheck_before_rejoin_enabled", True):
+        return False, ""
+    return disconnect_ui_api_precheck(tab, rt_tab, cfg, reason, require_disconnect_toggle=False)
 
 
 
@@ -11805,6 +11829,18 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
         if last_pool_open > 0 and since < stagger:
             open_queue.insert(0, item)
             rt_tab["note"] = f"stagger wait {max(1, stagger - since)}s"
+            save_runtime_core(core, rt)
+            return True
+
+    if not item.get("bypass_api_precheck"):
+        api_blocked, api_note = api_precheck_before_rejoin(
+            tab,
+            rt_tab,
+            cfg,
+            f"before rejoin: {reason}",
+        )
+        if api_blocked:
+            rt_tab["note"] = api_note or rt_tab.get("note") or "api hold before rejoin"
             save_runtime_core(core, rt)
             return True
 
