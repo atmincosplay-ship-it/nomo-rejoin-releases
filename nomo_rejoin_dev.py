@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.63.0-dev-hatcher-core-helpers"
+__version__ = "V4.63.1-dev-hatcher-core-fix"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -15945,6 +15945,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
     session_start = now()
     loops = 0
     open_queue = []
+    core = RejoinCore(open_queue, cfg, rt)
     last_msg = "not uploaded yet"
     last_report_at = 0
 
