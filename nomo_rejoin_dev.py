@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.68.0-dev-api-gate"
+__version__ = "V4.68.1-dev-sync-off"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1640,11 +1640,11 @@ DEFAULT_CONFIG = {
     # Optional local file hook. Useful when config.zip must be expanded into clone
     # workspaces before Roblox/executor loads. Guarded command skips if config.zip
     # does not exist. Cooldown prevents heavy unzip/copy spam.
-    "workspace_sync_enabled": True,
+    "workspace_sync_enabled": False,
     "workspace_sync_market_only": True,
     "workspace_sync_command": DEFAULT_WORKSPACE_SYNC_COMMAND,
-    "workspace_sync_on_start": True,
-    "workspace_sync_before_open": True,
+    "workspace_sync_on_start": False,
+    "workspace_sync_before_open": False,
     "workspace_sync_periodic_enabled": False,
     "workspace_sync_interval_seconds": 10800,
     "workspace_sync_timeout_seconds": 90,
@@ -2269,7 +2269,7 @@ def load_json(path, default):
 
 
 
-NOMO_CONFIG_MIGRATION_VERSION = 361
+NOMO_CONFIG_MIGRATION_VERSION = 4681
 
 
 def _int_cfg(value, default=0):
@@ -2586,12 +2586,14 @@ def apply_update_migrations(cfg):
     if _int_cfg(cfg.get("runtime_stuck_reset_min_tabs"), 0) < 1:
         set_cfg("runtime_stuck_reset_min_tabs", 1)
 
-    # V3.61: default workspace/config sync ON for MARKET mode only.
-    if _int_cfg(cfg.get("_nomo_config_migration_version"), 0) < 361:
-        set_cfg("workspace_sync_enabled", True)
+    # V4.68.1: workspace/config sync is manual-only by default. It can be
+    # expensive and surprising before every rejoin, especially on multi-clone
+    # Redfinger devices.
+    if _int_cfg(cfg.get("_nomo_config_migration_version"), 0) < 4681:
+        set_cfg("workspace_sync_enabled", False)
         set_cfg("workspace_sync_market_only", True)
-        set_cfg("workspace_sync_on_start", True)
-        set_cfg("workspace_sync_before_open", True)
+        set_cfg("workspace_sync_on_start", False)
+        set_cfg("workspace_sync_before_open", False)
         set_cfg("workspace_sync_periodic_enabled", False)
         if _int_cfg(cfg.get("workspace_sync_interval_seconds"), 0) <= 300:
             set_cfg("workspace_sync_interval_seconds", 10800)
