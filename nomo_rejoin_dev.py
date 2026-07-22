@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.64.4-dev-stale-shell-close"
+__version__ = "V4.64.5-dev-revert-stale-shell-close"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1448,12 +1448,8 @@ DEFAULT_CONFIG = {
     "alive_recovery_hard_fallback": False,
     # App Cloner/Noka can leave a small stale launcher task after manual close.
     # If we send a game deep link into that shell, Roblox may land on Home.
-    # For selected-package hard opens, close the saved floating shell first, then
-    # exact-PID stop if a real process exists.
-    "close_stale_clone_window_before_hard_open": True,
-    "stale_clone_window_close_wait_seconds": 1,
-    # Older fallback: materialize the launcher task so exact-PID stop can clear
-    # it. Kept available, but skipped after the direct close-button cleanup.
+    # For selected-package hard opens, materialize that task once, exact-PID stop
+    # it, then send the intended deep link.
     "prewarm_closed_clone_before_hard_open": True,
     "prewarm_closed_clone_wait_seconds": 2,
 
@@ -2484,11 +2480,6 @@ def apply_update_migrations(cfg):
         set_cfg("prewarm_closed_clone_before_hard_open", True)
     if _int_cfg(cfg.get("prewarm_closed_clone_wait_seconds"), 0) <= 0:
         set_cfg("prewarm_closed_clone_wait_seconds", 2)
-    if "close_stale_clone_window_before_hard_open" not in cfg:
-        set_cfg("close_stale_clone_window_before_hard_open", True)
-    if _int_cfg(cfg.get("stale_clone_window_close_wait_seconds"), 0) <= 0:
-        set_cfg("stale_clone_window_close_wait_seconds", 1)
-
     if "login_challenge_detection_enabled" not in cfg:
         set_cfg("login_challenge_detection_enabled", True)
     if "login_challenge_api_detection_enabled" not in cfg:
@@ -3893,68 +3884,6 @@ def open_package_launcher(pkg, cfg):
     return False, cut(output or f"launcher returned {code}", 80)
 
 
-def app_cloner_window_rect(pkg, cfg):
-    """Return the selected clone's saved App Cloner floating-window bounds."""
-    pref = _app_cloner_pref_file(pkg, cfg)
-    if not pref:
-        return None
-
-    cmd = (
-        f"grep -E 'app_cloner_current_window_(left|top|right|bottom)' "
-        f"{shlex.quote(pref)} 2>/dev/null"
-    )
-    code, out = shell_timeout(cmd, cfg, capture=True, timeout=8)
-    if code != 0 or not out:
-        return None
-
-    values = {}
-    for line in out.splitlines():
-        m = re.search(r'app_cloner_current_window_(left|top|right|bottom)"\s+value="(-?\d+)', line)
-        if m:
-            values[m.group(1)] = int(m.group(2))
-
-    required = ("left", "top", "right", "bottom")
-    if not all(k in values for k in required):
-        return None
-
-    left, top, right, bottom = [values[k] for k in required]
-    if right <= left or bottom <= top:
-        return None
-    return [left, top, right, bottom]
-
-
-def close_stale_clone_window_for_hard_open(pkg, cfg, reason=""):
-    """Tap the selected clone's floating-window X when no exact PID exists."""
-    if not cfg.get("close_stale_clone_window_before_hard_open", True):
-        return False, "stale shell close disabled"
-    if not _is_noka_clone_package(pkg):
-        return False, "not a noka clone"
-    if package_alive(pkg, cfg, fresh=True):
-        return False, "package already alive"
-
-    rect = app_cloner_window_rect(pkg, cfg)
-    if not rect:
-        return False, "no saved clone window rect"
-
-    left, top, right, _bottom = rect
-    width = max(1, right - left)
-    # App Cloner close button sits in the top-right of the floating title bar.
-    x = right - max(12, min(28, width // 18))
-    y = top + max(12, min(24, width // 24))
-    code, out = shell_timeout(f"input tap {int(x)} {int(y)}", cfg, capture=True, timeout=8)
-    if code != 0:
-        return False, cut(out or f"tap returned {code}", 80)
-
-    wait_s = max(1, _int_cfg(cfg.get("stale_clone_window_close_wait_seconds"), 1))
-    wait_seconds(wait_s)
-    log_activity(
-        f"closed stale clone shell at {int(x)},{int(y)} before hard open: {cut(reason, 45)}",
-        pkg,
-        YELLOW,
-    )
-    return True, "closed stale shell"
-
-
 def prewarm_closed_clone_for_hard_open(pkg, cfg, reason=""):
     """Materialize a stale App Cloner mini-task so exact-PID stop can clear it."""
     if not cfg.get("prewarm_closed_clone_before_hard_open", True):
@@ -3991,14 +3920,9 @@ def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop
     link = android_launch_roblox_link(link, cfg)
 
     if not soft and require_stop and not skip_force_stop:
-        close_ok, close_note = close_stale_clone_window_for_hard_open(pkg, cfg, reason)
-        if close_ok:
-            log_activity(f"stale shell close ok before hard open: {cut(close_note, 40)}", pkg, DIM)
-        else:
-            log_activity(f"stale shell close skipped: {cut(close_note, 55)}", pkg, DIM)
-            prewarm_ok, prewarm_note = prewarm_closed_clone_for_hard_open(pkg, cfg, reason)
-            if prewarm_ok:
-                log_activity(f"prewarm ok before hard open: {cut(prewarm_note, 40)}", pkg, DIM)
+        prewarm_ok, prewarm_note = prewarm_closed_clone_for_hard_open(pkg, cfg, reason)
+        if prewarm_ok:
+            log_activity(f"prewarm ok before hard open: {cut(prewarm_note, 40)}", pkg, DIM)
         stopped, stop_note = force_stop_package(pkg, cfg, tries=3, wait_after=0.8, settle=1.0)
         log_activity(f"hard open stop check: {cut(stop_note, 70)}", pkg, DIM)
         if not stopped:
