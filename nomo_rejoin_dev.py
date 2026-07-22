@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.64.0-dev-slow-start-grace"
+__version__ = "V4.64.1-dev-load-fail-notes"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -11858,11 +11858,14 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                     allow_hard_fallback = False
 
             if allow_hard_fallback and retries_done < max_retries:
+                retry_reason = "homepage/no-state hard retry"
+                if fresh_msg in ("process never appeared", "died while loading"):
+                    retry_reason = "loading crash hard retry"
                 added, _ = queue_open(
                     open_queue,
                     tab,
                     target,
-                    f"homepage/no-state hard retry after {fresh_msg}",
+                    f"{retry_reason} after {fresh_msg}",
                     force=True,
                     mode="hard_force",
                     front=False,
@@ -11896,7 +11899,7 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                     retry_item = next(
                         (q for q in reversed(open_queue)
                          if q.get("tab", {}).get("package") == pkg
-                         and str(q.get("reason", "")).startswith("homepage/no-state hard retry")),
+                         and str(q.get("reason", "")).startswith(retry_reason)),
                         None,
                     )
                     if retry_item is not None:
