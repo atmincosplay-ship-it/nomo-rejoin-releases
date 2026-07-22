@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.65.0-dev-core-queue-path"
+__version__ = "V4.65.1-dev-core-recovery-queues"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8777,6 +8777,26 @@ class RejoinCore:
             metadata=hard_metadata,
         )
 
+    def queue_hatcher_old_state_hard(self, tab, rt_tab, hcfg, age_or_seconds, reason):
+        return queue_hatcher_alive_old_state_hard(
+            self.open_queue,
+            tab,
+            rt_tab,
+            hcfg,
+            self.cfg,
+            age_or_seconds,
+            reason,
+        )
+
+    def queue_disconnect_ui_rejoin(self, tab, target, rt_tab):
+        return queue_disconnect_ui_rejoin(
+            self.open_queue,
+            tab,
+            target,
+            rt_tab,
+            self.cfg,
+        )
+
     def process(self, session_start=None, loops=0):
         return process_open_queue(
             self.open_queue,
@@ -15587,8 +15607,8 @@ def start_hatcher_reporter(main_cfg=None):
                     note = f"old-state open grace {left}s"
                     status = "Loading"
                 elif alive and old_enabled and age >= old_sec:
-                    hard_added, hard_note, hard_action = queue_hatcher_alive_old_state_hard(
-                        open_queue, tab, rt_tab, hcfg, cfg, age, "hatcher alive old state hard"
+                    hard_added, hard_note, hard_action = core.queue_hatcher_old_state_hard(
+                        tab, rt_tab, hcfg, age, "hatcher alive old state hard"
                     )
                     if hard_action:
                         note = hard_note
@@ -15621,8 +15641,8 @@ def start_hatcher_reporter(main_cfg=None):
                         rt_tab["hatcher_no_state_since"] = now()
                         no_state_since = rt_tab["hatcher_no_state_since"]
                     no_state_for = max(0, now() - int(no_state_since))
-                    hard_added, hard_note, hard_action = queue_hatcher_alive_old_state_hard(
-                        open_queue, tab, rt_tab, hcfg, cfg, no_state_for, "hatcher alive no state hard"
+                    hard_added, hard_note, hard_action = core.queue_hatcher_old_state_hard(
+                        tab, rt_tab, hcfg, no_state_for, "hatcher alive no state hard"
                     )
                     if hard_action:
                         note = hard_note
@@ -16390,8 +16410,8 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                     status = "Loading"
                     note = f"old-state open grace {max(1, old_after_open_grace - old_open_age)}s"
                 elif alive and old_enabled and recovery_age >= old_sec:
-                    hard_added, hard_note, hard_action = queue_hatcher_alive_old_state_hard(
-                        open_queue, tab, rt_tab, hcfg, cfg, recovery_age, "hatcher alive old state recovery"
+                    hard_added, hard_note, hard_action = core.queue_hatcher_old_state_hard(
+                        tab, rt_tab, hcfg, recovery_age, "hatcher alive old state recovery"
                     )
                     if hard_action:
                         note = hard_note
@@ -16525,7 +16545,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
 
             # V3.53: direct Lua-detected disconnect/kick popup
             if state and alive and state_disconnect_ui(state) and cfg.get("rejoin_if_crash", True):
-                added, dnote = queue_disconnect_ui_rejoin(open_queue, tab, "hatcher", rt_tab, cfg)
+                added, dnote = core.queue_disconnect_ui_rejoin(tab, "hatcher", rt_tab)
                 status = "Queued" if (added or dnote == "already queued") else "Kicked"
                 note = f"{state_disconnect_note(state)} {dnote}".strip()
 
