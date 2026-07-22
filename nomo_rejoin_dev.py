@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.67.1-dev-moderated-api-detect"
+__version__ = "V4.67.2-dev-hold-display"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -12702,18 +12702,15 @@ def _nomo_start_market_rejoin_original(cfg):
                                 note = "hop queued"
 
             due_refresh, refresh_left = periodic_hard_refresh_due(rt_tab, cfg)
-            if due_refresh and not rj_handled and not core.has_work() and not core.has(pkg) and not solver_job_running(pkg):
-                if (not manual_login_blocked(rt_tab, cfg)) or cfg.get("periodic_hard_refresh_include_manual", True):
-                    added, _ = core.queue(
-                        tab, target, "periodic hard refresh",
-                        force=True, mode="hard_force", bypass_manual=True
-                    )
-                    if added:
-                        mark_periodic_hard_refresh(rt_tab)
-                        note = "periodic hard queued"
-                        status = "Queued"
-                elif note in ["ok", ""]:
-                    note = f"refresh in {format_age(refresh_left)}"
+            if due_refresh and not rj_handled and not manual_login_blocked(rt_tab, cfg) and not core.has_work() and not core.has(pkg) and not solver_job_running(pkg):
+                added, _ = core.queue(
+                    tab, target, "periodic hard refresh",
+                    force=True, mode="hard_force", bypass_manual=True
+                )
+                if added:
+                    mark_periodic_hard_refresh(rt_tab)
+                    note = "periodic hard queued"
+                    status = "Queued"
 
             # V3.88: two disconnected packages may legitimately be queued at
             # once, but single-flight still processes only one. Show FIFO position
@@ -12727,6 +12724,9 @@ def _nomo_start_market_rejoin_original(cfg):
                 else:
                     status = "Waiting"
                     note = f"queue #{qpos}; {note}".strip("; ")
+            elif manual_login_blocked(rt_tab, cfg):
+                status = "Manual"
+                note = rt_tab.get("manual_login_reason") or rt_tab.get("note") or "needs manual login"
 
             update_clone_session(rt_tab, status, cfg)
 
@@ -15964,18 +15964,19 @@ def start_hatcher_reporter(main_cfg=None):
                     status = "Offline"
 
             due_refresh, refresh_left = periodic_hard_refresh_due(rt_tab, cfg)
-            if due_refresh and not core.has_work() and not core.has(pkg):
-                if (not manual_login_blocked(rt_tab, cfg)) or cfg.get("periodic_hard_refresh_include_manual", True):
-                    added, _ = core.queue(
-                        tab, "hatcher", "periodic hard refresh",
-                        force=True, mode="hard_force", bypass_manual=True
-                    )
-                    if added:
-                        mark_periodic_hard_refresh(rt_tab)
-                        status = "Queued"
-                        note = "periodic hard queued"
-                elif note in ["ok", ""]:
-                    note = f"refresh in {format_age(refresh_left)}"
+            if due_refresh and not manual_login_blocked(rt_tab, cfg) and not core.has_work() and not core.has(pkg):
+                added, _ = core.queue(
+                    tab, "hatcher", "periodic hard refresh",
+                    force=True, mode="hard_force", bypass_manual=True
+                )
+                if added:
+                    mark_periodic_hard_refresh(rt_tab)
+                    status = "Queued"
+                    note = "periodic hard queued"
+
+            if manual_login_blocked(rt_tab, cfg) and not core.has(pkg):
+                status = "Manual"
+                note = rt_tab.get("manual_login_reason") or rt_tab.get("note") or "needs manual login"
 
             update_clone_session(rt_tab, status, cfg)
             rows.append({
@@ -16879,18 +16880,19 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
             # gets its normal turn; its queued generation performs one solver check before opening.
 
             due_refresh, refresh_left = periodic_hard_refresh_due(rt_tab, cfg)
-            if due_refresh and captcha_action is None and not core.has_work() and not core.has(pkg) and not solver_job_running(pkg):
-                if ((not manual_login_blocked(rt_tab, cfg)) or cfg.get("periodic_hard_refresh_include_manual", True)) and not (state and state_login_challenge_detail(state)):
-                    added, _ = core.queue(
-                        tab, "hatcher", "periodic hard refresh",
-                        force=True, mode="hard_force", bypass_manual=True
-                    )
-                    if added:
-                        mark_periodic_hard_refresh(rt_tab)
-                        status = "Queued"
-                        note = "periodic hard queued"
-                elif note in ["ok", ""]:
-                    note = f"refresh in {format_age(refresh_left)}"
+            if due_refresh and captcha_action is None and not manual_login_blocked(rt_tab, cfg) and not core.has_work() and not core.has(pkg) and not solver_job_running(pkg):
+                added, _ = core.queue(
+                    tab, "hatcher", "periodic hard refresh",
+                    force=True, mode="hard_force", bypass_manual=True
+                )
+                if added:
+                    mark_periodic_hard_refresh(rt_tab)
+                    status = "Queued"
+                    note = "periodic hard queued"
+
+            if manual_login_blocked(rt_tab, cfg) and not core.has(pkg):
+                status = "Manual"
+                note = rt_tab.get("manual_login_reason") or rt_tab.get("note") or "needs manual login"
 
             update_clone_session(rt_tab, status, cfg)
             rows.append({
