@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.65.7-dev-core-runtime-tab"
+__version__ = "V4.65.8-dev-core-runtime-save"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8684,6 +8684,9 @@ class RejoinCore:
     def runtime_tab(self, package):
         return get_runtime_tab(self.rt, package)
 
+    def save(self):
+        return save_runtime(self.rt)
+
     def open(self, tab, rt_tab, target, reason, **kwargs):
         return open_target(
             tab,
@@ -8830,6 +8833,12 @@ class RejoinCore:
             self.rt,
             enabled_tabs,
         )
+
+
+def save_runtime_core(core, rt):
+    if core is not None:
+        return core.save()
+    return save_runtime(rt)
 
 
 def queue_stuck_self_heal(open_queue, cfg, rt):
@@ -11592,18 +11601,18 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
         if not recovered:
             rt_tab["note"] = rt_tab.get("note") or "needs manual login"
             log_activity(f"queued open held by manual-login flag: {cut(detail, 70)}", pkg, YELLOW)
-            save_runtime(rt)
+            save_runtime_core(core, rt)
             return True
 
     if item.get("skip_if_alive") and effective_package_alive(tab, cfg):
         rt_tab["note"] = "queue skip alive"
-        save_runtime(rt)
+        save_runtime_core(core, rt)
         return True
 
     # If cooldown blocks this package, do not block other packages behind it.
     if not item.get("force") and not can_open(rt_tab, cfg):
         rt_tab["note"] = "cooldown queued"
-        save_runtime(rt)
+        save_runtime_core(core, rt)
         return True
 
     item_mode = str(item.get("mode", "hard") or "hard").lower()
@@ -11625,7 +11634,7 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
             else:
                 open_queue.insert(0, item)
                 rt_tab["note"] = f"waiting for {holder}"
-                save_runtime(rt)
+                save_runtime_core(core, rt)
                 return True
 
     # V3.79: LAST-SECOND HEALTH RECHECK
@@ -11639,7 +11648,7 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
             if package_alive(pkg, cfg, fresh=True) and state_recent_enough_for_alive(tab, cfg, seconds=stale_s):
                 rt_tab["note"] = "healed - open cancelled"
                 log_activity("open cancelled: healed while queued", pkg, GREEN)
-                save_runtime(rt)
+                save_runtime_core(core, rt)
                 return True
 
     # POOL-WIDE STAGGER
@@ -11650,7 +11659,7 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
         if last_pool_open > 0 and since < stagger:
             open_queue.insert(0, item)
             rt_tab["note"] = f"stagger wait {max(1, stagger - since)}s"
-            save_runtime(rt)
+            save_runtime_core(core, rt)
             return True
 
     preflight_state, preflight_item = solver_preflight_before_open(
@@ -11673,7 +11682,7 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
     if cfg.get("single_flight_open", True):
         rt["_open_lock_pkg"] = pkg
         rt["_open_lock_at"] = now()
-        save_runtime(rt)
+        save_runtime_core(core, rt)
 
     try:
         return _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason,
@@ -11682,7 +11691,7 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
         if cfg.get("single_flight_open", True) and str(rt.get("_open_lock_pkg", "")) == pkg:
             rt["_open_lock_pkg"] = ""
             rt["_open_lock_at"] = 0
-            save_runtime(rt)
+            save_runtime_core(core, rt)
 
 
 
