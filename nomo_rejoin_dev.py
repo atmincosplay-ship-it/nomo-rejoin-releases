@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.63.4-dev-market-start-core"
+__version__ = "V4.63.5-dev-market-hatcher-freshness"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -7412,9 +7412,12 @@ def pick_jsonbin_hatcher(cfg, rt):
     if not isinstance(hatchers, dict):
         return None, None, "jsonbin bad format"
 
-    stale_seconds = int(cfg.get("jsonbin_stale_seconds", 180))
+    stale_seconds = max(60, int(cfg.get("jsonbin_stale_seconds", 7200) or 7200))
     min_pets = int(cfg.get("jsonbin_min_hatcher_pets", 200))
     choices = []
+    skipped_stale = 0
+    skipped_future = 0
+    skipped_no_time = 0
 
     for name, h in hatchers.items():
         if not isinstance(h, dict):
@@ -7444,13 +7447,18 @@ def pick_jsonbin_hatcher(cfg, rt):
         if pets < min_pets and not ready_by_egg:
             continue
 
-        try:
-            updated_at = int(h.get("updated_at", 0))
-        except Exception:
-            updated_at = 0
+        updated_at = _cloudflare_item_updated_seconds(h)
+        if not updated_at:
+            skipped_no_time += 1
+            continue
 
         age = now() - updated_at if updated_at else 999999
+        if age < -60:
+            skipped_future += 1
+            continue
+        age = max(0, age)
         if age > stale_seconds:
+            skipped_stale += 1
             continue
 
         choices.append({
@@ -7462,7 +7470,15 @@ def pick_jsonbin_hatcher(cfg, rt):
         })
 
     if not choices:
-        return None, None, "no ready hatcher"
+        details = []
+        if skipped_stale:
+            details.append(f"stale={skipped_stale}")
+        if skipped_no_time:
+            details.append(f"no_time={skipped_no_time}")
+        if skipped_future:
+            details.append(f"future_time={skipped_future}")
+        suffix = " (" + ", ".join(details) + ")" if details else ""
+        return None, None, "no ready hatcher" + suffix
 
     choices.sort(key=lambda x: (x["pets"], x["updated_at"]), reverse=True)
     best = choices[0]
