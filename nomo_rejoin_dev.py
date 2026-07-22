@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.66.6-dev-core-latest-item"
+__version__ = "V4.66.7-dev-core-solver-poll"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8834,6 +8834,9 @@ class RejoinCore:
             self,
         )
 
+    def poll_solver_jobs(self):
+        return poll_solver_jobs(self.cfg, self.rt, self.open_queue, self)
+
     def has(self, package):
         return queue_has(self.open_queue, package)
 
@@ -11607,7 +11610,10 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
 
     # A pre-open solver may finish between dashboard ticks. Apply its result
     # while the matching generation is still in the queue.
-    poll_solver_jobs(cfg, rt, open_queue, core)
+    if core is not None:
+        core.poll_solver_jobs()
+    else:
+        poll_solver_jobs(cfg, rt, open_queue)
     if not open_queue:
         return True
 
@@ -12016,7 +12022,10 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
         save_runtime(rt)
 
         if fresh_msg == "solver result":
-            poll_solver_jobs(cfg, rt, open_queue, core)
+            if core is not None:
+                core.poll_solver_jobs()
+            else:
+                poll_solver_jobs(cfg, rt, open_queue)
 
         if not fresh_ok and fresh_msg not in (
             "stop",
@@ -12437,7 +12446,7 @@ def _nomo_start_market_rejoin_original(cfg):
 
         core.self_heal()
         core.watchdog(enabled_tabs)
-        poll_solver_jobs(cfg, rt, open_queue, core)
+        core.poll_solver_jobs()
 
         if cfg.get("workspace_sync_enabled", False) and cfg.get("workspace_sync_periodic_enabled", False) and workspace_sync_allowed_for_mode(cfg):
             run_workspace_sync(cfg, rt, reason="periodic", force=False)
@@ -15691,7 +15700,7 @@ def start_hatcher_reporter(main_cfg=None):
             return
 
         loops += 1
-        queue_stuck_self_heal(open_queue, cfg, rt)
+        core.self_heal()
         try:
             if resolve_usernames_auto(cfg, hcfg, rt, force=False, quiet=True):
                 save_hatcher_config(hcfg)
@@ -16429,7 +16438,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
 
         loops += 1
         core.self_heal()
-        poll_solver_jobs(cfg, rt, open_queue, core)
+        core.poll_solver_jobs()
         # Periodic auto username re-resolve (rate-limited inside the function).
         try:
             if resolve_usernames_auto(cfg, hcfg, rt, force=False, quiet=True):
