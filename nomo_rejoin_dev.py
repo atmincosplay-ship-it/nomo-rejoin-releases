@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.65.1-dev-core-recovery-queues"
+__version__ = "V4.65.2-dev-core-health-actions"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -9761,7 +9761,7 @@ def apply_common_health_action(open_queue, tab, target, rt_tab, cfg, rt, health,
 
 
 
-def maybe_queue_solver_busy_retry(open_queue, tab, target, rt_tab, cfg, health):
+def maybe_queue_solver_busy_retry(open_queue, tab, target, rt_tab, cfg, health, core=None):
     """Retry SERVER_BUSY only by opening the package again after cooldown.
 
     Never contact the provider from a healthy middle session. The provider call
@@ -9787,14 +9787,24 @@ def maybe_queue_solver_busy_retry(open_queue, tab, target, rt_tab, cfg, health):
     if queue_has(open_queue, pkg):
         return "Queued", "solver busy retry already queued", True
 
-    added, _ = queue_open(
-        open_queue, tab, target, "solver SERVER_BUSY retry",
-        force=True, mode="hard_force", bypass_manual=True,
-        metadata={
-            "solver_busy_retry": True,
-            "bypass_recheck": True,
-        },
-    )
+    if core is not None:
+        added, _ = core.queue(
+            tab, target, "solver SERVER_BUSY retry",
+            force=True, mode="hard_force", bypass_manual=True,
+            metadata={
+                "solver_busy_retry": True,
+                "bypass_recheck": True,
+            },
+        )
+    else:
+        added, _ = queue_open(
+            open_queue, tab, target, "solver SERVER_BUSY retry",
+            force=True, mode="hard_force", bypass_manual=True,
+            metadata={
+                "solver_busy_retry": True,
+                "bypass_recheck": True,
+            },
+        )
     if added:
         rt_tab["solver_busy_retry_pending"] = False
         rt_tab["solver_busy_retry_at"] = 0
@@ -9804,7 +9814,7 @@ def maybe_queue_solver_busy_retry(open_queue, tab, target, rt_tab, cfg, health):
     return health.get("status", "Loading"), "SERVER_BUSY retry queue failed", True
 
 
-def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, health):
+def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, health, core=None):
     """Turn one package-scoped visible challenge into one queued rejoin.
 
     V4.14 never submits the solver directly from a dashboard scan. The queued
@@ -9834,11 +9844,18 @@ def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, he
         rt_tab["note"] = note
         return "Queued", note, True
 
-    added, _ = queue_open(
-        open_queue, tab, target, "visible verification preflight rejoin",
-        force=True, mode="hard_force", bypass_manual=True,
-        metadata={"bypass_recheck": True},
-    )
+    if core is not None:
+        added, _ = core.queue(
+            tab, target, "visible verification preflight rejoin",
+            force=True, mode="hard_force", bypass_manual=True,
+            metadata={"bypass_recheck": True},
+        )
+    else:
+        added, _ = queue_open(
+            open_queue, tab, target, "visible verification preflight rejoin",
+            force=True, mode="hard_force", bypass_manual=True,
+            metadata={"bypass_recheck": True},
+        )
     if added:
         clear_hold(pkg)
         rt_tab["manual_login_needed"] = False
@@ -9854,7 +9871,7 @@ def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, he
     return "Captcha", rt_tab["note"], True
 
 
-def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=None, mode="market"):
+def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=None, mode="market", core=None):
     """SHARED rejoin engine for both Market and Hatcher."""
     pkg = tab.get("package")
     state = health.get("state")
@@ -9862,12 +9879,12 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
     bad = str(health.get("bad") or "")
 
     captcha_action = apply_visible_captcha_ui_action(
-        open_queue, tab, target, rt_tab, cfg, rt, health
+        open_queue, tab, target, rt_tab, cfg, rt, health, core
     )
     if captcha_action is not None:
         return captcha_action
 
-    busy_action = maybe_queue_solver_busy_retry(open_queue, tab, target, rt_tab, cfg, health)
+    busy_action = maybe_queue_solver_busy_retry(open_queue, tab, target, rt_tab, cfg, health, core)
     if busy_action is not None:
         return busy_action
 
@@ -9883,16 +9900,26 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
     # --- join/login challenge: provider calls are event-bound to a rejoin ---
     if bad == "challenge" or (state and state_login_challenge_detail(state)):
         cancel_queued_package(open_queue, pkg)
-        added, _ = queue_open(
-            open_queue, tab, target, "join challenge pre-solver rejoin",
-            force=True, mode="hard_force", bypass_manual=True,
-            metadata={"bypass_recheck": True},
-        )
+        if core is not None:
+            added, _ = core.queue(
+                tab, target, "join challenge pre-solver rejoin",
+                force=True, mode="hard_force", bypass_manual=True,
+                metadata={"bypass_recheck": True},
+            )
+        else:
+            added, _ = queue_open(
+                open_queue, tab, target, "join challenge pre-solver rejoin",
+                force=True, mode="hard_force", bypass_manual=True,
+                metadata={"bypass_recheck": True},
+            )
         return ("Queued" if added else "Manual"),                ("challenge rejoin queued; solver runs before open" if added else "challenge already queued"), True
 
     # --- disconnect / kick popup: always kill+open ---
     if bad == "disconnect" or (state and state_disconnect_ui(state)):
-        added, dnote = queue_disconnect_ui_rejoin(open_queue, tab, target, rt_tab, cfg)
+        if core is not None:
+            added, dnote = core.queue_disconnect_ui_rejoin(tab, target, rt_tab)
+        else:
+            added, dnote = queue_disconnect_ui_rejoin(open_queue, tab, target, rt_tab, cfg)
         status = "Queued" if (added or dnote == "already queued") else "Kicked"
         note = f"{state_disconnect_note(state)} {dnote}".strip()
         return status, note, True
@@ -9925,16 +9952,26 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
 
         # old past trigger -> kill + open THIS one clone
         if age >= trigger:
-            added, _ = queue_open(
-                open_queue, tab, target,
-                f"{mode} alive old state {format_age(age)}",
-                force=True, mode="hard_force", skip_if_alive=False, bypass_manual=True,
-                metadata={
-                    "pid_only_recovery": True,
-                    "recovery_must_open_once": True,
-                    "bypass_recheck": True,
-                },
-            )
+            if core is not None:
+                added, _ = core.queue_exact_pid_recovery(
+                    tab,
+                    target,
+                    f"{mode} alive old state {format_age(age)}",
+                    skip_if_alive=False,
+                    bypass_manual=True,
+                    metadata={"bypass_recheck": True},
+                )
+            else:
+                added, _ = queue_open(
+                    open_queue, tab, target,
+                    f"{mode} alive old state {format_age(age)}",
+                    force=True, mode="hard_force", skip_if_alive=False, bypass_manual=True,
+                    metadata={
+                        "pid_only_recovery": True,
+                        "recovery_must_open_once": True,
+                        "bypass_recheck": True,
+                    },
+                )
             return ("Queued" if added else "Stale"), \
                    (f"old {format_age(age)} kill+open" if added else "already queued"), True
 
@@ -9945,28 +9982,48 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
     if alive:
         if in_grace:
             return "Loading", "no state grace", True
+        if core is not None:
+            added, _ = core.queue_exact_pid_recovery(
+                tab,
+                target,
+                f"{mode} alive no-state hard",
+                skip_if_alive=False,
+                bypass_manual=True,
+                metadata={"bypass_recheck": True},
+            )
+        else:
+            added, _ = queue_open(
+                open_queue, tab, target, f"{mode} alive no-state hard",
+                force=True, mode="hard_force", skip_if_alive=False, bypass_manual=True,
+                metadata={
+                    "pid_only_recovery": True,
+                    "recovery_must_open_once": True,
+                    "bypass_recheck": True,
+                },
+            )
+        return ("Queued" if added else "No state"), \
+               ("no-state kill+open" if added else "already queued"), True
+
+    # dead -> kill + open
+    if core is not None:
+        added, _ = core.queue_exact_pid_recovery(
+            tab,
+            target,
+            f"{mode} crash/dead",
+            skip_if_alive=True,
+            bypass_manual=True,
+            metadata={"bypass_recheck": True},
+        )
+    else:
         added, _ = queue_open(
-            open_queue, tab, target, f"{mode} alive no-state hard",
-            force=True, mode="hard_force", skip_if_alive=False, bypass_manual=True,
+            open_queue, tab, target, f"{mode} crash/dead",
+            force=True, mode="hard_force", skip_if_alive=True, bypass_manual=True,
             metadata={
                 "pid_only_recovery": True,
                 "recovery_must_open_once": True,
                 "bypass_recheck": True,
             },
         )
-        return ("Queued" if added else "No state"), \
-               ("no-state kill+open" if added else "already queued"), True
-
-    # dead -> kill + open
-    added, _ = queue_open(
-        open_queue, tab, target, f"{mode} crash/dead",
-        force=True, mode="hard_force", skip_if_alive=True, bypass_manual=True,
-        metadata={
-            "pid_only_recovery": True,
-            "recovery_must_open_once": True,
-            "bypass_recheck": True,
-        },
-    )
     return ("Queued" if added else "Offline"), \
            ("crash kill+open" if added else "already queued"), True
 
@@ -12320,7 +12377,7 @@ def _nomo_start_market_rejoin_original(cfg):
             # SHARED REJOIN ENGINE
             # -----------------------------------------------------
             rj_status, rj_note, rj_handled = apply_rejoin_action(
-                open_queue, tab, target, rt_tab, cfg, rt, health, mode="market"
+                open_queue, tab, target, rt_tab, cfg, rt, health, mode="market", core=core
             )
             if rj_handled:
                 status = rj_status or status
