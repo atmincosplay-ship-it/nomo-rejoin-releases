@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.64.2-dev-stale-task-prewarm"
+__version__ = "V4.64.3-dev-retry-trace"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -3888,14 +3888,17 @@ def open_package_launcher(pkg, cfg):
 def prewarm_closed_clone_for_hard_open(pkg, cfg, reason=""):
     """Materialize a stale App Cloner mini-task so exact-PID stop can clear it."""
     if not cfg.get("prewarm_closed_clone_before_hard_open", True):
+        log_activity("prewarm skipped: disabled", pkg, DIM)
         return False, "prewarm disabled"
     if not _is_noka_clone_package(pkg):
         return False, "not a noka clone"
     if package_alive(pkg, cfg, fresh=True):
+        log_activity("prewarm skipped: exact PID already alive", pkg, DIM)
         return False, "package already alive"
 
     ok, note = open_package_launcher(pkg, cfg)
     if not ok:
+        log_activity(f"prewarm launcher failed: {cut(note, 60)}", pkg, YELLOW)
         return False, note
 
     wait_s = max(1, int(cfg.get("prewarm_closed_clone_wait_seconds", 2) or 2))
@@ -3907,6 +3910,7 @@ def prewarm_closed_clone_for_hard_open(pkg, cfg, reason=""):
             YELLOW,
         )
         return True, "prewarmed"
+    log_activity("prewarm launcher opened but no exact PID", pkg, YELLOW)
     return False, "prewarm no pid"
 
 
@@ -3917,8 +3921,11 @@ def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop
     link = android_launch_roblox_link(link, cfg)
 
     if not soft and require_stop and not skip_force_stop:
-        prewarm_closed_clone_for_hard_open(pkg, cfg, reason)
+        prewarm_ok, prewarm_note = prewarm_closed_clone_for_hard_open(pkg, cfg, reason)
+        if prewarm_ok:
+            log_activity(f"prewarm ok before hard open: {cut(prewarm_note, 40)}", pkg, DIM)
         stopped, stop_note = force_stop_package(pkg, cfg, tries=3, wait_after=0.8, settle=1.0)
+        log_activity(f"hard open stop check: {cut(stop_note, 70)}", pkg, DIM)
         if not stopped:
             # Never send another VIEW intent while the old exact package PID is
             # still alive. On App Cloner this creates a second/cascaded window.
@@ -11942,6 +11949,11 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                         retry_item["homepage_hard_retries"] = retries_done + 1
                         retry_item["bypass_recheck"] = True
                     rt_tab["note"] = f"{fresh_msg}; hard retry {retries_done + 1}/{max_retries}"
+                    log_activity(
+                        f"queued {retry_reason} {retries_done + 1}/{max_retries} after {fresh_msg}",
+                        pkg,
+                        YELLOW,
+                    )
                     save_runtime(rt)
 
             elif actual_open_mode == "soft" and cfg.get("soft_hop_fallback_hard", True):
