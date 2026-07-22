@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.64.9-dev-core-open-path"
+__version__ = "V4.65.0-dev-core-queue-path"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -7938,8 +7938,7 @@ def market_run_route_queue(cfg, tabs, target, reason):
         package = str(tab.get("package") or "")
         if not package:
             continue
-        added, note = queue_open(
-            open_queue,
+        added, note = core.queue(
             tab,
             target,
             reason,
@@ -15480,14 +15479,14 @@ def start_hatcher_reporter(main_cfg=None):
             elif raw_alive and cfg.get("start_reopen_alive_without_fresh_state", True):
                 rt_tab["note"] = "start alive no-fresh -> soft"
                 save_runtime(rt)
-                queue_open(
-                    open_queue, tab, "hatcher", "hatcher start alive no-fresh",
+                core.queue(
+                    tab, "hatcher", "hatcher start alive no-fresh",
                     force=True,
                     skip_if_alive=False,
                     mode="soft"
                 )
             elif not raw_alive:
-                queue_open(open_queue, tab, "hatcher", "hatcher start", force=True, skip_if_alive=True, mode="hard")
+                core.queue(tab, "hatcher", "hatcher start", force=True, skip_if_alive=True, mode="hard")
             else:
                 rt_tab["note"] = "start already open"
                 save_runtime(rt)
@@ -15607,7 +15606,7 @@ def start_hatcher_reporter(main_cfg=None):
                     stale = age > int(cfg.get("state_stale_seconds", 180))
                     if alive and stale and cfg.get("ignore_alive_stale_state", True):
                         if hcfg.get("hatcher_rejoin_alive_stale", False) and age >= stale_reopen_age(cfg) and cfg.get("rejoin_if_crash", True):
-                            added, _ = queue_open(open_queue, tab, "hatcher", "hatcher stale", mode="soft")
+                            added, _ = core.queue(tab, "hatcher", "hatcher stale", mode="soft")
                             note = "stale queued" if added else "already queued"
                             status = "Queued" if added else "Stale"
                         else:
@@ -15653,7 +15652,7 @@ def start_hatcher_reporter(main_cfg=None):
                 dead_confirm = int(hcfg.get("hatcher_dead_confirm_seconds", 30) or 30)
 
                 if dead_for >= dead_confirm:
-                    added, _ = queue_open(open_queue, tab, "hatcher", "hatcher crash", skip_if_alive=True)
+                    added, _ = core.queue(tab, "hatcher", "hatcher crash", skip_if_alive=True)
                     note = "crash queued" if added else "already queued"
                     status = "Queued" if added else "Offline"
                 else:
@@ -15663,8 +15662,8 @@ def start_hatcher_reporter(main_cfg=None):
             due_refresh, refresh_left = periodic_hard_refresh_due(rt_tab, cfg)
             if due_refresh and not open_queue and not queue_has(open_queue, pkg):
                 if (not manual_login_blocked(rt_tab, cfg)) or cfg.get("periodic_hard_refresh_include_manual", True):
-                    added, _ = queue_open(
-                        open_queue, tab, "hatcher", "periodic hard refresh",
+                    added, _ = core.queue(
+                        tab, "hatcher", "periodic hard refresh",
                         force=True, mode="hard_force", bypass_manual=True
                     )
                     if added:
@@ -16414,7 +16413,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
 
                         if disconnect_stale and cfg.get("force_stop_alive_on_disconnect_popup", True) and cfg.get("rejoin_if_crash", True):
                             if cfg.get("smart_open_queue", True) or cfg.get("solver_enabled", False):
-                                added, _ = queue_open(open_queue, tab, "hatcher", "disconnect popup/stale", force=True, mode="hard_force")
+                                added, _ = core.queue(tab, "hatcher", "disconnect popup/stale", force=True, mode="hard_force")
                                 note = "disconnect queued" if added else "already queued"
                                 status = "Queued" if added else "Stale"
                             else:
@@ -16423,7 +16422,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                                 status = "Loading" if ok else "Stale"
                         elif hcfg.get("hatcher_rejoin_alive_stale", False) and age >= force_stale and cfg.get("rejoin_if_crash", True):
                             if cfg.get("smart_open_queue", True) or cfg.get("solver_enabled", False):
-                                added, _ = queue_open(open_queue, tab, "hatcher", "stale too long", force=True, mode="soft")
+                                added, _ = core.queue(tab, "hatcher", "stale too long", force=True, mode="soft")
                                 note = "stale queued" if added else "already queued"
                                 status = "Queued" if added else "Stale"
                             else:
@@ -16436,8 +16435,8 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                             if (recovery_age >= int(cfg.get("hatcher_alive_old_state_hard_force_seconds", 180) or 180)
                                     and recovery_age <= int(cfg.get("hatcher_alive_old_state_max_valid_seconds", 86400) or 86400)
                                     and cfg.get("rejoin_if_crash", True)):
-                                added, _ = queue_open(
-                                    open_queue, tab, "hatcher",
+                                added, _ = core.queue(
+                                    tab, "hatcher",
                                     f"alive old state {recovery_age}s",
                                     force=True, mode="hard_force",
                                     metadata={"bypass_recheck": True, "pid_only_recovery": True},
@@ -16561,8 +16560,8 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
             # one package rejoin; the queued generation owns one pre-open provider call.
             if health.get("bad") == "challenge" or (state and state_login_challenge_detail(state)):
                 cancel_queued_package(open_queue, pkg)
-                added, _ = queue_open(
-                    open_queue, tab, "hatcher", "join challenge pre-solver rejoin",
+                added, _ = core.queue(
+                    tab, "hatcher", "join challenge pre-solver rejoin",
                     force=True, mode="hard_force", bypass_manual=True,
                     metadata={"bypass_recheck": True},
                 )
@@ -16584,8 +16583,8 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
             due_refresh, refresh_left = periodic_hard_refresh_due(rt_tab, cfg)
             if due_refresh and captcha_action is None and not open_queue and not queue_has(open_queue, pkg) and not solver_job_running(pkg):
                 if ((not manual_login_blocked(rt_tab, cfg)) or cfg.get("periodic_hard_refresh_include_manual", True)) and not (state and state_login_challenge_detail(state)):
-                    added, _ = queue_open(
-                        open_queue, tab, "hatcher", "periodic hard refresh",
+                    added, _ = core.queue(
+                        tab, "hatcher", "periodic hard refresh",
                         force=True, mode="hard_force", bypass_manual=True
                     )
                     if added:
