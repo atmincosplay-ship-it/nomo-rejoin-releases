@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.68.1-dev-sync-off"
+__version__ = "V4.68.2-dev-core-fallbacks"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8849,6 +8849,28 @@ class RejoinCore:
             metadata={"bypass_recheck": True},
         )
 
+    def queue_route_retry(self, tab, target, reason, metadata=None):
+        return self.queue(
+            tab,
+            target,
+            reason,
+            force=True,
+            mode="route",
+            front=False,
+            metadata=metadata,
+        )
+
+    def queue_hard_retry(self, tab, target, reason, metadata=None, front=False):
+        return self.queue(
+            tab,
+            target,
+            reason,
+            force=True,
+            mode="hard_force",
+            front=front,
+            metadata=metadata,
+        )
+
     def process(self, session_start=None, loops=0):
         return process_open_queue(
             self.open_queue,
@@ -12290,13 +12312,10 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                 }
                 retry_reason = f"join fail {join_fail_count}/{failures_before_hard}; route retry after {fresh_msg}"
                 if core is not None:
-                    added, _ = core.queue(
+                    added, _ = core.queue_route_retry(
                         tab,
                         target,
                         retry_reason,
-                        force=True,
-                        mode="route",
-                        front=False,
                         metadata=retry_meta,
                     )
                 else:
@@ -12352,13 +12371,10 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                     ),
                 }
                 if core is not None:
-                    added, _ = core.queue(
+                    added, _ = core.queue_hard_retry(
                         tab,
                         target,
                         f"{retry_reason} after {fresh_msg}",
-                        force=True,
-                        mode="hard_force",
-                        front=False,
                         metadata=hard_meta,
                     )
                 else:
@@ -12395,7 +12411,7 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
 
             elif actual_open_mode == "soft" and cfg.get("soft_hop_fallback_hard", True):
                 if core is not None:
-                    core.queue(tab, target, "soft fallback hard", force=True, mode="hard_force", front=True)
+                    core.queue_hard_retry(tab, target, "soft fallback hard", front=True)
                 else:
                     queue_open(open_queue, tab, target, "soft fallback hard", force=True, mode="hard_force", front=True)
     else:
@@ -12413,7 +12429,7 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
         if mode in ("soft", "route") and cfg.get("soft_hop_fallback_hard", True):
             fallback_reason = "route failed hard" if mode == "route" else "soft failed hard"
             if core is not None:
-                core.queue(tab, target, fallback_reason, force=True, mode="hard_force", front=True)
+                core.queue_hard_retry(tab, target, fallback_reason, front=True)
             else:
                 queue_open(open_queue, tab, target, fallback_reason, force=True, mode="hard_force", front=True)
 
