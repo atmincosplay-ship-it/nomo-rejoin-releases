@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.65.3-dev-core-fallback-queues"
+__version__ = "V4.65.4-dev-core-cancel-path"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8677,6 +8677,9 @@ class RejoinCore:
             **kwargs,
         )
 
+    def cancel(self, package):
+        return cancel_queued_package(self.open_queue, package)
+
     def open(self, tab, rt_tab, target, reason, **kwargs):
         return open_target(
             tab,
@@ -9899,7 +9902,10 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
 
     # --- join/login challenge: provider calls are event-bound to a rejoin ---
     if bad == "challenge" or (state and state_login_challenge_detail(state)):
-        cancel_queued_package(open_queue, pkg)
+        if core is not None:
+            core.cancel(pkg)
+        else:
+            cancel_queued_package(open_queue, pkg)
         if core is not None:
             added, _ = core.queue(
                 tab, target, "join challenge pre-solver rejoin",
@@ -11961,10 +11967,13 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
             "solver result",
         ):
             if item.get("manual_booster_hard_route"):
-                cancel_queued_package(
-                    open_queue,
-                    pkg,
-                )
+                if core is not None:
+                    core.cancel(pkg)
+                else:
+                    cancel_queued_package(
+                        open_queue,
+                        pkg,
+                    )
                 rt_tab["note"] = (
                     "Booster hard private join failed: "
                     + str(fresh_msg)
@@ -11991,7 +12000,10 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
             # Redfinger window layout. Isolate this package and continue others.
             if item.get("solver_recovery") and cfg.get("manual_hold_after_solver_rejoin_timeout", True):
                 solver_result = str(item.get("solver_result", "solver clear") or "solver clear")
-                cancel_queued_package(open_queue, pkg)
+                if core is not None:
+                    core.cancel(pkg)
+                else:
+                    cancel_queued_package(open_queue, pkg)
                 rt_tab["manual_login_needed"] = True
                 rt_tab["manual_login_reason"] = "join blocked after solver recovery"
                 rt_tab["manual_login_detail"] = f"{solver_result}; {fresh_msg}; no fresh state after recovery"
@@ -12019,7 +12031,10 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                 disconnect_hard_attempt_done or retries_done >= max_retries
             ):
                 cooldown = max(60, int(cfg.get("disconnect_ui_incident_cooldown_seconds", 300) or 300))
-                cancel_queued_package(open_queue, pkg)
+                if core is not None:
+                    core.cancel(pkg)
+                else:
+                    cancel_queued_package(open_queue, pkg)
                 rt_tab["disconnect_ui_recovery_active"] = False
                 rt_tab["disconnect_ui_recovery_stage"] = "hold"
                 rt_tab["disconnect_ui_hold_until"] = now() + cooldown
