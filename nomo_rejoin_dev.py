@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.66.2-dev-core-work-state"
+__version__ = "V4.66.3-dev-core-health-boundary"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -9779,7 +9779,8 @@ def apply_common_health_action(open_queue, tab, target, rt_tab, cfg, rt, health,
         no_state_for = max(0, now() - int(no_state_since))
         hard_after = int(cfg.get("hatcher_alive_old_state_hard_force_seconds", 300) or 300)
         has_pkg = core.has(pkg) if core is not None else queue_has(open_queue, pkg)
-        if no_state_for >= hard_after and not open_queue and not has_pkg:
+        has_work = core.has_work() if core is not None else bool(open_queue)
+        if no_state_for >= hard_after and not has_work and not has_pkg:
             if core is not None:
                 added, _ = core.queue(tab, target, f"{mode} alive no-state hard",
                                       force=True, mode="hard_force")
@@ -16725,7 +16726,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
             # provider is never called from the middle-session dashboard. Queue
             # one package rejoin; the queued generation owns one pre-open provider call.
             if health.get("bad") == "challenge" or (state and state_login_challenge_detail(state)):
-                cancel_queued_package(open_queue, pkg)
+                core.cancel(pkg)
                 added, _ = core.queue(
                     tab, "hatcher", "join challenge pre-solver rejoin",
                     force=True, mode="hard_force", bypass_manual=True,
