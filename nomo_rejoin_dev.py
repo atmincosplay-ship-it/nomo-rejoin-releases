@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.65.8-dev-core-runtime-save"
+__version__ = "V4.65.9-dev-core-finish-path"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8687,6 +8687,9 @@ class RejoinCore:
     def save(self):
         return save_runtime(self.rt)
 
+    def finish(self, rt_tab, **kwargs):
+        return core_finish_rejoin(rt_tab, **kwargs)
+
     def open(self, tab, rt_tab, target, reason, **kwargs):
         return open_target(
             tab,
@@ -11974,11 +11977,14 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
             rt_tab["note"] = "route " + fresh_msg
         else:
             rt_tab["note"] = fresh_msg
-        core_finish_rejoin(
-            rt_tab,
-            verified=bool(fresh_ok),
-            note=fresh_msg,
-        )
+        if core is not None:
+            core.finish(rt_tab, verified=bool(fresh_ok), note=fresh_msg)
+        else:
+            core_finish_rejoin(
+                rt_tab,
+                verified=bool(fresh_ok),
+                note=fresh_msg,
+            )
         save_runtime(rt)
 
         if fresh_msg == "solver result":
@@ -12206,11 +12212,14 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                     queue_open(open_queue, tab, target, "soft fallback hard", force=True, mode="hard_force", front=True)
     else:
         rt_tab["note"] = msg
-        core_finish_rejoin(
-            rt_tab,
-            verified=False,
-            note=msg,
-        )
+        if core is not None:
+            core.finish(rt_tab, verified=False, note=msg)
+        else:
+            core_finish_rejoin(
+                rt_tab,
+                verified=False,
+                note=msg,
+            )
         save_runtime(rt)
 
         if mode in ("soft", "route") and cfg.get("soft_hop_fallback_hard", True):
