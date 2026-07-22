@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.63.1-dev-hatcher-core-fix"
+__version__ = "V4.63.2-dev-hatcher-core-soft"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -16125,8 +16125,20 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                 if problem_code:
                     should_q, wait_note = should_queue_hatcher_teleport_rejoin(rt_tab, hcfg, cfg, problem_code)
                     if should_q and cfg.get("rejoin_if_crash", True):
-                        mode = "soft" if alive else "hard"
-                        added, _ = queue_open(open_queue, tab, "hatcher", problem_note, force=True, mode=mode)
+                        if alive:
+                            added, _ = core.queue_soft_recovery(
+                                tab,
+                                "hatcher",
+                                problem_note,
+                            )
+                        else:
+                            added, _ = core.queue_exact_pid_recovery(
+                                tab,
+                                "hatcher",
+                                problem_note,
+                                skip_if_alive=True,
+                                bypass_manual=True,
+                            )
                         note = "private rejoin queued" if added else "already queued"
                         status = "Queued" if added else "Wrong server"
                     else:
@@ -16288,7 +16300,11 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                         status = "No state"
                         note = f"no-state cooldown {format_age(no_state_cooldown_left)}"
                     elif hcfg.get("hatcher_rejoin_alive_stale", False) and cfg.get("rejoin_if_crash", True):
-                        added, _ = queue_open(open_queue, tab, "hatcher", "hatcher no state", mode="soft")
+                        added, _ = core.queue_soft_recovery(
+                            tab,
+                            "hatcher",
+                            "hatcher no state",
+                        )
                         note = "no state queued" if added else "no state wait"
                         status = "Queued" if added else "No state"
                     else:
