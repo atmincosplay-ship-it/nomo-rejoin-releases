@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.63.6-dev-hatcher-route-note"
+__version__ = "V4.63.7-dev-restock-force-fresh"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1585,6 +1585,7 @@ DEFAULT_CONFIG = {
     "cloudflare_secret": "",
     "cloudflare_timeout_seconds": 8,
     "jsonbin_cache_seconds": 600,
+    "jsonbin_force_refresh_on_restock_route": True,
     "jsonbin_stale_seconds": 7200,
     "jsonbin_min_hatcher_pets": 100,
     "jsonbin_no_hatcher_action": "stay_market",  # stay_market / fallback_restock
@@ -2379,6 +2380,8 @@ def apply_update_migrations(cfg):
     # it, a 277h missing-ts age passes the 180s floor and force-loops the pool.
     if _int_cfg(cfg.get("alive_old_state_max_valid_seconds"), 0) < 86400:
         set_cfg("alive_old_state_max_valid_seconds", 86400)
+    if "jsonbin_force_refresh_on_restock_route" not in cfg:
+        set_cfg("jsonbin_force_refresh_on_restock_route", True)
 
     # V3.79: short startup grace so the hatcher table doesn't sit on "waiting"
     # for the full 6-minute post-open window.
@@ -7398,11 +7401,11 @@ def read_hatchers_cached(cfg, rt, force=False):
     return data, err
 
 
-def pick_jsonbin_hatcher(cfg, rt):
+def pick_jsonbin_hatcher(cfg, rt, force=False):
     if not cfg.get("jsonbin_hatchers_enabled", False):
         return None, None, "jsonbin off"
 
-    data, err = read_hatchers_cached(cfg, rt)
+    data, err = read_hatchers_cached(cfg, rt, force=force)
 
     if err or not data:
         return None, None, f"jsonbin {err}"
@@ -8283,7 +8286,8 @@ def resolve_restock_link(tab, rt_tab, cfg, rt=None):
     fallback = tab.get("restock_link") or cfg.get("restock_link")
 
     if cfg.get("jsonbin_hatchers_enabled", False) and rt is not None:
-        link, hatcher, err = pick_jsonbin_hatcher(cfg, rt)
+        force_fresh = bool(cfg.get("jsonbin_force_refresh_on_restock_route", True))
+        link, hatcher, err = pick_jsonbin_hatcher(cfg, rt, force=force_fresh)
 
         if link:
             rt_tab["last_hatcher"] = hatcher.get("name") if hatcher else "jsonbin"
