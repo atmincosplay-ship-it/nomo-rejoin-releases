@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.66.5-dev-core-solver-result"
+__version__ = "V4.66.6-dev-core-latest-item"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8843,6 +8843,15 @@ class RejoinCore:
     def has_work(self):
         return bool(self.open_queue)
 
+    def latest(self, package, reason_prefix=""):
+        for item in reversed(self.open_queue):
+            if item.get("tab", {}).get("package") != package:
+                continue
+            if reason_prefix and not str(item.get("reason", "")).startswith(reason_prefix):
+                continue
+            return item
+        return None
+
     def clear(self):
         self.open_queue.clear()
 
@@ -12207,12 +12216,15 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                         metadata=hard_meta,
                     )
                 if added:
-                    retry_item = next(
-                        (q for q in reversed(open_queue)
-                         if q.get("tab", {}).get("package") == pkg
-                         and str(q.get("reason", "")).startswith(retry_reason)),
-                        None,
-                    )
+                    if core is not None:
+                        retry_item = core.latest(pkg, retry_reason)
+                    else:
+                        retry_item = next(
+                            (q for q in reversed(open_queue)
+                             if q.get("tab", {}).get("package") == pkg
+                             and str(q.get("reason", "")).startswith(retry_reason)),
+                            None,
+                        )
                     if retry_item is not None:
                         retry_item["homepage_hard_retries"] = retries_done + 1
                         retry_item["bypass_recheck"] = True
