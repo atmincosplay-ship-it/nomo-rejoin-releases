@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.63.8-dev-loading-no-captcha-safe"
+__version__ = "V4.63.9-dev-loading-alive-guard"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -9784,7 +9784,7 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
 
     # --- protect loads: if WE opened it recently, don't touch during grace ---
     last_open = int(rt_tab.get("last_open", 0) or 0)
-    in_grace = last_open > 0 and (now() - last_open) < grace
+    in_grace = alive and last_open > 0 and (now() - last_open) < grace
 
     if state:
         age = state_age_seconds(state)
