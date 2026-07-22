@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.66.1-dev-core-factory"
+__version__ = "V4.66.2-dev-core-work-state"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -6516,12 +6516,12 @@ def manual_restart_tabs_via_queue(
                 YELLOW,
             )
 
-    while open_queue:
+    while core.has_work():
         if stop_requested():
             save_runtime(rt)
             return False
         core.process()
-        if open_queue and not wait_seconds(1, rt):
+        if core.has_work() and not wait_seconds(1, rt):
             return False
 
     save_runtime(rt)
@@ -7957,12 +7957,12 @@ def market_run_route_queue(cfg, tabs, target, reason):
                 YELLOW,
             )
 
-    while open_queue:
+    while core.has_work():
         if stop_requested():
             save_runtime(rt)
             return False, "stopped"
         core.process()
-        if open_queue and not wait_seconds(1, rt):
+        if core.has_work() and not wait_seconds(1, rt):
             return False, "stopped"
 
     save_runtime(rt)
@@ -8827,6 +8827,12 @@ class RejoinCore:
 
     def position(self, package):
         return queue_position(self.open_queue, package)
+
+    def has_work(self):
+        return bool(self.open_queue)
+
+    def clear(self):
+        self.open_queue.clear()
 
     def self_heal(self):
         return queue_stuck_self_heal(self.open_queue, self.cfg, self.rt)
@@ -12392,12 +12398,12 @@ def _nomo_start_market_rejoin_original(cfg):
                     bypass_manual=False,
                 )
 
-            while open_queue:
+            while core.has_work():
                 if stop_requested():
                     save_runtime(rt)
                     return
                 core.process(session_start, loops)
-                if open_queue:
+                if core.has_work():
                     if not wait_seconds(int(cfg.get("delay_between_open", 45)), rt):
                         return
 
@@ -12559,7 +12565,7 @@ def _nomo_start_market_rejoin_original(cfg):
                                 note = "hop queued"
 
             due_refresh, refresh_left = periodic_hard_refresh_due(rt_tab, cfg)
-            if due_refresh and not rj_handled and not open_queue and not core.has(pkg) and not solver_job_running(pkg):
+            if due_refresh and not rj_handled and not core.has_work() and not core.has(pkg) and not solver_job_running(pkg):
                 if (not manual_login_blocked(rt_tab, cfg)) or cfg.get("periodic_hard_refresh_include_manual", True):
                     added, _ = core.queue(
                         tab, target, "periodic hard refresh",
@@ -12612,19 +12618,19 @@ def _nomo_start_market_rejoin_original(cfg):
         try:
             delta_key_result = delta_key_auto_monitor_tick(
                 cfg,
-                safe_to_act=not bool(open_queue),
+                safe_to_act=not core.has_work(),
             )
         except Exception as exc:
             log_activity(f"Delta key auto tick failed: {cut(exc, 90)}", "", YELLOW)
 
         if delta_key_auto_should_pause_rejoin(delta_key_result, cfg):
-            if open_queue:
-                open_queue.clear()
+            if core.has_work():
+                core.clear()
             if not wait_seconds(5, rt):
                 return
             continue
 
-        if open_queue and cfg.get("smart_open_queue", True):
+        if core.has_work() and cfg.get("smart_open_queue", True):
             if not wait_seconds(2, rt):
                 return
             core.process(session_start, loops)
@@ -15652,12 +15658,12 @@ def start_hatcher_reporter(main_cfg=None):
                 rt_tab["note"] = "start already open"
                 save_runtime(rt)
 
-        while open_queue:
+        while core.has_work():
             if stop_requested():
                 save_runtime(rt)
                 return
             core.process(session_start, loops)
-            if open_queue:
+            if core.has_work():
                 if not wait_seconds(int(cfg.get("delay_between_open", 45)), rt):
                     return
 
@@ -15821,7 +15827,7 @@ def start_hatcher_reporter(main_cfg=None):
                     status = "Offline"
 
             due_refresh, refresh_left = periodic_hard_refresh_due(rt_tab, cfg)
-            if due_refresh and not open_queue and not core.has(pkg):
+            if due_refresh and not core.has_work() and not core.has(pkg):
                 if (not manual_login_blocked(rt_tab, cfg)) or cfg.get("periodic_hard_refresh_include_manual", True):
                     added, _ = core.queue(
                         tab, "hatcher", "periodic hard refresh",
@@ -15862,7 +15868,7 @@ def start_hatcher_reporter(main_cfg=None):
             last_msg = f"[{date_time_text()}] {tag}: {msg}"
         hatcher_rejoin_status_screen(rows, hcfg, cfg, session_start, loops, last_msg)
 
-        if open_queue and cfg.get("smart_open_queue", True):
+        if core.has_work() and cfg.get("smart_open_queue", True):
             if not wait_seconds(2, rt):
                 return
             core.process(session_start, loops)
@@ -16741,7 +16747,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
             # gets its normal turn; its queued generation performs one solver check before opening.
 
             due_refresh, refresh_left = periodic_hard_refresh_due(rt_tab, cfg)
-            if due_refresh and captcha_action is None and not open_queue and not core.has(pkg) and not solver_job_running(pkg):
+            if due_refresh and captcha_action is None and not core.has_work() and not core.has(pkg) and not solver_job_running(pkg):
                 if ((not manual_login_blocked(rt_tab, cfg)) or cfg.get("periodic_hard_refresh_include_manual", True)) and not (state and state_login_challenge_detail(state)):
                     added, _ = core.queue(
                         tab, "hatcher", "periodic hard refresh",
@@ -16803,19 +16809,19 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
         try:
             delta_key_result = delta_key_auto_monitor_tick(
                 cfg,
-                safe_to_act=not bool(open_queue),
+                safe_to_act=not core.has_work(),
             )
         except Exception as exc:
             log_activity(f"Delta key auto tick failed: {cut(exc, 90)}", "", YELLOW)
 
         if delta_key_auto_should_pause_rejoin(delta_key_result, cfg):
-            if open_queue:
-                open_queue.clear()
+            if core.has_work():
+                core.clear()
             if not wait_seconds(5, rt):
                 return
             continue
 
-        if open_queue and cfg.get("smart_open_queue", True):
+        if core.has_work() and cfg.get("smart_open_queue", True):
             if not wait_seconds(2, rt):
                 return
             core.process(session_start, loops)
