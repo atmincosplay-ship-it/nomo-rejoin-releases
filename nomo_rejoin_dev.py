@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.66.4-dev-core-challenge-action"
+__version__ = "V4.66.5-dev-core-solver-result"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -11598,7 +11598,7 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
 
     # A pre-open solver may finish between dashboard ticks. Apply its result
     # while the matching generation is still in the queue.
-    poll_solver_jobs(cfg, rt, open_queue)
+    poll_solver_jobs(cfg, rt, open_queue, core)
     if not open_queue:
         return True
 
@@ -12007,7 +12007,7 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
         save_runtime(rt)
 
         if fresh_msg == "solver result":
-            poll_solver_jobs(cfg, rt, open_queue)
+            poll_solver_jobs(cfg, rt, open_queue, core)
 
         if not fresh_ok and fresh_msg not in (
             "stop",
@@ -12425,7 +12425,7 @@ def _nomo_start_market_rejoin_original(cfg):
 
         core.self_heal()
         core.watchdog(enabled_tabs)
-        poll_solver_jobs(cfg, rt, open_queue)
+        poll_solver_jobs(cfg, rt, open_queue, core)
 
         if cfg.get("workspace_sync_enabled", False) and cfg.get("workspace_sync_periodic_enabled", False) and workspace_sync_allowed_for_mode(cfg):
             run_workspace_sync(cfg, rt, reason="periodic", force=False)
@@ -16417,7 +16417,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
 
         loops += 1
         core.self_heal()
-        poll_solver_jobs(cfg, rt, open_queue)
+        poll_solver_jobs(cfg, rt, open_queue, core)
         # Periodic auto username re-resolve (rate-limited inside the function).
         try:
             if resolve_usernames_auto(cfg, hcfg, rt, force=False, quiet=True):
@@ -25199,7 +25199,7 @@ def handle_detected_solver_challenge(tab, cfg, rt, rt_tab, reason):
     return "Manual", note
 
 
-def poll_solver_jobs(cfg, rt, open_queue):
+def poll_solver_jobs(cfg, rt, open_queue, core=None):
     """Apply completed jobs on the main thread; never expose cookies/tokens."""
     completed = []
     with _SOLVER_LOCK:
@@ -25377,7 +25377,10 @@ def poll_solver_jobs(cfg, rt, open_queue):
 
             # Remove only stale/duplicate queue entries for this package. Never
             # disturb another clone's queued recovery.
-            cancel_queued_package(open_queue, pkg)
+            if core is not None:
+                core.cancel(pkg)
+            else:
+                cancel_queued_package(open_queue, pkg)
 
             # This is a post-open provider result. The current Roblox task can
             # already be trapped behind 529, so both clear statuses get exactly
@@ -25391,19 +25394,27 @@ def poll_solver_jobs(cfg, rt, open_queue):
                     activity += " - " + cut(detail, 70)
                 log_activity(activity, pkg, GREEN)
 
-                added, _ = queue_open(
-                    open_queue, tab, target, f"solver {result_label.lower()} rejoin",
-                    force=True, mode="hard_force", bypass_manual=True,
-                    metadata={
-                        "solver_recovery": True,
-                        "auth_result_recovery": True,
-                        "solver_result": result_label,
-                        "skip_solver_once": True,
-                        "skip_solver_probe": True,
-                        "solver_preflight_done": True,
-                        "bypass_recheck": True,
-                    },
-                )
+                solver_metadata = {
+                    "solver_recovery": True,
+                    "auth_result_recovery": True,
+                    "solver_result": result_label,
+                    "skip_solver_once": True,
+                    "skip_solver_probe": True,
+                    "solver_preflight_done": True,
+                    "bypass_recheck": True,
+                }
+                if core is not None:
+                    added, _ = core.queue(
+                        tab, target, f"solver {result_label.lower()} rejoin",
+                        force=True, mode="hard_force", bypass_manual=True,
+                        metadata=solver_metadata,
+                    )
+                else:
+                    added, _ = queue_open(
+                        open_queue, tab, target, f"solver {result_label.lower()} rejoin",
+                        force=True, mode="hard_force", bypass_manual=True,
+                        metadata=solver_metadata,
+                    )
                 if not added:
                     rt_tab["note"] = f"{result_label} - already queued"
             else:
