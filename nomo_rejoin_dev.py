@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.64.5-dev-revert-stale-shell-close"
+__version__ = "V4.64.6-dev-hard-after-3-fails"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1480,6 +1480,7 @@ DEFAULT_CONFIG = {
     "activity_log_lines": 6,
     "homepage_stuck_fallback_seconds": 240,
     "homepage_stuck_max_hard_retries": 1,
+    "join_failures_before_hard_rejoin": 3,
 
     # Queue/runtime self-heal:
     # If Termux is stopped during an open/wait cycle, runtime.json may keep a
@@ -2465,6 +2466,8 @@ def apply_update_migrations(cfg):
         set_cfg("homepage_stuck_fallback_seconds", 240)
     if "homepage_stuck_max_hard_retries" not in cfg:
         set_cfg("homepage_stuck_max_hard_retries", 1)
+    if _int_cfg(cfg.get("join_failures_before_hard_rejoin"), 0) <= 0:
+        set_cfg("join_failures_before_hard_rejoin", 3)
 
     # V4.23: roll back alive soft-open recovery. On App Cloner builds a second
     # VIEW intent to an already-open task creates duplicate/cascaded windows.
@@ -4032,6 +4035,7 @@ def core_finish_rejoin(rt_tab, *, verified=False, note="", state_ts=0):
     if state_ts:
         rt_tab["core_last_verify_state_ts"] = int(state_ts or 0)
     if verified:
+        rt_tab["homepage_join_fail_count"] = 0
         rt_tab["core_last_verified_open_at"] = int(
             rt_tab.get("core_pending_open_at", 0) or 0
         )
@@ -11898,6 +11902,46 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                 allow_hard_fallback = bool(cfg.get("alive_recovery_hard_fallback", True))
                 if item.get("no_hard_fallback"):
                     allow_hard_fallback = False
+
+            alive_for_retry = package_alive(pkg, cfg, fresh=True)
+            join_fail_count = int(rt_tab.get("homepage_join_fail_count", 0) or 0) + 1
+            rt_tab["homepage_join_fail_count"] = join_fail_count
+            failures_before_hard = max(
+                1,
+                int(cfg.get("join_failures_before_hard_rejoin", 3) or 3),
+            )
+
+            if allow_hard_fallback and alive_for_retry and join_fail_count < failures_before_hard:
+                added, _ = queue_open(
+                    open_queue,
+                    tab,
+                    target,
+                    f"join fail {join_fail_count}/{failures_before_hard}; route retry after {fresh_msg}",
+                    force=True,
+                    mode="route",
+                    front=False,
+                    metadata={
+                        "solver_preflight_done": True,
+                        "skip_solver_once": True,
+                        "skip_solver_probe": True,
+                        "solver_result": str(item.get("solver_result", "") or ""),
+                        "manual_booster_route": bool(item.get("manual_booster_route")),
+                        "manual_booster_second_intent_done": bool(
+                            item.get("manual_booster_second_intent_done")
+                        ),
+                    },
+                )
+                rt_tab["note"] = (
+                    f"{fresh_msg}; join fail {join_fail_count}/{failures_before_hard}; "
+                    + ("route retry queued" if added else "route retry already queued")
+                )
+                log_activity(
+                    f"join fail {join_fail_count}/{failures_before_hard}; route retry before hard",
+                    pkg,
+                    YELLOW,
+                )
+                save_runtime(rt)
+                return True
 
             if allow_hard_fallback and retries_done < max_retries:
                 retry_reason = "homepage/no-state hard retry"
