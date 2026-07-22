@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.64.1-dev-load-fail-notes"
+__version__ = "V4.64.2-dev-stale-task-prewarm"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1446,6 +1446,12 @@ DEFAULT_CONFIG = {
     "alive_recovery_soft_first": False,
     "alive_recovery_soft_timeout_seconds": 90,
     "alive_recovery_hard_fallback": False,
+    # App Cloner/Noka can leave a small stale launcher task after manual close.
+    # If we send a game deep link into that shell, Roblox may land on Home.
+    # For selected-package hard opens, materialize that task once, exact-PID stop
+    # it, then send the intended deep link.
+    "prewarm_closed_clone_before_hard_open": True,
+    "prewarm_closed_clone_wait_seconds": 2,
 
     # Pool-wide stagger: minimum seconds between any two hard opens across ALL
     # clones. Spaces out restarts so reloads don't overlap (memory spikes) and
@@ -2470,6 +2476,10 @@ def apply_update_migrations(cfg):
         set_cfg("_nomo_app_cloner_recovery_migration", 423)
     if _int_cfg(cfg.get("alive_recovery_soft_timeout_seconds"), 0) < 30:
         set_cfg("alive_recovery_soft_timeout_seconds", 90)
+    if "prewarm_closed_clone_before_hard_open" not in cfg:
+        set_cfg("prewarm_closed_clone_before_hard_open", True)
+    if _int_cfg(cfg.get("prewarm_closed_clone_wait_seconds"), 0) <= 0:
+        set_cfg("prewarm_closed_clone_wait_seconds", 2)
 
     if "login_challenge_detection_enabled" not in cfg:
         set_cfg("login_challenge_detection_enabled", True)
@@ -3875,6 +3885,31 @@ def open_package_launcher(pkg, cfg):
     return False, cut(output or f"launcher returned {code}", 80)
 
 
+def prewarm_closed_clone_for_hard_open(pkg, cfg, reason=""):
+    """Materialize a stale App Cloner mini-task so exact-PID stop can clear it."""
+    if not cfg.get("prewarm_closed_clone_before_hard_open", True):
+        return False, "prewarm disabled"
+    if not _is_noka_clone_package(pkg):
+        return False, "not a noka clone"
+    if package_alive(pkg, cfg, fresh=True):
+        return False, "package already alive"
+
+    ok, note = open_package_launcher(pkg, cfg)
+    if not ok:
+        return False, note
+
+    wait_s = max(1, int(cfg.get("prewarm_closed_clone_wait_seconds", 2) or 2))
+    wait_seconds(wait_s)
+    if package_alive(pkg, cfg, fresh=True):
+        log_activity(
+            f"prewarm stale task before hard open: {cut(reason, 60)}",
+            pkg,
+            YELLOW,
+        )
+        return True, "prewarmed"
+    return False, "prewarm no pid"
+
+
 def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop=True, skip_force_stop=False, allow_launcher_fallback=False):
     if not link or str(link).startswith("PUT_"):
         return False, "no link"
@@ -3882,6 +3917,7 @@ def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop
     link = android_launch_roblox_link(link, cfg)
 
     if not soft and require_stop and not skip_force_stop:
+        prewarm_closed_clone_for_hard_open(pkg, cfg, reason)
         stopped, stop_note = force_stop_package(pkg, cfg, tries=3, wait_after=0.8, settle=1.0)
         if not stopped:
             # Never send another VIEW intent while the old exact package PID is
