@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.64.6-dev-hard-after-3-fails"
+__version__ = "V4.64.7-dev-open-policy-core"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8431,6 +8431,18 @@ def _alive_recovery_soft_allowed(reason, pkg_alive, cfg):
     return any(token in low for token in recovery_tokens)
 
 
+def classify_open_mode(mode):
+    """Normalize requested open mode into the core rejoin policy fields."""
+    mode_s = str(mode or "hard").lower()
+    intentional_route = mode_s in ["route", "switch", "reuse_task"]
+    return {
+        "mode": mode_s,
+        "intentional_route": intentional_route,
+        "soft": (mode_s == "soft") or intentional_route,
+        "hard_force": mode_s in ["hard_force", "force", "force_stop", "force-stop"],
+    }
+
+
 
 def open_target(tab, rt_tab, cfg, target, reason, force=False, rt=None, mode="hard"):
     if not force and not can_open(rt_tab, cfg):
@@ -8442,10 +8454,11 @@ def open_target(tab, rt_tab, cfg, target, reason, force=False, rt=None, mode="ha
         rt_tab["note"] = "no restock link" if target == "restock" else "no link"
         return False, rt_tab["note"]
 
-    mode_s = str(mode or "hard").lower()
-    intentional_route = mode_s in ["route", "switch", "reuse_task"]
-    soft = (mode_s == "soft") or intentional_route
-    hard_force = mode_s in ["hard_force", "force", "force_stop", "force-stop"]
+    open_mode = classify_open_mode(mode)
+    mode_s = open_mode["mode"]
+    intentional_route = open_mode["intentional_route"]
+    soft = open_mode["soft"]
+    hard_force = open_mode["hard_force"]
     pkg_alive = package_alive(tab["package"], cfg, fresh=True)
 
     # V4.15: `disable_soft_rejoin` still disables ordinary/scheduled soft hops,
