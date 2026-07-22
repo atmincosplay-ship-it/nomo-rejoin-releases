@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.64.8-dev-resolve-open-policy"
+__version__ = "V4.64.9-dev-core-open-path"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -7931,6 +7931,7 @@ def market_run_route_queue(cfg, tabs, target, reason):
     """Use the normal route queue: task reuse first, one exact-PID fallback."""
     rt = load_runtime()
     open_queue = []
+    core = RejoinCore(open_queue, cfg, rt)
     queued = []
 
     for tab in tabs:
@@ -7963,7 +7964,7 @@ def market_run_route_queue(cfg, tabs, target, reason):
         if stop_requested():
             save_runtime(rt)
             return False, "stopped"
-        process_open_queue(open_queue, cfg, rt)
+        core.process()
         if open_queue and not wait_seconds(1, rt):
             return False, "stopped"
 
@@ -8677,6 +8678,17 @@ class RejoinCore:
             **kwargs,
         )
 
+    def open(self, tab, rt_tab, target, reason, **kwargs):
+        return open_target(
+            tab,
+            rt_tab,
+            self.cfg,
+            target,
+            reason,
+            rt=self.rt,
+            **kwargs,
+        )
+
     def queue_exact_pid_recovery(
         self,
         tab,
@@ -8773,6 +8785,7 @@ class RejoinCore:
             self.rt,
             session_start,
             loops,
+            self,
         )
 
     def has(self, package):
@@ -11451,7 +11464,7 @@ def solver_preflight_before_open(open_queue, item, tab, rt_tab, pkg, target, cfg
     return "ready", item
 
 
-def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0):
+def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=None):
     if not open_queue:
         return False
 
@@ -11567,7 +11580,7 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0):
 
     try:
         return _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason,
-                              mode, is_hard, cfg, rt)
+                              mode, is_hard, cfg, rt, core)
     finally:
         if cfg.get("single_flight_open", True) and str(rt.get("_open_lock_pkg", "")) == pkg:
             rt["_open_lock_pkg"] = ""
@@ -11675,7 +11688,7 @@ def market_booster_second_soft_intent(
     return True, second_opened_at, "second soft intent sent"
 
 
-def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_hard, cfg, rt):
+def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_hard, cfg, rt, core=None):
     """The actual target-only open -> wait-for-fresh cycle for one package."""
     display_mode = str(mode or "hard")
     if _alive_recovery_soft_allowed(reason, package_alive(pkg, cfg, fresh=True), cfg):
@@ -11684,7 +11697,17 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
     rt_tab["note"] = f"opening -> {target}"
     save_runtime(rt)
     log_activity(f"opening -> {target} ({display_mode})", pkg)
-    ok, msg = open_target(tab, rt_tab, cfg, target, reason, force=item.get("force", False), rt=rt, mode=mode)
+    if core is not None:
+        ok, msg = core.open(
+            tab,
+            rt_tab,
+            target,
+            reason,
+            force=item.get("force", False),
+            mode=mode,
+        )
+    else:
+        ok, msg = open_target(tab, rt_tab, cfg, target, reason, force=item.get("force", False), rt=rt, mode=mode)
     opened_at = int(rt_tab.get("last_open", now()))
 
     if ok and item.get("hatcher_old_state_recovery"):
@@ -15473,7 +15496,7 @@ def start_hatcher_reporter(main_cfg=None):
             if stop_requested():
                 save_runtime(rt)
                 return
-            process_open_queue(open_queue, cfg, rt, session_start, loops)
+            core.process(session_start, loops)
             if open_queue:
                 if not wait_seconds(int(cfg.get("delay_between_open", 45)), rt):
                     return
@@ -15682,7 +15705,7 @@ def start_hatcher_reporter(main_cfg=None):
         if open_queue and cfg.get("smart_open_queue", True):
             if not wait_seconds(2, rt):
                 return
-            process_open_queue(open_queue, cfg, rt, session_start, loops)
+            core.process(session_start, loops)
             continue
 
         if not wait_seconds(int(cfg.get("check_interval", 10)), rt):
