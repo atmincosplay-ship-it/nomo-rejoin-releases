@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.66.0-dev-core-target-link"
+__version__ = "V4.66.1-dev-core-factory"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -6482,8 +6482,7 @@ def manual_restart_tabs_via_queue(
 ):
     """Option 6 restart path using the same one-generation solver gate."""
     rt = load_runtime()
-    open_queue = []
-    core = RejoinCore(open_queue, cfg, rt)
+    open_queue, core = make_rejoin_core(cfg, rt)
     tabs = list(tabs or [])
 
     for tab in tabs:
@@ -7930,8 +7929,7 @@ def market_run_booster_hard_join_queue(
 def market_run_route_queue(cfg, tabs, target, reason):
     """Use the normal route queue: task reuse first, one exact-PID fallback."""
     rt = load_runtime()
-    open_queue = []
-    core = RejoinCore(open_queue, cfg, rt)
+    open_queue, core = make_rejoin_core(cfg, rt)
     queued = []
 
     for tab in tabs:
@@ -8658,10 +8656,10 @@ def queue_open(open_queue, tab, target, reason, force=False, skip_if_alive=False
 
 
 class RejoinCore:
-    """Thin facade over the existing shared rejoin queue/open engine.
+    """Shared rejoin subsystem used by Market, Hatcher, and future modes.
 
-    Step 1 keeps behavior identical while giving future modes one obvious
-    object to reuse instead of calling queue helpers directly everywhere.
+    Mode code should queue intent and let this core own open/cancel/runtime
+    bookkeeping so exact-PID safety stays consistent across every mode.
     """
 
     def __init__(self, open_queue, cfg, rt):
@@ -8840,6 +8838,11 @@ class RejoinCore:
             self.rt,
             enabled_tabs,
         )
+
+
+def make_rejoin_core(cfg, rt):
+    open_queue = []
+    return open_queue, RejoinCore(open_queue, cfg, rt)
 
 
 def save_runtime_core(core, rt):
@@ -12332,8 +12335,7 @@ def _nomo_start_market_rejoin_original(cfg):
     rt = load_runtime()
     session_start = now()
     loops = 0
-    open_queue = []
-    core = RejoinCore(open_queue, cfg, rt)
+    open_queue, core = make_rejoin_core(cfg, rt)
 
     enabled_tabs = [t for t in cfg["tabs"] if t.get("enabled", True)]
 
@@ -15601,8 +15603,7 @@ def start_hatcher_reporter(main_cfg=None):
     rt = load_runtime()
     session_start = now()
     loops = 0
-    open_queue = []
-    core = RejoinCore(open_queue, cfg, rt)
+    open_queue, core = make_rejoin_core(cfg, rt)
     last_msg = "not uploaded yet"
     last_report_at = 0
 
@@ -16312,8 +16313,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
 
     session_start = now()
     loops = 0
-    open_queue = []
-    core = RejoinCore(open_queue, cfg, rt)
+    open_queue, core = make_rejoin_core(cfg, rt)
     last_msg = "not uploaded yet"
     last_report_at = 0
 
