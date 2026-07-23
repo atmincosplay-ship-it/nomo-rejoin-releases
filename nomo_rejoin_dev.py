@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.68.4-dev-core-old-state"
+__version__ = "V4.68.6-dev-core-startup-helpers"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8910,6 +8910,19 @@ class RejoinCore:
             metadata=merged,
         )
 
+    def queue_start_recovery(self, tab, target, reason, metadata=None):
+        merged = {"bypass_recheck": True}
+        if isinstance(metadata, dict):
+            merged.update(metadata)
+        return self.queue_exact_pid_recovery(
+            tab,
+            target,
+            reason,
+            skip_if_alive=True,
+            bypass_manual=True,
+            metadata=merged,
+        )
+
     def process(self, session_start=None, loops=0):
         return process_open_queue(
             self.open_queue,
@@ -15868,14 +15881,12 @@ def start_hatcher_reporter(main_cfg=None):
             elif raw_alive and cfg.get("start_reopen_alive_without_fresh_state", True):
                 rt_tab["note"] = "start alive no-fresh -> soft"
                 save_runtime(rt)
-                core.queue(
+                core.queue_soft_recovery(
                     tab, "hatcher", "hatcher start alive no-fresh",
-                    force=True,
-                    skip_if_alive=False,
-                    mode="soft"
+                    metadata={"skip_if_alive": False},
                 )
             elif not raw_alive:
-                core.queue(tab, "hatcher", "hatcher start", force=True, skip_if_alive=True, mode="hard")
+                core.queue_start_recovery(tab, "hatcher", "hatcher start")
             else:
                 rt_tab["note"] = "start already open"
                 save_runtime(rt)
@@ -16618,12 +16629,10 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                 rt_tab["note"] = f"start alive -> grace {startup_grace}s"
                 continue
 
-            core.queue_exact_pid_recovery(
+            core.queue_start_recovery(
                 tab,
                 "hatcher",
                 "hatcher start",
-                skip_if_alive=True,
-                bypass_manual=True,
             )
         save_runtime(rt)
 
@@ -16930,12 +16939,10 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
             ):
                 if cfg.get("smart_open_queue", True) or cfg.get("solver_enabled", False):
                     dead_reason = "crash/dead"
-                    added, _ = core.queue_exact_pid_recovery(
+                    added, _ = core.queue_crash_recovery(
                         tab,
                         "hatcher",
                         dead_reason,
-                        skip_if_alive=True,
-                        bypass_manual=True,
                     )
                     note = "crash queued" if added else "already queued"
                     status = "Queued" if added else "Offline"
