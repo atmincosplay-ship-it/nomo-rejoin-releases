@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.69.2-dev-manual-recover-refresh"
+__version__ = "V4.69.3-dev-healthy-clears-manual"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -9909,6 +9909,9 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
         # Do not let an old popup cooldown delay a later, unrelated Error 288.
         rt_tab["disconnect_ui_since"] = 0
         rt_tab["last_disconnect_ui_open"] = 0
+        if manual_login_blocked(rt_tab, cfg):
+            clear_manual_login_block(rt_tab)
+            clear_hold(pkg)
     visible_window = None
     visible_note = ""
     if raw_alive:
