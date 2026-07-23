@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.68.9-dev-oldstate-attempt-cooldown"
+__version__ = "V4.69.0-dev-oldstate-save-cooldown"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8807,7 +8807,7 @@ class RejoinCore:
         )
 
     def queue_hatcher_old_state_hard(self, tab, rt_tab, hcfg, age_or_seconds, reason):
-        return queue_hatcher_alive_old_state_hard(
+        result = queue_hatcher_alive_old_state_hard(
             self.open_queue,
             tab,
             rt_tab,
@@ -8816,6 +8816,13 @@ class RejoinCore:
             age_or_seconds,
             reason,
         )
+        try:
+            added, _note, action = result
+            if added or action:
+                self.save()
+        except Exception:
+            pass
+        return result
 
     def queue_disconnect_ui_rejoin(self, tab, target, rt_tab):
         return queue_disconnect_ui_rejoin(
