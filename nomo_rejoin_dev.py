@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.70.6-dev-exact-pid-metadata"
+__version__ = "V4.70.7-dev-exact-pid-fallbacks"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -10312,11 +10312,7 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
                     open_queue, tab, target,
                     f"{mode} alive old state {format_age(age)}",
                     force=True, mode="hard_force", skip_if_alive=False, bypass_manual=True,
-                    metadata={
-                        "pid_only_recovery": True,
-                        "recovery_must_open_once": True,
-                        "bypass_recheck": True,
-                    },
+                    metadata=exact_pid_recovery_metadata(),
                 )
             return ("Queued" if added else "Stale"), \
                    (f"old {format_age(age)} kill+open" if added else "already queued"), True
@@ -10338,11 +10334,7 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
             added, _ = queue_open(
                 open_queue, tab, target, f"{mode} alive no-state hard",
                 force=True, mode="hard_force", skip_if_alive=False, bypass_manual=True,
-                metadata={
-                    "pid_only_recovery": True,
-                    "recovery_must_open_once": True,
-                    "bypass_recheck": True,
-                },
+                metadata=exact_pid_recovery_metadata(),
             )
         return ("Queued" if added else "No state"), \
                ("no-state kill+open" if added else "already queued"), True
@@ -10358,11 +10350,7 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
         added, _ = queue_open(
             open_queue, tab, target, f"{mode} crash/dead",
             force=True, mode="hard_force", skip_if_alive=True, bypass_manual=True,
-            metadata={
-                "pid_only_recovery": True,
-                "recovery_must_open_once": True,
-                "bypass_recheck": True,
-            },
+            metadata=exact_pid_recovery_metadata(),
         )
     return ("Queued" if added else "Offline"), \
            ("crash kill+open" if added else "already queued"), True
@@ -13350,12 +13338,9 @@ def booster_hatcher_startup_queue(
             skip_if_alive=True,
             mode="hard_force",
             bypass_manual=True,
-            metadata={
-                "pid_only_recovery": True,
-                "recovery_must_open_once": True,
-                "bypass_recheck": True,
+            metadata=exact_pid_recovery_metadata({
                 "booster_hatcher_core": True,
-            },
+            }),
         )
         if added:
             queued.append(package)
