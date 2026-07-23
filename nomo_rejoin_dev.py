@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.72.5-dev-private-queue-primitives"
+__version__ = "V4.72.6-dev-core-pause-api"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -9081,8 +9081,12 @@ class RejoinCore:
     def clear(self):
         self.open_queue.clear()
 
+    def clear_for_pause(self):
+        """Drop pending opens when a safety gate says rejoin should pause."""
+        self.clear()
+
     def self_heal(self):
-        return queue_stuck_self_heal(self.open_queue, self.cfg, self.rt)
+        return _queue_stuck_self_heal(self.open_queue, self.cfg, self.rt)
 
     def watchdog(self, enabled_tabs=None):
         return _runtime_stuck_watchdog(
@@ -9104,7 +9108,7 @@ def save_runtime_core(core, rt):
     return save_runtime(rt)
 
 
-def queue_stuck_self_heal(open_queue, cfg, rt):
+def _queue_stuck_self_heal(open_queue, cfg, rt):
     """Clear stale temporary queue/cooldown runtime without deleting config."""
     if not cfg.get("queue_stuck_self_heal_enabled", True):
         return False
@@ -12935,7 +12939,7 @@ def _nomo_start_market_rejoin_original(cfg):
 
         if delta_key_auto_should_pause_rejoin(delta_key_result, cfg):
             if core.has_work():
-                core.clear()
+                core.clear_for_pause()
             if not wait_seconds(5, rt):
                 return
             continue
@@ -17109,7 +17113,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
 
         if delta_key_auto_should_pause_rejoin(delta_key_result, cfg):
             if core.has_work():
-                core.clear()
+                core.clear_for_pause()
             if not wait_seconds(5, rt):
                 return
             continue
