@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.71.8-dev-solver-metadata-core"
+__version__ = "V4.71.9-dev-process-core-default"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -11997,20 +11997,19 @@ def solver_preflight_before_open(open_queue, item, tab, rt_tab, pkg, target, cfg
 def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=None):
     if not open_queue:
         return False
+    if core is None:
+        core = RejoinCore(open_queue, cfg, rt)
 
     # A pre-open solver may finish between dashboard ticks. Apply its result
     # while the matching generation is still in the queue.
-    if core is not None:
-        core.poll_solver_jobs()
-    else:
-        poll_solver_jobs(cfg, rt, open_queue)
+    core.poll_solver_jobs()
     if not open_queue:
         return True
 
     item = open_queue.pop(0)
     tab = item["tab"]
     pkg = tab["package"]
-    rt_tab = core.runtime_tab(pkg) if core is not None else get_runtime_tab(rt, pkg)
+    rt_tab = core.runtime_tab(pkg)
     target = item.get("target", rt_tab.get("target", "market"))
     reason = item.get("reason", "queued open")
     mode = str(item.get("mode", "hard") or "hard").lower()
@@ -12545,24 +12544,12 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                     ),
                 }
                 retry_reason = f"join fail {join_fail_count}/{failures_before_hard}; route retry after {fresh_msg}"
-                if core is not None:
-                    added, _ = core.queue_route_retry(
-                        tab,
-                        target,
-                        retry_reason,
-                        metadata=retry_meta,
-                    )
-                else:
-                    added, _ = queue_open(
-                        open_queue,
-                        tab,
-                        target,
-                        retry_reason,
-                        force=True,
-                        mode="route",
-                        front=False,
-                        metadata=retry_meta,
-                    )
+                added, _ = core.queue_route_retry(
+                    tab,
+                    target,
+                    retry_reason,
+                    metadata=retry_meta,
+                )
                 rt_tab["note"] = (
                     f"{fresh_msg}; join fail {join_fail_count}/{failures_before_hard}; "
                     + ("route retry queued" if added else "route retry already queued")
@@ -12601,34 +12588,14 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                 else:
                     hard_meta["disconnect_recovery"] = False
                     hard_meta["disconnect_recovery_stage"] = ""
-                if core is not None:
-                    added, _ = core.queue_hard_retry(
-                        tab,
-                        target,
-                        f"{retry_reason} after {fresh_msg}",
-                        metadata=hard_meta,
-                    )
-                else:
-                    added, _ = queue_open(
-                        open_queue,
-                        tab,
-                        target,
-                        f"{retry_reason} after {fresh_msg}",
-                        force=True,
-                        mode="hard_force",
-                        front=False,
-                        metadata=hard_meta,
-                    )
+                added, _ = core.queue_hard_retry(
+                    tab,
+                    target,
+                    f"{retry_reason} after {fresh_msg}",
+                    metadata=hard_meta,
+                )
                 if added:
-                    if core is not None:
-                        retry_item = core.latest(pkg, retry_reason)
-                    else:
-                        retry_item = next(
-                            (q for q in reversed(open_queue)
-                             if q.get("tab", {}).get("package") == pkg
-                             and str(q.get("reason", "")).startswith(retry_reason)),
-                            None,
-                        )
+                    retry_item = core.latest(pkg, retry_reason)
                     if retry_item is not None:
                         retry_item["homepage_hard_retries"] = retries_done + 1
                         retry_item["bypass_recheck"] = True
@@ -12641,10 +12608,7 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                     save_runtime(rt)
 
             elif actual_open_mode == "soft" and cfg.get("soft_hop_fallback_hard", True):
-                if core is not None:
-                    core.queue_hard_retry(tab, target, "soft fallback hard", front=True)
-                else:
-                    queue_open(open_queue, tab, target, "soft fallback hard", force=True, mode="hard_force", front=True)
+                core.queue_hard_retry(tab, target, "soft fallback hard", front=True)
     else:
         rt_tab["note"] = msg
         if core is not None:
@@ -12659,10 +12623,7 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
 
         if mode in ("soft", "route") and cfg.get("soft_hop_fallback_hard", True):
             fallback_reason = "route failed hard" if mode == "route" else "soft failed hard"
-            if core is not None:
-                core.queue_hard_retry(tab, target, fallback_reason, front=True)
-            else:
-                queue_open(open_queue, tab, target, fallback_reason, force=True, mode="hard_force", front=True)
+            core.queue_hard_retry(tab, target, fallback_reason, front=True)
 
     return True
 
