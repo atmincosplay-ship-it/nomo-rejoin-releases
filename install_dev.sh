@@ -76,7 +76,10 @@ fi
 
 PYTHON="${PREFIX:-/data/data/com.termux/files/usr}/bin/python"
 if [ ! -x "$PYTHON" ]; then
-  PYTHON="$(command -v python)"
+  PYTHON="$(command -v python 2>/dev/null || true)"
+fi
+if [ -z "$PYTHON" ] || [ ! -x "$PYTHON" ]; then
+  PYTHON="$(command -v python3 2>/dev/null || true)"
 fi
 if [ -z "$PYTHON" ] || [ ! -x "$PYTHON" ]; then
   echo "Python missing. Install it first: pkg install -y python"
