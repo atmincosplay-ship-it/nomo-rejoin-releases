@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.69.6-dev-queue-log-prune"
+__version__ = "V4.69.7-dev-hatcher-queue-position"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8625,6 +8625,28 @@ def queue_position(open_queue, pkg):
     return 0
 
 
+def core_queue_display(core, pkg, status, note):
+    """Return user-facing status/note when a package is already queued."""
+    if core is None:
+        return status, note
+    try:
+        qpos = core.position(pkg)
+    except Exception:
+        qpos = 0
+    if qpos <= 0:
+        return status, note
+    reason = ""
+    try:
+        item = core.latest(pkg)
+        reason = str((item or {}).get("reason", "") or "")
+    except Exception:
+        reason = ""
+    reason = cut(reason, 40) if reason else str(note or "queued")
+    if qpos == 1:
+        return "Next", f"next: {reason}"
+    return "Waiting", f"queue #{qpos}: {reason}"
+
+
 def _new_open_generation(package):
     """Unique token for one real queued open/rejoin attempt."""
     return f"{time.time_ns()}:{str(package or '')}"
@@ -16183,6 +16205,7 @@ def start_hatcher_reporter(main_cfg=None):
                     status = "Queued"
                     note = "periodic hard queued"
 
+            status, note = core_queue_display(core, pkg, status, note)
             if manual_login_blocked(rt_tab, cfg) and not core.has(pkg):
                 status = "Manual"
                 note = rt_tab.get("manual_login_reason") or rt_tab.get("note") or "needs manual login"
@@ -17096,6 +17119,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                     status = "Queued"
                     note = "periodic hard queued"
 
+            status, note = core_queue_display(core, pkg, status, note)
             if manual_login_blocked(rt_tab, cfg) and not core.has(pkg):
                 status = "Manual"
                 note = rt_tab.get("manual_login_reason") or rt_tab.get("note") or "needs manual login"
