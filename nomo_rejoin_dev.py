@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.72.8-dev-core-process-once"
+__version__ = "V4.72.9-dev-core-drain-helper"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -6542,13 +6542,8 @@ def manual_restart_tabs_via_queue(
                 YELLOW,
             )
 
-    while core.has_work():
-        if stop_requested():
-            save_runtime(rt)
-            return False
-        core.process()
-        if core.has_work() and not wait_seconds(1, rt):
-            return False
+    if not core.drain(delay_seconds=1):
+        return False
 
     save_runtime(rt)
     return True
@@ -7979,13 +7974,8 @@ def market_run_route_queue(cfg, tabs, target, reason):
                 YELLOW,
             )
 
-    while core.has_work():
-        if stop_requested():
-            save_runtime(rt)
-            return False, "stopped"
-        core.process()
-        if core.has_work() and not wait_seconds(1, rt):
-            return False, "stopped"
+    if not core.drain(delay_seconds=1):
+        return False, "stopped"
 
     save_runtime(rt)
     if not queued:
@@ -9069,6 +9059,16 @@ class RejoinCore:
         if not wait_seconds(2, self.rt):
             return None
         self.process(session_start, loops)
+        return True
+
+    def drain(self, session_start=None, loops=0, delay_seconds=1):
+        while self.has_work():
+            if stop_requested():
+                self.save()
+                return False
+            self.process(session_start, loops)
+            if self.has_work() and not wait_seconds(int(delay_seconds or 1), self.rt):
+                return False
         return True
 
     def poll_solver_jobs(self):
@@ -12738,14 +12738,8 @@ def _nomo_start_market_rejoin_original(cfg):
                     bypass_manual=False,
                 )
 
-            while core.has_work():
-                if stop_requested():
-                    save_runtime(rt)
-                    return
-                core.process(session_start, loops)
-                if core.has_work():
-                    if not wait_seconds(int(cfg.get("delay_between_open", 45)), rt):
-                        return
+            if not core.drain(session_start, loops, cfg.get("delay_between_open", 45)):
+                return
 
     # --------------------------------------------------------
     # AUTO LOOP
@@ -15980,14 +15974,8 @@ def start_hatcher_reporter(main_cfg=None):
                 rt_tab["note"] = "start already open"
                 save_runtime(rt)
 
-        while core.has_work():
-            if stop_requested():
-                save_runtime(rt)
-                return
-            core.process(session_start, loops)
-            if core.has_work():
-                if not wait_seconds(int(cfg.get("delay_between_open", 45)), rt):
-                    return
+        if not core.drain(session_start, loops, cfg.get("delay_between_open", 45)):
+            return
 
     while True:
         if stop_requested():
