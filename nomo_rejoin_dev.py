@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.69.3-dev-healthy-clears-manual"
+__version__ = "V4.69.4-dev-oldstate-singleflight"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -9382,6 +9382,10 @@ def queue_hatcher_alive_old_state_hard(open_queue, tab, rt_tab, hcfg, cfg, age_o
         },
     )
     if not added:
+        if int(rt_tab.get("hatcher_alive_old_state_hard_last", 0) or 0) <= 0:
+            rt_tab["hatcher_alive_old_state_hard_last"] = t
+            rt_tab["hatcher_alive_old_state_hard_age"] = age_i
+            rt_tab["hatcher_alive_old_state_hard_reason"] = str(reason or "alive old state")
         return False, "already queued", True
 
     # Start the cooldown at queue-time. If Android/API/preflight blocks the
