@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.69.4-dev-oldstate-singleflight"
+__version__ = "V4.69.5-dev-queue-log-dedupe"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -2022,6 +2022,7 @@ def date_time_text():
 # ============================================================
 _ACTIVITY_LOG = []          # list of (ts, package, action, color)
 _ACTIVITY_MAX = 200         # keep last N in memory
+_ACTIVITY_DEDUPE = {}       # (package, action) -> last emitted ts
 _ACTIVITY_ROTATE_LAST_CHECK = 0
 _ACTIVITY_LOG_MAX_BYTES = 1 * 1024 * 1024
 _ACTIVITY_LOG_BACKUPS = 2
@@ -2063,12 +2064,22 @@ def log_activity(action, pkg="", color=None):
     color:  ANSI color code; auto-derived from the action text if omitted.
     """
     global _ACTIVITY_LOG
+    pkg_s = str(pkg or "")
+    action_s = str(action or "")
+    low = action_s.lower()
+    if low.startswith("queued ") and "already queued" not in low:
+        t = now()
+        key = (pkg_s, action_s)
+        last_emit = int(_ACTIVITY_DEDUPE.get(key, 0) or 0)
+        if last_emit and t - last_emit < 45:
+            return
+        _ACTIVITY_DEDUPE[key] = t
     if color is None:
         try:
             color = note_color(action)
         except Exception:
             color = WHITE
-    _ACTIVITY_LOG.append((now(), str(pkg or ""), str(action or ""), color))
+    _ACTIVITY_LOG.append((now(), pkg_s, action_s, color))
     if len(_ACTIVITY_LOG) > _ACTIVITY_MAX:
         _ACTIVITY_LOG = _ACTIVITY_LOG[-_ACTIVITY_MAX:]
 
