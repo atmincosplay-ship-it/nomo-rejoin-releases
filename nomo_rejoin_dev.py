@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.72.4-dev-hatcher-core-helper"
+__version__ = "V4.72.5-dev-private-queue-primitives"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8603,11 +8603,11 @@ def wait_seconds(seconds, rt=None):
     return True
 
 
-def queue_has(open_queue, pkg):
+def _queue_has(open_queue, pkg):
     return any(item.get("tab", {}).get("package") == pkg for item in open_queue)
 
 
-def queue_latest_for_package(open_queue, package, reason_prefix=""):
+def _queue_latest_for_package(open_queue, package, reason_prefix=""):
     package = str(package or "")
     for item in reversed(open_queue or []):
         if str(item.get("tab", {}).get("package", "")) != package:
@@ -8618,7 +8618,7 @@ def queue_latest_for_package(open_queue, package, reason_prefix=""):
     return None
 
 
-def queue_position(open_queue, pkg):
+def _queue_position(open_queue, pkg):
     """1-based FIFO position for a package, or 0 when not queued."""
     for idx, item in enumerate(open_queue or [], 1):
         if item.get("tab", {}).get("package") == pkg:
@@ -8736,9 +8736,9 @@ def _remove_queued_generation(open_queue, package, generation):
 
 
 # Internal queue primitive. Mode loops should prefer RejoinCore.queue().
-def queue_open(open_queue, tab, target, reason, force=False, skip_if_alive=False, mode="hard", front=False, bypass_manual=False, metadata=None):
+def _queue_open(open_queue, tab, target, reason, force=False, skip_if_alive=False, mode="hard", front=False, bypass_manual=False, metadata=None):
     pkg = tab.get("package")
-    existing = queue_latest_for_package(open_queue, pkg)
+    existing = _queue_latest_for_package(open_queue, pkg)
     if existing is not None:
         existing["duplicate_seen_at"] = now()
         existing["duplicate_count"] = int(existing.get("duplicate_count", 0) or 0) + 1
@@ -8782,7 +8782,7 @@ class RejoinCore:
         self.rt = rt
 
     def queue(self, tab, target, reason, **kwargs):
-        return queue_open(
+        return _queue_open(
             self.open_queue,
             tab,
             target,
@@ -9067,16 +9067,16 @@ class RejoinCore:
         return poll_solver_jobs(self.cfg, self.rt, self.open_queue, self)
 
     def has(self, package):
-        return queue_has(self.open_queue, package)
+        return _queue_has(self.open_queue, package)
 
     def position(self, package):
-        return queue_position(self.open_queue, package)
+        return _queue_position(self.open_queue, package)
 
     def has_work(self):
         return bool(self.open_queue)
 
     def latest(self, package, reason_prefix=""):
-        return queue_latest_for_package(self.open_queue, package, reason_prefix)
+        return _queue_latest_for_package(self.open_queue, package, reason_prefix)
 
     def clear(self):
         self.open_queue.clear()
@@ -9474,7 +9474,7 @@ def _queue_hatcher_alive_old_state_hard(open_queue, tab, rt_tab, hcfg, cfg, age_
         left = max(1, cooldown_seconds - (t - last))
         return False, f"old-state hard cooldown {left}s", False
 
-    added, _ = queue_open(
+    added, _ = _queue_open(
         open_queue, tab, "hatcher",
         str(reason or "hatcher alive old state hard"),
         force=True, mode="hard_force", front=False,
@@ -9649,7 +9649,7 @@ def _queue_disconnect_ui_rejoin(open_queue, tab, target, rt_tab, cfg):
     # and solver job are gone. Detect that orphaned lock and repair it immediately.
     if rt_tab.get("disconnect_ui_recovery_active"):
         pkg = str((tab or {}).get("package", "") or "")
-        live_owner = bool(queue_has(open_queue, pkg) or solver_job_running(pkg))
+        live_owner = bool(_queue_has(open_queue, pkg) or solver_job_running(pkg))
         if live_owner:
             return False, "kick recovery active"
 
@@ -9679,7 +9679,7 @@ def _queue_disconnect_ui_rejoin(open_queue, tab, target, rt_tab, cfg):
 
     # V3.88: FIFO, not front insertion. A later D popup must not jump ahead of
     # an already-waiting B popup. Single-flight still recovers only one package.
-    added, anote = queue_open(
+    added, anote = _queue_open(
         open_queue, tab, target, "kick/disconnect popup",
         force=True, mode=mode, front=False, bypass_manual=True,
         metadata=disconnect_recovery_metadata("initial"),
