@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.68.6-dev-core-startup-helpers"
+__version__ = "V4.68.7-dev-core-stale-soft"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8923,6 +8923,14 @@ class RejoinCore:
             metadata=merged,
         )
 
+    def queue_stale_soft_recovery(self, tab, target, reason, metadata=None):
+        return self.queue_soft_recovery(
+            tab,
+            target,
+            reason,
+            metadata=metadata,
+        )
+
     def process(self, session_start=None, loops=0):
         return process_open_queue(
             self.open_queue,
@@ -16006,7 +16014,7 @@ def start_hatcher_reporter(main_cfg=None):
                     stale = age > int(cfg.get("state_stale_seconds", 180))
                     if alive and stale and cfg.get("ignore_alive_stale_state", True):
                         if hcfg.get("hatcher_rejoin_alive_stale", False) and age >= stale_reopen_age(cfg) and cfg.get("rejoin_if_crash", True):
-                            added, _ = core.queue(tab, "hatcher", "hatcher stale", mode="soft")
+                            added, _ = core.queue_stale_soft_recovery(tab, "hatcher", "hatcher stale")
                             note = "stale queued" if added else "already queued"
                             status = "Queued" if added else "Stale"
                         else:
@@ -16052,7 +16060,7 @@ def start_hatcher_reporter(main_cfg=None):
                 dead_confirm = int(hcfg.get("hatcher_dead_confirm_seconds", 30) or 30)
 
                 if dead_for >= dead_confirm:
-                    added, _ = core.queue(tab, "hatcher", "hatcher crash", skip_if_alive=True)
+                    added, _ = core.queue_crash_recovery(tab, "hatcher", "hatcher crash")
                     note = "crash queued" if added else "already queued"
                     status = "Queued" if added else "Offline"
                 else:
@@ -16811,7 +16819,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
 
                         if disconnect_stale and cfg.get("force_stop_alive_on_disconnect_popup", True) and cfg.get("rejoin_if_crash", True):
                             if cfg.get("smart_open_queue", True) or cfg.get("solver_enabled", False):
-                                added, _ = core.queue(tab, "hatcher", "disconnect popup/stale", force=True, mode="hard_force")
+                                added, _ = core.queue_hard_retry(tab, "hatcher", "disconnect popup/stale")
                                 note = "disconnect queued" if added else "already queued"
                                 status = "Queued" if added else "Stale"
                             else:
@@ -16820,7 +16828,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                                 status = "Loading" if ok else "Stale"
                         elif hcfg.get("hatcher_rejoin_alive_stale", False) and age >= force_stale and cfg.get("rejoin_if_crash", True):
                             if cfg.get("smart_open_queue", True) or cfg.get("solver_enabled", False):
-                                added, _ = core.queue(tab, "hatcher", "stale too long", force=True, mode="soft")
+                                added, _ = core.queue_stale_soft_recovery(tab, "hatcher", "stale too long")
                                 note = "stale queued" if added else "already queued"
                                 status = "Queued" if added else "Stale"
                             else:
@@ -16833,11 +16841,9 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                             if (recovery_age >= int(cfg.get("hatcher_alive_old_state_hard_force_seconds", 180) or 180)
                                     and recovery_age <= int(cfg.get("hatcher_alive_old_state_max_valid_seconds", 86400) or 86400)
                                     and cfg.get("rejoin_if_crash", True)):
-                                added, _ = core.queue(
+                                added, _ = core.queue_alive_old_state_recovery(
                                     tab, "hatcher",
                                     f"alive old state {recovery_age}s",
-                                    force=True, mode="hard_force",
-                                    metadata={"bypass_recheck": True, "pid_only_recovery": True},
                                 )
                                 note = f"old {recovery_age}s PID kill+open" if added else "already queued"
                                 status = "Queued" if added else "Stale"
