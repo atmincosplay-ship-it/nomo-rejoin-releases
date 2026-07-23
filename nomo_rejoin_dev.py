@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.70.5-dev-core-manual-queue"
+__version__ = "V4.70.6-dev-exact-pid-metadata"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8614,6 +8614,18 @@ def queue_position(open_queue, pkg):
     return 0
 
 
+def exact_pid_recovery_metadata(extra=None):
+    """Shared metadata for one-clone exact-PID kill/open recovery."""
+    merged = {
+        "bypass_recheck": True,
+        "pid_only_recovery": True,
+        "recovery_must_open_once": True,
+    }
+    if isinstance(extra, dict):
+        merged.update(extra)
+    return merged
+
+
 def core_queue_display(core, pkg, status, note):
     """Return user-facing status/note when a package is already queued."""
     if core is None:
@@ -8758,13 +8770,6 @@ class RejoinCore:
         metadata=None,
     ):
         """Queue one exact-PID hard recovery for a single clone package."""
-        merged = {
-            "bypass_recheck": True,
-            "pid_only_recovery": True,
-            "recovery_must_open_once": True,
-        }
-        if isinstance(metadata, dict):
-            merged.update(metadata)
         return self.queue(
             tab,
             target,
@@ -8774,7 +8779,7 @@ class RejoinCore:
             mode="hard_force",
             front=front,
             bypass_manual=bypass_manual,
-            metadata=merged,
+            metadata=exact_pid_recovery_metadata(metadata),
         )
 
     def queue_soft_recovery(
@@ -9419,14 +9424,11 @@ def queue_hatcher_alive_old_state_hard(open_queue, tab, rt_tab, hcfg, cfg, age_o
         open_queue, tab, "hatcher",
         str(reason or "hatcher alive old state hard"),
         force=True, mode="hard_force", front=False,
-        metadata={
-            "bypass_recheck": True,
-            "pid_only_recovery": True,
-            "recovery_must_open_once": True,
+        metadata=exact_pid_recovery_metadata({
             "hatcher_old_state_recovery": True,
             "hatcher_old_state_age": age_i,
             "hatcher_old_state_reason": str(reason or "alive old state"),
-        },
+        }),
     )
     if not added:
         if int(rt_tab.get("hatcher_alive_old_state_hard_last", 0) or 0) <= 0:
