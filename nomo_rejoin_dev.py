@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.70.0-dev-core-hard-retry"
+__version__ = "V4.70.1-dev-core-solver-queue"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8896,6 +8896,29 @@ class RejoinCore:
             metadata={"bypass_recheck": True},
         )
 
+    def queue_solver_busy_retry(self, tab, target):
+        return self.queue_exact_pid_recovery(
+            tab,
+            target,
+            "solver SERVER_BUSY retry",
+            skip_if_alive=False,
+            bypass_manual=True,
+            metadata={
+                "solver_busy_retry": True,
+                "bypass_recheck": True,
+            },
+        )
+
+    def queue_solver_result_recovery(self, tab, target, result_label, metadata=None):
+        return self.queue_exact_pid_recovery(
+            tab,
+            target,
+            f"solver {str(result_label or '').lower()} rejoin",
+            skip_if_alive=False,
+            bypass_manual=True,
+            metadata=metadata,
+        )
+
     def queue_route_retry(self, tab, target, reason, metadata=None):
         return self.queue(
             tab,
@@ -10139,14 +10162,7 @@ def maybe_queue_solver_busy_retry(open_queue, tab, target, rt_tab, cfg, health, 
         return "Queued", "solver busy retry already queued", True
 
     if core is not None:
-        added, _ = core.queue(
-            tab, target, "solver SERVER_BUSY retry",
-            force=True, mode="hard_force", bypass_manual=True,
-            metadata={
-                "solver_busy_retry": True,
-                "bypass_recheck": True,
-            },
-        )
+        added, _ = core.queue_solver_busy_retry(tab, target)
     else:
         added, _ = queue_open(
             open_queue, tab, target, "solver SERVER_BUSY retry",
@@ -25788,10 +25804,8 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
                     "bypass_recheck": True,
                 }
                 if core is not None:
-                    added, _ = core.queue(
-                        tab, target, f"solver {result_label.lower()} rejoin",
-                        force=True, mode="hard_force", bypass_manual=True,
-                        metadata=solver_metadata,
+                    added, _ = core.queue_solver_result_recovery(
+                        tab, target, result_label, solver_metadata
                     )
                 else:
                     added, _ = queue_open(
