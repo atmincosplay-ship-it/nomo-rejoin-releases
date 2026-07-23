@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.71.7-dev-booster-start-core"
+__version__ = "V4.71.8-dev-solver-metadata-core"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8664,6 +8664,22 @@ def disconnect_recovery_metadata(stage="initial", extra=None):
     return merged
 
 
+def solver_result_recovery_metadata(result_label="", extra=None):
+    """Shared metadata for the one post-solver hard recovery open."""
+    merged = {
+        "solver_recovery": True,
+        "auth_result_recovery": True,
+        "solver_result": str(result_label or ""),
+        "skip_solver_once": True,
+        "skip_solver_probe": True,
+        "solver_preflight_done": True,
+        "bypass_recheck": True,
+    }
+    if isinstance(extra, dict):
+        merged.update(extra)
+    return merged
+
+
 def core_queue_display(core, pkg, status, note):
     """Return user-facing status/note when a package is already queued."""
     if core is None:
@@ -8951,7 +8967,7 @@ class RejoinCore:
             f"solver {str(result_label or '').lower()} rejoin",
             skip_if_alive=False,
             bypass_manual=True,
-            metadata=metadata,
+            metadata=solver_result_recovery_metadata(result_label, metadata),
         )
 
     def queue_route_retry(self, tab, target, reason, metadata=None, bypass_manual=False):
@@ -25777,15 +25793,7 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
                     activity += " - " + cut(detail, 70)
                 log_activity(activity, pkg, GREEN)
 
-                solver_metadata = {
-                    "solver_recovery": True,
-                    "auth_result_recovery": True,
-                    "solver_result": result_label,
-                    "skip_solver_once": True,
-                    "skip_solver_probe": True,
-                    "solver_preflight_done": True,
-                    "bypass_recheck": True,
-                }
+                solver_metadata = solver_result_recovery_metadata(result_label)
                 if core is not None:
                     added, _ = core.queue_solver_result_recovery(
                         tab, target, result_label, solver_metadata
