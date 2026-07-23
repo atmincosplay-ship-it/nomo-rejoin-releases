@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.71.9-dev-process-core-default"
+__version__ = "V4.72.0-dev-health-core-default"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -10106,12 +10106,14 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
 
 def apply_common_health_action(open_queue, tab, target, rt_tab, cfg, rt, health, mode="market", core=None):
     """Legacy health shim. New mode loops should use apply_rejoin_action()."""
+    if core is None:
+        core = RejoinCore(open_queue, cfg, rt)
     pkg = tab.get("package")
     bad = str(health.get("bad") or "")
     state = health.get("state")
 
     if bad == "face_lock":
-        removed = core.cancel(pkg) if core is not None else cancel_queued_package(open_queue, pkg)
+        removed = core.cancel(pkg)
         if removed:
             log_activity(f"face lock hold cancelled {removed} queued reopen(s)", pkg, YELLOW)
         return "Face Lock", health.get("note", "account locked; manual verification"), False
@@ -10120,10 +10122,7 @@ def apply_common_health_action(open_queue, tab, target, rt_tab, cfg, rt, health,
         return health.get("status", ""), health.get("note", ""), False
 
     if bad == "disconnect" and cfg.get("rejoin_if_crash", True):
-        if core is not None:
-            added, dnote = core.queue_disconnect_ui_rejoin(tab, target, rt_tab)
-        else:
-            added, dnote = queue_disconnect_ui_rejoin(open_queue, tab, target, rt_tab, cfg)
+        added, dnote = core.queue_disconnect_ui_rejoin(tab, target, rt_tab)
         status = "Queued" if (added or dnote == "already queued") else "Kicked"
         note = f"{state_disconnect_note(state)} {dnote}".strip()
         return status, note, True
@@ -10143,26 +10142,19 @@ def apply_common_health_action(open_queue, tab, target, rt_tab, cfg, rt, health,
             return "No state", "alive no-state wait", True
         no_state_for = max(0, now() - int(no_state_since))
         hard_after = int(cfg.get("hatcher_alive_old_state_hard_force_seconds", 300) or 300)
-        has_pkg = core.has(pkg) if core is not None else queue_has(open_queue, pkg)
-        has_work = core.has_work() if core is not None else bool(open_queue)
+        has_pkg = core.has(pkg)
+        has_work = core.has_work()
         if no_state_for >= hard_after and not has_work and not has_pkg:
-            if core is not None:
-                added, _ = core.queue_alive_no_state_recovery(
-                    tab, target, f"{mode} alive no-state hard"
-                )
-            else:
-                added, _ = queue_open(open_queue, tab, target, f"{mode} alive no-state hard",
-                                      force=True, mode="hard_force")
+            added, _ = core.queue_alive_no_state_recovery(
+                tab, target, f"{mode} alive no-state hard"
+            )
             return ("Queued" if added else "No state"), ("no-state hard queued" if added else "already queued"), True
         return "No state", f"alive no-state {format_age(no_state_for)}/{format_age(hard_after)}", True
 
     if bad == "dead" and cfg.get("rejoin_if_crash", True):
         rt_tab[f"{mode}_no_state_since"] = 0
         if cfg.get("smart_open_queue", True) or cfg.get("solver_enabled", False):
-            if core is not None:
-                added, _ = core.queue_crash_recovery(tab, target, "crash/dead")
-            else:
-                added, _ = queue_open(open_queue, tab, target, "crash/dead", skip_if_alive=True)
+            added, _ = core.queue_crash_recovery(tab, target, "crash/dead")
             return ("Queued" if added else "Offline"), ("crash queued" if added else "already queued"), True
         ok, msg = open_target(tab, rt_tab, cfg, target, "crash/dead", rt=rt)
         return ("Loading" if ok else "Offline"), ("crash open" if ok else msg), True
