@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.72.7-dev-core-idle-helper"
+__version__ = "V4.72.8-dev-core-process-once"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -9063,6 +9063,14 @@ class RejoinCore:
             self,
         )
 
+    def process_once_if_enabled(self, session_start=None, loops=0):
+        if not self.has_work() or not self.cfg.get("smart_open_queue", True):
+            return False
+        if not wait_seconds(2, self.rt):
+            return None
+        self.process(session_start, loops)
+        return True
+
     def poll_solver_jobs(self):
         return poll_solver_jobs(self.cfg, self.rt, self.open_queue, self)
 
@@ -12951,10 +12959,10 @@ def _nomo_start_market_rejoin_original(cfg):
                 return
             continue
 
-        if core.has_work() and cfg.get("smart_open_queue", True):
-            if not wait_seconds(2, rt):
-                return
-            core.process(session_start, loops)
+        processed = core.process_once_if_enabled(session_start, loops)
+        if processed is None:
+            return
+        if processed:
             continue
 
         if not wait_seconds(int(cfg.get("check_interval", 10)), rt):
@@ -16181,10 +16189,10 @@ def start_hatcher_reporter(main_cfg=None):
             last_msg = f"[{date_time_text()}] {tag}: {msg}"
         hatcher_rejoin_status_screen(rows, hcfg, cfg, session_start, loops, last_msg)
 
-        if core.has_work() and cfg.get("smart_open_queue", True):
-            if not wait_seconds(2, rt):
-                return
-            core.process(session_start, loops)
+        processed = core.process_once_if_enabled(session_start, loops)
+        if processed is None:
+            return
+        if processed:
             continue
 
         if not wait_seconds(int(cfg.get("check_interval", 10)), rt):
@@ -17125,10 +17133,10 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                 return
             continue
 
-        if core.has_work() and cfg.get("smart_open_queue", True):
-            if not wait_seconds(2, rt):
-                return
-            core.process(session_start, loops)
+        processed = core.process_once_if_enabled(session_start, loops)
+        if processed is None:
+            return
+        if processed:
             continue
 
         if not wait_seconds(int(cfg.get("check_interval", 10)), rt):
