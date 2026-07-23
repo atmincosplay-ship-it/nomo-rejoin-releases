@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.73.1-dev-core-save-direct"
+__version__ = "V4.73.2-dev-core-requeue-front"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -9071,6 +9071,9 @@ class RejoinCore:
     def latest(self, package, reason_prefix=""):
         return _queue_latest_for_package(self.open_queue, package, reason_prefix)
 
+    def requeue_front(self, item):
+        self.open_queue.insert(0, item)
+
     def queue_display(self, package, status, note):
         """Return user-facing status/note when a package is already queued."""
         try:
@@ -12015,7 +12018,7 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
                 rt["_open_lock_pkg"] = ""
                 rt["_open_lock_at"] = 0
             else:
-                open_queue.insert(0, item)
+                core.requeue_front(item)
                 rt_tab["note"] = f"waiting for {holder}"
                 core.save()
                 return True
@@ -12040,7 +12043,7 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
         last_pool_open = int(rt.get("_last_pool_hard_open", 0) or 0)
         since = now() - last_pool_open
         if last_pool_open > 0 and since < stagger:
-            open_queue.insert(0, item)
+            core.requeue_front(item)
             rt_tab["note"] = f"stagger wait {max(1, stagger - since)}s"
             core.save()
             return True
