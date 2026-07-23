@@ -90,10 +90,11 @@ if [ "$#" -eq 0 ]; then
   set -- menu
 fi
 
-echo "NOMO dev launch: python=$PYTHON app=$APP args=$*"
-NOMO_DEV_LAUNCH_TRACE=1 "$PYTHON" -u "$APP" "$@"
+"$PYTHON" -u "$APP" "$@"
 rc=$?
-echo "NOMO dev exited with code $rc"
+if [ "$rc" -ne 0 ]; then
+  echo "NOMO dev exited with code $rc"
+fi
 exit "$rc"
 EOF
 
