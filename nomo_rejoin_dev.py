@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.69.1-dev-cookie-refresh-precheck"
+__version__ = "V4.69.2-dev-manual-recover-refresh"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -11463,13 +11463,20 @@ def maybe_clear_manual_login_prejoin(tab, cfg, rt, rt_tab, min_interval=120):
         return False, "manual recover cooldown"
 
     rt_tab["manual_login_last_recover_check"] = now()
-    cookie = cached_cookie_for_package(tab.get("package", ""))
+    pkg = str(tab.get("package", "") or "")
+    cookie = cached_cookie_for_package(pkg)
+    if cfg.get("api_precheck_refresh_invalid_cookie_enabled", True):
+        refreshed_cookie, refresh_note = refresh_cached_cookie_for_package(pkg)
+        if refreshed_cookie:
+            cookie = refreshed_cookie
+        elif refresh_note:
+            rt_tab["manual_login_last_refresh_note"] = refresh_note
     api_hit, api_detail = roblox_cookie_detection(cookie) if cookie else (None, "api skipped no cookie")
     ui_hit, ui_detail = ui_login_challenge_detection(tab, cfg, force=True, allow_unscoped=False) if cfg.get("login_challenge_ui_detection_enabled", True) else (None, "ui skipped")
 
     if api_hit is False and ui_hit is not True:
         clear_manual_login_block(rt_tab)
-        clear_hold(tab.get("package", ""))
+        clear_hold(pkg)
         rt_tab["note"] = "login ok, waiting ingame"
         save_runtime(rt)
         return True, f"{api_detail}; {ui_detail}"
