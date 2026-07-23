@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.69.8-dev-manual-hold-helper"
+__version__ = "V4.69.9-dev-solver-hold-helper"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -9892,11 +9892,13 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
         if not int(rt_tab.get("face_lock_detected_at", 0) or 0):
             rt_tab["face_lock_detected_at"] = now()
         if cfg.get("face_lock_auto_hold", True):
-            rt_tab["manual_login_needed"] = True
-            rt_tab["manual_login_reason"] = "face_lock"
-            rt_tab["manual_login_detail"] = detail
-            rt_tab["manual_login_detected_at"] = int(rt_tab.get("face_lock_detected_at", now()) or now())
-            rt_tab["note"] = "account locked; use Recovery Tools"
+            mark_manual_login_block(
+                rt_tab,
+                "face_lock",
+                detail,
+                "account locked; use Recovery Tools",
+                int(rt_tab.get("face_lock_detected_at", now()) or now()),
+            )
             if first_hit:
                 set_hold(pkg, "face_lock")
                 log_activity("FACE LOCK detected; package held for manual verification", pkg, RED)
@@ -11481,10 +11483,7 @@ def detect_and_mark_manual_login(tab, cfg, rt, rt_tab, reason):
 
     # If solver failed/not enabled, or this is a non-CAPTCHA gate, mark manual hold.
     detail = f"{reason}; " + "; ".join(x for x in details if x)
-    rt_tab["manual_login_needed"] = True
-    rt_tab["manual_login_reason"] = reason
-    rt_tab["manual_login_detail"] = detail
-    rt_tab["manual_login_detected_at"] = now()
+    mark_manual_login_block(rt_tab, reason, detail, "")
     low_detail = detail.lower()
     if (
         "529" in low_detail
@@ -11686,19 +11685,17 @@ def wait_until_fresh_after_open(
                     == "captcha_or_face_lock"
                 )
                 rt_tab["captcha_ui_retry_at"] = now() + retry_after
-                rt_tab["manual_login_needed"] = True
-                rt_tab["manual_login_reason"] = (
+                hold_reason = (
                     "captcha or face lock remains after one recovery"
                     if is_auth_529
                     else "verification remains after one recovery"
                 )
-                rt_tab["manual_login_detail"] = detail
-                rt_tab["manual_login_detected_at"] = now()
-                rt_tab["note"] = (
+                hold_note = (
                     "CAPTCHA / FACE LOCK HOLD after one recovery"
                     if is_auth_529
                     else "verification hold after one recovery"
                 )
+                mark_manual_login_block(rt_tab, hold_reason, detail, hold_note)
                 set_hold(
                     pkg,
                     rt_tab["manual_login_reason"],
@@ -11738,14 +11735,11 @@ def wait_until_fresh_after_open(
                     state
                 )
                 rt_tab["captcha_ui_retry_at"] = now() + retry_after
-                rt_tab["manual_login_needed"] = True
-                rt_tab["manual_login_reason"] = (
-                    "challenge remains after one recovery"
-                )
-                rt_tab["manual_login_detail"] = challenge_detail
-                rt_tab["manual_login_detected_at"] = now()
-                rt_tab["note"] = (
-                    "CAPTCHA HOLD after one recovery"
+                mark_manual_login_block(
+                    rt_tab,
+                    "challenge remains after one recovery",
+                    challenge_detail,
+                    "CAPTCHA HOLD after one recovery",
                 )
                 set_hold(
                     pkg,
@@ -11936,11 +11930,12 @@ def solver_preflight_before_open(open_queue, item, tab, rt_tab, pkg, target, cfg
             save_runtime(rt)
             return "ready", item
 
-        rt_tab["manual_login_needed"] = True
-        rt_tab["manual_login_reason"] = "invalid or missing package cookie"
-        rt_tab["manual_login_detail"] = str(note)
-        rt_tab["manual_login_detected_at"] = now()
-        rt_tab["note"] = str(note)
+        mark_manual_login_block(
+            rt_tab,
+            "invalid or missing package cookie",
+            str(note),
+            str(note),
+        )
         set_hold(pkg, str(note))
         log_activity(f"solver preflight blocked open: {cut(note, 80)}", pkg, RED)
         save_runtime(rt)
@@ -12438,11 +12433,12 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                     core.cancel(pkg)
                 else:
                     cancel_queued_package(open_queue, pkg)
-                rt_tab["manual_login_needed"] = True
-                rt_tab["manual_login_reason"] = "join blocked after solver recovery"
-                rt_tab["manual_login_detail"] = f"{solver_result}; {fresh_msg}; no fresh state after recovery"
-                rt_tab["manual_login_detected_at"] = now()
-                rt_tab["note"] = f"{solver_result} but still no state - check homepage/age gate"
+                mark_manual_login_block(
+                    rt_tab,
+                    "join blocked after solver recovery",
+                    f"{solver_result}; {fresh_msg}; no fresh state after recovery",
+                    f"{solver_result} but still no state - check homepage/age gate",
+                )
                 set_hold(pkg, "join blocked after solver recovery")
                 log_activity(
                     f"{solver_result} recovery still no state; package held (no more hard loop)",
@@ -12685,11 +12681,12 @@ def api_check_package(package, cache=None, cfg=None):
                     set_hold(package, "challenge")
                     rt = load_runtime()
                     rt_tab = get_runtime_tab(rt, package)
-                    rt_tab["manual_login_needed"] = True
-                    rt_tab["manual_login_reason"] = "challenge after solve"
-                    rt_tab["manual_login_detail"] = "solver failed to clear challenge"
-                    rt_tab["manual_login_detected_at"] = now()
-                    rt_tab["note"] = "needs manual login"
+                    mark_manual_login_block(
+                        rt_tab,
+                        "challenge after solve",
+                        "solver failed to clear challenge",
+                        "needs manual login",
+                    )
                     save_runtime(rt)
                     print(col(f"  {package}: CHALLENGE detected (placed on hold)", YELLOW))
                     return
@@ -12698,11 +12695,12 @@ def api_check_package(package, cache=None, cfg=None):
                 set_hold(package, "challenge")
                 rt = load_runtime()
                 rt_tab = get_runtime_tab(rt, package)
-                rt_tab["manual_login_needed"] = True
-                rt_tab["manual_login_reason"] = "solver failed"
-                rt_tab["manual_login_detail"] = msg
-                rt_tab["manual_login_detected_at"] = now()
-                rt_tab["note"] = "needs manual login"
+                mark_manual_login_block(
+                    rt_tab,
+                    "solver failed",
+                    msg,
+                    "needs manual login",
+                )
                 save_runtime(rt)
                 print(col(f"  {package}: CHALLENGE detected (placed on hold)", YELLOW))
                 return
@@ -12710,11 +12708,12 @@ def api_check_package(package, cache=None, cfg=None):
             set_hold(package, "challenge")
             rt = load_runtime()
             rt_tab = get_runtime_tab(rt, package)
-            rt_tab["manual_login_needed"] = True
-            rt_tab["manual_login_reason"] = "api challenge"
-            rt_tab["manual_login_detail"] = "challenge detected, solver disabled"
-            rt_tab["manual_login_detected_at"] = now()
-            rt_tab["note"] = "needs manual login"
+            mark_manual_login_block(
+                rt_tab,
+                "api challenge",
+                "challenge detected, solver disabled",
+                "needs manual login",
+            )
             save_runtime(rt)
             print(col(f"  {package}: CHALLENGE detected (placed on hold)", YELLOW))
     elif status == "invalid":
@@ -25570,12 +25569,13 @@ def handle_detected_solver_challenge(tab, cfg, rt, rt_tab, reason):
         return "Solving", note
 
     # Disabled, missing credentials/cookie, or cooldown after a failed attempt.
-    rt_tab["manual_login_needed"] = True
-    rt_tab["manual_login_reason"] = "captcha/login challenge"
-    rt_tab["manual_login_detail"] = str(reason or note)
-    if not int(rt_tab.get("manual_login_detected_at", 0) or 0):
-        rt_tab["manual_login_detected_at"] = now()
-    rt_tab["note"] = note
+    mark_manual_login_block(
+        rt_tab,
+        "captcha/login challenge",
+        str(reason or note),
+        note,
+        int(rt_tab.get("manual_login_detected_at", 0) or 0) or now(),
+    )
     set_hold(pkg, note)
     save_runtime(rt)
     return "Manual", note
@@ -25664,11 +25664,12 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
                 _remove_queued_generation(open_queue, pkg, generation)
                 rt_tab["solver_busy_retry_pending"] = False
                 rt_tab["solver_busy_retry_at"] = 0
-                rt_tab["manual_login_needed"] = True
-                rt_tab["manual_login_reason"] = "invalid package cookie"
-                rt_tab["manual_login_detail"] = err
-                rt_tab["manual_login_detected_at"] = now()
-                rt_tab["note"] = "INVALID_COOKIES - refresh account cookie"
+                mark_manual_login_block(
+                    rt_tab,
+                    "invalid package cookie",
+                    err,
+                    "INVALID_COOKIES - refresh account cookie",
+                )
                 set_hold(pkg, "solver rejected invalid/expired package cookie")
                 log_activity("solver INVALID_COOKIES before open; package held", pkg, RED)
             elif cfg.get("solver_preflight_open_on_failure", True):
@@ -25682,11 +25683,12 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
                 log_activity(f"solver error before open; original rejoin continues once: {cut(err, 70)}", pkg, YELLOW)
             else:
                 _remove_queued_generation(open_queue, pkg, generation)
-                rt_tab["manual_login_needed"] = True
-                rt_tab["manual_login_reason"] = "solver failed before rejoin"
-                rt_tab["manual_login_detail"] = err
-                rt_tab["manual_login_detected_at"] = now()
-                rt_tab["note"] = f"solver failed before open: {cut(err, 70)}"
+                mark_manual_login_block(
+                    rt_tab,
+                    "solver failed before rejoin",
+                    err,
+                    f"solver failed before open: {cut(err, 70)}",
+                )
                 set_hold(pkg, f"solver failed before open: {err}")
                 log_activity(f"solver failed before open; package held: {cut(err, 70)}", pkg, RED)
             changed = True
@@ -25823,11 +25825,12 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
         elif status_code in {"INVALID_COOKIES", "INVALID_COOKIE", "UNAUTHORIZED", "AUTH_FAILED"}:
             rt_tab["solver_busy_retry_pending"] = False
             rt_tab["solver_busy_retry_at"] = 0
-            rt_tab["manual_login_needed"] = True
-            rt_tab["manual_login_reason"] = "invalid package cookie"
-            rt_tab["manual_login_detail"] = err
-            rt_tab["manual_login_detected_at"] = now()
-            rt_tab["note"] = "INVALID_COOKIES - refresh account cookie"
+            mark_manual_login_block(
+                rt_tab,
+                "invalid package cookie",
+                err,
+                "INVALID_COOKIES - refresh account cookie",
+            )
             set_hold(pkg, "solver rejected invalid/expired package cookie")
             log_activity("solver INVALID_COOKIES; not retrying", pkg, RED)
         elif str(job.get("phase", "")) == "probe" and not job.get("detected"):
@@ -25840,11 +25843,12 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
                 pkg, YELLOW,
             )
         else:
-            rt_tab["manual_login_needed"] = True
-            rt_tab["manual_login_reason"] = "solver failed"
-            rt_tab["manual_login_detail"] = err
-            rt_tab["manual_login_detected_at"] = now()
-            rt_tab["note"] = f"solver failed: {cut(err, 80)}"
+            mark_manual_login_block(
+                rt_tab,
+                "solver failed",
+                err,
+                f"solver failed: {cut(err, 80)}",
+            )
             set_hold(pkg, f"solver failed: {err}")
             send_login_challenge_alert(cfg, tab, rt_tab, rt_tab["note"])
             log_activity(f"solver failed: {cut(err, 100)}", pkg, RED)
