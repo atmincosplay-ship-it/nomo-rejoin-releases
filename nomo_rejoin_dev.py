@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.70.3-dev-core-periodic-queue"
+__version__ = "V4.70.4-dev-core-route-queue"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -12899,13 +12899,10 @@ def _nomo_start_market_rejoin_original(cfg):
                     )
                     note = f"{booster_name}; hold {hold_text}"
                 elif target == "booster" and hold_expired:
-                    added, _ = core.queue(
+                    added, _ = core.queue_route_retry(
                         tab,
                         "market",
                         "manual Booster hold ended",
-                        force=True,
-                        mode="route",
-                        bypass_manual=True,
                         metadata={
                             "skip_solver_once": True,
                             "skip_solver_probe": True,
@@ -12923,26 +12920,23 @@ def _nomo_start_market_rejoin_original(cfg):
                     idle_no_gain = now() - int(rt_tab.get("last_gain_ts", now()))
 
                     if pets < int(cfg["restock_below"]) and target != "restock":
-                        added, _ = core.queue(
+                        added, _ = core.queue_route_retry(
                             tab, "restock", f"pets<{cfg['restock_below']}",
-                            mode="route",
                             metadata={"skip_solver_once": True, "skip_solver_probe": True},
                         )
                         note = "restock queued" if added else "already queued"
                         status = "Queued" if added else status
                     elif pets >= int(cfg["ready_market_at"]) and target != "market":
-                        added, _ = core.queue(
+                        added, _ = core.queue_route_retry(
                             tab, "market", f"pets>={cfg['ready_market_at']}",
-                            mode="route",
                             metadata={"skip_solver_once": True, "skip_solver_probe": True},
                         )
                         note = "market queued" if added else "already queued"
                         status = "Queued" if added else status
                     elif (target == "restock" and pets >= int(cfg["idle_min_pet_to_market"])
                           and idle_no_gain >= int(cfg["idle_no_gain_seconds"])):
-                        added, _ = core.queue(
+                        added, _ = core.queue_route_retry(
                             tab, "market", "idle no gain",
-                            mode="route",
                             metadata={"skip_solver_once": True, "skip_solver_probe": True},
                         )
                         note = "idle queued" if added else "already queued"
@@ -12961,7 +12955,7 @@ def _nomo_start_market_rejoin_original(cfg):
                             if note in ["ok", ""]:
                                 note = f"hop delay {delay_left}s"
                         else:
-                            added, _ = core.queue(tab, target, "scheduled soft hop", mode="soft")
+                            added, _ = core.queue_soft_recovery(tab, target, "scheduled soft hop")
                             schedule_next_soft_hop(rt_tab, cfg)
                             if added and note in ["ok", ""]:
                                 note = "hop queued"
