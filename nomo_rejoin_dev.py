@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.72.6-dev-core-pause-api"
+__version__ = "V4.72.7-dev-core-idle-helper"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -9075,6 +9075,13 @@ class RejoinCore:
     def has_work(self):
         return bool(self.open_queue)
 
+    def idle_for(self, package, include_solver=True):
+        if self.has_work() or self.has(package):
+            return False
+        if include_solver and solver_job_running(package):
+            return False
+        return True
+
     def latest(self, package, reason_prefix=""):
         return _queue_latest_for_package(self.open_queue, package, reason_prefix)
 
@@ -12882,7 +12889,7 @@ def _nomo_start_market_rejoin_original(cfg):
                                 note = "hop queued"
 
             due_refresh, refresh_left = periodic_hard_refresh_due(rt_tab, cfg)
-            if due_refresh and not rj_handled and not manual_login_blocked(rt_tab, cfg) and not core.has_work() and not core.has(pkg) and not solver_job_running(pkg):
+            if due_refresh and not rj_handled and not manual_login_blocked(rt_tab, cfg) and core.idle_for(pkg):
                 added, _ = core.queue_hard_retry(tab, target, "periodic hard refresh")
                 if added:
                     mark_periodic_hard_refresh(rt_tab)
@@ -16134,7 +16141,7 @@ def start_hatcher_reporter(main_cfg=None):
                     status = "Offline"
 
             due_refresh, refresh_left = periodic_hard_refresh_due(rt_tab, cfg)
-            if due_refresh and not manual_login_blocked(rt_tab, cfg) and not core.has_work() and not core.has(pkg):
+            if due_refresh and not manual_login_blocked(rt_tab, cfg) and core.idle_for(pkg, include_solver=False):
                 added, _ = core.queue_hard_retry(tab, "hatcher", "periodic hard refresh")
                 if added:
                     mark_periodic_hard_refresh(rt_tab)
@@ -17045,7 +17052,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
             # gets its normal turn; its queued generation performs one solver check before opening.
 
             due_refresh, refresh_left = periodic_hard_refresh_due(rt_tab, cfg)
-            if due_refresh and captcha_action is None and not manual_login_blocked(rt_tab, cfg) and not core.has_work() and not core.has(pkg) and not solver_job_running(pkg):
+            if due_refresh and captcha_action is None and not manual_login_blocked(rt_tab, cfg) and core.idle_for(pkg):
                 added, _ = core.queue_hard_retry(tab, "hatcher", "periodic hard refresh")
                 if added:
                     mark_periodic_hard_refresh(rt_tab)
