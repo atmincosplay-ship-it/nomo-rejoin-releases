@@ -78,6 +78,14 @@ PYTHON="${PREFIX:-/data/data/com.termux/files/usr}/bin/python"
 if [ ! -x "$PYTHON" ]; then
   PYTHON="$(command -v python)"
 fi
+if [ -z "$PYTHON" ] || [ ! -x "$PYTHON" ]; then
+  echo "Python missing. Install it first: pkg install -y python"
+  exit 1
+fi
+
+if [ "$#" -eq 0 ]; then
+  set -- menu
+fi
 
 "$PYTHON" "$APP" "$@"
 rc=$?

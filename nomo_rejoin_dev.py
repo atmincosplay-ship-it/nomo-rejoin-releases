@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.71.2-dev-launch-guard"
+__version__ = "V4.71.3-dev-explicit-menu"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -29722,8 +29722,10 @@ def handle_nomo_cli_command():
     if len(sys.argv) < 2:
         return False
     command = clean_terminal_input(sys.argv[1]).lower()
+    if command in {"menu", "open", "ui", "main"}:
+        return False
     if command not in {"update", "install", "version", "rollback", "source", "repo", "repair", "doctor", "diag", "status", "why", "route", "routes", "list", "ls"}:
-        print("Usage: nomo [update|version|rollback|source|repair|doctor|why|list]")
+        print("Usage: nomo [menu|update|version|rollback|source|repair|doctor|why|list]")
         return True
 
     cfg = load_config()
