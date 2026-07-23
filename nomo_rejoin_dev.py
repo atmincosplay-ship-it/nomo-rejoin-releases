@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.72.1-dev-action-core-default"
+__version__ = "V4.72.2-dev-solver-core-only"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -25696,16 +25696,9 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
                 log_activity(activity, pkg, GREEN)
 
                 solver_metadata = solver_result_recovery_metadata(result_label)
-                if core is not None:
-                    added, _ = core.queue_solver_result_recovery(
-                        tab, target, result_label, solver_metadata
-                    )
-                else:
-                    added, _ = queue_open(
-                        open_queue, tab, target, f"solver {result_label.lower()} rejoin",
-                        force=True, mode="hard_force", bypass_manual=True,
-                        metadata=solver_metadata,
-                    )
+                added, _ = core.queue_solver_result_recovery(
+                    tab, target, result_label, solver_metadata
+                )
                 if not added:
                     rt_tab["note"] = f"{result_label} - already queued"
             else:
