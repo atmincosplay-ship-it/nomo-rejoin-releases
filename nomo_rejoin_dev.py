@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.68.2-dev-core-fallbacks"
+__version__ = "V4.68.3-dev-core-recovery-names"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8871,6 +8871,32 @@ class RejoinCore:
             metadata=metadata,
         )
 
+    def queue_alive_no_state_recovery(self, tab, target, reason, metadata=None):
+        merged = {"bypass_recheck": True}
+        if isinstance(metadata, dict):
+            merged.update(metadata)
+        return self.queue_exact_pid_recovery(
+            tab,
+            target,
+            reason,
+            skip_if_alive=False,
+            bypass_manual=True,
+            metadata=merged,
+        )
+
+    def queue_crash_recovery(self, tab, target, reason, metadata=None):
+        merged = {"bypass_recheck": True}
+        if isinstance(metadata, dict):
+            merged.update(metadata)
+        return self.queue_exact_pid_recovery(
+            tab,
+            target,
+            reason,
+            skip_if_alive=True,
+            bypass_manual=True,
+            metadata=merged,
+        )
+
     def process(self, session_start=None, loops=0):
         return process_open_queue(
             self.open_queue,
@@ -9937,8 +9963,9 @@ def apply_common_health_action(open_queue, tab, target, rt_tab, cfg, rt, health,
         has_work = core.has_work() if core is not None else bool(open_queue)
         if no_state_for >= hard_after and not has_work and not has_pkg:
             if core is not None:
-                added, _ = core.queue(tab, target, f"{mode} alive no-state hard",
-                                      force=True, mode="hard_force")
+                added, _ = core.queue_alive_no_state_recovery(
+                    tab, target, f"{mode} alive no-state hard"
+                )
             else:
                 added, _ = queue_open(open_queue, tab, target, f"{mode} alive no-state hard",
                                       force=True, mode="hard_force")
@@ -9949,7 +9976,7 @@ def apply_common_health_action(open_queue, tab, target, rt_tab, cfg, rt, health,
         rt_tab[f"{mode}_no_state_since"] = 0
         if cfg.get("smart_open_queue", True) or cfg.get("solver_enabled", False):
             if core is not None:
-                added, _ = core.queue(tab, target, "crash/dead", skip_if_alive=True)
+                added, _ = core.queue_crash_recovery(tab, target, "crash/dead")
             else:
                 added, _ = queue_open(open_queue, tab, target, "crash/dead", skip_if_alive=True)
             return ("Queued" if added else "Offline"), ("crash queued" if added else "already queued"), True
@@ -10175,13 +10202,10 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
         if in_grace:
             return "Loading", "no state grace", True
         if core is not None:
-            added, _ = core.queue_exact_pid_recovery(
+            added, _ = core.queue_alive_no_state_recovery(
                 tab,
                 target,
                 f"{mode} alive no-state hard",
-                skip_if_alive=False,
-                bypass_manual=True,
-                metadata={"bypass_recheck": True},
             )
         else:
             added, _ = queue_open(
@@ -10198,13 +10222,10 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
 
     # dead -> kill + open
     if core is not None:
-        added, _ = core.queue_exact_pid_recovery(
+        added, _ = core.queue_crash_recovery(
             tab,
             target,
             f"{mode} crash/dead",
-            skip_if_alive=True,
-            bypass_manual=True,
-            metadata={"bypass_recheck": True},
         )
     else:
         added, _ = queue_open(
