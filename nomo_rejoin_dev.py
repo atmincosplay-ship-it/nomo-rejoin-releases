@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.70.8-dev-route-helper-flags"
+__version__ = "V4.71.0-dev-disconnect-fallback"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8637,6 +8637,21 @@ def skip_solver_route_metadata(extra=None):
     return merged
 
 
+def disconnect_recovery_metadata(stage="initial", extra=None):
+    """Shared metadata for package-scoped disconnect/kick popup recovery."""
+    merged = {
+        "disconnect_recovery": True,
+        "disconnect_recovery_stage": str(stage or "initial"),
+        # A kicked client may keep writing a fresh state behind the popup.
+        # Never let the generic fresh-state recheck cancel this target-only
+        # exact-PID restart, or the dashboard will queue it forever.
+        "bypass_recheck": True,
+    }
+    if isinstance(extra, dict):
+        merged.update(extra)
+    return merged
+
+
 def core_queue_display(core, pkg, status, note):
     """Return user-facing status/note when a package is already queued."""
     if core is None:
@@ -9640,14 +9655,7 @@ def queue_disconnect_ui_rejoin(open_queue, tab, target, rt_tab, cfg):
     added, anote = queue_open(
         open_queue, tab, target, "kick/disconnect popup",
         force=True, mode=mode, front=False, bypass_manual=True,
-        metadata={
-            "disconnect_recovery": True,
-            "disconnect_recovery_stage": "initial",
-            # A kicked client may keep writing a fresh state behind the popup.
-            # Never let the generic fresh-state recheck cancel this target-only
-            # exact-PID restart, or the dashboard will queue it forever.
-            "bypass_recheck": True,
-        },
+        metadata=disconnect_recovery_metadata("initial"),
     )
     if added:
         rt_tab["last_disconnect_ui_open"] = t
@@ -12552,14 +12560,6 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                     "skip_solver_once": True,
                     "skip_solver_probe": True,
                     "solver_result": str(item.get("solver_result", "") or ""),
-                    "disconnect_recovery": bool(
-                        item.get("disconnect_recovery")
-                    ),
-                    "disconnect_recovery_stage": (
-                        "hard_fallback"
-                        if item.get("disconnect_recovery")
-                        else ""
-                    ),
                     "manual_booster_route": bool(
                         item.get("manual_booster_route")
                     ),
@@ -12569,6 +12569,11 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                         )
                     ),
                 }
+                if item.get("disconnect_recovery"):
+                    hard_meta.update(disconnect_recovery_metadata("hard_fallback"))
+                else:
+                    hard_meta["disconnect_recovery"] = False
+                    hard_meta["disconnect_recovery_stage"] = ""
                 if core is not None:
                     added, _ = core.queue_hard_retry(
                         tab,
