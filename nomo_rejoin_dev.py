@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.68.3-dev-core-recovery-names"
+__version__ = "V4.68.4-dev-core-old-state"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8897,6 +8897,19 @@ class RejoinCore:
             metadata=merged,
         )
 
+    def queue_alive_old_state_recovery(self, tab, target, reason, metadata=None):
+        merged = {"bypass_recheck": True}
+        if isinstance(metadata, dict):
+            merged.update(metadata)
+        return self.queue_exact_pid_recovery(
+            tab,
+            target,
+            reason,
+            skip_if_alive=False,
+            bypass_manual=True,
+            metadata=merged,
+        )
+
     def process(self, session_start=None, loops=0):
         return process_open_queue(
             self.open_queue,
@@ -10172,13 +10185,10 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
         # old past trigger -> kill + open THIS one clone
         if age >= trigger:
             if core is not None:
-                added, _ = core.queue_exact_pid_recovery(
+                added, _ = core.queue_alive_old_state_recovery(
                     tab,
                     target,
                     f"{mode} alive old state {format_age(age)}",
-                    skip_if_alive=False,
-                    bypass_manual=True,
-                    metadata={"bypass_recheck": True},
                 )
             else:
                 added, _ = queue_open(
