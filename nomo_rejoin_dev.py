@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.69.7-dev-hatcher-queue-position"
+__version__ = "V4.69.8-dev-manual-hold-helper"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -9505,11 +9505,13 @@ def disconnect_ui_api_precheck(tab, rt_tab, cfg, reason="kick popup", require_di
 
     if blocked is True:
         rt_tab["disconnect_ui_api_last_status"] = "challenge"
-        rt_tab["manual_login_needed"] = True
-        rt_tab["manual_login_reason"] = "api challenge"
-        rt_tab["manual_login_detail"] = detail or f"{reason}; api challenge"
-        rt_tab["manual_login_detected_at"] = t
-        rt_tab["note"] = f"{reason}; api challenge hold"
+        mark_manual_login_block(
+            rt_tab,
+            "api challenge",
+            detail or f"{reason}; api challenge",
+            f"{reason}; api challenge hold",
+            t,
+        )
         set_hold(pkg, "api challenge")
         log_activity(f"{reason}; API challenge before rejoin - package held", pkg, YELLOW)
         return True, rt_tab["note"]
@@ -9533,13 +9535,16 @@ def disconnect_ui_api_precheck(tab, rt_tab, cfg, reason="kick popup", require_di
                 detail = refreshed_detail or refresh_note or detail
                 detail_l = detail.lower()
         rt_tab["disconnect_ui_api_last_status"] = api_status
-        rt_tab["manual_login_needed"] = True
-        rt_tab["manual_login_reason"] = "api user moderated" if api_status == "moderated" else "api invalid/expired"
-        rt_tab["manual_login_detail"] = detail or f"{reason}; {rt_tab['manual_login_reason']}"
-        rt_tab["manual_login_detected_at"] = t
-        rt_tab["note"] = f"{reason}; {rt_tab['manual_login_reason']} hold"
-        set_hold(pkg, rt_tab["manual_login_reason"])
-        log_activity(f"{reason}; {rt_tab['manual_login_reason']} before rejoin - package held", pkg, RED)
+        manual_reason = "api user moderated" if api_status == "moderated" else "api invalid/expired"
+        mark_manual_login_block(
+            rt_tab,
+            manual_reason,
+            detail or f"{reason}; {manual_reason}",
+            f"{reason}; {manual_reason} hold",
+            t,
+        )
+        set_hold(pkg, manual_reason)
+        log_activity(f"{reason}; {manual_reason} before rejoin - package held", pkg, RED)
         return True, rt_tab["note"]
 
     rt_tab["disconnect_ui_api_last_status"] = "error"
@@ -10372,6 +10377,20 @@ def clear_manual_login_block(rt_tab):
     clear_face_lock_runtime(rt_tab)
     rt_tab.pop("solver_attempted", None)  # legacy V3.80 field
     rt_tab["note"] = "manual login cleared"
+    return True
+
+
+def mark_manual_login_block(rt_tab, reason, detail="", note="", detected_at=None):
+    """Central setter for auth/manual holds.
+
+    Keeping these fields written together prevents future modes from creating a
+    half-hold that blocks routing but displays the wrong reason.
+    """
+    rt_tab["manual_login_needed"] = True
+    rt_tab["manual_login_reason"] = str(reason or "manual login")
+    rt_tab["manual_login_detail"] = str(detail or reason or "manual login")
+    rt_tab["manual_login_detected_at"] = int(detected_at or now())
+    rt_tab["note"] = str(note or rt_tab["manual_login_detail"])
     return True
 
 
