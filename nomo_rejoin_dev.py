@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.69.5-dev-queue-log-dedupe"
+__version__ = "V4.69.6-dev-queue-log-prune"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -2074,6 +2074,10 @@ def log_activity(action, pkg="", color=None):
         if last_emit and t - last_emit < 45:
             return
         _ACTIVITY_DEDUPE[key] = t
+        if len(_ACTIVITY_DEDUPE) > 300:
+            for old_key, old_ts in list(_ACTIVITY_DEDUPE.items()):
+                if t - int(old_ts or 0) > 300:
+                    _ACTIVITY_DEDUPE.pop(old_key, None)
     if color is None:
         try:
             color = note_color(action)
