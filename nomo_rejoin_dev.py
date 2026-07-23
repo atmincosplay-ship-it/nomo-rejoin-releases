@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.70.7-dev-exact-pid-fallbacks"
+__version__ = "V4.70.8-dev-route-helper-flags"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8626,6 +8626,17 @@ def exact_pid_recovery_metadata(extra=None):
     return merged
 
 
+def skip_solver_route_metadata(extra=None):
+    """Shared metadata for route switches that must not re-run solver preflight."""
+    merged = {
+        "skip_solver_once": True,
+        "skip_solver_probe": True,
+    }
+    if isinstance(extra, dict):
+        merged.update(extra)
+    return merged
+
+
 def core_queue_display(core, pkg, status, note):
     """Return user-facing status/note when a package is already queued."""
     if core is None:
@@ -8911,7 +8922,7 @@ class RejoinCore:
             metadata=metadata,
         )
 
-    def queue_route_retry(self, tab, target, reason, metadata=None):
+    def queue_route_retry(self, tab, target, reason, metadata=None, bypass_manual=False):
         return self.queue(
             tab,
             target,
@@ -8919,6 +8930,7 @@ class RejoinCore:
             force=True,
             mode="route",
             front=False,
+            bypass_manual=bypass_manual,
             metadata=metadata,
         )
 
@@ -12882,10 +12894,8 @@ def _nomo_start_market_rejoin_original(cfg):
                         tab,
                         "market",
                         "manual Booster hold ended",
-                        metadata={
-                            "skip_solver_once": True,
-                            "skip_solver_probe": True,
-                        },
+                        metadata=skip_solver_route_metadata(),
+                        bypass_manual=True,
                     )
                     note = "market return queued" if added else "market return already queued"
                     status = "Queued" if added else status
@@ -12901,14 +12911,14 @@ def _nomo_start_market_rejoin_original(cfg):
                     if pets < int(cfg["restock_below"]) and target != "restock":
                         added, _ = core.queue_route_retry(
                             tab, "restock", f"pets<{cfg['restock_below']}",
-                            metadata={"skip_solver_once": True, "skip_solver_probe": True},
+                            metadata=skip_solver_route_metadata(),
                         )
                         note = "restock queued" if added else "already queued"
                         status = "Queued" if added else status
                     elif pets >= int(cfg["ready_market_at"]) and target != "market":
                         added, _ = core.queue_route_retry(
                             tab, "market", f"pets>={cfg['ready_market_at']}",
-                            metadata={"skip_solver_once": True, "skip_solver_probe": True},
+                            metadata=skip_solver_route_metadata(),
                         )
                         note = "market queued" if added else "already queued"
                         status = "Queued" if added else status
@@ -12916,7 +12926,7 @@ def _nomo_start_market_rejoin_original(cfg):
                           and idle_no_gain >= int(cfg["idle_no_gain_seconds"])):
                         added, _ = core.queue_route_retry(
                             tab, "market", "idle no gain",
-                            metadata={"skip_solver_once": True, "skip_solver_probe": True},
+                            metadata=skip_solver_route_metadata(),
                         )
                         note = "idle queued" if added else "already queued"
                         status = "Queued" if added else status
