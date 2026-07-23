@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.71.0-dev-disconnect-fallback"
+__version__ = "V4.71.1-dev-queue-duplicate-core"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8606,6 +8606,17 @@ def queue_has(open_queue, pkg):
     return any(item.get("tab", {}).get("package") == pkg for item in open_queue)
 
 
+def queue_latest_for_package(open_queue, package, reason_prefix=""):
+    package = str(package or "")
+    for item in reversed(open_queue or []):
+        if str(item.get("tab", {}).get("package", "")) != package:
+            continue
+        if reason_prefix and not str(item.get("reason", "")).startswith(reason_prefix):
+            continue
+        return item
+    return None
+
+
 def queue_position(open_queue, pkg):
     """1-based FIFO position for a package, or 0 when not queued."""
     for idx, item in enumerate(open_queue or [], 1):
@@ -8710,7 +8721,12 @@ def _remove_queued_generation(open_queue, package, generation):
 # Internal queue primitive. Mode loops should prefer RejoinCore.queue().
 def queue_open(open_queue, tab, target, reason, force=False, skip_if_alive=False, mode="hard", front=False, bypass_manual=False, metadata=None):
     pkg = tab.get("package")
-    if queue_has(open_queue, pkg):
+    existing = queue_latest_for_package(open_queue, pkg)
+    if existing is not None:
+        existing["duplicate_seen_at"] = now()
+        existing["duplicate_count"] = int(existing.get("duplicate_count", 0) or 0) + 1
+        existing["duplicate_reason"] = str(reason or "")
+        existing["duplicate_mode"] = str(mode or "hard")
         return False, "already queued"
     item = {
         "tab": tab,
@@ -9043,13 +9059,7 @@ class RejoinCore:
         return bool(self.open_queue)
 
     def latest(self, package, reason_prefix=""):
-        for item in reversed(self.open_queue):
-            if item.get("tab", {}).get("package") != package:
-                continue
-            if reason_prefix and not str(item.get("reason", "")).startswith(reason_prefix):
-                continue
-            return item
-        return None
+        return queue_latest_for_package(self.open_queue, package, reason_prefix)
 
     def clear(self):
         self.open_queue.clear()
