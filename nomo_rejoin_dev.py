@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.68.7-dev-core-stale-soft"
+__version__ = "V4.68.8-dev-oldstate-cooldown-fix"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -16841,11 +16841,14 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                             if (recovery_age >= int(cfg.get("hatcher_alive_old_state_hard_force_seconds", 180) or 180)
                                     and recovery_age <= int(cfg.get("hatcher_alive_old_state_max_valid_seconds", 86400) or 86400)
                                     and cfg.get("rejoin_if_crash", True)):
-                                added, _ = core.queue_alive_old_state_recovery(
-                                    tab, "hatcher",
+                                added, hard_note, _ = core.queue_hatcher_old_state_hard(
+                                    tab,
+                                    rt_tab,
+                                    hcfg,
+                                    recovery_age,
                                     f"alive old state {recovery_age}s",
                                 )
-                                note = f"old {recovery_age}s PID kill+open" if added else "already queued"
+                                note = f"old {recovery_age}s PID kill+open" if added else hard_note
                                 status = "Queued" if added else "Stale"
                             else:
                                 status = "Online"
