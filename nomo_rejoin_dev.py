@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.69.0-dev-oldstate-save-cooldown"
+__version__ = "V4.69.1-dev-cookie-refresh-precheck"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1553,6 +1553,7 @@ DEFAULT_CONFIG = {
     "disconnect_ui_api_precheck_cooldown_seconds": 120,
     "api_precheck_before_rejoin_enabled": True,
     "api_precheck_block_retry_seconds": 600,
+    "api_precheck_refresh_invalid_cookie_enabled": True,
     "minimized_window_detection_enabled": True,
     "minimized_window_reopen_enabled": False,  # status-only; dumpsys is not package-safe enough
     "minimized_window_reopen_mode": "soft",
@@ -2615,6 +2616,8 @@ def apply_update_migrations(cfg):
         set_cfg("api_precheck_before_rejoin_enabled", True)
     if "api_precheck_block_retry_seconds" not in cfg:
         set_cfg("api_precheck_block_retry_seconds", 600)
+    if "api_precheck_refresh_invalid_cookie_enabled" not in cfg:
+        set_cfg("api_precheck_refresh_invalid_cookie_enabled", True)
     if "disconnect_ui_retry_seconds" not in cfg:
         set_cfg("disconnect_ui_retry_seconds", 60)
     if "disconnect_ui_hard_after_seconds" not in cfg:
@@ -9425,6 +9428,19 @@ def disconnect_ui_api_precheck(tab, rt_tab, cfg, reason="kick popup", require_di
     if last:
         status = str(rt_tab.get("disconnect_ui_api_last_status", "") or "")
         wait_for = block_cooldown if status in ("challenge", "invalid", "moderated") else cooldown
+        if status == "invalid" and cfg.get("api_precheck_refresh_invalid_cookie_enabled", True):
+            refreshed_cookie, refresh_note = refresh_cached_cookie_for_package(pkg)
+            if refreshed_cookie:
+                refreshed_blocked, refreshed_detail = roblox_cookie_detection(refreshed_cookie)
+                if refreshed_blocked is False:
+                    rt_tab["disconnect_ui_api_last_status"] = "valid"
+                    rt_tab["disconnect_ui_api_last_detail"] = refreshed_detail
+                    clear_hold(pkg)
+                    clear_manual_login_block(rt_tab)
+                    rt_tab["note"] = f"api cookie refreshed; {refreshed_detail}"
+                    log_activity(f"API cookie refresh cleared invalid cache: {refreshed_detail}", pkg, GREEN)
+                    return False, rt_tab["note"]
+                rt_tab["disconnect_ui_api_last_detail"] = str(refreshed_detail or refresh_note)
         if t - last < wait_for and status in ("challenge", "invalid", "moderated"):
             note = str(rt_tab.get("note", "") or f"{reason}; api {status} hold")
             return True, note
@@ -9460,6 +9476,21 @@ def disconnect_ui_api_precheck(tab, rt_tab, cfg, reason="kick popup", require_di
     detail_l = detail.lower()
     if "invalid" in detail_l or "expired" in detail_l or "moderated" in detail_l:
         api_status = "moderated" if "moderated" in detail_l else "invalid"
+        if api_status == "invalid" and cfg.get("api_precheck_refresh_invalid_cookie_enabled", True):
+            refreshed_cookie, refresh_note = refresh_cached_cookie_for_package(pkg)
+            if refreshed_cookie:
+                refreshed_blocked, refreshed_detail = roblox_cookie_detection(refreshed_cookie)
+                refreshed_detail = str(refreshed_detail or "")
+                if refreshed_blocked is False:
+                    rt_tab["disconnect_ui_api_last_status"] = "valid"
+                    rt_tab["disconnect_ui_api_last_detail"] = refreshed_detail
+                    clear_hold(pkg)
+                    clear_manual_login_block(rt_tab)
+                    rt_tab["note"] = f"api cookie refreshed; {refreshed_detail}"
+                    log_activity(f"{reason}; API cookie refresh cleared invalid cache: {refreshed_detail}", pkg, GREEN)
+                    return False, rt_tab["note"]
+                detail = refreshed_detail or refresh_note or detail
+                detail_l = detail.lower()
         rt_tab["disconnect_ui_api_last_status"] = api_status
         rt_tab["manual_login_needed"] = True
         rt_tab["manual_login_reason"] = "api user moderated" if api_status == "moderated" else "api invalid/expired"
@@ -10310,6 +10341,42 @@ def cached_cookie_for_package(pkg):
         return str(ent.get("cookie", "") or "").strip()
     except Exception:
         return ""
+
+
+def refresh_cached_cookie_for_package(pkg):
+    """Refresh cookie_cache.json from the currently logged-in package session."""
+    pkg = str(pkg or "").strip()
+    if not pkg:
+        return "", "no package"
+    try:
+        cookie = get_cookie_from_package(pkg)
+    except Exception as exc:
+        return "", f"cookie refresh failed: {exc}"
+    cookie = str(cookie or "").strip()
+    if not cookie:
+        return "", "package cookie unavailable"
+
+    cache = load_cookie_cache()
+    ent = cache.get(pkg)
+    if not isinstance(ent, dict):
+        ent = {}
+    ent["cookie"] = cookie
+    ent["updated"] = now()
+    try:
+        username, user_id = get_username_from_cookie(cookie, timeout=8)
+        if username:
+            ent["username"] = username
+        if user_id:
+            ent["user_id"] = str(user_id)
+    except Exception:
+        pass
+    cache[pkg] = ent
+    try:
+        with open(COOKIE_CACHE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, indent=2)
+    except Exception as exc:
+        return cookie, f"cookie refreshed but cache save failed: {exc}"
+    return cookie, "cookie refreshed"
 
 
 def roblox_cookie_detection(cookie):
