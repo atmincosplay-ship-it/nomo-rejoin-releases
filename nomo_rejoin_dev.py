@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.72.2-dev-solver-core-only"
+__version__ = "V4.72.3-dev-private-core-helpers"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8918,7 +8918,7 @@ class RejoinCore:
         return result
 
     def queue_disconnect_ui_rejoin(self, tab, target, rt_tab):
-        return queue_disconnect_ui_rejoin(
+        return _queue_disconnect_ui_rejoin(
             self.open_queue,
             tab,
             target,
@@ -9085,7 +9085,7 @@ class RejoinCore:
         return queue_stuck_self_heal(self.open_queue, self.cfg, self.rt)
 
     def watchdog(self, enabled_tabs=None):
-        return runtime_stuck_watchdog(
+        return _runtime_stuck_watchdog(
             self.open_queue,
             self.cfg,
             self.rt,
@@ -9216,7 +9216,7 @@ def clear_runtime_temp_state(rt, reason="runtime watchdog"):
     return changed
 
 
-def runtime_stuck_watchdog(open_queue, cfg, rt, enabled_tabs=None):
+def _runtime_stuck_watchdog(open_queue, cfg, rt, enabled_tabs=None):
     """Reset stuck runtime/open_queue after a long Queued state."""
     if not cfg.get("runtime_stuck_reset_enabled", True):
         return False
@@ -9631,7 +9631,7 @@ def api_precheck_before_rejoin(tab, rt_tab, cfg, reason="queued rejoin"):
 
 
 
-def queue_disconnect_ui_rejoin(open_queue, tab, target, rt_tab, cfg):
+def _queue_disconnect_ui_rejoin(open_queue, tab, target, rt_tab, cfg):
     if not cfg.get("disconnect_ui_rejoin_enabled", True):
         return False, "kick popup wait"
 
