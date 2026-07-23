@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.68.8-dev-oldstate-cooldown-fix"
+__version__ = "V4.68.9-dev-oldstate-attempt-cooldown"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -9374,8 +9374,10 @@ def queue_hatcher_alive_old_state_hard(open_queue, tab, rt_tab, hcfg, cfg, age_o
     if not added:
         return False, "already queued", True
 
-    # Cooldown starts only after _do_open_cycle confirms that Android accepted
-    # the real target open. A queued item may be blocked, cancelled, or held.
+    # Start the cooldown at queue-time. If Android/API/preflight blocks the
+    # queued open before _do_open_cycle can confirm it, waiting for confirmation
+    # lets this path requeue every dashboard tick.
+    rt_tab["hatcher_alive_old_state_hard_last"] = t
     rt_tab["hatcher_alive_old_state_hard_age"] = age_i
     rt_tab["hatcher_alive_old_state_hard_reason"] = str(reason or "alive old state")
     return True, "old-state PID hard queued", True
