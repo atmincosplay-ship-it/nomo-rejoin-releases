@@ -743,6 +743,7 @@ import hashlib
 import platform
 import zipfile
 import struct
+import traceback
 from pathlib import Path
 from datetime import datetime
 
@@ -750,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.71.1-dev-queue-duplicate-core"
+__version__ = "V4.71.2-dev-launch-guard"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -34186,5 +34187,16 @@ if __name__ == "__main__":
         reset_terminal()
         print("\n[!] NOMO REJOIN stopped. Back to Termux.")
         sys.exit(130)
+    except Exception as e:
+        reset_terminal()
+        print("")
+        print(f"[NOMO DEV LAUNCH ERROR] {type(e).__name__}: {e}")
+        print("")
+        traceback.print_exc()
+        try:
+            input("\nPress ENTER to return to Termux...")
+        except Exception:
+            pass
+        sys.exit(1)
     finally:
         reset_terminal()

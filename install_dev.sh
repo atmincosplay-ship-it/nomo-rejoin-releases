@@ -79,7 +79,12 @@ if [ ! -x "$PYTHON" ]; then
   PYTHON="$(command -v python)"
 fi
 
-exec "$PYTHON" "$APP" "$@"
+"$PYTHON" "$APP" "$@"
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  echo "NOMO dev exited with code $rc"
+fi
+exit "$rc"
 EOF
 
 chmod 755 "$CMD"
