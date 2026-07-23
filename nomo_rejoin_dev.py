@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.71.6-dev-clean-launcher"
+__version__ = "V4.71.7-dev-booster-start-core"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -13333,6 +13333,7 @@ def booster_hatcher_startup_queue(
     """Use Hatcher's hard closed-package startup behavior for Booster."""
     queued = []
     skipped = []
+    core = RejoinCore(open_queue, cfg, rt)
 
     if not cfg.get("open_all_on_start", True):
         return queued, skipped
@@ -13355,18 +13356,15 @@ def booster_hatcher_startup_queue(
             skipped.append((package, "already alive"))
             continue
 
-        added, note = queue_open(
-            open_queue,
+        added, note = core.queue_exact_pid_recovery(
             tab,
             "hatcher",
             "booster hatcher-core start",
-            force=True,
             skip_if_alive=True,
-            mode="hard_force",
             bypass_manual=True,
-            metadata=exact_pid_recovery_metadata({
+            metadata={
                 "booster_hatcher_core": True,
-            }),
+            },
         )
         if added:
             queued.append(package)
