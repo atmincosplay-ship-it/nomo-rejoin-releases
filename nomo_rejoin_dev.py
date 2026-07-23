@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.70.4-dev-core-route-queue"
+__version__ = "V4.70.5-dev-core-manual-queue"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -6526,18 +6526,11 @@ def manual_restart_tabs_via_queue(
             if callable(target_for_tab)
             else str(target_for_tab or "market")
         )
-        added, note = core.queue(
+        added, note = core.queue_hard_retry(
             tab,
             target,
             reason,
-            force=True,
-            skip_if_alive=False,
-            mode="hard_force",
-            bypass_manual=True,
             metadata={
-                "pid_only_recovery": True,
-                "recovery_must_open_once": True,
-                "bypass_recheck": True,
                 "manual_option6": True,
             },
         )
@@ -7968,14 +7961,10 @@ def market_run_route_queue(cfg, tabs, target, reason):
         package = str(tab.get("package") or "")
         if not package:
             continue
-        added, note = core.queue(
+        added, note = core.queue_route_retry(
             tab,
             target,
             reason,
-            force=True,
-            skip_if_alive=False,
-            mode="route",
-            bypass_manual=True,
             metadata={
                 "manual_booster_route": target == "booster",
             },
