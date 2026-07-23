@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.72.3-dev-private-core-helpers"
+__version__ = "V4.72.4-dev-hatcher-core-helper"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8900,7 +8900,7 @@ class RejoinCore:
         )
 
     def queue_hatcher_old_state_hard(self, tab, rt_tab, hcfg, age_or_seconds, reason):
-        result = queue_hatcher_alive_old_state_hard(
+        result = _queue_hatcher_alive_old_state_hard(
             self.open_queue,
             tab,
             rt_tab,
@@ -9451,7 +9451,7 @@ def hatcher_alive_old_state_hard_settings(hcfg, cfg):
 
 
 
-def queue_hatcher_alive_old_state_hard(open_queue, tab, rt_tab, hcfg, cfg, age_or_seconds, reason):
+def _queue_hatcher_alive_old_state_hard(open_queue, tab, rt_tab, hcfg, cfg, age_or_seconds, reason):
     """Queue one affected Hatcher package for verified exact-PID restart."""
     enabled, age_seconds, max_valid_seconds, cooldown_seconds = hatcher_alive_old_state_hard_settings(hcfg, cfg)
     pkg = str((tab or {}).get("package", "") or "")
@@ -12382,13 +12382,7 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
             "solver result",
         ):
             if item.get("manual_booster_hard_route"):
-                if core is not None:
-                    core.cancel(pkg)
-                else:
-                    cancel_queued_package(
-                        open_queue,
-                        pkg,
-                    )
+                core.cancel(pkg)
                 rt_tab["note"] = (
                     "Booster hard private join failed: "
                     + str(fresh_msg)
