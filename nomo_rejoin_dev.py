@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.70.2-dev-core-challenge-queue"
+__version__ = "V4.70.3-dev-core-periodic-queue"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -12968,10 +12968,7 @@ def _nomo_start_market_rejoin_original(cfg):
 
             due_refresh, refresh_left = periodic_hard_refresh_due(rt_tab, cfg)
             if due_refresh and not rj_handled and not manual_login_blocked(rt_tab, cfg) and not core.has_work() and not core.has(pkg) and not solver_job_running(pkg):
-                added, _ = core.queue(
-                    tab, target, "periodic hard refresh",
-                    force=True, mode="hard_force", bypass_manual=True
-                )
+                added, _ = core.queue_hard_retry(tab, target, "periodic hard refresh")
                 if added:
                     mark_periodic_hard_refresh(rt_tab)
                     note = "periodic hard queued"
@@ -16228,10 +16225,7 @@ def start_hatcher_reporter(main_cfg=None):
 
             due_refresh, refresh_left = periodic_hard_refresh_due(rt_tab, cfg)
             if due_refresh and not manual_login_blocked(rt_tab, cfg) and not core.has_work() and not core.has(pkg):
-                added, _ = core.queue(
-                    tab, "hatcher", "periodic hard refresh",
-                    force=True, mode="hard_force", bypass_manual=True
-                )
+                added, _ = core.queue_hard_retry(tab, "hatcher", "periodic hard refresh")
                 if added:
                     mark_periodic_hard_refresh(rt_tab)
                     status = "Queued"
@@ -17142,10 +17136,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
 
             due_refresh, refresh_left = periodic_hard_refresh_due(rt_tab, cfg)
             if due_refresh and captcha_action is None and not manual_login_blocked(rt_tab, cfg) and not core.has_work() and not core.has(pkg) and not solver_job_running(pkg):
-                added, _ = core.queue(
-                    tab, "hatcher", "periodic hard refresh",
-                    force=True, mode="hard_force", bypass_manual=True
-                )
+                added, _ = core.queue_hard_retry(tab, "hatcher", "periodic hard refresh")
                 if added:
                     mark_periodic_hard_refresh(rt_tab)
                     status = "Queued"
