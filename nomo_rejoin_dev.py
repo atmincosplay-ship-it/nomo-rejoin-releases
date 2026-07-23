@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.72.0-dev-health-core-default"
+__version__ = "V4.72.1-dev-action-core-default"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -10169,6 +10169,8 @@ def maybe_queue_solver_busy_retry(open_queue, tab, target, rt_tab, cfg, health, 
     Never contact the provider from a healthy middle session. The provider call
     remains inside wait-after-open and therefore happens once for that retry open.
     """
+    if core is None:
+        core = RejoinCore(open_queue, cfg, None)
     if not rt_tab.get("solver_busy_retry_pending"):
         return None
 
@@ -10186,20 +10188,10 @@ def maybe_queue_solver_busy_retry(open_queue, tab, target, rt_tab, cfg, health, 
     pkg = str((tab or {}).get("package", "") or "")
     if solver_job_running(pkg):
         return "Solving", solver_job_note(pkg), True
-    if queue_has(open_queue, pkg):
+    if core.has(pkg):
         return "Queued", "solver busy retry already queued", True
 
-    if core is not None:
-        added, _ = core.queue_solver_busy_retry(tab, target)
-    else:
-        added, _ = queue_open(
-            open_queue, tab, target, "solver SERVER_BUSY retry",
-            force=True, mode="hard_force", bypass_manual=True,
-            metadata={
-                "solver_busy_retry": True,
-                "bypass_recheck": True,
-            },
-        )
+    added, _ = core.queue_solver_busy_retry(tab, target)
     if added:
         rt_tab["solver_busy_retry_pending"] = False
         rt_tab["solver_busy_retry_at"] = 0
@@ -10215,6 +10207,8 @@ def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, he
     V4.14 never submits the solver directly from a dashboard scan. The queued
     generation owns one pre-open solver request, then one Roblox launch.
     """
+    if core is None:
+        core = RejoinCore(open_queue, cfg, rt)
     if str((health or {}).get("bad") or "") != "ui_challenge":
         return None
 
@@ -10234,20 +10228,12 @@ def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, he
         rt_tab["note"] = note
         return "Captcha", note, True
 
-    already_queued = core.has(pkg) if core is not None else queue_has(open_queue, pkg)
-    if already_queued:
+    if core.has(pkg):
         note = "verification UI; rejoin already queued"
         rt_tab["note"] = note
         return "Queued", note, True
 
-    if core is not None:
-        added, _ = core.queue_visible_verification_rejoin(tab, target)
-    else:
-        added, _ = queue_open(
-            open_queue, tab, target, "visible verification preflight rejoin",
-            force=True, mode="hard_force", bypass_manual=True,
-            metadata={"bypass_recheck": True},
-        )
+    added, _ = core.queue_visible_verification_rejoin(tab, target)
     if added:
         clear_hold(pkg)
         rt_tab["manual_login_needed"] = False
@@ -10265,6 +10251,8 @@ def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, he
 
 def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=None, mode="market", core=None):
     """SHARED rejoin engine for both Market and Hatcher."""
+    if core is None:
+        core = RejoinCore(open_queue, cfg, rt)
     pkg = tab.get("package")
     state = health.get("state")
     alive = bool(health.get("alive"))
@@ -10291,23 +10279,12 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
 
     # --- join/login challenge: provider calls are event-bound to a rejoin ---
     if bad == "challenge" or (state and state_login_challenge_detail(state)):
-        if core is not None:
-            added, _ = core.queue_join_challenge_rejoin(tab, target)
-        else:
-            cancel_queued_package(open_queue, pkg)
-            added, _ = queue_open(
-                open_queue, tab, target, "join challenge pre-solver rejoin",
-                force=True, mode="hard_force", bypass_manual=True,
-                metadata={"bypass_recheck": True},
-            )
+        added, _ = core.queue_join_challenge_rejoin(tab, target)
         return ("Queued" if added else "Manual"),                ("challenge rejoin queued; solver runs before open" if added else "challenge already queued"), True
 
     # --- disconnect / kick popup: always kill+open ---
     if bad == "disconnect" or (state and state_disconnect_ui(state)):
-        if core is not None:
-            added, dnote = core.queue_disconnect_ui_rejoin(tab, target, rt_tab)
-        else:
-            added, dnote = queue_disconnect_ui_rejoin(open_queue, tab, target, rt_tab, cfg)
+        added, dnote = core.queue_disconnect_ui_rejoin(tab, target, rt_tab)
         status = "Queued" if (added or dnote == "already queued") else "Kicked"
         note = f"{state_disconnect_note(state)} {dnote}".strip()
         return status, note, True
@@ -10340,19 +10317,11 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
 
         # old past trigger -> kill + open THIS one clone
         if age >= trigger:
-            if core is not None:
-                added, _ = core.queue_alive_old_state_recovery(
-                    tab,
-                    target,
-                    f"{mode} alive old state {format_age(age)}",
-                )
-            else:
-                added, _ = queue_open(
-                    open_queue, tab, target,
-                    f"{mode} alive old state {format_age(age)}",
-                    force=True, mode="hard_force", skip_if_alive=False, bypass_manual=True,
-                    metadata=exact_pid_recovery_metadata(),
-                )
+            added, _ = core.queue_alive_old_state_recovery(
+                tab,
+                target,
+                f"{mode} alive old state {format_age(age)}",
+            )
             return ("Queued" if added else "Stale"), \
                    (f"old {format_age(age)} kill+open" if added else "already queued"), True
 
@@ -10363,34 +10332,20 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
     if alive:
         if in_grace:
             return "Loading", "no state grace", True
-        if core is not None:
-            added, _ = core.queue_alive_no_state_recovery(
-                tab,
-                target,
-                f"{mode} alive no-state hard",
-            )
-        else:
-            added, _ = queue_open(
-                open_queue, tab, target, f"{mode} alive no-state hard",
-                force=True, mode="hard_force", skip_if_alive=False, bypass_manual=True,
-                metadata=exact_pid_recovery_metadata(),
-            )
+        added, _ = core.queue_alive_no_state_recovery(
+            tab,
+            target,
+            f"{mode} alive no-state hard",
+        )
         return ("Queued" if added else "No state"), \
                ("no-state kill+open" if added else "already queued"), True
 
     # dead -> kill + open
-    if core is not None:
-        added, _ = core.queue_crash_recovery(
-            tab,
-            target,
-            f"{mode} crash/dead",
-        )
-    else:
-        added, _ = queue_open(
-            open_queue, tab, target, f"{mode} crash/dead",
-            force=True, mode="hard_force", skip_if_alive=True, bypass_manual=True,
-            metadata=exact_pid_recovery_metadata(),
-        )
+    added, _ = core.queue_crash_recovery(
+        tab,
+        target,
+        f"{mode} crash/dead",
+    )
     return ("Queued" if added else "Offline"), \
            ("crash kill+open" if added else "already queued"), True
 
@@ -12460,10 +12415,7 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
             # Redfinger window layout. Isolate this package and continue others.
             if item.get("solver_recovery") and cfg.get("manual_hold_after_solver_rejoin_timeout", True):
                 solver_result = str(item.get("solver_result", "solver clear") or "solver clear")
-                if core is not None:
-                    core.cancel(pkg)
-                else:
-                    cancel_queued_package(open_queue, pkg)
+                core.cancel(pkg)
                 mark_manual_login_block(
                     rt_tab,
                     "join blocked after solver recovery",
@@ -12492,10 +12444,7 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                 disconnect_hard_attempt_done or retries_done >= max_retries
             ):
                 cooldown = max(60, int(cfg.get("disconnect_ui_incident_cooldown_seconds", 300) or 300))
-                if core is not None:
-                    core.cancel(pkg)
-                else:
-                    cancel_queued_package(open_queue, pkg)
+                core.cancel(pkg)
                 rt_tab["disconnect_ui_recovery_active"] = False
                 rt_tab["disconnect_ui_recovery_stage"] = "hold"
                 rt_tab["disconnect_ui_hold_until"] = now() + cooldown
@@ -25551,6 +25500,9 @@ def handle_detected_solver_challenge(tab, cfg, rt, rt_tab, reason):
 
 def poll_solver_jobs(cfg, rt, open_queue, core=None):
     """Apply completed jobs on the main thread; never expose cookies/tokens."""
+    if core is None:
+        core = RejoinCore(open_queue, cfg, rt)
+
     completed = []
     with _SOLVER_LOCK:
         for pkg, job in list(_SOLVER_JOBS.items()):
@@ -25729,10 +25681,7 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
 
             # Remove only stale/duplicate queue entries for this package. Never
             # disturb another clone's queued recovery.
-            if core is not None:
-                core.cancel(pkg)
-            else:
-                cancel_queued_package(open_queue, pkg)
+            core.cancel(pkg)
 
             # This is a post-open provider result. The current Roblox task can
             # already be trapped behind 529, so both clear statuses get exactly
