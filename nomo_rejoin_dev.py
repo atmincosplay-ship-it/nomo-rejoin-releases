@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.75.8-dev-core-solver-challenge"
+__version__ = "V4.75.9-dev-core-solver-preflight-api"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -9096,6 +9096,19 @@ class RejoinCore:
             self,
         )
 
+    def solver_preflight_before_open(self, item, tab, rt_tab, pkg, target):
+        return solver_preflight_before_open(
+            self.open_queue,
+            item,
+            tab,
+            rt_tab,
+            pkg,
+            target,
+            self.cfg,
+            self.rt,
+            self,
+        )
+
     def process_once_if_enabled(self, session_start=None, loops=0):
         if not self.has_work() or not self.cfg.get("smart_open_queue", True):
             return False
@@ -12098,8 +12111,8 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
             core.save()
             return True
 
-    preflight_state, preflight_item = solver_preflight_before_open(
-        open_queue, item, tab, rt_tab, pkg, target, cfg, rt, core
+    preflight_state, preflight_item = core.solver_preflight_before_open(
+        item, tab, rt_tab, pkg, target
     )
     if preflight_state != "ready":
         return True
