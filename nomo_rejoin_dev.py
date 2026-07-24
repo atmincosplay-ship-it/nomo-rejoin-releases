@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.74.3-dev-core-wait-solver-save"
+__version__ = "V4.74.4-dev-core-wait-save"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -11626,6 +11626,8 @@ def wait_until_fresh_after_open(
 ):
     if not cfg.get("wait_fresh_after_open", True):
         return True, "fresh wait disabled"
+    if core is None:
+        core = RejoinCore([], cfg, rt)
 
     timeout = int(timeout_override if timeout_override is not None else cfg.get("open_wait_fresh_seconds", 240))
     check_every = max(1, int(cfg.get("open_wait_check_seconds", 5)))
@@ -11649,7 +11651,7 @@ def wait_until_fresh_after_open(
     while now() - start < timeout:
         elapsed = now() - start
         if stop_requested():
-            save_runtime(rt)
+            core.save()
             return False, "stop"
 
         alive = package_alive(tab["package"], cfg)
@@ -11678,7 +11680,7 @@ def wait_until_fresh_after_open(
                 # the full configured timeout; otherwise a post-solver recovery
                 # is judged dead only ~45s after launch.
                 rt_tab["note"] = probe_note
-                save_runtime(rt)
+                core.save()
 
         completion = solver_job_completion_state(pkg)
         if completion in ("no_challenge", "challenge_result"):
@@ -11732,7 +11734,7 @@ def wait_until_fresh_after_open(
                     pkg,
                     rt_tab["manual_login_reason"],
                 )
-                save_runtime(rt)
+                core.save()
                 log_activity(
                     rt_tab["note"]
                     + f"; provider cooldown {format_age(retry_after)}",
@@ -11744,10 +11746,7 @@ def wait_until_fresh_after_open(
                 tab, cfg, rt, rt_tab, "visible package-scoped verification UI", core=core
             )
             rt_tab["note"] = solver_note
-            if core is not None:
-                core.save()
-            else:
-                save_runtime(rt)
+            core.save()
             return False, "solver pending" if solver_status == "Solving" else "manual challenge"
         if state_disconnect_ui(state):
             status_note = state_disconnect_note(state)
@@ -11780,7 +11779,7 @@ def wait_until_fresh_after_open(
                     pkg,
                     rt_tab["manual_login_reason"],
                 )
-                save_runtime(rt)
+                core.save()
                 log_activity(
                     rt_tab["note"]
                     + f"; provider cooldown {format_age(retry_after)}",
@@ -11792,10 +11791,7 @@ def wait_until_fresh_after_open(
                 tab, cfg, rt, rt_tab, state_login_challenge_detail(state), core=core
             )
             rt_tab["note"] = solver_note
-            if core is not None:
-                core.save()
-            else:
-                save_runtime(rt)
+            core.save()
             # Release the single-flight open lock immediately. The background
             # solver continues while the next clone is allowed to load.
             return False, "solver pending" if solver_status == "Solving" else "manual challenge"
@@ -11832,7 +11828,7 @@ def wait_until_fresh_after_open(
 
         # Surface it in the table's Note column
         rt_tab["note"] = f"{status_note} {elapsed}/{timeout}s"
-        save_runtime(rt)
+        core.save()
 
         wait_fresh_screen(tab, cfg, elapsed, timeout, alive, state, err, status_note)
 
@@ -11861,7 +11857,7 @@ def wait_until_fresh_after_open(
             clear_disconnect_ui_incident(rt_tab)
             rt_tab["solver_busy_retry_pending"] = False
             rt_tab["solver_busy_retry_at"] = 0
-            save_runtime(rt)
+            core.save()
             log_activity("fresh clean state - rejoin complete", pkg, GREEN)
             return True, "fresh"
     
@@ -11880,7 +11876,7 @@ def wait_until_fresh_after_open(
 
         for _ in range(check_every):
             if stop_requested():
-                save_runtime(rt)
+                core.save()
                 return False, "stop"
             time.sleep(1)
 
