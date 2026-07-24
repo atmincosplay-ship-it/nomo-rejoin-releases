@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.73.5-dev-core-disconnect-queue"
+__version__ = "V4.73.6-dev-core-open-save-a"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -12120,6 +12120,7 @@ def market_booster_second_soft_intent(
     first_opened_at,
     expected_place_id,
     expected_job_id,
+    core=None,
 ):
     """Retry the same task-reuse deep link once when Roblox lands on Home."""
     if not cfg.get(
@@ -12141,7 +12142,10 @@ def market_booster_second_soft_intent(
 
     for _ in range(delay):
         if stop_requested():
-            save_runtime(rt)
+            if core is not None:
+                core.save()
+            else:
+                save_runtime(rt)
             return False, first_opened_at, "stop"
 
         confirmed, _state, _note = (
@@ -12179,7 +12183,10 @@ def market_booster_second_soft_intent(
     )
     rt_tab["note"] = "Booster second soft intent"
     rt_tab["market_booster_second_intent_at"] = now()
-    save_runtime(rt)
+    if core is not None:
+        core.save()
+    else:
+        save_runtime(rt)
 
     ok, note = open_target(
         tab,
@@ -12201,7 +12208,10 @@ def market_booster_second_soft_intent(
         package,
         GREEN if ok else RED,
     )
-    save_runtime(rt)
+    if core is not None:
+        core.save()
+    else:
+        save_runtime(rt)
 
     if not ok:
         return True, first_opened_at, f"second intent failed: {note}"
@@ -12216,7 +12226,10 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
         display_mode = "alive-soft-first"
     opening_screen(tab, target, cfg, 1, max(1, len(open_queue) + 1), mode=display_mode)
     rt_tab["note"] = f"opening -> {target}"
-    save_runtime(rt)
+    if core is not None:
+        core.save()
+    else:
+        save_runtime(rt)
     log_activity(f"opening -> {target} ({display_mode})", pkg)
     if core is not None:
         ok, msg = core.open(
@@ -12242,7 +12255,10 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
         rt["_last_pool_hard_open"] = now()
     log_activity(f"open {'ok' if ok else 'FAILED'}: {msg}", pkg,
                  GREEN if ok else RED)
-    save_runtime(rt)
+    if core is not None:
+        core.save()
+    else:
+        save_runtime(rt)
 
     if ok:
         actual_open_mode = str(
@@ -12297,6 +12313,7 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                     rt_tab.get("booster_route_job_id")
                     or ""
                 ),
+                core,
             )
             if not retry_continue:
                 rt_tab["note"] = retry_note
