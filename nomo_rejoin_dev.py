@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.75.7-dev-core-watchdog-save"
+__version__ = "V4.75.8-dev-core-solver-challenge"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8838,6 +8838,16 @@ class RejoinCore:
             self,
         )
 
+    def handle_detected_solver_challenge(self, tab, rt_tab, reason):
+        return handle_detected_solver_challenge(
+            tab,
+            self.cfg,
+            self.rt,
+            rt_tab,
+            reason,
+            core=self,
+        )
+
     def queue_exact_pid_recovery(
         self,
         tab,
@@ -11730,8 +11740,8 @@ def wait_until_fresh_after_open(
                     RED,
                 )
                 return False, "manual challenge"
-            solver_status, solver_note = handle_detected_solver_challenge(
-                tab, cfg, rt, rt_tab, "visible package-scoped verification UI", core=core
+            solver_status, solver_note = core.handle_detected_solver_challenge(
+                tab, rt_tab, "visible package-scoped verification UI"
             )
             rt_tab["note"] = solver_note
             core.save()
@@ -11775,8 +11785,8 @@ def wait_until_fresh_after_open(
                     RED,
                 )
                 return False, "manual challenge"
-            solver_status, solver_note = handle_detected_solver_challenge(
-                tab, cfg, rt, rt_tab, state_login_challenge_detail(state), core=core
+            solver_status, solver_note = core.handle_detected_solver_challenge(
+                tab, rt_tab, state_login_challenge_detail(state)
             )
             rt_tab["note"] = solver_note
             core.save()
