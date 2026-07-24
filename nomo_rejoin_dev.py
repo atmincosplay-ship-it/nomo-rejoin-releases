@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.73.2-dev-core-requeue-front"
+__version__ = "V4.73.3-dev-core-generation-helpers"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -9074,6 +9074,15 @@ class RejoinCore:
     def requeue_front(self, item):
         self.open_queue.insert(0, item)
 
+    def pop_generation(self, package, generation):
+        return _pop_queued_generation(self.open_queue, package, generation)
+
+    def remove_generation(self, package, generation):
+        return _remove_queued_generation(self.open_queue, package, generation)
+
+    def find_generation(self, package, generation):
+        return _find_queued_generation(self.open_queue, package, generation)
+
     def queue_display(self, package, status, note):
         """Return user-facing status/note when a package is already queued."""
         try:
@@ -11849,7 +11858,7 @@ def wait_until_fresh_after_open(
     return False, "fresh timeout"
 
 
-def solver_preflight_before_open(open_queue, item, tab, rt_tab, pkg, target, cfg, rt):
+def solver_preflight_before_open(open_queue, item, tab, rt_tab, pkg, target, cfg, rt, core=None):
     """Gate one queue generation on exactly one solver request before launch.
 
     Returns (state, item): state is ready, waiting, or handled. Waiting keeps the
@@ -11876,9 +11885,11 @@ def solver_preflight_before_open(open_queue, item, tab, rt_tab, pkg, target, cfg
         if solver_job_completion_state(pkg):
             # poll_solver_jobs needs the generation present in the real queue so
             # it can unlock/remove exactly that item.
-            open_queue.insert(0, item)
-            poll_solver_jobs(cfg, rt, open_queue)
-            updated = _pop_queued_generation(open_queue, pkg, generation)
+            if core is None:
+                core = RejoinCore(open_queue, cfg, rt)
+            core.requeue_front(item)
+            core.poll_solver_jobs()
+            updated = core.pop_generation(pkg, generation)
             if updated is None:
                 return "handled", None
             item = updated
@@ -12061,7 +12072,7 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
             return True
 
     preflight_state, preflight_item = solver_preflight_before_open(
-        open_queue, item, tab, rt_tab, pkg, target, cfg, rt
+        open_queue, item, tab, rt_tab, pkg, target, cfg, rt, core
     )
     if preflight_state != "ready":
         return True
@@ -25533,7 +25544,7 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
         # NO_CAPTCHA both lead to one Roblox launch—not open -> solve -> reopen.
         if str(job.get("phase", "")) == "preopen":
             generation = str(job.get("open_generation", "") or "")
-            queued_item = _find_queued_generation(open_queue, pkg, generation)
+            queued_item = core.find_generation(pkg, generation)
             detail = _solver_probe_detail(response)
 
             if no_captcha_result or solved_result:
@@ -25570,13 +25581,13 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
                     600,
                     int(cfg.get("solver_preflight_server_busy_retry_seconds", 600) or 600),
                 )
-                _remove_queued_generation(open_queue, pkg, generation)
+                core.remove_generation(pkg, generation)
                 rt_tab["solver_busy_retry_pending"] = True
                 rt_tab["solver_busy_retry_at"] = now() + retry_after
                 rt_tab["note"] = f"SERVER_BUSY; retry rejoin in {format_age(retry_after)}"
                 log_activity(f"solver SERVER_BUSY before open; retry in {format_age(retry_after)}", pkg, YELLOW)
             elif status_code in {"INVALID_COOKIES", "INVALID_COOKIE", "UNAUTHORIZED", "AUTH_FAILED"}:
-                _remove_queued_generation(open_queue, pkg, generation)
+                core.remove_generation(pkg, generation)
                 rt_tab["solver_busy_retry_pending"] = False
                 rt_tab["solver_busy_retry_at"] = 0
                 mark_manual_login_block(
@@ -25597,7 +25608,7 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
                     queued_item["skip_solver_probe"] = True
                 log_activity(f"solver error before open; original rejoin continues once: {cut(err, 70)}", pkg, YELLOW)
             else:
-                _remove_queued_generation(open_queue, pkg, generation)
+                core.remove_generation(pkg, generation)
                 mark_manual_login_block(
                     rt_tab,
                     "solver failed before rejoin",
