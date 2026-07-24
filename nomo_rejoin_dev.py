@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.74.6-dev-core-captcha-action"
+__version__ = "V4.74.7-dev-core-busy-action"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8827,6 +8827,17 @@ class RejoinCore:
             self,
         )
 
+    def maybe_queue_solver_busy_retry(self, tab, target, rt_tab, health):
+        return maybe_queue_solver_busy_retry(
+            self.open_queue,
+            tab,
+            target,
+            rt_tab,
+            self.cfg,
+            health,
+            self,
+        )
+
     def queue_exact_pid_recovery(
         self,
         tab,
@@ -10334,7 +10345,7 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
     if captcha_action is not None:
         return captcha_action
 
-    busy_action = maybe_queue_solver_busy_retry(open_queue, tab, target, rt_tab, cfg, health, core)
+    busy_action = core.maybe_queue_solver_busy_retry(tab, target, rt_tab, health)
     if busy_action is not None:
         return busy_action
 
