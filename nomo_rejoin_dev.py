@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.74.2-dev-core-solver-start-save"
+__version__ = "V4.74.3-dev-core-wait-solver-save"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -11622,6 +11622,7 @@ def wait_until_fresh_after_open(
     allow_solver_probe=True,
     expected_place_id="",
     expected_job_id="",
+    core=None,
 ):
     if not cfg.get("wait_fresh_after_open", True):
         return True, "fresh wait disabled"
@@ -11740,10 +11741,13 @@ def wait_until_fresh_after_open(
                 )
                 return False, "manual challenge"
             solver_status, solver_note = handle_detected_solver_challenge(
-                tab, cfg, rt, rt_tab, "visible package-scoped verification UI"
+                tab, cfg, rt, rt_tab, "visible package-scoped verification UI", core=core
             )
             rt_tab["note"] = solver_note
-            save_runtime(rt)
+            if core is not None:
+                core.save()
+            else:
+                save_runtime(rt)
             return False, "solver pending" if solver_status == "Solving" else "manual challenge"
         if state_disconnect_ui(state):
             status_note = state_disconnect_note(state)
@@ -11785,10 +11789,13 @@ def wait_until_fresh_after_open(
                 )
                 return False, "manual challenge"
             solver_status, solver_note = handle_detected_solver_challenge(
-                tab, cfg, rt, rt_tab, state_login_challenge_detail(state)
+                tab, cfg, rt, rt_tab, state_login_challenge_detail(state), core=core
             )
             rt_tab["note"] = solver_note
-            save_runtime(rt)
+            if core is not None:
+                core.save()
+            else:
+                save_runtime(rt)
             # Release the single-flight open lock immediately. The background
             # solver continues while the next clone is allowed to load.
             return False, "solver pending" if solver_status == "Solving" else "manual challenge"
@@ -12411,6 +12418,7 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
             ),
             expected_place_id=route_expected_place,
             expected_job_id=route_expected_job_id,
+            core=core,
         )
         if actual_open_mode == "soft":
             rt_tab["note"] = "soft " + fresh_msg
@@ -25503,13 +25511,16 @@ def _solver_error_text(response):
     return cut(str(value or "unknown solver error"), 180)
 
 
-def handle_detected_solver_challenge(tab, cfg, rt, rt_tab, reason):
+def handle_detected_solver_challenge(tab, cfg, rt, rt_tab, reason, core=None):
     """Start/describe a solver job, or isolate the package if unavailable."""
     pkg = str((tab or {}).get("package", "") or "")
-    started, note = start_solver_job(tab, cfg, rt, rt_tab, reason)
+    started, note = start_solver_job(tab, cfg, rt, rt_tab, reason, core=core)
     if started:
         rt_tab["note"] = note
-        save_runtime(rt)
+        if core is not None:
+            core.save()
+        else:
+            save_runtime(rt)
         return "Solving", note
 
     # Disabled, missing credentials/cookie, or cooldown after a failed attempt.
@@ -25521,7 +25532,10 @@ def handle_detected_solver_challenge(tab, cfg, rt, rt_tab, reason):
         int(rt_tab.get("manual_login_detected_at", 0) or 0) or now(),
     )
     set_hold(pkg, note)
-    save_runtime(rt)
+    if core is not None:
+        core.save()
+    else:
+        save_runtime(rt)
     return "Manual", note
 
 
