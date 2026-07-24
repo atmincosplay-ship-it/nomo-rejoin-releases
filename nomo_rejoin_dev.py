@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.73.3-dev-core-generation-helpers"
+__version__ = "V4.73.4-dev-core-old-state-queue"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8876,6 +8876,7 @@ class RejoinCore:
             self.cfg,
             age_or_seconds,
             reason,
+            self,
         )
         try:
             added, _note, action = result
@@ -9473,7 +9474,7 @@ def hatcher_alive_old_state_hard_settings(hcfg, cfg):
 
 
 
-def _queue_hatcher_alive_old_state_hard(open_queue, tab, rt_tab, hcfg, cfg, age_or_seconds, reason):
+def _queue_hatcher_alive_old_state_hard(open_queue, tab, rt_tab, hcfg, cfg, age_or_seconds, reason, core=None):
     """Queue one affected Hatcher package for verified exact-PID restart."""
     enabled, age_seconds, max_valid_seconds, cooldown_seconds = hatcher_alive_old_state_hard_settings(hcfg, cfg)
     pkg = str((tab or {}).get("package", "") or "")
@@ -9496,15 +9497,17 @@ def _queue_hatcher_alive_old_state_hard(open_queue, tab, rt_tab, hcfg, cfg, age_
         left = max(1, cooldown_seconds - (t - last))
         return False, f"old-state hard cooldown {left}s", False
 
-    added, _ = _queue_open(
-        open_queue, tab, "hatcher",
+    if core is None:
+        core = RejoinCore(open_queue, cfg, {})
+    added, _ = core.queue_exact_pid_recovery(
+        tab, "hatcher",
         str(reason or "hatcher alive old state hard"),
-        force=True, mode="hard_force", front=False,
-        metadata=exact_pid_recovery_metadata({
+        front=False,
+        metadata={
             "hatcher_old_state_recovery": True,
             "hatcher_old_state_age": age_i,
             "hatcher_old_state_reason": str(reason or "alive old state"),
-        }),
+        },
     )
     if not added:
         if int(rt_tab.get("hatcher_alive_old_state_hard_last", 0) or 0) <= 0:
