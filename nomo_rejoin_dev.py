@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.73.6-dev-core-open-save-a"
+__version__ = "V4.73.7-dev-core-open-save-b"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -12317,7 +12317,10 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
             )
             if not retry_continue:
                 rt_tab["note"] = retry_note
-                save_runtime(rt)
+                if core is not None:
+                    core.save()
+                else:
+                    save_runtime(rt)
                 return True
 
             opened_at = retry_opened_at
@@ -12325,7 +12328,10 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                 "manual_booster_second_intent_done"
             ] = True
             rt_tab["note"] = retry_note
-            save_runtime(rt)
+            if core is not None:
+                core.save()
+            else:
+                save_runtime(rt)
 
         if item.get("disconnect_recovery"):
             timeout = max(20, int(cfg.get("disconnect_recovery_wait_seconds", 60) or 60))
@@ -12414,7 +12420,10 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                 verified=bool(fresh_ok),
                 note=fresh_msg,
             )
-        save_runtime(rt)
+        if core is not None:
+            core.save()
+        else:
+            save_runtime(rt)
 
         if fresh_msg == "solver result":
             if core is not None:
@@ -12440,14 +12449,20 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                     pkg,
                     RED,
                 )
-                save_runtime(rt)
+                if core is not None:
+                    core.save()
+                else:
+                    save_runtime(rt)
                 return True
 
             if rt_tab.get("solver_busy_retry_pending"):
                 retry_at = int(rt_tab.get("solver_busy_retry_at", 0) or 0)
                 left = max(1, retry_at - now()) if retry_at else 600
                 rt_tab["note"] = f"SERVER_BUSY; waiting {format_age(left)} for retry rejoin"
-                save_runtime(rt)
+                if core is not None:
+                    core.save()
+                else:
+                    save_runtime(rt)
                 return True
 
             # V3.87: A provider clear gets exactly one recovery open. If that
@@ -12468,7 +12483,10 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                     f"{solver_result} recovery still no state; package held (no more hard loop)",
                     pkg, RED,
                 )
-                save_runtime(rt)
+                if core is not None:
+                    core.save()
+                else:
+                    save_runtime(rt)
                 return True
 
             retries_done = int(item.get("homepage_hard_retries", 0) or 0)
@@ -12495,7 +12513,10 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                     f"kick popup survived soft+hard recovery; package held {format_age(cooldown)}",
                     pkg, RED,
                 )
-                save_runtime(rt)
+                if core is not None:
+                    core.save()
+                else:
+                    save_runtime(rt)
                 return True
 
             allow_hard_fallback = cfg.get("homepage_stuck_hard_fallback_enabled", True)
