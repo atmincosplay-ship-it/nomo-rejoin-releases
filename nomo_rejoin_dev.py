@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.73.4-dev-core-old-state-queue"
+__version__ = "V4.73.5-dev-core-disconnect-queue"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8893,6 +8893,7 @@ class RejoinCore:
             target,
             rt_tab,
             self.cfg,
+            self,
         )
 
     def queue_join_challenge_rejoin(self, tab, target):
@@ -9656,7 +9657,7 @@ def api_precheck_before_rejoin(tab, rt_tab, cfg, reason="queued rejoin"):
 
 
 
-def _queue_disconnect_ui_rejoin(open_queue, tab, target, rt_tab, cfg):
+def _queue_disconnect_ui_rejoin(open_queue, tab, target, rt_tab, cfg, core=None):
     if not cfg.get("disconnect_ui_rejoin_enabled", True):
         return False, "kick popup wait"
 
@@ -9704,8 +9705,10 @@ def _queue_disconnect_ui_rejoin(open_queue, tab, target, rt_tab, cfg):
 
     # V3.88: FIFO, not front insertion. A later D popup must not jump ahead of
     # an already-waiting B popup. Single-flight still recovers only one package.
-    added, anote = _queue_open(
-        open_queue, tab, target, "kick/disconnect popup",
+    if core is None:
+        core = RejoinCore(open_queue, cfg, {})
+    added, anote = core.queue(
+        tab, target, "kick/disconnect popup",
         force=True, mode=mode, front=False, bypass_manual=True,
         metadata=disconnect_recovery_metadata("initial"),
     )
