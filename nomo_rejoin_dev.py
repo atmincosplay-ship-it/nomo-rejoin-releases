@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.74.1-dev-core-solver-preflight-save"
+__version__ = "V4.74.2-dev-core-solver-start-save"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -11942,6 +11942,7 @@ def solver_preflight_before_open(open_queue, item, tab, rt_tab, pkg, target, cfg
         phase="preopen",
         open_generation=generation,
         target_override=target,
+        core=core,
     )
     if started:
         item["solver_preflight_waiting"] = True
@@ -25385,7 +25386,7 @@ def _solver_worker(package, cookie, cfg_snapshot, place_id):
             job["finished_at"] = now()
 
 
-def start_solver_job(tab, cfg, rt, rt_tab, reason, force=False, phase="solve", open_generation="", target_override=""):
+def start_solver_job(tab, cfg, rt, rt_tab, reason, force=False, phase="solve", open_generation="", target_override="", core=None):
     pkg = str((tab or {}).get("package", "") or "")
     if not pkg:
         return False, "solver: missing package"
@@ -25468,7 +25469,10 @@ def start_solver_job(tab, cfg, rt, rt_tab, reason, force=False, phase="solve", o
     rt_tab["solver_last_attempt"] = job["started_at"]
     rt_tab["solver_reason"] = job["reason"]
     rt_tab["note"] = "solver before open" if job["phase"] == "preopen" else "solver starting"
-    save_runtime(rt)
+    if core is not None:
+        core.save()
+    else:
+        save_runtime(rt)
     prefix = "solver before open" if job["phase"] == "preopen" else "solver started"
     generation_note = (
         f" gen={str(job.get('open_generation', ''))[-8:]}"
