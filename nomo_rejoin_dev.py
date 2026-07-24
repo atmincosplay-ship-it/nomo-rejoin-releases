@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.74.5-dev-core-action-api"
+__version__ = "V4.74.6-dev-core-captcha-action"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8813,6 +8813,18 @@ class RejoinCore:
             hcfg=hcfg,
             mode=mode,
             core=self,
+        )
+
+    def apply_visible_captcha_ui_action(self, tab, target, rt_tab, health):
+        return apply_visible_captcha_ui_action(
+            self.open_queue,
+            tab,
+            target,
+            rt_tab,
+            self.cfg,
+            self.rt,
+            health,
+            self,
         )
 
     def queue_exact_pid_recovery(
@@ -17079,8 +17091,8 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
             # V4.12: visible package-scoped verification UI outranks every
             # stale/dead/routing decision above. Remove only this package's queued
             # opens and solve/hold it without restarting the other clones.
-            captcha_action = apply_visible_captcha_ui_action(
-                open_queue, tab, "hatcher", rt_tab, cfg, rt, health, core
+            captcha_action = core.apply_visible_captcha_ui_action(
+                tab, "hatcher", rt_tab, health
             )
             if captcha_action is not None:
                 status, note, _ = captcha_action
