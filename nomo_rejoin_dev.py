@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.74.4-dev-core-wait-save"
+__version__ = "V4.74.5-dev-core-action-api"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8801,6 +8801,20 @@ class RejoinCore:
             self,
         )
 
+    def apply_rejoin_action(self, tab, target, rt_tab, health, hcfg=None, mode="market"):
+        return apply_rejoin_action(
+            self.open_queue,
+            tab,
+            target,
+            rt_tab,
+            self.cfg,
+            self.rt,
+            health,
+            hcfg=hcfg,
+            mode=mode,
+            core=self,
+        )
+
     def queue_exact_pid_recovery(
         self,
         tab,
@@ -12828,8 +12842,8 @@ def _nomo_start_market_rejoin_original(cfg):
             # -----------------------------------------------------
             # SHARED REJOIN ENGINE
             # -----------------------------------------------------
-            rj_status, rj_note, rj_handled = apply_rejoin_action(
-                open_queue, tab, target, rt_tab, cfg, rt, health, mode="market", core=core
+            rj_status, rj_note, rj_handled = core.apply_rejoin_action(
+                tab, target, rt_tab, health, mode="market"
             )
             if rj_handled:
                 status = rj_status or status
