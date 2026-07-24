@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.74.0-dev-core-solver-save"
+__version__ = "V4.74.1-dev-core-solver-preflight-save"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -11886,6 +11886,9 @@ def solver_preflight_before_open(open_queue, item, tab, rt_tab, pkg, target, cfg
     Returns (state, item): state is ready, waiting, or handled. Waiting keeps the
     queue item; handled means it was held/removed and must not be opened.
     """
+    if core is None:
+        core = RejoinCore(open_queue, cfg, rt)
+
     if (
         not cfg.get("solver_enabled", False)
         or not cfg.get("solver_once_per_rejoin", True)
@@ -11921,7 +11924,7 @@ def solver_preflight_before_open(open_queue, item, tab, rt_tab, pkg, target, cfg
         if solver_job_running(pkg):
             open_queue.append(item)
             rt_tab["note"] = solver_job_note(pkg)
-            save_runtime(rt)
+            core.save()
             return "waiting", item
 
         # A vanished in-memory job should not permanently wedge this queue item.
@@ -11944,7 +11947,7 @@ def solver_preflight_before_open(open_queue, item, tab, rt_tab, pkg, target, cfg
         item["solver_preflight_waiting"] = True
         open_queue.append(item)
         rt_tab["note"] = note
-        save_runtime(rt)
+        core.save()
         return "waiting", item
 
     note_l = str(note or "").lower()
@@ -11960,7 +11963,7 @@ def solver_preflight_before_open(open_queue, item, tab, rt_tab, pkg, target, cfg
             item["skip_solver_probe"] = True
             rt_tab["note"] = "solver cookie unavailable; recovery open continues once"
             log_activity("solver cookie unavailable; exact-PID recovery continues once", pkg, YELLOW)
-            save_runtime(rt)
+            core.save()
             return "ready", item
 
         mark_manual_login_block(
@@ -11971,7 +11974,7 @@ def solver_preflight_before_open(open_queue, item, tab, rt_tab, pkg, target, cfg
         )
         set_hold(pkg, str(note))
         log_activity(f"solver preflight blocked open: {cut(note, 80)}", pkg, RED)
-        save_runtime(rt)
+        core.save()
         return "handled", None
 
     # Misconfiguration or a local precheck problem must not destroy the original
@@ -11983,7 +11986,7 @@ def solver_preflight_before_open(open_queue, item, tab, rt_tab, pkg, target, cfg
     item["skip_solver_probe"] = True
     rt_tab["note"] = f"solver skipped; opening once: {cut(note, 60)}"
     log_activity(f"solver skipped before open; original rejoin continues: {cut(note, 75)}", pkg, YELLOW)
-    save_runtime(rt)
+    core.save()
     return "ready", item
 
 
