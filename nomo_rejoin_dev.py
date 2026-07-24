@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.73.9-dev-core-open-cycle-api"
+__version__ = "V4.74.0-dev-core-solver-save"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -25775,7 +25775,7 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
         changed = True
 
     if changed:
-        save_runtime(rt)
+        core.save()
     return changed
 
 
