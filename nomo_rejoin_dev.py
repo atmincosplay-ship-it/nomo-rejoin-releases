@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.75.0-dev-core-market-loop-save"
+__version__ = "V4.75.1-dev-core-market-tick-save"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -12929,7 +12929,7 @@ def _nomo_start_market_rejoin_original(cfg):
             })
 
         # #2: persist runtime ONCE per tick
-        save_runtime(rt)
+        core.save()
 
         status_screen(rows, cfg, session_start, loops)
 
