@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.75.5-dev-core-hatcher-tick-save"
+__version__ = "V4.75.6-dev-core-hatcher-only-tick-save"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -17073,7 +17073,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
             })
 
         # One atomic shared-runtime write after all package rows are updated.
-        save_runtime(rt)
+        core.save()
 
         # Backend/reporting cadence is independent from the 10-second local
         # health loop. Reuse this cycle's state reads when a report is due.
