@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.74.8-dev-core-remove-legacy-shim"
+__version__ = "V4.74.9-dev-core-booster-intent"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -12123,6 +12123,9 @@ def market_booster_second_soft_intent(
     core=None,
 ):
     """Retry the same task-reuse deep link once when Roblox lands on Home."""
+    if core is None:
+        core = RejoinCore([], cfg, rt)
+
     if not cfg.get(
         "market_booster_second_intent_enabled",
         True,
@@ -12142,10 +12145,7 @@ def market_booster_second_soft_intent(
 
     for _ in range(delay):
         if stop_requested():
-            if core is not None:
-                core.save()
-            else:
-                save_runtime(rt)
+            core.save()
             return False, first_opened_at, "stop"
 
         confirmed, _state, _note = (
@@ -12183,10 +12183,7 @@ def market_booster_second_soft_intent(
     )
     rt_tab["note"] = "Booster second soft intent"
     rt_tab["market_booster_second_intent_at"] = now()
-    if core is not None:
-        core.save()
-    else:
-        save_runtime(rt)
+    core.save()
 
     ok, note = open_target(
         tab,
@@ -12208,10 +12205,7 @@ def market_booster_second_soft_intent(
         package,
         GREEN if ok else RED,
     )
-    if core is not None:
-        core.save()
-    else:
-        save_runtime(rt)
+    core.save()
 
     if not ok:
         return True, first_opened_at, f"second intent failed: {note}"
