@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.75.2-dev-core-booster-start-save"
+__version__ = "V4.75.3-dev-core-hatcher-start-save"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -15959,10 +15959,10 @@ def start_hatcher_reporter(main_cfg=None):
             rt_tab["target"] = "hatcher"
             if fresh_state:
                 rt_tab["note"] = "start fresh state"
-                save_runtime(rt)
+                core.save()
             elif raw_alive and cfg.get("start_reopen_alive_without_fresh_state", True):
                 rt_tab["note"] = "start alive no-fresh -> soft"
-                save_runtime(rt)
+                core.save()
                 core.queue_soft_recovery(
                     tab, "hatcher", "hatcher start alive no-fresh",
                     metadata={"skip_if_alive": False},
@@ -15971,14 +15971,14 @@ def start_hatcher_reporter(main_cfg=None):
                 core.queue_start_recovery(tab, "hatcher", "hatcher start")
             else:
                 rt_tab["note"] = "start already open"
-                save_runtime(rt)
+                core.save()
 
         if not core.drain(session_start, loops, cfg.get("delay_between_open", 45)):
             return
 
     while True:
         if stop_requested():
-            save_runtime(rt)
+            core.save()
             return
 
         loops += 1
