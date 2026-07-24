@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.75.9-dev-core-solver-preflight-api"
+__version__ = "V4.76.0-dev-core-visible-captcha-save"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -10295,12 +10295,12 @@ def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, he
         rt_tab["manual_login_reason"] = ""
         rt_tab["manual_login_detail"] = ""
         rt_tab["note"] = "verification UI; solver-before-open queued"
-        save_runtime(rt)
+        core.save()
         log_activity("verification UI; queued one solver-before-open rejoin", pkg, YELLOW)
         return "Queued", rt_tab["note"], True
 
     rt_tab["note"] = "verification UI; queue failed"
-    save_runtime(rt)
+    core.save()
     return "Captcha", rt_tab["note"], True
 
 
