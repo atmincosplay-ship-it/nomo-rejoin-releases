@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.73.7-dev-core-open-save-b"
+__version__ = "V4.73.8-dev-core-open-save-c"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -12221,27 +12221,23 @@ def market_booster_second_soft_intent(
 
 def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_hard, cfg, rt, core=None):
     """The actual target-only open -> wait-for-fresh cycle for one package."""
+    if core is None:
+        core = RejoinCore(open_queue, cfg, rt)
     display_mode = str(mode or "hard")
     if _alive_recovery_soft_allowed(reason, package_alive(pkg, cfg, fresh=True), cfg):
         display_mode = "alive-soft-first"
     opening_screen(tab, target, cfg, 1, max(1, len(open_queue) + 1), mode=display_mode)
     rt_tab["note"] = f"opening -> {target}"
-    if core is not None:
-        core.save()
-    else:
-        save_runtime(rt)
+    core.save()
     log_activity(f"opening -> {target} ({display_mode})", pkg)
-    if core is not None:
-        ok, msg = core.open(
-            tab,
-            rt_tab,
-            target,
-            reason,
-            force=item.get("force", False),
-            mode=mode,
-        )
-    else:
-        ok, msg = open_target(tab, rt_tab, cfg, target, reason, force=item.get("force", False), rt=rt, mode=mode)
+    ok, msg = core.open(
+        tab,
+        rt_tab,
+        target,
+        reason,
+        force=item.get("force", False),
+        mode=mode,
+    )
     opened_at = int(rt_tab.get("last_open", now()))
 
     if ok and item.get("hatcher_old_state_recovery"):
@@ -12255,10 +12251,7 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
         rt["_last_pool_hard_open"] = now()
     log_activity(f"open {'ok' if ok else 'FAILED'}: {msg}", pkg,
                  GREEN if ok else RED)
-    if core is not None:
-        core.save()
-    else:
-        save_runtime(rt)
+    core.save()
 
     if ok:
         actual_open_mode = str(
@@ -12317,10 +12310,7 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
             )
             if not retry_continue:
                 rt_tab["note"] = retry_note
-                if core is not None:
-                    core.save()
-                else:
-                    save_runtime(rt)
+                core.save()
                 return True
 
             opened_at = retry_opened_at
@@ -12328,10 +12318,7 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                 "manual_booster_second_intent_done"
             ] = True
             rt_tab["note"] = retry_note
-            if core is not None:
-                core.save()
-            else:
-                save_runtime(rt)
+            core.save()
 
         if item.get("disconnect_recovery"):
             timeout = max(20, int(cfg.get("disconnect_recovery_wait_seconds", 60) or 60))
@@ -12412,24 +12399,11 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
             rt_tab["note"] = "route " + fresh_msg
         else:
             rt_tab["note"] = fresh_msg
-        if core is not None:
-            core.finish(rt_tab, verified=bool(fresh_ok), note=fresh_msg)
-        else:
-            core_finish_rejoin(
-                rt_tab,
-                verified=bool(fresh_ok),
-                note=fresh_msg,
-            )
-        if core is not None:
-            core.save()
-        else:
-            save_runtime(rt)
+        core.finish(rt_tab, verified=bool(fresh_ok), note=fresh_msg)
+        core.save()
 
         if fresh_msg == "solver result":
-            if core is not None:
-                core.poll_solver_jobs()
-            else:
-                poll_solver_jobs(cfg, rt, open_queue)
+            core.poll_solver_jobs()
 
         if not fresh_ok and fresh_msg not in (
             "stop",
@@ -12449,20 +12423,14 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                     pkg,
                     RED,
                 )
-                if core is not None:
-                    core.save()
-                else:
-                    save_runtime(rt)
+                core.save()
                 return True
 
             if rt_tab.get("solver_busy_retry_pending"):
                 retry_at = int(rt_tab.get("solver_busy_retry_at", 0) or 0)
                 left = max(1, retry_at - now()) if retry_at else 600
                 rt_tab["note"] = f"SERVER_BUSY; waiting {format_age(left)} for retry rejoin"
-                if core is not None:
-                    core.save()
-                else:
-                    save_runtime(rt)
+                core.save()
                 return True
 
             # V3.87: A provider clear gets exactly one recovery open. If that
@@ -12483,10 +12451,7 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                     f"{solver_result} recovery still no state; package held (no more hard loop)",
                     pkg, RED,
                 )
-                if core is not None:
-                    core.save()
-                else:
-                    save_runtime(rt)
+                core.save()
                 return True
 
             retries_done = int(item.get("homepage_hard_retries", 0) or 0)
@@ -12513,10 +12478,7 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                     f"kick popup survived soft+hard recovery; package held {format_age(cooldown)}",
                     pkg, RED,
                 )
-                if core is not None:
-                    core.save()
-                else:
-                    save_runtime(rt)
+                core.save()
                 return True
 
             allow_hard_fallback = cfg.get("homepage_stuck_hard_fallback_enabled", True)
@@ -12562,7 +12524,7 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                     pkg,
                     YELLOW,
                 )
-                save_runtime(rt)
+                core.save()
                 return True
 
             if allow_hard_fallback and retries_done < max_retries:
@@ -12608,21 +12570,14 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                         pkg,
                         YELLOW,
                     )
-                    save_runtime(rt)
+                    core.save()
 
             elif actual_open_mode == "soft" and cfg.get("soft_hop_fallback_hard", True):
                 core.queue_hard_retry(tab, target, "soft fallback hard", front=True)
     else:
         rt_tab["note"] = msg
-        if core is not None:
-            core.finish(rt_tab, verified=False, note=msg)
-        else:
-            core_finish_rejoin(
-                rt_tab,
-                verified=False,
-                note=msg,
-            )
-        save_runtime(rt)
+        core.finish(rt_tab, verified=False, note=msg)
+        core.save()
 
         if mode in ("soft", "route") and cfg.get("soft_hop_fallback_hard", True):
             fallback_reason = "route failed hard" if mode == "route" else "soft failed hard"
