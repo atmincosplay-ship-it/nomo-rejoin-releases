@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.74.7-dev-core-busy-action"
+__version__ = "V4.74.8-dev-core-remove-legacy-shim"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -10183,65 +10183,6 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
         "bad": bad_kind,
         "visible_window": visible_window,
     }
-
-
-def apply_common_health_action(open_queue, tab, target, rt_tab, cfg, rt, health, mode="market", core=None):
-    """Legacy health shim. New mode loops should use apply_rejoin_action()."""
-    if core is None:
-        core = RejoinCore(open_queue, cfg, rt)
-    pkg = tab.get("package")
-    bad = str(health.get("bad") or "")
-    state = health.get("state")
-
-    if bad == "face_lock":
-        removed = core.cancel(pkg)
-        if removed:
-            log_activity(f"face lock hold cancelled {removed} queued reopen(s)", pkg, YELLOW)
-        return "Face Lock", health.get("note", "account locked; manual verification"), False
-
-    if bad in ("manual", "challenge"):
-        return health.get("status", ""), health.get("note", ""), False
-
-    if bad == "disconnect" and cfg.get("rejoin_if_crash", True):
-        added, dnote = core.queue_disconnect_ui_rejoin(tab, target, rt_tab)
-        status = "Queued" if (added or dnote == "already queued") else "Kicked"
-        note = f"{state_disconnect_note(state)} {dnote}".strip()
-        return status, note, True
-
-    if bad == "minimized":
-        # V3.86: status-only. Android dumpsys does not reliably distinguish a
-        # deliberately minimized clone from another non-focused floating clone.
-        # Never queue/open/stop from this signal; exact stale-state recovery owns it.
-        return "Minimized", "minimized status only; waiting for state", True
-
-    if bad == "no_state" and cfg.get("rejoin_if_crash", True):
-        since_key = f"{mode}_no_state_since"
-        no_state_since = int(rt_tab.get(since_key, 0) or 0)
-        if no_state_since <= 0:
-            rt_tab[since_key] = now()
-            save_runtime(rt)
-            return "No state", "alive no-state wait", True
-        no_state_for = max(0, now() - int(no_state_since))
-        hard_after = int(cfg.get("hatcher_alive_old_state_hard_force_seconds", 300) or 300)
-        has_pkg = core.has(pkg)
-        has_work = core.has_work()
-        if no_state_for >= hard_after and not has_work and not has_pkg:
-            added, _ = core.queue_alive_no_state_recovery(
-                tab, target, f"{mode} alive no-state hard"
-            )
-            return ("Queued" if added else "No state"), ("no-state hard queued" if added else "already queued"), True
-        return "No state", f"alive no-state {format_age(no_state_for)}/{format_age(hard_after)}", True
-
-    if bad == "dead" and cfg.get("rejoin_if_crash", True):
-        rt_tab[f"{mode}_no_state_since"] = 0
-        if cfg.get("smart_open_queue", True) or cfg.get("solver_enabled", False):
-            added, _ = core.queue_crash_recovery(tab, target, "crash/dead")
-            return ("Queued" if added else "Offline"), ("crash queued" if added else "already queued"), True
-        ok, msg = open_target(tab, rt_tab, cfg, target, "crash/dead", rt=rt)
-        return ("Loading" if ok else "Offline"), ("crash open" if ok else msg), True
-
-    return health.get("status", ""), health.get("note", ""), False
-
 
 
 def maybe_queue_solver_busy_retry(open_queue, tab, target, rt_tab, cfg, health, core=None):
