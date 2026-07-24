@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.74.9-dev-core-booster-intent"
+__version__ = "V4.75.0-dev-core-market-loop-save"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -12708,7 +12708,7 @@ def _nomo_start_market_rejoin_original(cfg):
 
                 if raw_alive or fresh_state:
                     rt_tab["note"] = "start alive - skipped"
-                    save_runtime(rt)
+                    core.save()
                 else:
                     tabs_to_open.append((tab, "hard", True))
         else:
@@ -12745,7 +12745,7 @@ def _nomo_start_market_rejoin_original(cfg):
     # --------------------------------------------------------
     while True:
         if stop_requested():
-            save_runtime(rt)
+            core.save()
             return
 
         loops += 1
