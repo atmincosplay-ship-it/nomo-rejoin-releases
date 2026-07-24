@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.73.8-dev-core-open-save-c"
+__version__ = "V4.73.9-dev-core-open-cycle-api"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8785,6 +8785,22 @@ class RejoinCore:
             **kwargs,
         )
 
+    def open_cycle(self, item, tab, rt_tab, pkg, target, reason, mode, is_hard):
+        return _do_open_cycle(
+            self.open_queue,
+            item,
+            tab,
+            rt_tab,
+            pkg,
+            target,
+            reason,
+            mode,
+            is_hard,
+            self.cfg,
+            self.rt,
+            self,
+        )
+
     def queue_exact_pid_recovery(
         self,
         tab,
@@ -12100,8 +12116,7 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
         core.save()
 
     try:
-        return _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason,
-                              mode, is_hard, cfg, rt, core)
+        return core.open_cycle(item, tab, rt_tab, pkg, target, reason, mode, is_hard)
     finally:
         if cfg.get("single_flight_open", True) and str(rt.get("_open_lock_pkg", "")) == pkg:
             rt["_open_lock_pkg"] = ""
