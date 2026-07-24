@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.75.6-dev-core-hatcher-only-tick-save"
+__version__ = "V4.75.7-dev-core-watchdog-save"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -9165,7 +9165,7 @@ class RejoinCore:
         self.clear()
 
     def self_heal(self):
-        return _queue_stuck_self_heal(self.open_queue, self.cfg, self.rt)
+        return _queue_stuck_self_heal(self.open_queue, self.cfg, self.rt, self)
 
     def watchdog(self, enabled_tabs=None):
         return _runtime_stuck_watchdog(
@@ -9173,6 +9173,7 @@ class RejoinCore:
             self.cfg,
             self.rt,
             enabled_tabs,
+            self,
         )
 
 
@@ -9181,7 +9182,7 @@ def make_rejoin_core(cfg, rt):
     return open_queue, RejoinCore(open_queue, cfg, rt)
 
 
-def _queue_stuck_self_heal(open_queue, cfg, rt):
+def _queue_stuck_self_heal(open_queue, cfg, rt, core=None):
     """Clear stale temporary queue/cooldown runtime without deleting config."""
     if not cfg.get("queue_stuck_self_heal_enabled", True):
         return False
@@ -9241,7 +9242,10 @@ def _queue_stuck_self_heal(open_queue, cfg, rt):
             changed = True
 
     if changed:
-        save_runtime(rt)
+        if core is not None:
+            core.save()
+        else:
+            save_runtime(rt)
 
     return changed
 
@@ -9293,7 +9297,7 @@ def clear_runtime_temp_state(rt, reason="runtime watchdog"):
     return changed
 
 
-def _runtime_stuck_watchdog(open_queue, cfg, rt, enabled_tabs=None):
+def _runtime_stuck_watchdog(open_queue, cfg, rt, enabled_tabs=None, core=None):
     """Reset stuck runtime/open_queue after a long Queued state."""
     if not cfg.get("runtime_stuck_reset_enabled", True):
         return False
@@ -9344,7 +9348,10 @@ def _runtime_stuck_watchdog(open_queue, cfg, rt, enabled_tabs=None):
     if set(prev_pkgs) != set(queued_pkgs):
         watch["stuck_since"] = t
         watch["stuck_pkgs"] = queued_pkgs
-        save_runtime(rt)
+        if core is not None:
+            core.save()
+        else:
+            save_runtime(rt)
         return False
 
     stuck_since = int(watch.get("stuck_since", t) or t)
@@ -9358,7 +9365,10 @@ def _runtime_stuck_watchdog(open_queue, cfg, rt, enabled_tabs=None):
     watch["stuck_since"] = t
     watch["stuck_pkgs"] = []
     watch["last_auto_reset_pkgs"] = queued_pkgs
-    save_runtime(rt)
+    if core is not None:
+        core.save()
+    else:
+        save_runtime(rt)
     return changed
 
 def stale_reopen_age(cfg):
