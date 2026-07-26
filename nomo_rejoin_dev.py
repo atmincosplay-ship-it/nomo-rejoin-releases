@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.76.8-dev-private-cookie-preflight"
+__version__ = "V4.76.9-dev-private-code-refresh"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -24458,6 +24458,61 @@ def set_private_server_friends_allowed(cookie, server_id, enabled=True):
     return False, last_err, {}
 
 
+def refresh_private_server_join_code(cookie, server_id, friends_allowed=True):
+    """Ask Roblox for a fresh private-server link code for an owned server."""
+    server_id = str(server_id or "").strip()
+    if not server_id:
+        return None, "missing private server id"
+
+    xsrf_token = get_xsrf_token(cookie)
+    if not xsrf_token:
+        return None, "failed to get X-CSRF token"
+
+    url = (
+        "https://games.roblox.com/v1/vip-servers/"
+        f"{urllib.parse.quote(server_id, safe='')}/permissions"
+    )
+    payload = {
+        "newJoinCode": True,
+        "friendsAllowed": bool(friends_allowed),
+        "usersToAdd": [],
+        "usersToRemove": [],
+    }
+
+    data, err, headers = _roblox_json_request(
+        url,
+        cookie=cookie,
+        method="PATCH",
+        payload=payload,
+        timeout=20,
+        xsrf_token=xsrf_token,
+    )
+    if err:
+        token2 = headers.get("x-csrf-token") or headers.get("X-CSRF-TOKEN")
+        if token2 and token2 != xsrf_token:
+            data, err, _ = _roblox_json_request(
+                url,
+                cookie=cookie,
+                method="PATCH",
+                payload=payload,
+                timeout=20,
+                xsrf_token=token2,
+            )
+
+    if err:
+        return None, err
+
+    item = _normalize_private_server_item(data if isinstance(data, dict) else {})
+    if item and (item.get("link_code") or item.get("access_code")):
+        return item, ""
+
+    refreshed = fetch_private_server_metadata(cookie, server_id)
+    if refreshed and (refreshed.get("link_code") or refreshed.get("access_code")):
+        return refreshed, ""
+
+    return None, "Roblox did not return a refreshed join code"
+
+
 def add_private_server_allowed_users(cookie, server_id, user_ids, friends_allowed=True, chunk_size=25):
     """Add specific Roblox user IDs without removing existing members.
 
@@ -25356,6 +25411,25 @@ def auto_fetch_private_servers(
             continue
 
         usable = usable or existing
+        if usable.get("id"):
+            refreshed_item, refresh_err = refresh_private_server_join_code(
+                cookie,
+                usable.get("id", ""),
+                friends_allowed=True,
+            )
+            if refreshed_item:
+                usable = _merge_private_server_item(usable, refreshed_item)
+                existing = usable
+                print(col("Fresh private join code saved for this account.", GREEN))
+            else:
+                print(col(f"Fresh join code refresh failed: {refresh_err}", YELLOW))
+        owner_note = str(usable.get("owner_id") or "-")
+        code_note = "link" if usable.get("link_code") else ("access" if usable.get("access_code") else "no-code")
+        print(col(
+            f"Private server check: id={cut(usable.get('id', '-'), 12)} "
+            f"owner={owner_note} cookie_user={user_id or '-'} code={code_note}",
+            DIM,
+        ))
         link = build_private_server_link(place_id, usable)
 
         # One-time permission sync can still run when Roblox lists an existing
