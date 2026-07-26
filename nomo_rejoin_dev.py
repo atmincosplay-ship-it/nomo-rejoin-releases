@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.76.6-dev-share-web-link"
+__version__ = "V4.76.7-dev-proven-private-route"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -3956,12 +3956,6 @@ def android_safe_roblox_link(link, cfg=None):
         if m:
             parsed_access = urllib.parse.unquote(m.group(1))
 
-    if (
-        low.startswith(("https://www.roblox.com/games/", "http://www.roblox.com/games/"))
-        and (parsed_code or parsed_access)
-    ):
-        return raw
-
     if pid and parsed_code:
         return (
             "roblox://experiences/start?placeId=" + str(pid)
@@ -4004,16 +3998,6 @@ def android_launch_roblox_link(link, cfg=None):
         return raw
 
     low = raw.lower()
-    if (
-        low.startswith(("https://www.roblox.com/games/", "http://www.roblox.com/games/"))
-        and (
-            "privateserverlinkcode=" in low
-            or "accesscode=" in low
-            or "linkcode=" in low
-        )
-    ):
-        return raw
-
     place_id = extract_place_id_from_link(raw)
     link_code = ""
     access_code = ""
@@ -6670,9 +6654,12 @@ def set_private_server(cfg):
         else:
             print(col(f"Auto-convert failed: {convert_err}", YELLOW))
             print(col(
-                "Saving Roblox share deep-link fallback instead.",
-                YELLOW,
+                "Open the share link in a browser first, then paste the converted "
+                "roblox.com/games/...privateServerLinkCode=... URL.",
+                RED,
             ))
+            pause()
+            return
     normalized, _place_id, link_code, access_code = normalized_private_route_link(
         link,
         default_place_id=str(cfg.get("place_id") or "126884695634066"),
@@ -24826,17 +24813,6 @@ def normalized_private_route_link(
 ):
     record = record if isinstance(record, dict) else {}
 
-    share_deep_link = ""
-    if is_roblox_server_share_link(link):
-        share_deep_link = roblox_server_share_deep_link(link)
-        if share_deep_link:
-            return (
-                share_deep_link,
-                str(default_place_id or record.get("place_id") or ""),
-                "share",
-                "",
-            )
-
     place_id, link_code, access_code = private_join_parts(
         link,
         default_place_id=(
@@ -24876,8 +24852,9 @@ def normalized_private_route_link(
 
     if link_code:
         return (
-            "https://www.roblox.com/games/"
-            f"{place_id}/NOMO?privateServerLinkCode="
+            "roblox://experiences/start?"
+            f"placeId={place_id}"
+            "&privateServerLinkCode="
             f"{urllib.parse.quote(link_code, safe='')}",
             place_id,
             link_code,
@@ -24886,8 +24863,9 @@ def normalized_private_route_link(
 
     if access_code:
         return (
-            "https://www.roblox.com/games/"
-            f"{place_id}/NOMO?accessCode="
+            "roblox://experiences/start?"
+            f"placeId={place_id}"
+            "&accessCode="
             f"{urllib.parse.quote(access_code, safe='')}",
             place_id,
             "",
@@ -24971,20 +24949,21 @@ def market_booster_route_state_confirmed(
 
 
 def build_private_server_link(place_id, item):
-    """Build the browser-style private link that Noka accepts reliably."""
+    """Build an Android Roblox deep link from an actual join/link code."""
     if not isinstance(item, dict):
         return ""
     code = str(item.get("link_code") or "").strip()
     if code:
         return (
-            f"https://www.roblox.com/games/{place_id}/NOMO?privateServerLinkCode="
+            f"roblox://experiences/start?placeId={place_id}"
+            f"&privateServerLinkCode="
             f"{urllib.parse.quote(code, safe='')}"
         )
     access = str(item.get("access_code") or "").strip()
     if access:
         return (
-            f"https://www.roblox.com/games/{place_id}/NOMO?accessCode="
-            f"{urllib.parse.quote(access, safe='')}"
+            f"roblox://experiences/start?placeId={place_id}"
+            f"&accessCode={urllib.parse.quote(access, safe='')}"
         )
     return ""
 
