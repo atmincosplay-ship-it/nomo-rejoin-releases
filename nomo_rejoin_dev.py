@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.76.7-dev-proven-private-route"
+__version__ = "V4.76.8-dev-private-cookie-preflight"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -25003,6 +25003,69 @@ def _hatcher_profile_for_package(hcfg, cfg, pkg, username=""):
     return prof
 
 
+def private_server_cookie_preflight(pkg, cfg, cache):
+    """Return a verified package cookie and authenticated identity."""
+    cache = cache if isinstance(cache, dict) else {}
+    cookie = get_cookie_from_package(pkg)
+    source = "package"
+    if not cookie:
+        cookie = str((cache.get(pkg) or {}).get("cookie") or "").strip()
+        source = "cache" if cookie else ""
+    if not cookie:
+        return None, "", "", "NO COOKIE", "No package cookie found"
+
+    username, user_id = get_username_from_cookie(cookie, timeout=12)
+    if not username:
+        state = check_cookie_challenge(cookie)
+        return None, "", "", f"COOKIE {state.upper()}", f"Cookie is not usable ({state})"
+
+    tab = None
+    for item in cfg.get("tabs", []):
+        if item.get("package") == pkg:
+            tab = item
+            break
+
+    state_user = ""
+    state_age = 999999
+    if tab:
+        state, state_err = read_state(tab)
+        if state:
+            state_user = str(state.get("username") or "").strip()
+            state_age = int(state.get("age", 999999) or 999999)
+        elif state_err and source == "cache":
+            return None, "", "", "STATE UNKNOWN", f"Cached cookie refused because state is {state_err}"
+
+    if state_user and state_age <= 600:
+        if _sanitize_state_name(state_user).lower() != _sanitize_state_name(username).lower():
+            return (
+                None,
+                "",
+                "",
+                "USER MISMATCH",
+                f"State user {state_user} != cookie user {username}",
+            )
+
+    entry = cache.get(pkg) if isinstance(cache.get(pkg), dict) else {}
+    entry.update({
+        "cookie": cookie,
+        "username": username,
+        "user_id": user_id,
+        "source": source,
+        "updated": now(),
+    })
+    cache[pkg] = entry
+    try:
+        with open(COOKIE_CACHE, "w", encoding="utf-8") as handle:
+            json.dump(cache, handle, indent=2)
+    except Exception:
+        pass
+
+    note = f"{source} cookie"
+    if state_user:
+        note += f", state {state_user} age {format_uptime(state_age)}"
+    return cookie, username, user_id, "OK", note
+
+
 def auto_fetch_private_servers(
     cfg, selected_packages=None, pause_at_end=True, *,
     sync_market_access=True, automatic=False, place_id_override=None
@@ -25121,23 +25184,14 @@ def auto_fetch_private_servers(
 
     for pkg in selected:
         print(col(f"\n[{pkg}]", CYAN))
-        # Prefer fresh extraction from that exact clone. Cache is only fallback.
-        cookie = get_cookie_from_package(pkg)
+        cookie, username, user_id, preflight_status, preflight_note = (
+            private_server_cookie_preflight(pkg, cfg, cache)
+        )
         if not cookie:
-            cookie = str((cache.get(pkg) or {}).get("cookie") or "").strip()
-            if cookie:
-                print(col("Using cached package cookie (direct extraction unavailable).", YELLOW))
-        if not cookie:
-            print(col("No cookie found; skipped.", RED))
-            results.append((pkg, "NO COOKIE"))
+            print(col(f"{preflight_note}; skipped.", RED))
+            results.append((pkg, preflight_status))
             continue
-
-        username, user_id = get_username_from_cookie(cookie, timeout=12)
-        if not username:
-            state = check_cookie_challenge(cookie)
-            print(col(f"Cookie is not usable ({state}); skipped.", RED))
-            results.append((pkg, f"COOKIE {state.upper()}"))
-            continue
+        print(col(f"Identity preflight: {preflight_note}", DIM))
         print(f"Account: {username} ({user_id})")
 
         profile = _hatcher_profile_for_package(hcfg, cfg, pkg, username=username)
