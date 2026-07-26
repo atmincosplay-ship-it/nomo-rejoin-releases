@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.76.3-dev-private-account-reset"
+__version__ = "V4.76.4-dev-private-saved-verify"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -25170,15 +25170,39 @@ def auto_fetch_private_servers(
                 print(col("Owned server found without a join code; duplicate creation will be skipped.", YELLOW))
 
         # Some Roblox list endpoints omit a just-created/legacy owned server. A
-        # verified or previously saved profile still proves one exists, so do not
-        # attempt another create and hit the one-server limit.
+        # verified profile can still prove one exists, so do not attempt another
+        # create and hit the one-server limit. A local-only saved link is not
+        # trusted here because packages can change accounts and then keep a
+        # stale private link that returns Roblox 524 "no permission".
         if not existing and saved_item:
             verified = None
             if saved_item.get("id"):
                 verified = fetch_private_server_metadata(cookie, saved_item.get("id"))
-            existing = _merge_private_server_item(verified, saved_item) if verified else saved_item
-            usable = existing
-            print(col("Using the server already saved for this package; duplicate creation skipped.", YELLOW))
+            verified_owner = str((verified or {}).get("owner_id") or "").strip()
+            if verified and user_id and verified_owner == str(user_id):
+                existing = _merge_private_server_item(verified, saved_item)
+                usable = existing
+                print(col("Verified saved private server belongs to this account; duplicate creation skipped.", YELLOW))
+            else:
+                for key in (
+                    "server_link",
+                    "private_server_id",
+                    "private_server_link_code",
+                    "private_server_access_code",
+                    "private_server_market_allowlist_hash",
+                    "private_server_market_allowlist_error",
+                ):
+                    profile[key] = ""
+                profile["private_server_friends_allowed"] = False
+                profile["private_server_market_users_synced"] = 0
+                profile["private_server_market_users_failed"] = []
+                profile["private_server_synced_at"] = 0
+                saved_item = None
+                changed = True
+                print(col(
+                    "Saved private server was not returned as owned by this account; cleared.",
+                    YELLOW,
+                ))
 
         if not existing and create_missing:
             server_name = f"NOMO {username}"[:50]
