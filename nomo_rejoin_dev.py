@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.76.5-dev-web-private-link"
+__version__ = "V4.76.6-dev-share-web-link"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -3790,6 +3790,36 @@ def is_roblox_server_share_link(link):
     return False
 
 
+def roblox_server_share_deep_link(link):
+    raw = str(link or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urllib.parse.urlparse(raw)
+        query = urllib.parse.parse_qs(
+            parsed.query,
+            keep_blank_values=False,
+        )
+        values = query.get("code") or query.get("shareCode")
+        if values and values[0]:
+            return (
+                "roblox://navigation/share_links?code="
+                + urllib.parse.quote(str(values[0]).strip(), safe="")
+                + "&type=Server"
+            )
+    except Exception:
+        pass
+
+    match = re.search(r"(?:[?&])(?:code|shareCode)=([^&#\s]+)", raw, flags=re.I)
+    if match:
+        return (
+            "roblox://navigation/share_links?code="
+            + urllib.parse.quote(urllib.parse.unquote(match.group(1)).strip(), safe="")
+            + "&type=Server"
+        )
+    return ""
+
+
 def _private_route_from_text(text):
     raw = str(text or "").strip()
     if not raw:
@@ -6640,12 +6670,9 @@ def set_private_server(cfg):
         else:
             print(col(f"Auto-convert failed: {convert_err}", YELLOW))
             print(col(
-                "Open the share link in a browser first, then paste the converted "
-                "roblox.com/games/...privateServerLinkCode=... URL.",
-                RED,
+                "Saving Roblox share deep-link fallback instead.",
+                YELLOW,
             ))
-            pause()
-            return
     normalized, _place_id, link_code, access_code = normalized_private_route_link(
         link,
         default_place_id=str(cfg.get("place_id") or "126884695634066"),
@@ -24798,6 +24825,17 @@ def normalized_private_route_link(
     default_place_id="",
 ):
     record = record if isinstance(record, dict) else {}
+
+    share_deep_link = ""
+    if is_roblox_server_share_link(link):
+        share_deep_link = roblox_server_share_deep_link(link)
+        if share_deep_link:
+            return (
+                share_deep_link,
+                str(default_place_id or record.get("place_id") or ""),
+                "share",
+                "",
+            )
 
     place_id, link_code, access_code = private_join_parts(
         link,
