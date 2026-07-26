@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.77.2-dev-private-member-retry"
+__version__ = "V4.77.3-dev-private-config-url"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -25516,6 +25516,12 @@ def auto_fetch_private_servers(
             f"owner={owner_note} cookie_user={user_id or '-'} code={code_note}",
             DIM,
         ))
+        if usable.get("id"):
+            print(col(
+                "Configure URL: "
+                f"https://www.roblox.com/private-server/configure/{usable.get('id')}",
+                DIM,
+            ))
         link = build_private_server_link(place_id, usable)
 
         # One-time permission sync can still run when Roblox lists an existing
