@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.76.9-dev-private-code-refresh"
+__version__ = "V4.77.0-dev-private-start-route"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -3986,11 +3986,9 @@ def android_safe_roblox_link(link, cfg=None):
 def android_launch_roblox_link(link, cfg=None):
     """Return the final Android VIEW URI without mutating saved configuration.
 
-    Delta currently honors private joins in the direct-app form:
-        roblox://placeId=<id>&linkCode=<code>
-
-    Existing saved links may continue using experiences/start and
-    privateServerLinkCode. Conversion happens only immediately before am start.
+    Keep private server launches on Roblox's experiences/start route. Some
+    clone builds reject the shorter placeId/linkCode form with 524 even when
+    the account is allowed on the private server.
     """
     normalized = android_safe_roblox_link(link, cfg)
     raw = str(normalized or "").strip()
@@ -4032,14 +4030,14 @@ def android_launch_roblox_link(link, cfg=None):
 
     if place_id and link_code:
         return (
-            "roblox://placeId=" + str(place_id)
-            + "&linkCode="
+            "roblox://experiences/start?placeId=" + str(place_id)
+            + "&privateServerLinkCode="
             + urllib.parse.quote(link_code, safe="")
         )
 
     if place_id and access_code:
         return (
-            "roblox://placeId=" + str(place_id)
+            "roblox://experiences/start?placeId=" + str(place_id)
             + "&accessCode="
             + urllib.parse.quote(access_code, safe="")
         )
