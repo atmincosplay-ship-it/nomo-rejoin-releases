@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.76.0-dev-core-visible-captcha-save"
+__version__ = "V4.76.1-dev-private-link-guard"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -3759,6 +3759,37 @@ def extract_place_id_from_link(link):
     return ""
 
 
+def is_roblox_server_share_link(link):
+    """Return true for Roblox invite/share links that must be browser-converted."""
+    raw = str(link or "").strip()
+    if not raw:
+        return False
+
+    try:
+        parsed = urllib.parse.urlparse(raw)
+        query = urllib.parse.parse_qs(
+            parsed.query,
+            keep_blank_values=False,
+        )
+        code_values = query.get("code") or query.get("shareCode")
+        type_values = query.get("type") or query.get("shareType")
+        share_type = str(type_values[0] if type_values else "").strip().lower()
+        is_share_path = (
+            "roblox.com" in str(parsed.netloc).lower()
+            and str(parsed.path or "").lower().rstrip("/") == "/share"
+        )
+        if code_values and code_values[0] and (share_type == "server" or is_share_path):
+            return True
+    except Exception:
+        pass
+
+    if re.search(r"roblox\.com/share\?[^#\s]*\bcode=", raw, flags=re.I):
+        if re.search(r"(?:[?&])type=server(?:[&#\s]|$)", raw, flags=re.I):
+            return True
+
+    return False
+
+
 
 
 
@@ -3870,7 +3901,6 @@ def android_launch_roblox_link(link, cfg=None):
         )
         if match:
             link_code = urllib.parse.unquote(match.group(1)).strip()
-
     if not access_code:
         match = re.search(r"accessCode=([^&#]+)", raw, re.I)
         if match:
@@ -6174,6 +6204,17 @@ def set_hatcher_servers(main_cfg=None):
         link_code
         or access_code
     ):
+        if is_roblox_server_share_link(raw):
+            print(
+                col(
+                    "Rejected: Roblox share?code links are invite codes. "
+                    "Open that link in a browser first, then paste the converted "
+                    "roblox.com/games/...privateServerLinkCode=... URL.",
+                    RED,
+                )
+            )
+            pause()
+            return
         print(
             col(
                 "Rejected: placeId/share-only links can join public. "
@@ -24596,7 +24637,6 @@ def private_join_parts(link, default_place_id=""):
             link_code = urllib.parse.unquote(
                 match.group(1)
             ).strip()
-
     if not access_code:
         match = re.search(
             r"accessCode=([^&#\\s]+)",
