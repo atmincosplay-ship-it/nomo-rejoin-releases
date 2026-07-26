@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.77.3-dev-private-config-url"
+__version__ = "V4.77.4-dev-private-universe-label"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -24080,6 +24080,26 @@ def get_universe_id_from_place(place_id):
         print(f"Error getting universe ID: {e}")
         return None
 
+
+def get_universe_game_info(universe_id):
+    """Return public Roblox game metadata for a universe ID."""
+    universe_id = str(universe_id or "").strip()
+    if not universe_id:
+        return {}, "missing universe id"
+    url = (
+        "https://games.roblox.com/v1/games?universeIds="
+        + urllib.parse.quote(universe_id, safe="")
+    )
+    data, err, _ = _roblox_json_request(url, timeout=15)
+    if err:
+        return {}, err
+    items = data.get("data") if isinstance(data, dict) else None
+    if isinstance(items, list) and items:
+        first = items[0]
+        return first if isinstance(first, dict) else {}, ""
+    return {}, "empty game info"
+
+
 def roblox_http_error_text(e):
     try:
         body = e.read().decode("utf-8", errors="replace")
@@ -25253,6 +25273,22 @@ def auto_fetch_private_servers(
         print(col("Could not resolve universe ID.", RED))
         pause()
         return
+
+    game_info, game_info_err = get_universe_game_info(universe_id)
+    game_name = str(game_info.get("name") or game_info.get("Name") or "unknown").strip()
+    root_place_id = str(
+        game_info.get("rootPlaceId")
+        or game_info.get("rootPlaceID")
+        or game_info.get("RootPlaceId")
+        or "-"
+    ).strip()
+    if game_info:
+        print(col(
+            f"Game: {game_name} | RootPlace: {root_place_id}",
+            CYAN,
+        ))
+    else:
+        print(col(f"Game info unavailable: {game_info_err}", YELLOW))
 
     enabled, price, product_raw, product_err = get_private_server_product_info(universe_id)
 
