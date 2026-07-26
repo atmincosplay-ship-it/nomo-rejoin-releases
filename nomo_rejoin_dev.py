@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.76.4-dev-private-saved-verify"
+__version__ = "V4.76.5-dev-web-private-link"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -3926,6 +3926,12 @@ def android_safe_roblox_link(link, cfg=None):
         if m:
             parsed_access = urllib.parse.unquote(m.group(1))
 
+    if (
+        low.startswith(("https://www.roblox.com/games/", "http://www.roblox.com/games/"))
+        and (parsed_code or parsed_access)
+    ):
+        return raw
+
     if pid and parsed_code:
         return (
             "roblox://experiences/start?placeId=" + str(pid)
@@ -3965,6 +3971,17 @@ def android_launch_roblox_link(link, cfg=None):
     normalized = android_safe_roblox_link(link, cfg)
     raw = str(normalized or "").strip()
     if not raw:
+        return raw
+
+    low = raw.lower()
+    if (
+        low.startswith(("https://www.roblox.com/games/", "http://www.roblox.com/games/"))
+        and (
+            "privateserverlinkcode=" in low
+            or "accesscode=" in low
+            or "linkcode=" in low
+        )
+    ):
         return raw
 
     place_id = extract_place_id_from_link(raw)
@@ -6629,6 +6646,12 @@ def set_private_server(cfg):
             ))
             pause()
             return
+    normalized, _place_id, link_code, access_code = normalized_private_route_link(
+        link,
+        default_place_id=str(cfg.get("place_id") or "126884695634066"),
+    )
+    if normalized and (link_code or access_code):
+        link = normalized
     for tab in chosen_tabs:
         tab["restock_link"] = link
     if len(chosen_tabs) == len(cfg.get("tabs", [])):
@@ -24815,9 +24838,8 @@ def normalized_private_route_link(
 
     if link_code:
         return (
-            "roblox://experiences/start?"
-            f"placeId={place_id}"
-            "&privateServerLinkCode="
+            "https://www.roblox.com/games/"
+            f"{place_id}/NOMO?privateServerLinkCode="
             f"{urllib.parse.quote(link_code, safe='')}",
             place_id,
             link_code,
@@ -24826,9 +24848,8 @@ def normalized_private_route_link(
 
     if access_code:
         return (
-            "roblox://experiences/start?"
-            f"placeId={place_id}"
-            "&accessCode="
+            "https://www.roblox.com/games/"
+            f"{place_id}/NOMO?accessCode="
             f"{urllib.parse.quote(access_code, safe='')}",
             place_id,
             "",
@@ -24912,21 +24933,20 @@ def market_booster_route_state_confirmed(
 
 
 def build_private_server_link(place_id, item):
-    """Build an Android Roblox deep link from an actual join/link code."""
+    """Build the browser-style private link that Noka accepts reliably."""
     if not isinstance(item, dict):
         return ""
     code = str(item.get("link_code") or "").strip()
     if code:
         return (
-            f"roblox://experiences/start?placeId={place_id}"
-            f"&privateServerLinkCode="
+            f"https://www.roblox.com/games/{place_id}/NOMO?privateServerLinkCode="
             f"{urllib.parse.quote(code, safe='')}"
         )
     access = str(item.get("access_code") or "").strip()
     if access:
         return (
-            f"roblox://experiences/start?placeId={place_id}"
-            f"&accessCode={urllib.parse.quote(access, safe='')}"
+            f"https://www.roblox.com/games/{place_id}/NOMO?accessCode="
+            f"{urllib.parse.quote(access, safe='')}"
         )
     return ""
 
