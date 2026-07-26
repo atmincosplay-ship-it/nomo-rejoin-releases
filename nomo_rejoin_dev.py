@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.77.4-dev-private-universe-label"
+__version__ = "V4.77.5-dev-private-code-prefer"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -3958,13 +3958,13 @@ def android_safe_roblox_link(link, cfg=None):
 
     if pid and parsed_code:
         return (
-            "roblox://experiences/start?placeId=" + str(pid)
-            + "&privateServerLinkCode="
+            "roblox://placeId=" + str(pid)
+            + "&linkCode="
             + urllib.parse.quote(parsed_code, safe="")
         )
     if pid and parsed_access:
         return (
-            "roblox://experiences/start?placeId=" + str(pid)
+            "roblox://placeId=" + str(pid)
             + "&accessCode=" + urllib.parse.quote(parsed_access, safe="")
         )
 
@@ -3986,9 +3986,9 @@ def android_safe_roblox_link(link, cfg=None):
 def android_launch_roblox_link(link, cfg=None):
     """Return the final Android VIEW URI without mutating saved configuration.
 
-    Keep private server launches on Roblox's experiences/start route. Some
-    clone builds reject the shorter placeId/linkCode form with 524 even when
-    the account is allowed on the private server.
+    Launch private servers through the direct Roblox app route. Noka/App Cloner
+    builds can ignore the experiences/start privateServerLinkCode parameter and
+    fall back to a public server, while placeId/linkCode remains scoped.
     """
     normalized = android_safe_roblox_link(link, cfg)
     raw = str(normalized or "").strip()
@@ -4030,14 +4030,14 @@ def android_launch_roblox_link(link, cfg=None):
 
     if place_id and link_code:
         return (
-            "roblox://experiences/start?placeId=" + str(place_id)
-            + "&privateServerLinkCode="
+            "roblox://placeId=" + str(place_id)
+            + "&linkCode="
             + urllib.parse.quote(link_code, safe="")
         )
 
     if place_id and access_code:
         return (
-            "roblox://experiences/start?placeId=" + str(place_id)
+            "roblox://placeId=" + str(place_id)
             + "&accessCode="
             + urllib.parse.quote(access_code, safe="")
         )
@@ -6314,6 +6314,10 @@ def set_hatcher_servers(main_cfg=None):
             raw = converted
         else:
             print(col(f"Auto-convert failed: {convert_err}", YELLOW))
+            fallback = roblox_server_share_deep_link(raw)
+            if fallback:
+                print(col("Saving Roblox app share route as fallback.", YELLOW))
+                raw = fallback
 
     (
         normalized,
@@ -6346,15 +6350,19 @@ def set_hatcher_servers(main_cfg=None):
             )
             pause()
             return
-        print(
-            col(
-                "Rejected: placeId/share-only links can join public. "
-                "Use linkCode/privateServerLinkCode or accessCode.",
-                RED,
+        if str(raw).lower().startswith("roblox://navigation/share_links?"):
+            normalized = raw
+            print(col("Saved share route fallback. Prefer auto-fetch when possible.", YELLOW))
+        else:
+            print(
+                col(
+                    "Rejected: placeId/share-only links can join public. "
+                    "Use linkCode/privateServerLinkCode or accessCode.",
+                    RED,
+                )
             )
-        )
-        pause()
-        return
+            pause()
+            return
 
     for profile in selected_profiles:
         profile["server_link"] = normalized
@@ -24166,6 +24174,9 @@ def _normalize_private_server_item(item):
     access_code = _first_value(item, (
         "accessCode", "reservedServerAccessCode"
     ))
+    browser_link = _first_value(item, (
+        "link", "shareLink", "privateServerLink", "privateServerShareLink"
+    ))
     owner = item.get("owner") if isinstance(item.get("owner"), dict) else {}
     owner_id = _first_value(item, ("ownerId", "ownerUserId", "userId"))
     if not owner_id:
@@ -24183,6 +24194,7 @@ def _normalize_private_server_item(item):
         "name": str(name),
         "link_code": str(link_code) if link_code is not None else "",
         "access_code": str(access_code) if access_code is not None else "",
+        "browser_link": str(browser_link) if browser_link is not None else "",
         "owner_id": str(owner_id) if owner_id is not None else "",
         "active": bool(active),
         "raw": item,
@@ -24226,7 +24238,7 @@ def _merge_private_server_item(base, extra):
     if not extra:
         return base
     merged = dict(base)
-    for key in ("id", "name", "link_code", "access_code", "owner_id"):
+    for key in ("id", "name", "link_code", "access_code", "browser_link", "owner_id"):
         if not merged.get(key) and extra.get(key):
             merged[key] = extra[key]
     if extra.get("active") is False:
@@ -24875,6 +24887,7 @@ def _private_server_item_from_profile(profile):
     server_id = str(profile.get("private_server_id") or "").strip()
     link_code = str(profile.get("private_server_link_code") or "").strip()
     access_code = str(profile.get("private_server_access_code") or "").strip()
+    browser_link = str(profile.get("private_server_browser_link") or "").strip()
     saved_link = str(profile.get("server_link") or "").strip()
 
     # Recover codes from both current and older saved link formats.
@@ -24900,6 +24913,7 @@ def _private_server_item_from_profile(profile):
         "name": str(profile.get("hatcher_name") or "NOMO Hatcher"),
         "link_code": link_code,
         "access_code": access_code,
+        "browser_link": browser_link,
         "owner_id": "",
         "active": True,
         "raw": {},
@@ -25013,9 +25027,9 @@ def normalized_private_route_link(
 
     if link_code:
         return (
-            "roblox://experiences/start?"
+            "roblox://"
             f"placeId={place_id}"
-            "&privateServerLinkCode="
+            "&linkCode="
             f"{urllib.parse.quote(link_code, safe='')}",
             place_id,
             link_code,
@@ -25024,7 +25038,7 @@ def normalized_private_route_link(
 
     if access_code:
         return (
-            "roblox://experiences/start?"
+            "roblox://"
             f"placeId={place_id}"
             "&accessCode="
             f"{urllib.parse.quote(access_code, safe='')}",
@@ -25116,16 +25130,19 @@ def build_private_server_link(place_id, item):
     code = str(item.get("link_code") or "").strip()
     if code:
         return (
-            f"roblox://experiences/start?placeId={place_id}"
-            f"&privateServerLinkCode="
+            f"roblox://placeId={place_id}"
+            f"&linkCode="
             f"{urllib.parse.quote(code, safe='')}"
         )
     access = str(item.get("access_code") or "").strip()
     if access:
         return (
-            f"roblox://experiences/start?placeId={place_id}"
+            f"roblox://placeId={place_id}"
             f"&accessCode={urllib.parse.quote(access, safe='')}"
         )
+    browser_link = str(item.get("browser_link") or "").strip()
+    if is_roblox_server_share_link(browser_link):
+        return roblox_server_share_deep_link(browser_link) or browser_link
     return ""
 
 
@@ -25457,6 +25474,7 @@ def auto_fetch_private_servers(
                     "private_server_id",
                     "private_server_link_code",
                     "private_server_access_code",
+                    "private_server_browser_link",
                     "private_server_market_allowlist_hash",
                     "private_server_market_allowlist_error",
                 ):
@@ -25559,6 +25577,21 @@ def auto_fetch_private_servers(
                 DIM,
             ))
         link = build_private_server_link(place_id, usable)
+        browser_link = str(usable.get("browser_link") or "").strip()
+        if usable.get("link_code"):
+            code_text = str(usable.get("link_code") or "")
+            print(col(
+                f"Join code: {code_text[:6]}...{code_text[-6:] if len(code_text) > 6 else code_text}",
+                DIM,
+            ))
+        if browser_link:
+            share_code_match = re.search(r"(?:[?&])code=([^&#\s]+)", browser_link, flags=re.I)
+            if share_code_match:
+                share_code = urllib.parse.unquote(share_code_match.group(1))
+                print(col(
+                    f"Share link code: {share_code[:6]}...{share_code[-6:] if len(share_code) > 6 else share_code}",
+                    DIM,
+                ))
 
         # One-time permission sync can still run when Roblox lists an existing
         # server without returning its join code. Specific Market users are
@@ -25600,6 +25633,7 @@ def auto_fetch_private_servers(
         profile["private_server_id"] = usable.get("id", "") or profile.get("private_server_id", "")
         profile["private_server_link_code"] = usable.get("link_code", "") or profile.get("private_server_link_code", "")
         profile["private_server_access_code"] = usable.get("access_code", "") or profile.get("private_server_access_code", "")
+        profile["private_server_browser_link"] = browser_link or profile.get("private_server_browser_link", "")
         profile["private_server_friends_allowed"] = bool(friends_ok)
         profile["private_server_permissions_error"] = "" if friends_ok else str(friends_err or "")[:300]
         profile["private_server_permissions_synced_at"] = now()
