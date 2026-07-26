@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.77.0-dev-private-start-route"
+__version__ = "V4.77.1-dev-private-member-verify"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -24511,12 +24511,62 @@ def refresh_private_server_join_code(cookie, server_id, friends_allowed=True):
     return None, "Roblox did not return a refreshed join code"
 
 
+def fetch_private_server_permissions_raw(cookie, server_id):
+    server_id = str(server_id or "").strip()
+    if not server_id:
+        return None, "missing private server id"
+    url = (
+        "https://games.roblox.com/v1/vip-servers/"
+        f"{urllib.parse.quote(server_id, safe='')}/permissions"
+    )
+    data, err, _ = _roblox_json_request(url, cookie=cookie, method="GET", timeout=20)
+    if err:
+        return None, err
+    return data if isinstance(data, dict) else {}, ""
+
+
+def json_contains_exact_user_id(obj, user_id):
+    wanted = str(user_id or "").strip()
+    if not wanted:
+        return False
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            key_l = str(key).lower()
+            if key_l in {"id", "userid", "user_id", "userids", "user_ids"}:
+                if isinstance(value, (str, int)) and str(value) == wanted:
+                    return True
+                if isinstance(value, list) and any(str(item) == wanted for item in value):
+                    return True
+            if json_contains_exact_user_id(value, wanted):
+                return True
+    elif isinstance(obj, list):
+        for item in obj:
+            if json_contains_exact_user_id(item, wanted):
+                return True
+    return False
+
+
+def private_server_user_is_member(cookie, server_id, user_id):
+    permissions, err = fetch_private_server_permissions_raw(cookie, server_id)
+    if not err and json_contains_exact_user_id(permissions, user_id):
+        return True, "permissions"
+
+    # Some Roblox responses expose members only on the server metadata endpoint.
+    url = f"https://games.roblox.com/v1/vip-servers/{urllib.parse.quote(str(server_id), safe='')}"
+    data, meta_err, _ = _roblox_json_request(url, cookie=cookie, method="GET", timeout=20)
+    if not meta_err and json_contains_exact_user_id(data, user_id):
+        return True, "metadata"
+
+    detail = err or meta_err or "user not visible in private server permissions"
+    return False, detail
+
+
 def add_private_server_allowed_users(cookie, server_id, user_ids, friends_allowed=True, chunk_size=25):
     """Add specific Roblox user IDs without removing existing members.
 
-    Returns (added_ids, failed_items). Roblox accepts additive usersToAdd PATCHes;
-    mixed chunks fall back to one user at a time so one restricted account cannot
-    block all other Market accounts.
+    Returns (added_ids, failed_items). A PATCH success is not enough: Roblox can
+    return OK while the configure page still shows no server members. Count a
+    user only after a follow-up permissions read confirms the ID is present.
     """
     server_id = str(server_id or "").strip()
     ids = []
@@ -24539,12 +24589,18 @@ def add_private_server_allowed_users(cookie, server_id, user_ids, friends_allowe
         f"{urllib.parse.quote(server_id, safe='')}/permissions"
     )
 
-    def patch(one_chunk):
+    def patch(one_chunk, shape="ids"):
         nonlocal xsrf_token
+        if shape == "id_objects":
+            users_to_add = [{"id": int(x)} for x in one_chunk]
+        elif shape == "user_id_objects":
+            users_to_add = [{"userId": int(x)} for x in one_chunk]
+        else:
+            users_to_add = [int(x) for x in one_chunk]
         payload = {
             "newJoinCode": False,
             "friendsAllowed": bool(friends_allowed),
-            "usersToAdd": [int(x) for x in one_chunk],
+            "usersToAdd": users_to_add,
             "usersToRemove": [],
         }
         data, err, headers = _roblox_json_request(
@@ -24568,15 +24624,37 @@ def add_private_server_allowed_users(cookie, server_id, user_ids, friends_allowe
         chunk = ids[start:start + size]
         ok, err, _ = patch(chunk)
         if ok:
-            added.extend(chunk)
-            continue
-        # A single ineligible user can reject a whole chunk. Retry individually.
+            unverified = []
+            for uid in chunk:
+                present, verify_err = private_server_user_is_member(cookie, server_id, uid)
+                if present:
+                    added.append(uid)
+                else:
+                    unverified.append((uid, verify_err))
+            if not unverified:
+                continue
+            chunk = [uid for uid, _ in unverified]
+            err = "; ".join(f"{uid}: {cut(verr, 80)}" for uid, verr in unverified[:3])
+
+        # A single ineligible user can reject a whole chunk, and some Roblox
+        # builds accept only object-shaped usersToAdd entries. Retry each user
+        # with all known safe additive shapes, verifying after every success.
         for uid in chunk:
-            ok1, err1, _ = patch([uid])
-            if ok1:
-                added.append(uid)
-            else:
-                failed.append({"user_id": uid, "error": err1 or err or "permission update failed"})
+            last_err = err or "permission update failed"
+            confirmed = False
+            for shape in ("ids", "id_objects", "user_id_objects"):
+                ok1, err1, _ = patch([uid], shape=shape)
+                if not ok1:
+                    last_err = err1 or last_err
+                    continue
+                present, verify_err = private_server_user_is_member(cookie, server_id, uid)
+                if present:
+                    added.append(uid)
+                    confirmed = True
+                    break
+                last_err = verify_err or "PATCH ok but user not visible in permissions"
+            if not confirmed:
+                failed.append({"user_id": uid, "error": last_err})
     return added, failed
 
 
