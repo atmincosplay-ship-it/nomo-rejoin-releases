@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.76.1-dev-private-link-guard"
+__version__ = "V4.76.3-dev-private-account-reset"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -3790,6 +3790,99 @@ def is_roblox_server_share_link(link):
     return False
 
 
+def _private_route_from_text(text):
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    raw = (
+        raw.replace("&amp;", "&")
+        .replace("\\u0026", "&")
+        .replace("%26", "&")
+    )
+
+    patterns = [
+        r"https?://(?:www\.)?roblox\.com/[^\s\"'<>]+(?:privateServerLinkCode|linkCode|accessCode)=[^\s\"'<>]+",
+        r"roblox://[^\s\"'<>]+(?:privateServerLinkCode|linkCode|accessCode)=[^\s\"'<>]+",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, raw, flags=re.I)
+        if match:
+            return urllib.parse.unquote(match.group(0)).strip()
+
+    place_id = extract_place_id_from_link(raw)
+    if not place_id:
+        return ""
+
+    code = ""
+    access = ""
+    match = re.search(
+        r"(?:privateServerLinkCode|linkCode)=([^&#\s\"'<>]+)",
+        raw,
+        flags=re.I,
+    )
+    if match:
+        code = urllib.parse.unquote(match.group(1)).strip()
+    if not code:
+        match = re.search(
+            r"accessCode=([^&#\s\"'<>]+)",
+            raw,
+            flags=re.I,
+        )
+        if match:
+            access = urllib.parse.unquote(match.group(1)).strip()
+
+    if code:
+        return (
+            "https://www.roblox.com/games/"
+            + str(place_id)
+            + "/NOMO?privateServerLinkCode="
+            + urllib.parse.quote(code, safe="")
+        )
+    if access:
+        return (
+            "https://www.roblox.com/games/"
+            + str(place_id)
+            + "/NOMO?accessCode="
+            + urllib.parse.quote(access, safe="")
+        )
+    return ""
+
+
+def resolve_roblox_server_share_link(link, timeout=15):
+    """Follow Roblox share links and return the real private link when exposed."""
+    raw = str(link or "").strip()
+    if not is_roblox_server_share_link(raw):
+        return "", "not a Roblox Server share link"
+
+    url = raw
+    if url.startswith("www.roblox.com/"):
+        url = "https://" + url
+    if not url.lower().startswith(("http://", "https://")):
+        return "", "share link is not an http URL"
+
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 NOMO-Rejoin",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            final_url = str(resp.geturl() or "")
+            converted = _private_route_from_text(final_url)
+            if converted:
+                return converted, ""
+            body = resp.read(250000).decode("utf-8", errors="ignore")
+            converted = _private_route_from_text(body)
+            if converted:
+                return converted, ""
+            return "", "Roblox did not expose a converted privateServerLinkCode URL"
+    except Exception as exc:
+        return "", f"share resolve failed: {exc}"
+
+
 
 
 
@@ -6184,6 +6277,15 @@ def set_hatcher_servers(main_cfg=None):
     if not raw:
         return
 
+    if is_roblox_server_share_link(raw):
+        print(col("Roblox share link detected; trying to convert it...", CYAN))
+        converted, convert_err = resolve_roblox_server_share_link(raw)
+        if converted:
+            print(col("Converted share link to privateServerLinkCode URL.", GREEN))
+            raw = converted
+        else:
+            print(col(f"Auto-convert failed: {convert_err}", YELLOW))
+
     (
         normalized,
         _place_id,
@@ -6512,6 +6614,21 @@ def set_private_server(cfg):
     link = input("\nPaste MARKET restock/private-server link for selected package(s):\n> ").strip()
     if not link:
         return
+    if is_roblox_server_share_link(link):
+        print(col("Roblox share link detected; trying to convert it...", CYAN))
+        converted, convert_err = resolve_roblox_server_share_link(link)
+        if converted:
+            print(col("Converted share link to privateServerLinkCode URL.", GREEN))
+            link = converted
+        else:
+            print(col(f"Auto-convert failed: {convert_err}", YELLOW))
+            print(col(
+                "Open the share link in a browser first, then paste the converted "
+                "roblox.com/games/...privateServerLinkCode=... URL.",
+                RED,
+            ))
+            pause()
+            return
     for tab in chosen_tabs:
         tab["restock_link"] = link
     if len(chosen_tabs) == len(cfg.get("tabs", [])):
@@ -24987,7 +25104,43 @@ def auto_fetch_private_servers(
         print(f"Account: {username} ({user_id})")
 
         profile = _hatcher_profile_for_package(hcfg, cfg, pkg, username=username)
+        previous_name = str(profile.get("hatcher_name") or "").strip()
+        if (
+            previous_name
+            and previous_name != str(pkg)
+            and previous_name.lower() != str(username).strip().lower()
+        ):
+            for key in (
+                "server_link",
+                "private_server_id",
+                "private_server_link_code",
+                "private_server_access_code",
+                "private_server_market_allowlist_hash",
+                "private_server_market_allowlist_error",
+            ):
+                profile[key] = ""
+            profile["private_server_friends_allowed"] = False
+            profile["private_server_market_users_synced"] = 0
+            profile["private_server_market_users_failed"] = []
+            profile["private_server_synced_at"] = 0
+            changed = True
+            print(col(
+                f"Package account changed ({previous_name} -> {username}); "
+                "old saved private link cleared.",
+                YELLOW,
+            ))
         saved_item = _private_server_item_from_profile(profile)
+        if (
+            saved_item
+            and saved_item.get("owner_id")
+            and user_id
+            and str(saved_item.get("owner_id")) != str(user_id)
+        ):
+            saved_item = None
+            print(col(
+                "Saved private server belongs to a different user; ignoring it.",
+                YELLOW,
+            ))
 
         servers, fetch_err = fetch_owned_private_servers(cookie, place_id, universe_id, user_id=user_id)
         usable = next((s for s in servers if s.get("active", True) and (s.get("link_code") or s.get("access_code"))), None)
