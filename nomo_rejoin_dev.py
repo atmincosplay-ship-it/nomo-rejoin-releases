@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.77.5-dev-private-code-prefer"
+__version__ = "V4.77.6-dev-hatcher-link-rebuild"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -16077,14 +16077,40 @@ def hatcher_status_screen(hcfg, last_msg=""):
     print(col("Type Q + ENTER to stop / return to Hatching Mode menu", DIM))
 
 
+def hatcher_profile_private_link(prof, hcfg=None):
+    """Return the safest current private route for a Hatcher/Booster profile."""
+    prof = prof if isinstance(prof, dict) else {}
+    hcfg = load_hatcher_config() if hcfg is None else hcfg
+    expected_place = str(
+        prof.get("private_server_place_id")
+        or prof.get("place_id")
+        or hcfg.get("expected_place_id")
+        or "126884695634066"
+    ).strip()
+    link, _place_id, link_code, access_code = normalized_private_route_link(
+        str(prof.get("server_link") or ""),
+        record=prof,
+        default_place_id=expected_place,
+    )
+    if link and (link_code or access_code):
+        return link
+
+    browser_link = str(prof.get("private_server_browser_link") or "").strip()
+    if is_roblox_server_share_link(browser_link):
+        return roblox_server_share_deep_link(browser_link) or browser_link
+
+    return str(prof.get("server_link") or "").strip()
+
+
 def hatcher_profile_to_tab(prof):
+    private_link = hatcher_profile_private_link(prof)
     return {
         "enabled": prof.get("enabled", True),
         "package": prof.get("package", ""),
         "user_name": prof.get("hatcher_name", prof.get("package", "hatcher")),
         "stat_file": prof.get("state_file", ""),
-        "server_link": prof.get("server_link", ""),
-        "restock_link": prof.get("server_link", ""),
+        "server_link": private_link,
+        "restock_link": private_link,
     }
 
 
@@ -17516,7 +17542,7 @@ def open_all_hatcher_tabs_once(
     )
     print(
         col(
-            "Saved Hatcher server_link is passed unchanged.",
+            "Saved Hatcher private route is rebuilt from joinCode when available.",
             GREEN,
         )
     )
