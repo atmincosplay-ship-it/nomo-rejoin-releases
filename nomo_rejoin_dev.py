@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.77.1-dev-private-member-verify"
+__version__ = "V4.77.2-dev-private-member-retry"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -24603,18 +24603,28 @@ def add_private_server_allowed_users(cookie, server_id, user_ids, friends_allowe
             "usersToAdd": users_to_add,
             "usersToRemove": [],
         }
-        data, err, headers = _roblox_json_request(
-            url, cookie=cookie, method="PATCH", payload=payload, timeout=25,
-            xsrf_token=xsrf_token,
-        )
-        if err:
-            token2 = headers.get("x-csrf-token") or headers.get("X-CSRF-TOKEN")
-            if token2 and token2 != xsrf_token:
-                xsrf_token = token2
-                data, err, _ = _roblox_json_request(
-                    url, cookie=cookie, method="PATCH", payload=payload, timeout=25,
-                    xsrf_token=xsrf_token,
-                )
+        data, err, headers = None, "permission update not attempted", {}
+        for attempt in range(3):
+            data, err, headers = _roblox_json_request(
+                url, cookie=cookie, method="PATCH", payload=payload, timeout=25,
+                xsrf_token=xsrf_token,
+            )
+            if err:
+                token2 = headers.get("x-csrf-token") or headers.get("X-CSRF-TOKEN")
+                if token2 and token2 != xsrf_token:
+                    xsrf_token = token2
+                    data, err, headers = _roblox_json_request(
+                        url, cookie=cookie, method="PATCH", payload=payload, timeout=25,
+                        xsrf_token=xsrf_token,
+                    )
+            if not err:
+                break
+            # Roblox sometimes throws transient HTTP 500 for private-server
+            # permission updates. Retry only server-side failures; validation
+            # errors should fall through to the next payload shape immediately.
+            if "HTTP 500" not in str(err):
+                break
+            time.sleep(1.0 + attempt)
         return not bool(err), str(err or ""), data if isinstance(data, dict) else {}
 
     added = []
@@ -25565,7 +25575,13 @@ def auto_fetch_private_servers(
         base_action = "CREATED" if created else "FOUND"
         if link:
             base_action += " + SAVED"
-            access_suffix = f" + ALLOWED {len(allowed_added)}" if allowed_added else ""
+            if allowed_failed:
+                access_suffix = (
+                    f" + PARTIAL ALLOWED {len(allowed_added)}/{len(market_ids)}"
+                    if market_ids else ""
+                )
+            else:
+                access_suffix = f" + ALLOWED {len(allowed_added)}" if allowed_added else ""
             action = (f"{base_action} + FRIENDS{access_suffix}" if friends_ok
                       else f"{base_action} / FRIENDS FAILED{access_suffix}")
             print(col(f"{action}: {short_link(profile['server_link'])}", GREEN if friends_ok and not allowed_failed else YELLOW))
