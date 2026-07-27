@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.78.6-dev-root-place-guard"
+__version__ = "V4.78.7-dev-wrong-place-retry"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -25712,6 +25712,21 @@ def auto_fetch_private_servers(
             ))
 
         servers, fetch_err = fetch_owned_private_servers(cookie, place_id, universe_id, user_id=user_id)
+        wrong_place_servers = []
+        correct_or_unknown_servers = []
+        for server in servers:
+            server_root_place = str(server.get("root_place_id") or "").strip()
+            if server_root_place and server_root_place != str(place_id):
+                wrong_place_servers.append(server)
+            else:
+                correct_or_unknown_servers.append(server)
+        if wrong_place_servers:
+            print(col(
+                f"Ignored {len(wrong_place_servers)} private server(s) from another root place "
+                f"(wanted {place_id}).",
+                YELLOW,
+            ))
+        servers = correct_or_unknown_servers
         usable = next((s for s in servers if s.get("active", True) and (s.get("link_code") or s.get("access_code"))), None)
         existing = usable or next((s for s in servers if s.get("active", True)), None)
         created = False
@@ -25748,7 +25763,35 @@ def auto_fetch_private_servers(
             if saved_item.get("id"):
                 verified = fetch_private_server_metadata(cookie, saved_item.get("id"))
             verified_owner = str((verified or {}).get("owner_id") or "").strip()
-            if verified and user_id and verified_owner == str(user_id):
+            verified_root_place = str((verified or {}).get("root_place_id") or "").strip()
+            if verified_root_place and verified_root_place != str(place_id):
+                for key in (
+                    "server_link",
+                    "private_server_id",
+                    "private_server_link_code",
+                    "private_server_access_code",
+                    "private_server_browser_link",
+                    "private_server_owner_id",
+                    "private_server_place_id",
+                    "private_server_actual_place_id",
+                    "private_server_root_place_id",
+                    "private_server_universe_id",
+                    "private_server_game_name",
+                    "private_server_market_allowlist_hash",
+                    "private_server_market_allowlist_error",
+                ):
+                    profile[key] = ""
+                profile["private_server_friends_allowed"] = False
+                profile["private_server_market_users_synced"] = 0
+                profile["private_server_market_users_failed"] = []
+                profile["private_server_synced_at"] = 0
+                saved_item = None
+                changed = True
+                print(col(
+                    f"Saved private server root place {verified_root_place} != requested {place_id}; cleared.",
+                    RED,
+                ))
+            elif verified and user_id and verified_owner == str(user_id):
                 existing = _merge_private_server_item(saved_item, verified, prefer_extra=True)
                 usable = existing
                 print(col("Verified saved private server belongs to this account; duplicate creation skipped.", YELLOW))
