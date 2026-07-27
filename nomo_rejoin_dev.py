@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.80.0-dev-solver-nocaptcha-trust"
+__version__ = "V4.80.1-dev-android-524-hold"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -10352,7 +10352,8 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
             rt_tab["android_disconnect_candidate_at"] = now()
             rt_tab["android_disconnect_candidate_count"] = count
 
-            required = max(2, int(cfg.get("android_disconnect_confirmations_required", 2) or 2))
+            is_private_524 = str(android_popup.get("reason", "") or "") == "private_server_permission_denied"
+            required = 1 if is_private_524 else max(2, int(cfg.get("android_disconnect_confirmations_required", 2) or 2))
             if count >= required:
                 merged_state = dict(state or {})
                 merged_state["disconnected"] = True
@@ -10672,6 +10673,9 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
     # --- disconnect / kick popup: always kill+open ---
     if bad == "disconnect" or (state and state_disconnect_ui(state)):
         if str((state or {}).get("disconnect_code") or "") == "524":
+            removed = core.cancel(pkg)
+            if removed:
+                core.save()
             existing_hold = int(rt_tab.get("disconnect_ui_hold_until", 0) or 0)
             if existing_hold > now():
                 rt_tab["note"] = "private server permission denied; fix server members/link"
@@ -10680,7 +10684,7 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
             rt_tab["disconnect_ui_hold_until"] = now() + hold_seconds
             rt_tab["note"] = "private server permission denied; fix server members/link"
             log_activity(
-                "private server 524 permission denied; held package until members/link are fixed",
+                "private server 524 permission denied; cancelled queued retry and held package",
                 pkg,
                 RED,
             )
