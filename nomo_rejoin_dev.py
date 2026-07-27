@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.78.4-dev-share-route-first"
+__version__ = "V4.78.5-dev-private-owner-guard"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -25028,6 +25028,8 @@ def _private_server_item_from_profile(profile):
     link_code = str(profile.get("private_server_link_code") or "").strip()
     access_code = str(profile.get("private_server_access_code") or "").strip()
     browser_link = str(profile.get("private_server_browser_link") or "").strip()
+    owner_id = str(profile.get("private_server_owner_id") or "").strip()
+    place_id = str(profile.get("private_server_place_id") or "").strip()
     saved_link = str(profile.get("server_link") or "").strip()
     if not browser_link and is_roblox_server_share_link(saved_link):
         browser_link = saved_link
@@ -25056,7 +25058,8 @@ def _private_server_item_from_profile(profile):
         "link_code": link_code,
         "access_code": access_code,
         "browser_link": browser_link,
-        "owner_id": "",
+        "owner_id": owner_id,
+        "place_id": place_id,
         "active": True,
         "raw": {},
     }
@@ -25557,6 +25560,8 @@ def auto_fetch_private_servers(
 
         profile = _hatcher_profile_for_package(hcfg, cfg, pkg, username=username)
         previous_name = str(profile.get("hatcher_name") or "").strip()
+        saved_owner_id = str(profile.get("private_server_owner_id") or "").strip()
+        saved_place_id = str(profile.get("private_server_place_id") or "").strip()
         if (
             previous_name
             and previous_name != str(pkg)
@@ -25567,6 +25572,9 @@ def auto_fetch_private_servers(
                 "private_server_id",
                 "private_server_link_code",
                 "private_server_access_code",
+                "private_server_browser_link",
+                "private_server_owner_id",
+                "private_server_place_id",
                 "private_server_market_allowlist_hash",
                 "private_server_market_allowlist_error",
             ):
@@ -25579,6 +25587,50 @@ def auto_fetch_private_servers(
             print(col(
                 f"Package account changed ({previous_name} -> {username}); "
                 "old saved private link cleared.",
+                YELLOW,
+            ))
+        elif saved_owner_id and user_id and saved_owner_id != str(user_id):
+            for key in (
+                "server_link",
+                "private_server_id",
+                "private_server_link_code",
+                "private_server_access_code",
+                "private_server_browser_link",
+                "private_server_owner_id",
+                "private_server_place_id",
+                "private_server_market_allowlist_hash",
+                "private_server_market_allowlist_error",
+            ):
+                profile[key] = ""
+            profile["private_server_friends_allowed"] = False
+            profile["private_server_market_users_synced"] = 0
+            profile["private_server_market_users_failed"] = []
+            profile["private_server_synced_at"] = 0
+            changed = True
+            print(col(
+                f"Saved private server owner {saved_owner_id} != package user {user_id}; cleared.",
+                YELLOW,
+            ))
+        elif saved_place_id and saved_place_id != str(place_id):
+            for key in (
+                "server_link",
+                "private_server_id",
+                "private_server_link_code",
+                "private_server_access_code",
+                "private_server_browser_link",
+                "private_server_owner_id",
+                "private_server_place_id",
+                "private_server_market_allowlist_hash",
+                "private_server_market_allowlist_error",
+            ):
+                profile[key] = ""
+            profile["private_server_friends_allowed"] = False
+            profile["private_server_market_users_synced"] = 0
+            profile["private_server_market_users_failed"] = []
+            profile["private_server_synced_at"] = 0
+            changed = True
+            print(col(
+                f"Saved private server place {saved_place_id} != requested place {place_id}; cleared.",
                 YELLOW,
             ))
         saved_item = _private_server_item_from_profile(profile)
@@ -25642,6 +25694,8 @@ def auto_fetch_private_servers(
                     "private_server_link_code",
                     "private_server_access_code",
                     "private_server_browser_link",
+                    "private_server_owner_id",
+                    "private_server_place_id",
                     "private_server_market_allowlist_hash",
                     "private_server_market_allowlist_error",
                 ):
@@ -25801,6 +25855,8 @@ def auto_fetch_private_servers(
         profile["private_server_link_code"] = usable.get("link_code", "") or profile.get("private_server_link_code", "")
         profile["private_server_access_code"] = usable.get("access_code", "") or profile.get("private_server_access_code", "")
         profile["private_server_browser_link"] = browser_link or profile.get("private_server_browser_link", "")
+        profile["private_server_owner_id"] = str(usable.get("owner_id") or user_id or "")
+        profile["private_server_place_id"] = str(place_id or profile.get("private_server_place_id") or "")
         profile["private_server_friends_allowed"] = bool(friends_ok)
         profile["private_server_permissions_error"] = "" if friends_ok else str(friends_err or "")[:300]
         profile["private_server_permissions_synced_at"] = now()
@@ -28906,6 +28962,8 @@ def diagnose_hatcher_private_server_proof(cfg=None):
     profile = _hatcher_profile_for_package(hcfg, cfg, pkg, username=username or pkg)
     saved_item = _private_server_item_from_profile(profile) or {}
     server_id = str(profile.get("private_server_id") or saved_item.get("id") or "").strip()
+    saved_owner_id = str(profile.get("private_server_owner_id") or saved_item.get("owner_id") or "").strip()
+    saved_place_id = str(profile.get("private_server_place_id") or saved_item.get("place_id") or "").strip()
     place_id = str(
         profile.get("private_server_place_id")
         or hcfg.get("expected_place_id")
@@ -28961,6 +29019,8 @@ def diagnose_hatcher_private_server_proof(cfg=None):
         ["Cookie status", f"{status} | {note}"],
         ["Cookie account", f"{username or '-'} ({user_id or '-'})"],
         ["Saved server id", server_id or "-"],
+        ["Saved owner id", saved_owner_id or "-"],
+        ["Saved place id", saved_place_id or "-"],
         ["Place id", place_id or "-"],
         ["Saved route", short_link(saved_link) or "-"],
         ["Saved share", short_link(browser_link) or "-"],
