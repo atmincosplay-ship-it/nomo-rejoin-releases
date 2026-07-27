@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.79.3-dev-mode-registry-core"
+__version__ = "V4.79.4-dev-backend-label-core"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -7686,19 +7686,24 @@ def read_hatchers_cached(cfg, rt, force=False):
     return data, err
 
 
+def shared_backend_label(cfg):
+    provider = str(cfg.get("backend_provider", "jsonbin") or "jsonbin").strip().lower()
+    return "cloudflare" if provider == "cloudflare" else "jsonbin"
+
+
 def pick_jsonbin_hatcher(cfg, rt, force=False):
     if not cfg.get("jsonbin_hatchers_enabled", False):
-        return None, None, "jsonbin off"
+        return None, None, f"{shared_backend_label(cfg)} off"
 
     data, err = read_hatchers_cached(cfg, rt, force=force)
 
     if err or not data:
-        return None, None, f"jsonbin {err}"
+        return None, None, f"{shared_backend_label(cfg)} {err}"
 
     hatchers = data.get("hatchers", data if isinstance(data, dict) else {})
 
     if not isinstance(hatchers, dict):
-        return None, None, "jsonbin bad format"
+        return None, None, f"{shared_backend_label(cfg)} bad format"
 
     stale_seconds = max(60, int(cfg.get("jsonbin_stale_seconds", 7200) or 7200))
     min_pets = int(cfg.get("jsonbin_min_hatcher_pets", 200))
@@ -8559,17 +8564,18 @@ def market_booster_pool_menu(cfg):
 
 def resolve_restock_link(tab, rt_tab, cfg, rt=None):
     fallback = tab.get("restock_link") or cfg.get("restock_link")
+    backend_label = shared_backend_label(cfg)
 
     if cfg.get("jsonbin_hatchers_enabled", False) and rt is not None:
         force_fresh = bool(cfg.get("jsonbin_force_refresh_on_restock_route", True))
         link, hatcher, err = pick_jsonbin_hatcher(cfg, rt, force=force_fresh)
 
         if link:
-            rt_tab["last_hatcher"] = hatcher.get("name") if hatcher else "jsonbin"
+            rt_tab["last_hatcher"] = hatcher.get("name") if hatcher else backend_label
             rt_tab["last_hatcher_pets"] = hatcher.get("pets") if hatcher else ""
             rt_tab["last_hatcher_age"] = hatcher.get("age") if hatcher else ""
             rt_tab["jsonbin_last_error"] = ""
-            route_note = f"jsonbin:{rt_tab['last_hatcher']}"
+            route_note = f"{backend_label}:{rt_tab['last_hatcher']}"
             if hatcher:
                 route_note += (
                     f" age={format_age(hatcher.get('age', 0))}"
@@ -8581,7 +8587,7 @@ def resolve_restock_link(tab, rt_tab, cfg, rt=None):
 
         action = str(cfg.get("jsonbin_no_hatcher_action", "stay_market") or "stay_market").strip().lower()
         if action not in ["fallback_restock", "fallback", "restock"]:
-            return "", f"jsonbin:{err};stay_market"
+            return "", f"{backend_label}:{err};stay_market"
 
     return fallback, "config"
 
