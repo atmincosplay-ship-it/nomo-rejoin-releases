@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.79.0-dev-queue-upgrade-core"
+__version__ = "V4.79.1-dev-requeue-collapse-core"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -9417,6 +9417,33 @@ class RejoinCore:
         return _queue_latest_for_package(self.open_queue, package, reason_prefix)
 
     def requeue_front(self, item):
+        package = str((item.get("tab") or {}).get("package") or "")
+        if package:
+            for existing in list(self.open_queue):
+                if existing is item:
+                    continue
+                if str((existing.get("tab") or {}).get("package") or "") != package:
+                    continue
+                try:
+                    self.open_queue.remove(existing)
+                except ValueError:
+                    continue
+                metadata = {
+                    key: value
+                    for key, value in existing.items()
+                    if key not in {"open_generation", "queued_at", "tab"}
+                }
+                _merge_queue_duplicate(
+                    item,
+                    existing.get("target"),
+                    existing.get("reason"),
+                    force=bool(existing.get("force", False)),
+                    skip_if_alive=bool(existing.get("skip_if_alive", False)),
+                    mode=existing.get("mode", "hard"),
+                    front=True,
+                    bypass_manual=bool(existing.get("bypass_manual", False)),
+                    metadata=metadata,
+                )
         self.open_queue.insert(0, item)
 
     def pop_generation(self, package, generation):
