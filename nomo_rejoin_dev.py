@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.77.9-dev-fresh-private-code"
+__version__ = "V4.78.0-dev-private-permission-guard"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -10541,6 +10541,20 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
 
     # --- disconnect / kick popup: always kill+open ---
     if bad == "disconnect" or (state and state_disconnect_ui(state)):
+        if str((state or {}).get("disconnect_code") or "") == "524":
+            existing_hold = int(rt_tab.get("disconnect_ui_hold_until", 0) or 0)
+            if existing_hold > now():
+                rt_tab["note"] = "private server permission denied; fix server members/link"
+                return "Manual", rt_tab["note"], True
+            hold_seconds = max(300, int(cfg.get("disconnect_ui_incident_cooldown_seconds", 300) or 300))
+            rt_tab["disconnect_ui_hold_until"] = now() + hold_seconds
+            rt_tab["note"] = "private server permission denied; fix server members/link"
+            log_activity(
+                "private server 524 permission denied; held package until members/link are fixed",
+                pkg,
+                RED,
+            )
+            return "Manual", rt_tab["note"], True
         added, dnote = core.queue_disconnect_ui_rejoin(tab, target, rt_tab)
         status = "Queued" if (added or dnote == "already queued") else "Kicked"
         note = f"{state_disconnect_note(state)} {dnote}".strip()
@@ -10850,6 +10864,11 @@ def android_disconnect_ui_detail(pkg, cfg):
         "session expired",
         "error code: 288",
         "error code 288",
+        "you do not have permission to join this experience",
+        "you do not have permission to join this game",
+        "not authorized to join this experience",
+        "error code: 524",
+        "error code 524",
     ]
     hits = [term for term in strong_terms if term in low]
     # "Disconnected" by itself is accepted only when paired with a real popup
@@ -10862,11 +10881,12 @@ def android_disconnect_ui_detail(pkg, cfg):
         return None
 
     code_match = re.search(r"error\s*code\s*:?\s*(\d+)", joined, re.I)
+    reason = "private_server_permission_denied" if code_match and code_match.group(1) == "524" else "android_package_scoped_ui"
     return {
         "title": "Roblox Disconnect",
         "text": joined,
         "code": code_match.group(1) if code_match else "",
-        "reason": "android_package_scoped_ui",
+        "reason": reason,
         "hits": hits[:5],
     }
 
@@ -16095,6 +16115,31 @@ def hatcher_profile_private_link(prof, hcfg=None, cfg=None, refresh_vip=False):
             if cookie:
                 fresh = fetch_private_server_metadata(cookie, server_id)
                 if fresh:
+                    fresh_owner = str((fresh or {}).get("owner_id") or "").strip()
+                    current_user_id = str(_user_id or "").strip()
+                    if fresh_owner and current_user_id and fresh_owner != current_user_id:
+                        print(col(
+                            f"{short_pkg(package)} private-server OWNER MISMATCH: "
+                            f"server owner={fresh_owner}, package user={current_user_id}.",
+                            RED,
+                        ))
+                        print(col(
+                            "Saved private route was not opened because it belongs to another account.",
+                            RED,
+                        ))
+                        return ""
+                    refreshed, refresh_err = refresh_private_server_join_code(
+                        cookie,
+                        server_id,
+                        friends_allowed=True,
+                    )
+                    if refreshed:
+                        fresh = _merge_private_server_item(fresh, refreshed, prefer_extra=True)
+                    else:
+                        print(col(
+                            f"{short_pkg(package)} join-code refresh failed: {refresh_err}",
+                            YELLOW,
+                        ))
                     merged = _merge_private_server_item({
                         "id": server_id,
                         "link_code": str(prof.get("private_server_link_code") or ""),
