@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.77.7-dev-option6-vip-refresh"
+__version__ = "V4.77.8-dev-prefer-share-route"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1618,6 +1618,7 @@ DEFAULT_CONFIG = {
 
     "prefer_experience_start_links": True,
     "prefer_https_game_links": False,
+    "private_server_prefer_share_link": True,
     "soft_hop_enabled": True,
     "soft_hop_fallback_hard": False,
     "soft_hop_wait_fresh_seconds": 240,
@@ -16112,6 +16113,7 @@ def hatcher_profile_private_link(prof, hcfg=None, cfg=None, refresh_vip=False):
                             or "126884695634066"
                         ),
                         merged,
+                        cfg or load_config(),
                     ) or prof.get("server_link", "")
                     print(col(
                         f"{short_pkg(package)} VIP metadata refreshed as {username or package}.",
@@ -25212,10 +25214,17 @@ def market_booster_route_state_confirmed(
 
 
 
-def build_private_server_link(place_id, item):
+def build_private_server_link(place_id, item, cfg=None):
     """Build an Android Roblox deep link from an actual join/link code."""
     if not isinstance(item, dict):
         return ""
+    cfg = cfg or {}
+    browser_link = str(item.get("browser_link") or "").strip()
+    if cfg.get("private_server_prefer_share_link", True) and is_roblox_server_share_link(browser_link):
+        share_route = roblox_server_share_deep_link(browser_link)
+        if share_route:
+            return share_route
+
     code = str(item.get("link_code") or "").strip()
     if code:
         return (
@@ -25229,7 +25238,6 @@ def build_private_server_link(place_id, item):
             f"roblox://placeId={place_id}"
             f"&accessCode={urllib.parse.quote(access, safe='')}"
         )
-    browser_link = str(item.get("browser_link") or "").strip()
     if is_roblox_server_share_link(browser_link):
         return roblox_server_share_deep_link(browser_link) or browser_link
     return ""
@@ -25665,7 +25673,7 @@ def auto_fetch_private_servers(
                 f"https://www.roblox.com/private-server/configure/{usable.get('id')}",
                 DIM,
             ))
-        link = build_private_server_link(place_id, usable)
+        link = build_private_server_link(place_id, usable, cfg)
         browser_link = str(usable.get("browser_link") or "").strip()
         if usable.get("link_code"):
             code_text = str(usable.get("link_code") or "")
