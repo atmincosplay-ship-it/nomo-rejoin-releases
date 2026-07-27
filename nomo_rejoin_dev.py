@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.79.4-dev-backend-label-core"
+__version__ = "V4.79.5-dev-mode-menu-core"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -30128,10 +30128,12 @@ def mode_menu(cfg):
         banner("MODE SELECTION", cfg)
         print(f"Current mode: {col(active_mode_label(cfg), GREEN)}")
         print("")
-        print("1. Enable MARKET mode")
-        print("2. Enable HATCHER mode")
-        print("3. Enable BOOSTER mode")
-        print("4. Enable REJOIN ONLY mode")
+        mode_choices = {
+            str(index): mode
+            for index, mode in enumerate(REJOIN_MODE_ORDER, 1)
+        }
+        for index, mode in mode_choices.items():
+            print(f"{index}. Enable {REJOIN_MODE_INFO[mode]['label']} mode")
         print("5. Market config (pet routing / restock settings)")
         print("6. Hatcher config (reporting / backend settings)")
         print("7. Booster config (servers / reporting)")
@@ -30143,21 +30145,13 @@ def mode_menu(cfg):
             reset_terminal()
             drain_stdin()
             return
-        elif ch == "1":
-            cfg = set_active_rejoin_mode("market", cfg)
-            print(col("MARKET mode enabled.", GREEN))
+        elif ch in mode_choices:
+            mode = mode_choices[ch]
+            cfg = set_active_rejoin_mode(mode, cfg)
+            print(col(f"{REJOIN_MODE_INFO[mode]['label']} mode enabled.", GREEN))
+            if mode == "rejoin_only":
+                print(col("This mode ignores pet routing and Cloudflare reporting.", DIM))
             pause()
-        elif ch == "2":
-            cfg = set_active_rejoin_mode("hatcher", cfg)
-            print(col("HATCHER mode enabled.", GREEN))
-            pause()
-        elif ch == "3":
-            cfg = set_active_rejoin_mode("booster", cfg)
-            print(col("BOOSTER mode enabled.", GREEN)); pause()
-        elif ch == "4":
-            cfg = set_active_rejoin_mode("rejoin_only", cfg)
-            print(col("REJOIN ONLY mode enabled.", GREEN))
-            print(col("This mode ignores pet routing and Cloudflare reporting.", DIM)); pause()
         elif ch == "5":
             market_only_settings(cfg); cfg = load_config()
         elif ch == "6":
