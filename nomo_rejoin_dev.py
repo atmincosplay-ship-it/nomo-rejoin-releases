@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.79.6-dev-main-menu-polish"
+__version__ = "V4.79.7-dev-api-alive-soft"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -10025,6 +10025,14 @@ def disconnect_ui_api_precheck(tab, rt_tab, cfg, reason="kick popup", require_di
                     return False, rt_tab["note"]
                 detail = refreshed_detail or refresh_note or detail
                 detail_l = detail.lower()
+        if api_status == "invalid" and package_alive(pkg, cfg, fresh=True):
+            rt_tab["disconnect_ui_api_last_status"] = "invalid_alive"
+            rt_tab["disconnect_ui_api_last_detail"] = detail
+            clear_hold(pkg)
+            clear_manual_login_block(rt_tab)
+            rt_tab["note"] = "api invalid/expired, but app is alive"
+            log_activity(f"{reason}; API invalid/expired but app alive - not held", pkg, YELLOW)
+            return False, rt_tab["note"]
         rt_tab["disconnect_ui_api_last_status"] = api_status
         manual_reason = "api user moderated" if api_status == "moderated" else "api invalid/expired"
         mark_manual_login_block(
