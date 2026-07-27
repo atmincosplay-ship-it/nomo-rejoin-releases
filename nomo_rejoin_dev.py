@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.79.5-dev-mode-menu-core"
+__version__ = "V4.79.6-dev-main-menu-polish"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -5079,18 +5079,18 @@ MAIN_MENU_ITEMS = [
     ("2",  "Mode (Market/Hatcher/Booster/Rejoin Only)"),
     ("3",  "Package manager"),
     ("4",  "Refresh usernames"),
-    ("5",  "Set private server"),
+    ("5",  "Private server"),
     ("6",  "Force restart active tabs"),
     ("7",  "Export cookies"),
     ("8",  "Login via Cookie"),
     ("9",  "Advanced tools"),
-    ("11", "Cloudflare / config"),
+    ("11", "Cloudflare backend"),
     ("12", "AutoExec manager"),
-    ("13", "New Redfinger setup wizard"),
-    ("15", "NOMO update manager"),
-    ("19", "Delta device key manager"),
-    ("20", "Executor storage / paths"),
-    ("21", "Doctor / health"),
+    ("13", "Redfinger setup wizard"),
+    ("15", "Update NOMO"),
+    ("19", "Delta key manager"),
+    ("20", "Executor paths"),
+    ("21", "Doctor"),
     ("0",  "Exit"),
 ]
 
