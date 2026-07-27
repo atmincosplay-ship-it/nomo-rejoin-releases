@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.78.1-dev-private-proof"
+__version__ = "V4.78.2-dev-private-proof-plain"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -28923,7 +28923,21 @@ def diagnose_hatcher_private_server_proof(cfg=None):
     else:
         rows.append(["Share curl", "SKIP (no saved Roblox share URL)"])
 
-    draw_table(["Field", "Value"], rows, [24, max(42, term_width(cfg) - 30)], cfg)
+    label_width = 22
+    value_width = max(32, min(96, term_width(cfg) - label_width - 8))
+    print(col("Field".ljust(label_width) + "Value", CYAN))
+    print(col("-" * max(40, min(term_width(cfg), label_width + value_width + 3)), CYAN))
+    for label, value in rows:
+        label_text = str(label or "-")[:label_width - 1].ljust(label_width)
+        value_text = str(value or "-")
+        chunks = []
+        while len(value_text) > value_width:
+            chunks.append(value_text[:value_width])
+            value_text = value_text[value_width:]
+        chunks.append(value_text)
+        for idx, chunk in enumerate(chunks):
+            prefix = label_text if idx == 0 else " " * label_width
+            print(prefix + chunk)
     print("")
     print(col("Interpretation:", CYAN))
     if owner != "-" and user_id and owner != str(user_id) and not member_ok:
