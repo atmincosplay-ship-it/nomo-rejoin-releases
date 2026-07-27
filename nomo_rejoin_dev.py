@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.79.2-dev-mode-entry-core"
+__version__ = "V4.79.3-dev-mode-registry-core"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -4968,33 +4968,56 @@ def _ensure_rejoin_only_defaults(cfg):
                 changed = True
     return changed
 
+REJOIN_MODE_ORDER = ("market", "hatcher", "booster", "rejoin_only")
+REJOIN_MODE_INFO = {
+    "market": {
+        "label": "MARKET",
+        "flag": "market_mode_enabled",
+    },
+    "hatcher": {
+        "label": "HATCHER",
+        "flag": "hatcher_mode_enabled",
+    },
+    "booster": {
+        "label": "BOOSTER",
+        "flag": "booster_mode_enabled",
+    },
+    "rejoin_only": {
+        "label": "REJOIN ONLY",
+        "flag": "rejoin_only_mode_enabled",
+    },
+}
+
+
+def normalize_rejoin_mode(mode):
+    mode = str(mode or "market").lower().strip()
+    return mode if mode in REJOIN_MODE_INFO else "market"
+
+
+def rejoin_mode_flag(mode):
+    return REJOIN_MODE_INFO[normalize_rejoin_mode(mode)]["flag"]
+
+
 def normalize_active_mode_flags(cfg):
     """Keep Market, Hatcher, Booster, and Rejoin Only mutually exclusive."""
     changed = _ensure_rejoin_only_defaults(cfg)
-    allowed = ("market", "hatcher", "booster", "rejoin_only")
-    active = str(cfg.get("active_rejoin_mode", "market") or "market").lower().strip()
-    if active not in allowed:
-        active = "market"
+    active_raw = str(cfg.get("active_rejoin_mode", "market") or "market").lower().strip()
+    active = normalize_rejoin_mode(active_raw)
+    if active != active_raw:
         changed = True
 
     flags = {
-        "market": bool(cfg.get("market_mode_enabled", active == "market")),
-        "hatcher": bool(cfg.get("hatcher_mode_enabled", active == "hatcher")),
-        "booster": bool(cfg.get("booster_mode_enabled", active == "booster")),
-        "rejoin_only": bool(cfg.get("rejoin_only_mode_enabled", active == "rejoin_only")),
+        mode: bool(cfg.get(rejoin_mode_flag(mode), active == mode))
+        for mode in REJOIN_MODE_ORDER
     }
     if sum(1 for value in flags.values() if value) != 1:
         flags = {name: name == active for name in flags}
         changed = True
 
-    active2 = next((name for name, value in flags.items() if value), "market")
-    desired = {
-        "active_rejoin_mode": active2,
-        "market_mode_enabled": flags["market"],
-        "hatcher_mode_enabled": flags["hatcher"],
-        "booster_mode_enabled": flags["booster"],
-        "rejoin_only_mode_enabled": flags["rejoin_only"],
-    }
+    active2 = next((name for name in REJOIN_MODE_ORDER if flags.get(name)), "market")
+    desired = {"active_rejoin_mode": active2}
+    for mode in REJOIN_MODE_ORDER:
+        desired[rejoin_mode_flag(mode)] = bool(flags.get(mode))
     for key, value in desired.items():
         if cfg.get(key) != value:
             cfg[key] = value
@@ -5004,22 +5027,18 @@ def normalize_active_mode_flags(cfg):
 
 def active_rejoin_mode(cfg):
     normalize_active_mode_flags(cfg)
-    return str(cfg.get("active_rejoin_mode", "market") or "market")
+    return normalize_rejoin_mode(cfg.get("active_rejoin_mode", "market"))
 
 
 def set_active_rejoin_mode(mode, cfg=None):
     if cfg is None:
         cfg = load_config()
     _ensure_rejoin_only_defaults(cfg)
-    mode = str(mode or "market").lower().strip()
-    if mode not in ("market", "hatcher", "booster", "rejoin_only"):
-        mode = "market"
+    mode = normalize_rejoin_mode(mode)
 
     cfg["active_rejoin_mode"] = mode
-    cfg["market_mode_enabled"] = mode == "market"
-    cfg["hatcher_mode_enabled"] = mode == "hatcher"
-    cfg["booster_mode_enabled"] = mode == "booster"
-    cfg["rejoin_only_mode_enabled"] = mode == "rejoin_only"
+    for mode_name in REJOIN_MODE_ORDER:
+        cfg[rejoin_mode_flag(mode_name)] = mode_name == mode
 
     if mode in ("hatcher", "booster"):
         if cfg.get("hatcher_disable_scheduled_hop_on_enable", True):
@@ -5037,13 +5056,7 @@ def set_active_rejoin_mode(mode, cfg=None):
 
 def active_mode_label(cfg):
     mode = active_rejoin_mode(cfg)
-    if mode == "hatcher":
-        return "HATCHER"
-    if mode == "booster":
-        return "BOOSTER"
-    if mode == "rejoin_only":
-        return "REJOIN ONLY"
-    return "MARKET"
+    return REJOIN_MODE_INFO[mode]["label"]
 
 
 # ============================================================
@@ -32712,14 +32725,14 @@ def rejoin_only_menu(cfg):
 
 def start_active_rejoin_mode(cfg):
     """Start the currently selected mode through one shared entrypoint."""
+    starters = {
+        "market": _nomo_start_market_rejoin_original,
+        "hatcher": start_hatcher_safe_rejoiner,
+        "booster": start_booster_safe_rejoiner,
+        "rejoin_only": start_rejoin_only,
+    }
     mode = active_rejoin_mode(cfg)
-    if mode == "hatcher":
-        return start_hatcher_safe_rejoiner(cfg)
-    if mode == "booster":
-        return start_booster_safe_rejoiner(cfg)
-    if mode == "rejoin_only":
-        return start_rejoin_only(cfg)
-    return _nomo_start_market_rejoin_original(cfg)
+    return starters.get(mode, _nomo_start_market_rejoin_original)(cfg)
 
 
 def start_rejoin(cfg):
