@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.78.0-dev-private-permission-guard"
+__version__ = "V4.78.1-dev-private-proof"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -6539,6 +6539,7 @@ def _nomo_set_global_private_server_menu_original(cfg=None):
         print("3. Edit HATCHER / BOOSTER private servers manually")
         print("4. Fetch/create HATCHER / BOOSTER servers + sync Market access")
         print("5. Register MARKET accounts to D1 (one-time)")
+        print("6. Diagnose saved HATCHER private server")
         print("0. Back")
 
         drain_stdin()
@@ -6551,6 +6552,7 @@ def _nomo_set_global_private_server_menu_original(cfg=None):
                 "3",
                 "4",
                 "5",
+                "6",
                 "q",
                 "b",
                 "back",
@@ -6577,6 +6579,8 @@ def _nomo_set_global_private_server_menu_original(cfg=None):
                 )
             elif choice == "5":
                 register_market_accounts_to_d1(cfg)
+            elif choice == "6":
+                diagnose_hatcher_private_server_proof(cfg)
             else:
                 print("Invalid choice.")
                 time.sleep(1)
@@ -28776,6 +28780,161 @@ def run_private_server_fetch_shared(
         "hcfg": hcfg,
     })
     return result
+
+
+def curl_roblox_share_link(cookie, share_link, timeout=20):
+    """Resolve a Roblox share URL with one package cookie; returns proof fields."""
+    raw = str(share_link or "").strip()
+    if not raw:
+        return {
+            "ok": False,
+            "status": "",
+            "final_url": "",
+            "location": "",
+            "error": "missing share link",
+        }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    if cookie:
+        headers["Cookie"] = f".ROBLOSECURITY={cookie}"
+    try:
+        req = urllib.request.Request(raw, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=max(5, int(timeout or 20))) as resp:
+            body = resp.read(500).decode("utf-8", errors="replace")
+            return {
+                "ok": True,
+                "status": str(getattr(resp, "status", "") or resp.getcode() or ""),
+                "final_url": str(resp.geturl() or ""),
+                "location": str(resp.headers.get("Location") or ""),
+                "error": "",
+                "body_hint": cut(body.replace("\n", " "), 120),
+            }
+    except urllib.error.HTTPError as exc:
+        return {
+            "ok": False,
+            "status": str(exc.code),
+            "final_url": str(getattr(exc, "url", "") or raw),
+            "location": str(exc.headers.get("Location") or ""),
+            "error": roblox_http_error_text(exc) or str(exc),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "",
+            "final_url": raw,
+            "location": "",
+            "error": str(exc),
+        }
+
+
+def diagnose_hatcher_private_server_proof(cfg=None):
+    """Read-only proof for one package's saved Hatcher private server."""
+    cfg = load_config() if cfg is None else cfg
+    selected = choose_packages_common(
+        cfg,
+        "DIAGNOSE HATCHER PRIVATE SERVER",
+        multi=False,
+        installed_only=True,
+        include_discovered=True,
+    )
+    if not selected:
+        return
+
+    pkg = selected[0]
+    hcfg = load_hatcher_config()
+    cache = load_cookie_cache()
+    cookie, username, user_id, status, note = private_server_cookie_preflight(pkg, cfg, cache)
+    profile = _hatcher_profile_for_package(hcfg, cfg, pkg, username=username or pkg)
+    saved_item = _private_server_item_from_profile(profile) or {}
+    server_id = str(profile.get("private_server_id") or saved_item.get("id") or "").strip()
+    place_id = str(
+        profile.get("private_server_place_id")
+        or hcfg.get("expected_place_id")
+        or "126884695634066"
+    ).strip()
+    saved_link = str(profile.get("server_link") or "").strip()
+    browser_link = str(
+        profile.get("private_server_browser_link")
+        or saved_item.get("browser_link")
+        or ""
+    ).strip()
+    launch_route = hatcher_profile_private_link(
+        profile,
+        hcfg=hcfg,
+        cfg=cfg,
+        refresh_vip=False,
+    )
+
+    clear()
+    banner("PRIVATE SERVER PROOF", cfg)
+    print(col("Read-only. This does not regenerate links or change server members.", DIM))
+    print("")
+    rows = [
+        ["Package", pkg],
+        ["Cookie status", f"{status} | {note}"],
+        ["Cookie account", f"{username or '-'} ({user_id or '-'})"],
+        ["Saved server id", server_id or "-"],
+        ["Place id", place_id or "-"],
+        ["Saved route", short_link(saved_link) or "-"],
+        ["Saved share", short_link(browser_link) or "-"],
+        ["Launch route", short_link(launch_route) or "-"],
+    ]
+
+    metadata = None
+    meta_err = ""
+    permissions = None
+    perm_err = ""
+    member_ok = False
+    member_note = ""
+    if cookie and server_id:
+        metadata = fetch_private_server_metadata(cookie, server_id)
+        if not metadata:
+            meta_err = "metadata unavailable"
+        permissions, perm_err = fetch_private_server_permissions_raw(cookie, server_id)
+        member_ok, member_note = private_server_user_is_member(cookie, server_id, user_id)
+    elif not cookie:
+        meta_err = "no package cookie"
+        perm_err = "no package cookie"
+    else:
+        meta_err = "missing server id"
+        perm_err = "missing server id"
+
+    owner = str((metadata or {}).get("owner_id") or "-")
+    rows.extend([
+        ["API owner id", owner],
+        ["Owner matches cookie", "YES" if owner != "-" and user_id and owner == str(user_id) else "NO/UNKNOWN"],
+        ["API link code", "YES" if (metadata or {}).get("link_code") else "NO"],
+        ["API browser link", short_link((metadata or {}).get("browser_link", "")) or "-"],
+        ["Permissions API", "OK" if not perm_err else cut(perm_err, 80)],
+        ["User visible in perms", f"{'YES' if member_ok else 'NO'} ({member_note})"],
+    ])
+
+    share_probe = None
+    share_to_probe = browser_link or str((metadata or {}).get("browser_link") or "")
+    if cookie and is_roblox_server_share_link(share_to_probe):
+        share_probe = curl_roblox_share_link(cookie, share_to_probe)
+        rows.extend([
+            ["Share curl", f"{'OK' if share_probe.get('ok') else 'FAIL'} HTTP {share_probe.get('status') or '-'}"],
+            ["Share final URL", cut(share_probe.get("final_url", "") or "-", 90)],
+            ["Share error", cut(share_probe.get("error", "") or "-", 90)],
+        ])
+    else:
+        rows.append(["Share curl", "SKIP (no saved Roblox share URL)"])
+
+    draw_table(["Field", "Value"], rows, [24, max(42, term_width(cfg) - 30)], cfg)
+    print("")
+    print(col("Interpretation:", CYAN))
+    if owner != "-" and user_id and owner != str(user_id) and not member_ok:
+        print(col("- This package is not the private-server owner and is not visible in permissions. 524 is expected.", RED))
+    elif owner != "-" and user_id and owner == str(user_id):
+        print(col("- Cookie user owns the server. If this still gets 524, Roblox app/private-server policy is rejecting the join after API success.", YELLOW))
+    elif member_ok:
+        print(col("- Cookie user is visible in permissions. If this still gets 524, the final app route or Roblox privacy policy is suspect.", YELLOW))
+    else:
+        print(col("- Proof is incomplete. The next step is compare this table with the browser configure page.", YELLOW))
+    pause()
 
 
 def setup_hatcher_private_servers_shared(
