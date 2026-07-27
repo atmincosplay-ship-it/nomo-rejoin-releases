@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.79.8-dev-manual-auth-open"
+__version__ = "V4.79.9-dev-solver-evidence-only"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1321,10 +1321,9 @@ DEFAULT_CONFIG = {
     # The unique queue generation prevents duplicate submissions during the same
     # rejoin attempt. Healthy packages skipped at startup never reach this gate.
     "solver_once_per_rejoin": True,
-    # V4.58: every actual queued Market/Hatcher/Booster open generation owns one
-    # provider request. This includes hard, soft, route, switch, reuse-task, and
-    # manual Option 6 opens. It is still gated by solver_enabled and credentials.
-    "solver_preflight_every_open": True,
+    # Solver should be evidence-first. Sending every normal queued open to the
+    # provider creates noisy NO_CAPTCHA rows and is not needed for healthy rejoins.
+    "solver_preflight_every_open": False,
     # When the provider itself errors/times out (not INVALID_COOKIES/SERVER_BUSY),
     # still perform the original required rejoin once. No second solver request is
     # made for that generation.
@@ -2454,13 +2453,12 @@ def apply_update_migrations(cfg):
     # one recovery open. This clears the clone's 529 auth wrapper without loops.
     if cfg.get("solver_rejoin_on_no_captcha") is not True:
         set_cfg("solver_rejoin_on_no_captcha", True)
-    # V4.14: solver runs once before each real queued open. This supersedes the
-    # old wait-until-stale probe for those queue items without changing disabled
-    # solver behavior.
+    # V4.79.9: keep the solver evidence-first. Older configs may have this set
+    # to true from the preflight experiment; migrate them back to safe/no-spam.
     if cfg.get("solver_once_per_rejoin") is not True:
         set_cfg("solver_once_per_rejoin", True)
-    if cfg.get("solver_preflight_every_open") is not True:
-        set_cfg("solver_preflight_every_open", True)
+    if cfg.get("solver_preflight_every_open") is not False:
+        set_cfg("solver_preflight_every_open", False)
     if "solver_preflight_open_on_failure" not in cfg:
         set_cfg("solver_preflight_open_on_failure", True)
     if _int_cfg(cfg.get("solver_preflight_server_busy_retry_seconds"), 0) < 600:
@@ -12289,7 +12287,7 @@ def solver_preflight_before_open(open_queue, item, tab, rt_tab, pkg, target, cfg
     if (
         not cfg.get("solver_enabled", False)
         or not cfg.get("solver_once_per_rejoin", True)
-        or not cfg.get("solver_preflight_every_open", True)
+        or not cfg.get("solver_preflight_every_open", False)
         or item.get("skip_solver_once")
     ):
         return "ready", item
