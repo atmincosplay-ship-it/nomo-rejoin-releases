@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.78.3-dev-configure-proof"
+__version__ = "V4.78.4-dev-share-route-first"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -3143,7 +3143,7 @@ def short_link(link):
     if len(s) <= 26:
         return s
 
-    return s[:11] + "…" + s[-10:]
+    return s[:11] + "..." + s[-10:]
 
 
 def stop_requested():
@@ -25129,9 +25129,28 @@ def normalized_private_route_link(
     default_place_id="",
 ):
     record = record if isinstance(record, dict) else {}
+    raw = str(link or "").strip()
+
+    browser_link = str(
+        record.get("private_server_browser_link")
+        or record.get("browser_link")
+        or record.get("link")
+        or ""
+    ).strip()
+    share_link = raw if is_roblox_server_share_link(raw) else browser_link
+    if is_roblox_server_share_link(share_link):
+        route = roblox_server_share_deep_link(share_link) or share_link
+        if route:
+            place_id = str(
+                record.get("private_server_place_id")
+                or record.get("place_id")
+                or default_place_id
+                or ""
+            ).strip()
+            return route, place_id, "", ""
 
     place_id, link_code, access_code = private_join_parts(
-        link,
+        raw,
         default_place_id=(
             record.get("private_server_place_id")
             or record.get("place_id")
@@ -25188,18 +25207,6 @@ def normalized_private_route_link(
             "",
             access_code,
         )
-
-    browser_link = str(
-        record.get("private_server_browser_link")
-        or record.get("browser_link")
-        or record.get("link")
-        or ""
-    ).strip()
-    share_link = raw if is_roblox_server_share_link(raw) else browser_link
-    if is_roblox_server_share_link(share_link):
-        route = roblox_server_share_deep_link(share_link) or share_link
-        if route:
-            return route, place_id, "", ""
 
     return "", place_id, "", ""
 
@@ -28916,6 +28923,34 @@ def diagnose_hatcher_private_server_proof(cfg=None):
         cfg=cfg,
         refresh_vip=False,
     )
+    _saved_place, saved_link_code, saved_access_code = private_join_parts(
+        saved_link,
+        default_place_id=place_id,
+    )
+    _launch_place, launch_link_code, launch_access_code = private_join_parts(
+        launch_route,
+        default_place_id=place_id,
+    )
+    saved_share_code = ""
+    saved_share_match = re.search(r"(?:[?&])code=([^&#\s]+)", browser_link, flags=re.I)
+    if saved_share_match:
+        saved_share_code = urllib.parse.unquote(saved_share_match.group(1)).strip()
+    launch_share_code = ""
+    launch_share_match = re.search(r"(?:[?&])code=([^&#\s]+)", launch_route, flags=re.I)
+    if launch_share_match:
+        launch_share_code = urllib.parse.unquote(launch_share_match.group(1)).strip()
+    if launch_share_code:
+        launch_kind = "share"
+        launch_code = launch_share_code
+    elif launch_link_code:
+        launch_kind = "linkCode"
+        launch_code = launch_link_code
+    elif launch_access_code:
+        launch_kind = "accessCode"
+        launch_code = launch_access_code
+    else:
+        launch_kind = "-"
+        launch_code = "-"
 
     clear()
     banner("PRIVATE SERVER PROOF", cfg)
@@ -28930,6 +28965,10 @@ def diagnose_hatcher_private_server_proof(cfg=None):
         ["Saved route", short_link(saved_link) or "-"],
         ["Saved share", short_link(browser_link) or "-"],
         ["Launch route", short_link(launch_route) or "-"],
+        ["Saved share code", saved_share_code or "-"],
+        ["Saved link code", saved_link_code or "-"],
+        ["Launch kind", launch_kind],
+        ["Launch code", launch_code],
     ]
 
     metadata = None
