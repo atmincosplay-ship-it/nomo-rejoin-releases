@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.79.7-dev-api-alive-soft"
+__version__ = "V4.79.8-dev-manual-auth-open"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1555,6 +1555,8 @@ DEFAULT_CONFIG = {
     "api_precheck_before_rejoin_enabled": True,
     "api_precheck_block_retry_seconds": 600,
     "api_precheck_refresh_invalid_cookie_enabled": True,
+    "manual_auth_open_package_enabled": True,
+    "manual_auth_open_cooldown_seconds": 600,
     "minimized_window_detection_enabled": True,
     "minimized_window_reopen_enabled": False,  # status-only; dumpsys is not package-safe enough
     "minimized_window_reopen_mode": "soft",
@@ -2635,6 +2637,10 @@ def apply_update_migrations(cfg):
         set_cfg("api_precheck_block_retry_seconds", 600)
     if "api_precheck_refresh_invalid_cookie_enabled" not in cfg:
         set_cfg("api_precheck_refresh_invalid_cookie_enabled", True)
+    if "manual_auth_open_package_enabled" not in cfg:
+        set_cfg("manual_auth_open_package_enabled", True)
+    if "manual_auth_open_cooldown_seconds" not in cfg:
+        set_cfg("manual_auth_open_cooldown_seconds", 600)
     if "disconnect_ui_retry_seconds" not in cfg:
         set_cfg("disconnect_ui_retry_seconds", 60)
     if "disconnect_ui_hard_after_seconds" not in cfg:
@@ -10043,6 +10049,7 @@ def disconnect_ui_api_precheck(tab, rt_tab, cfg, reason="kick popup", require_di
             t,
         )
         set_hold(pkg, manual_reason)
+        maybe_open_manual_auth_package(tab, cfg, rt_tab, manual_reason)
         log_activity(f"{reason}; {manual_reason} before rejoin - package held", pkg, RED)
         return True, rt_tab["note"]
 
@@ -10771,6 +10778,40 @@ def mark_manual_login_block(rt_tab, reason, detail="", note="", detected_at=None
     rt_tab["manual_login_detected_at"] = int(detected_at or now())
     rt_tab["note"] = str(note or rt_tab["manual_login_detail"])
     return True
+
+
+def maybe_open_manual_auth_package(tab, cfg, rt_tab, reason="manual auth"):
+    """Bring up only the affected clone when human login/cookie help is needed."""
+    if not cfg.get("manual_auth_open_package_enabled", True):
+        return False, "manual auth open disabled"
+
+    pkg = str((tab or {}).get("package", "") or "").strip()
+    if not pkg:
+        return False, "no package"
+
+    cooldown = max(60, int(cfg.get("manual_auth_open_cooldown_seconds", 600) or 600))
+    last = int(rt_tab.get("manual_auth_last_open_at", 0) or 0)
+    if last > 0 and now() - last < cooldown:
+        return False, f"manual auth open cooldown {format_age(cooldown - (now() - last))}"
+
+    if package_alive(pkg, cfg, fresh=True):
+        rt_tab["manual_auth_last_open_at"] = now()
+        return False, "package already visible/alive"
+
+    ok, note = open_package_launcher(pkg, cfg)
+    rt_tab["manual_auth_last_open_at"] = now()
+    rt_tab["manual_auth_last_open_note"] = note
+    if ok:
+        expected = (
+            str((tab or {}).get("user_name", "") or "")
+            or str((tab or {}).get("hatcher_name", "") or "")
+            or pkg
+        )
+        rt_tab["note"] = f"manual login needed: {expected}"
+        log_activity(f"manual auth hold opened package: {cut(reason, 70)}", pkg, YELLOW)
+        return True, note
+    log_activity(f"manual auth hold could not open package: {cut(note, 70)}", pkg, RED)
+    return False, note
 
 
 def cached_cookie_for_package(pkg):
@@ -11882,6 +11923,7 @@ def detect_and_mark_manual_login(tab, cfg, rt, rt_tab, reason):
         rt_tab["note"] = "join captcha/manual"
     else:
         rt_tab["note"] = "needs manual login"
+    maybe_open_manual_auth_package(tab, cfg, rt_tab, reason)
     send_login_challenge_alert(cfg, tab, rt_tab, detail)
     save_runtime(rt)
     return True, detail
@@ -12329,6 +12371,7 @@ def solver_preflight_before_open(open_queue, item, tab, rt_tab, pkg, target, cfg
             str(note),
         )
         set_hold(pkg, str(note))
+        maybe_open_manual_auth_package(tab, cfg, rt_tab, "solver preflight invalid/missing cookie")
         log_activity(f"solver preflight blocked open: {cut(note, 80)}", pkg, RED)
         core.save()
         return "handled", None
