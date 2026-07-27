@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.77.8-dev-prefer-share-route"
+__version__ = "V4.77.9-dev-fresh-private-code"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -16102,7 +16102,7 @@ def hatcher_profile_private_link(prof, hcfg=None, cfg=None, refresh_vip=False):
                         "browser_link": str(prof.get("private_server_browser_link") or ""),
                         "name": str(prof.get("hatcher_name") or "NOMO Hatcher"),
                         "active": True,
-                    }, fresh)
+                    }, fresh, prefer_extra=True)
                     prof["private_server_link_code"] = str(merged.get("link_code") or "")
                     prof["private_server_access_code"] = str(merged.get("access_code") or "")
                     prof["private_server_browser_link"] = str(merged.get("browser_link") or "")
@@ -24323,14 +24323,14 @@ def fetch_private_server_metadata(cookie, server_id):
     return _normalize_private_server_item(data)
 
 
-def _merge_private_server_item(base, extra):
+def _merge_private_server_item(base, extra, prefer_extra=False):
     if not base:
-        return extra
+        return dict(extra or {})
     if not extra:
-        return base
+        return dict(base or {})
     merged = dict(base)
     for key in ("id", "name", "link_code", "access_code", "browser_link", "owner_id"):
-        if not merged.get(key) and extra.get(key):
+        if extra.get(key) and (prefer_extra or not merged.get(key)):
             merged[key] = extra[key]
     if extra.get("active") is False:
         merged["active"] = False
@@ -24390,7 +24390,7 @@ def fetch_owned_private_servers(cookie, place_id, universe_id, user_id=None):
     enriched = []
     for item in all_items:
         if item.get("id") and not (item.get("link_code") or item.get("access_code")):
-            item = _merge_private_server_item(item, fetch_private_server_metadata(cookie, item["id"]))
+            item = _merge_private_server_item(item, fetch_private_server_metadata(cookie, item["id"]), prefer_extra=True)
         enriched.append(item)
     enriched.sort(key=lambda x: (not bool(x.get("active", True)), not bool(x.get("link_code") or x.get("access_code"))))
     return enriched, "; ".join(dict.fromkeys(errors))
@@ -24459,14 +24459,14 @@ def _refresh_created_private_server(cookie, place_id, universe_id, user_id, crea
         )
         for server in servers:
             if created_id and str(server.get("id") or "") == created_id:
-                return _merge_private_server_item(created_item, server)
+                return _merge_private_server_item(created_item, server, prefer_extra=True)
             if created_name and str(server.get("name") or "") == created_name:
-                return _merge_private_server_item(created_item, server)
+                return _merge_private_server_item(created_item, server, prefer_extra=True)
         # If there is only one usable owned server, it is almost certainly the
         # one just created (free servers are limited to one for this experience).
         usable = [s for s in servers if s.get("link_code") or s.get("access_code")]
         if len(usable) == 1:
-            return _merge_private_server_item(created_item, usable[0])
+            return _merge_private_server_item(created_item, usable[0], prefer_extra=True)
     return created_item
 
 
@@ -24501,7 +24501,7 @@ def create_private_server(cookie, universe_id, name="NOMO Hatcher", expected_pri
         return None, err or "empty create response"
     item = _normalize_private_server_item(data)
     if item and item.get("id") and not (item.get("link_code") or item.get("access_code")):
-        item = _merge_private_server_item(item, fetch_private_server_metadata(cookie, item["id"]))
+        item = _merge_private_server_item(item, fetch_private_server_metadata(cookie, item["id"]), prefer_extra=True)
     return item, ""
 
 
@@ -24980,6 +24980,8 @@ def _private_server_item_from_profile(profile):
     access_code = str(profile.get("private_server_access_code") or "").strip()
     browser_link = str(profile.get("private_server_browser_link") or "").strip()
     saved_link = str(profile.get("server_link") or "").strip()
+    if not browser_link and is_roblox_server_share_link(saved_link):
+        browser_link = saved_link
 
     # Recover codes from both current and older saved link formats.
     if saved_link:
@@ -24997,7 +24999,7 @@ def _private_server_item_from_profile(profile):
             if m:
                 access_code = urllib.parse.unquote(m.group(1))
 
-    if not (server_id or link_code or access_code):
+    if not (server_id or link_code or access_code or browser_link):
         return None
     return {
         "id": server_id,
@@ -25137,6 +25139,18 @@ def normalized_private_route_link(
             "",
             access_code,
         )
+
+    browser_link = str(
+        record.get("private_server_browser_link")
+        or record.get("browser_link")
+        or record.get("link")
+        or ""
+    ).strip()
+    share_link = raw if is_roblox_server_share_link(raw) else browser_link
+    if is_roblox_server_share_link(share_link):
+        route = roblox_server_share_deep_link(share_link) or share_link
+        if route:
+            return route, place_id, "", ""
 
     return "", place_id, "", ""
 
@@ -25535,7 +25549,7 @@ def auto_fetch_private_servers(
         if existing and not usable:
             if existing.get("id"):
                 existing = _merge_private_server_item(
-                    existing, fetch_private_server_metadata(cookie, existing.get("id"))
+                    existing, fetch_private_server_metadata(cookie, existing.get("id")), prefer_extra=True
                 )
             if saved_item:
                 same_server = (
@@ -25562,7 +25576,7 @@ def auto_fetch_private_servers(
                 verified = fetch_private_server_metadata(cookie, saved_item.get("id"))
             verified_owner = str((verified or {}).get("owner_id") or "").strip()
             if verified and user_id and verified_owner == str(user_id):
-                existing = _merge_private_server_item(verified, saved_item)
+                existing = _merge_private_server_item(saved_item, verified, prefer_extra=True)
                 usable = existing
                 print(col("Verified saved private server belongs to this account; duplicate creation skipped.", YELLOW))
             else:
@@ -25655,7 +25669,7 @@ def auto_fetch_private_servers(
                 friends_allowed=True,
             )
             if refreshed_item:
-                usable = _merge_private_server_item(usable, refreshed_item)
+                usable = _merge_private_server_item(usable, refreshed_item, prefer_extra=True)
                 existing = usable
                 print(col("Fresh private join code saved for this account.", GREEN))
             else:
@@ -28677,7 +28691,27 @@ def run_private_server_fetch_shared(
             or ""
         ).strip()
 
-        if link and not link.startswith("YOUR_"):
+        normalized, _place_id, link_code, access_code = normalized_private_route_link(
+            link,
+            record=profile,
+            default_place_id=str(
+                hcfg.get("expected_place_id")
+                or place_id_override
+                or "126884695634066"
+            ),
+        )
+        browser_link = str(profile.get("private_server_browser_link") or "").strip()
+        has_private_route = bool(
+            normalized
+            and (
+                link_code
+                or access_code
+                or is_roblox_server_share_link(link)
+                or is_roblox_server_share_link(browser_link)
+            )
+        )
+
+        if has_private_route:
             ready.append(package)
         elif package:
             missing.append(package)
