@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.78.2-dev-private-proof-plain"
+__version__ = "V4.78.3-dev-configure-proof"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -28829,6 +28829,56 @@ def curl_roblox_share_link(cookie, share_link, timeout=20):
         }
 
 
+def curl_roblox_web_page(cookie, url, timeout=20, read_bytes=200000):
+    """Fetch a Roblox web page with one package cookie; read-only diagnostic."""
+    raw = str(url or "").strip()
+    if not raw:
+        return {
+            "ok": False,
+            "status": "",
+            "final_url": "",
+            "error": "missing url",
+            "text": "",
+        }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    if cookie:
+        headers["Cookie"] = f".ROBLOSECURITY={cookie}"
+    try:
+        req = urllib.request.Request(raw, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=max(5, int(timeout or 20))) as resp:
+            body = resp.read(max(1024, int(read_bytes or 200000))).decode(
+                "utf-8",
+                errors="replace",
+            )
+            return {
+                "ok": True,
+                "status": str(getattr(resp, "status", "") or resp.getcode() or ""),
+                "final_url": str(resp.geturl() or ""),
+                "error": "",
+                "text": body,
+            }
+    except urllib.error.HTTPError as exc:
+        body = roblox_http_error_text(exc)
+        return {
+            "ok": False,
+            "status": str(exc.code),
+            "final_url": str(getattr(exc, "url", "") or raw),
+            "error": body or str(exc),
+            "text": body,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "",
+            "final_url": raw,
+            "error": str(exc),
+            "text": "",
+        }
+
+
 def diagnose_hatcher_private_server_proof(cfg=None):
     """Read-only proof for one package's saved Hatcher private server."""
     cfg = load_config() if cfg is None else cfg
@@ -28913,8 +28963,12 @@ def diagnose_hatcher_private_server_proof(cfg=None):
 
     share_probe = None
     share_to_probe = browser_link or str((metadata or {}).get("browser_link") or "")
+    share_code = ""
     if cookie and is_roblox_server_share_link(share_to_probe):
         share_probe = curl_roblox_share_link(cookie, share_to_probe)
+        share_code_match = re.search(r"(?:[?&])code=([^&#\s]+)", share_to_probe, flags=re.I)
+        if share_code_match:
+            share_code = urllib.parse.unquote(share_code_match.group(1)).strip()
         rows.extend([
             ["Share curl", f"{'OK' if share_probe.get('ok') else 'FAIL'} HTTP {share_probe.get('status') or '-'}"],
             ["Share final URL", cut(share_probe.get("final_url", "") or "-", 90)],
@@ -28922,6 +28976,35 @@ def diagnose_hatcher_private_server_proof(cfg=None):
         ])
     else:
         rows.append(["Share curl", "SKIP (no saved Roblox share URL)"])
+
+    configure_url = (
+        f"https://www.roblox.com/private-server/configure/{urllib.parse.quote(server_id, safe='')}"
+        if server_id
+        else ""
+    )
+    configure_probe = None
+    configure_has_user = False
+    configure_has_server = False
+    configure_has_share = False
+    if cookie and configure_url:
+        configure_probe = curl_roblox_web_page(cookie, configure_url)
+        configure_text = str(configure_probe.get("text") or "")
+        configure_has_user = bool(
+            (user_id and str(user_id) in configure_text)
+            or (username and str(username).lower() in configure_text.lower())
+        )
+        configure_has_server = bool(server_id and str(server_id) in configure_text)
+        configure_has_share = bool(share_code and share_code in configure_text)
+        rows.extend([
+            ["Configure curl", f"{'OK' if configure_probe.get('ok') else 'FAIL'} HTTP {configure_probe.get('status') or '-'}"],
+            ["Configure final URL", cut(configure_probe.get("final_url", "") or "-", 90)],
+            ["Configure has user", "YES" if configure_has_user else "NO"],
+            ["Configure has server", "YES" if configure_has_server else "NO"],
+            ["Configure has share", "YES" if configure_has_share else "NO"],
+            ["Configure error", cut(configure_probe.get("error", "") or "-", 90)],
+        ])
+    else:
+        rows.append(["Configure curl", "SKIP (missing cookie or server id)"])
 
     label_width = 22
     value_width = max(32, min(96, term_width(cfg) - label_width - 8))
@@ -28944,7 +29027,7 @@ def diagnose_hatcher_private_server_proof(cfg=None):
         print(col("- This package is not the private-server owner and is not visible in permissions. 524 is expected.", RED))
     elif owner != "-" and user_id and owner == str(user_id):
         print(col("- Cookie user owns the server. If this still gets 524, Roblox app/private-server policy is rejecting the join after API success.", YELLOW))
-    elif member_ok:
+    elif member_ok or configure_has_user:
         print(col("- Cookie user is visible in permissions. If this still gets 524, the final app route or Roblox privacy policy is suspect.", YELLOW))
     else:
         print(col("- Proof is incomplete. The next step is compare this table with the browser configure page.", YELLOW))
