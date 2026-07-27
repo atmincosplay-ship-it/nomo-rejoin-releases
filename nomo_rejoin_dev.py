@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.79.9-dev-solver-evidence-only"
+__version__ = "V4.80.0-dev-solver-nocaptcha-trust"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1321,9 +1321,11 @@ DEFAULT_CONFIG = {
     # The unique queue generation prevents duplicate submissions during the same
     # rejoin attempt. Healthy packages skipped at startup never reach this gate.
     "solver_once_per_rejoin": True,
-    # Solver should be evidence-first. Sending every normal queued open to the
-    # provider creates noisy NO_CAPTCHA rows and is not needed for healthy rejoins.
-    "solver_preflight_every_open": False,
+    # Ask the provider before real queued opens, then trust a recent NO_CAPTCHA
+    # answer instead of submitting again on every retry.
+    "solver_preflight_every_open": True,
+    "solver_no_captcha_trust_seconds": 3600,
+    "solver_no_captcha_max_trusted_rejoins": 3,
     # When the provider itself errors/times out (not INVALID_COOKIES/SERVER_BUSY),
     # still perform the original required rejoin once. No second solver request is
     # made for that generation.
@@ -2453,12 +2455,16 @@ def apply_update_migrations(cfg):
     # one recovery open. This clears the clone's 529 auth wrapper without loops.
     if cfg.get("solver_rejoin_on_no_captcha") is not True:
         set_cfg("solver_rejoin_on_no_captcha", True)
-    # V4.79.9: keep the solver evidence-first. Older configs may have this set
-    # to true from the preflight experiment; migrate them back to safe/no-spam.
+    # V4.80: preflight is useful, but a recent NO_CAPTCHA answer is trusted for
+    # a bounded window to avoid provider spam during normal rejoin retries.
     if cfg.get("solver_once_per_rejoin") is not True:
         set_cfg("solver_once_per_rejoin", True)
-    if cfg.get("solver_preflight_every_open") is not False:
-        set_cfg("solver_preflight_every_open", False)
+    if cfg.get("solver_preflight_every_open") is not True:
+        set_cfg("solver_preflight_every_open", True)
+    if _int_cfg(cfg.get("solver_no_captcha_trust_seconds"), 0) < 300:
+        set_cfg("solver_no_captcha_trust_seconds", 3600)
+    if _int_cfg(cfg.get("solver_no_captcha_max_trusted_rejoins"), 0) < 1:
+        set_cfg("solver_no_captcha_max_trusted_rejoins", 3)
     if "solver_preflight_open_on_failure" not in cfg:
         set_cfg("solver_preflight_open_on_failure", True)
     if _int_cfg(cfg.get("solver_preflight_server_busy_retry_seconds"), 0) < 600:
@@ -12249,6 +12255,7 @@ def wait_until_fresh_after_open(
             clear_disconnect_ui_incident(rt_tab)
             rt_tab["solver_busy_retry_pending"] = False
             rt_tab["solver_busy_retry_at"] = 0
+            rt_tab["solver_no_captcha_trusted_rejoins"] = 0
             core.save()
             log_activity("fresh clean state - rejoin complete", pkg, GREEN)
             return True, "fresh"
@@ -12287,7 +12294,7 @@ def solver_preflight_before_open(open_queue, item, tab, rt_tab, pkg, target, cfg
     if (
         not cfg.get("solver_enabled", False)
         or not cfg.get("solver_once_per_rejoin", True)
-        or not cfg.get("solver_preflight_every_open", False)
+        or not cfg.get("solver_preflight_every_open", True)
         or item.get("skip_solver_once")
     ):
         return "ready", item
@@ -12299,6 +12306,27 @@ def solver_preflight_before_open(open_queue, item, tab, rt_tab, pkg, target, cfg
 
     if item.get("solver_preflight_done"):
         item["skip_solver_probe"] = True
+        return "ready", item
+
+    trust_until = int(rt_tab.get("solver_no_captcha_trust_until", 0) or 0)
+    trusted_rejoins = int(rt_tab.get("solver_no_captcha_trusted_rejoins", 0) or 0)
+    max_trusted = max(1, int(cfg.get("solver_no_captcha_max_trusted_rejoins", 3) or 3))
+    if trust_until > now() and trusted_rejoins < max_trusted:
+        rt_tab["solver_no_captcha_trusted_rejoins"] = trusted_rejoins + 1
+        rt_tab["note"] = (
+            f"NO_CAPTCHA trusted "
+            f"{rt_tab['solver_no_captcha_trusted_rejoins']}/{max_trusted}"
+        )
+        item["solver_preflight_done"] = True
+        item["solver_result"] = "NO_CAPTCHA_TRUSTED"
+        item["skip_solver_probe"] = True
+        log_activity(
+            f"solver NO_CAPTCHA trusted; no provider send "
+            f"{rt_tab['solver_no_captcha_trusted_rejoins']}/{max_trusted}",
+            pkg,
+            DIM,
+        )
+        core.save()
         return "ready", item
 
     if item.get("solver_preflight_waiting"):
@@ -26627,6 +26655,19 @@ def handle_detected_solver_challenge(tab, cfg, rt, rt_tab, reason, core=None):
     return "Manual", note
 
 
+def trust_solver_no_captcha(rt_tab, cfg):
+    trust_seconds = max(300, int(cfg.get("solver_no_captcha_trust_seconds", 3600) or 3600))
+    rt_tab["solver_no_captcha_trust_until"] = now() + trust_seconds
+    rt_tab["solver_no_captcha_trusted_rejoins"] = 0
+    rt_tab["solver_no_captcha_last_at"] = now()
+    return trust_seconds
+
+
+def clear_solver_no_captcha_trust(rt_tab):
+    rt_tab["solver_no_captcha_trust_until"] = 0
+    rt_tab["solver_no_captcha_trusted_rejoins"] = 0
+
+
 def poll_solver_jobs(cfg, rt, open_queue, core=None):
     """Apply completed jobs on the main thread; never expose cookies/tokens."""
     if core is None:
@@ -26681,6 +26722,10 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
                 rt_tab["solver_last_success"] = now()
                 rt_tab["solver_last_error"] = ""
                 rt_tab["solver_last_probe"] = detail
+                if no_captcha_result:
+                    trust_solver_no_captcha(rt_tab, cfg)
+                else:
+                    clear_solver_no_captcha_trust(rt_tab)
                 rt_tab["note"] = f"{result_label}; opening once"
                 if queued_item is not None:
                     queued_item["solver_preflight_waiting"] = False
@@ -26785,6 +26830,7 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
             rt_tab["solver_last_success"] = now()
             rt_tab["solver_last_error"] = ""
             rt_tab["solver_last_probe"] = detail
+            trust_solver_no_captcha(rt_tab, cfg)
             rt_tab["note"] = "NO_CAPTCHA; still waiting for game load"
             log_activity(
                 "solver NO_CAPTCHA during loading probe; no hard rejoin queued",
@@ -26807,6 +26853,10 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
             rt_tab["solver_last_success"] = now()
             rt_tab["solver_last_error"] = ""
             rt_tab["solver_last_probe"] = detail
+            if no_captcha_result:
+                trust_solver_no_captcha(rt_tab, cfg)
+            else:
+                clear_solver_no_captcha_trust(rt_tab)
 
             # Remove only stale/duplicate queue entries for this package. Never
             # disturb another clone's queued recovery.
