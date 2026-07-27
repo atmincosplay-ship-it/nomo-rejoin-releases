@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.78.5-dev-private-owner-guard"
+__version__ = "V4.78.6-dev-root-place-guard"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -16120,6 +16120,7 @@ def hatcher_profile_private_link(prof, hcfg=None, cfg=None, refresh_vip=False):
                 fresh = fetch_private_server_metadata(cookie, server_id)
                 if fresh:
                     fresh_owner = str((fresh or {}).get("owner_id") or "").strip()
+                    fresh_root_place = str((fresh or {}).get("root_place_id") or "").strip()
                     current_user_id = str(_user_id or "").strip()
                     if fresh_owner and current_user_id and fresh_owner != current_user_id:
                         print(col(
@@ -16129,6 +16130,18 @@ def hatcher_profile_private_link(prof, hcfg=None, cfg=None, refresh_vip=False):
                         ))
                         print(col(
                             "Saved private route was not opened because it belongs to another account.",
+                            RED,
+                        ))
+                        return ""
+                    expected_root_place = str(hcfg.get("expected_place_id") or "126884695634066").strip()
+                    if fresh_root_place and fresh_root_place != expected_root_place:
+                        print(col(
+                            f"{short_pkg(package)} private-server PLACE MISMATCH: "
+                            f"server root={fresh_root_place}, expected={expected_root_place}.",
+                            RED,
+                        ))
+                        print(col(
+                            "Saved private route was not opened because it belongs to another experience.",
                             RED,
                         ))
                         return ""
@@ -16157,8 +16170,8 @@ def hatcher_profile_private_link(prof, hcfg=None, cfg=None, refresh_vip=False):
                     prof["private_server_browser_link"] = str(merged.get("browser_link") or "")
                     prof["server_link"] = build_private_server_link(
                         str(
-                            prof.get("private_server_place_id")
-                            or hcfg.get("expected_place_id")
+                            hcfg.get("expected_place_id")
+                            or prof.get("private_server_place_id")
                             or "126884695634066"
                         ),
                         merged,
@@ -16180,9 +16193,9 @@ def hatcher_profile_private_link(prof, hcfg=None, cfg=None, refresh_vip=False):
                 ))
 
     expected_place = str(
-        prof.get("private_server_place_id")
+        hcfg.get("expected_place_id")
+        or prof.get("private_server_place_id")
         or prof.get("place_id")
-        or hcfg.get("expected_place_id")
         or "126884695634066"
     ).strip()
     link, _place_id, link_code, access_code = normalized_private_route_link(
@@ -16194,10 +16207,14 @@ def hatcher_profile_private_link(prof, hcfg=None, cfg=None, refresh_vip=False):
         return link
 
     browser_link = str(prof.get("private_server_browser_link") or "").strip()
-    if is_roblox_server_share_link(browser_link):
+    runtime_cfg = cfg or load_config()
+    if runtime_cfg.get("private_server_allow_share_only_route", False) and is_roblox_server_share_link(browser_link):
         return roblox_server_share_deep_link(browser_link) or browser_link
 
-    return str(prof.get("server_link") or "").strip()
+    saved_route = str(prof.get("server_link") or "").strip()
+    if is_roblox_server_share_link(saved_route) or "/share-links" in saved_route.lower():
+        return "" if not runtime_cfg.get("private_server_allow_share_only_route", False) else saved_route
+    return saved_route
 
 
 def hatcher_profile_to_tab(prof, hcfg=None, cfg=None, refresh_vip=False):
@@ -24317,6 +24334,32 @@ def _normalize_private_server_item(item):
     browser_link = _first_value(item, (
         "link", "shareLink", "privateServerLink", "privateServerShareLink"
     ))
+    game = item.get("game") if isinstance(item.get("game"), dict) else {}
+    universe = item.get("universe") if isinstance(item.get("universe"), dict) else {}
+    root_place = game.get("rootPlace") if isinstance(game.get("rootPlace"), dict) else {}
+    root_place_id = _first_value(item, (
+        "rootPlaceId", "rootPlaceID", "RootPlaceId", "placeId", "PlaceId"
+    ))
+    if not root_place_id:
+        root_place_id = _first_value(game, (
+            "rootPlaceId", "rootPlaceID", "RootPlaceId", "placeId", "PlaceId"
+        ))
+    if not root_place_id:
+        root_place_id = _first_value(root_place, (
+            "id", "Id", "placeId", "PlaceId", "rootPlaceId", "RootPlaceId"
+        ))
+    universe_id = _first_value(item, (
+        "universeId", "universeID", "UniverseId", "gameId", "GameId"
+    ))
+    if not universe_id:
+        universe_id = _first_value(game, ("id", "Id", "universeId", "UniverseId"))
+    if not universe_id:
+        universe_id = _first_value(universe, ("id", "Id", "universeId", "UniverseId"))
+    game_name = (
+        _first_value(game, ("name", "Name"))
+        or _first_value(item, ("gameName", "universeName", "name"))
+        or ""
+    )
     owner = item.get("owner") if isinstance(item.get("owner"), dict) else {}
     owner_id = _first_value(item, ("ownerId", "ownerUserId", "userId"))
     if not owner_id:
@@ -24336,6 +24379,9 @@ def _normalize_private_server_item(item):
         "access_code": str(access_code) if access_code is not None else "",
         "browser_link": str(browser_link) if browser_link is not None else "",
         "owner_id": str(owner_id) if owner_id is not None else "",
+        "root_place_id": str(root_place_id) if root_place_id is not None else "",
+        "universe_id": str(universe_id) if universe_id is not None else "",
+        "game_name": str(game_name) if game_name is not None else "",
         "active": bool(active),
         "raw": item,
     }
@@ -24378,7 +24424,10 @@ def _merge_private_server_item(base, extra, prefer_extra=False):
     if not extra:
         return dict(base or {})
     merged = dict(base)
-    for key in ("id", "name", "link_code", "access_code", "browser_link", "owner_id"):
+    for key in (
+        "id", "name", "link_code", "access_code", "browser_link",
+        "owner_id", "root_place_id", "universe_id", "game_name",
+    ):
         if extra.get(key) and (prefer_extra or not merged.get(key)):
             merged[key] = extra[key]
     if extra.get("active") is False:
@@ -25030,6 +25079,13 @@ def _private_server_item_from_profile(profile):
     browser_link = str(profile.get("private_server_browser_link") or "").strip()
     owner_id = str(profile.get("private_server_owner_id") or "").strip()
     place_id = str(profile.get("private_server_place_id") or "").strip()
+    actual_place_id = str(
+        profile.get("private_server_actual_place_id")
+        or profile.get("private_server_root_place_id")
+        or ""
+    ).strip()
+    universe_id = str(profile.get("private_server_universe_id") or "").strip()
+    game_name = str(profile.get("private_server_game_name") or "").strip()
     saved_link = str(profile.get("server_link") or "").strip()
     if not browser_link and is_roblox_server_share_link(saved_link):
         browser_link = saved_link
@@ -25060,6 +25116,9 @@ def _private_server_item_from_profile(profile):
         "browser_link": browser_link,
         "owner_id": owner_id,
         "place_id": place_id,
+        "root_place_id": actual_place_id,
+        "universe_id": universe_id,
+        "game_name": game_name,
         "active": True,
         "raw": {},
     }
@@ -25134,24 +25193,6 @@ def normalized_private_route_link(
     record = record if isinstance(record, dict) else {}
     raw = str(link or "").strip()
 
-    browser_link = str(
-        record.get("private_server_browser_link")
-        or record.get("browser_link")
-        or record.get("link")
-        or ""
-    ).strip()
-    share_link = raw if is_roblox_server_share_link(raw) else browser_link
-    if is_roblox_server_share_link(share_link):
-        route = roblox_server_share_deep_link(share_link) or share_link
-        if route:
-            place_id = str(
-                record.get("private_server_place_id")
-                or record.get("place_id")
-                or default_place_id
-                or ""
-            ).strip()
-            return route, place_id, "", ""
-
     place_id, link_code, access_code = private_join_parts(
         raw,
         default_place_id=(
@@ -25210,6 +25251,18 @@ def normalized_private_route_link(
             "",
             access_code,
         )
+
+    browser_link = str(
+        record.get("private_server_browser_link")
+        or record.get("browser_link")
+        or record.get("link")
+        or ""
+    ).strip()
+    share_link = raw if is_roblox_server_share_link(raw) else browser_link
+    if is_roblox_server_share_link(share_link):
+        route = roblox_server_share_deep_link(share_link) or share_link
+        if route:
+            return route, place_id, "", ""
 
     return "", place_id, "", ""
 
@@ -25293,10 +25346,6 @@ def build_private_server_link(place_id, item, cfg=None):
         return ""
     cfg = cfg or {}
     browser_link = str(item.get("browser_link") or "").strip()
-    if cfg.get("private_server_prefer_share_link", True) and is_roblox_server_share_link(browser_link):
-        share_route = roblox_server_share_deep_link(browser_link)
-        if share_route:
-            return share_route
 
     code = str(item.get("link_code") or "").strip()
     if code:
@@ -25311,6 +25360,10 @@ def build_private_server_link(place_id, item, cfg=None):
             f"roblox://placeId={place_id}"
             f"&accessCode={urllib.parse.quote(access, safe='')}"
         )
+    if cfg.get("private_server_prefer_share_link", True) and is_roblox_server_share_link(browser_link):
+        share_route = roblox_server_share_deep_link(browser_link)
+        if share_route:
+            return share_route
     if is_roblox_server_share_link(browser_link):
         return roblox_server_share_deep_link(browser_link) or browser_link
     return ""
@@ -25575,6 +25628,10 @@ def auto_fetch_private_servers(
                 "private_server_browser_link",
                 "private_server_owner_id",
                 "private_server_place_id",
+                "private_server_actual_place_id",
+                "private_server_root_place_id",
+                "private_server_universe_id",
+                "private_server_game_name",
                 "private_server_market_allowlist_hash",
                 "private_server_market_allowlist_error",
             ):
@@ -25598,6 +25655,10 @@ def auto_fetch_private_servers(
                 "private_server_browser_link",
                 "private_server_owner_id",
                 "private_server_place_id",
+                "private_server_actual_place_id",
+                "private_server_root_place_id",
+                "private_server_universe_id",
+                "private_server_game_name",
                 "private_server_market_allowlist_hash",
                 "private_server_market_allowlist_error",
             ):
@@ -25620,6 +25681,10 @@ def auto_fetch_private_servers(
                 "private_server_browser_link",
                 "private_server_owner_id",
                 "private_server_place_id",
+                "private_server_actual_place_id",
+                "private_server_root_place_id",
+                "private_server_universe_id",
+                "private_server_game_name",
                 "private_server_market_allowlist_hash",
                 "private_server_market_allowlist_error",
             ):
@@ -25696,6 +25761,10 @@ def auto_fetch_private_servers(
                     "private_server_browser_link",
                     "private_server_owner_id",
                     "private_server_place_id",
+                    "private_server_actual_place_id",
+                    "private_server_root_place_id",
+                    "private_server_universe_id",
+                    "private_server_game_name",
                     "private_server_market_allowlist_hash",
                     "private_server_market_allowlist_error",
                 ):
@@ -25784,11 +25853,46 @@ def auto_fetch_private_servers(
                 print(col("Fresh private join code saved for this account.", GREEN))
             else:
                 print(col(f"Fresh join code refresh failed: {refresh_err}", YELLOW))
+        actual_place_id = str(
+            usable.get("root_place_id")
+            or usable.get("place_id")
+            or ""
+        ).strip()
+        if actual_place_id and actual_place_id != str(place_id):
+            for key in (
+                "server_link",
+                "private_server_id",
+                "private_server_link_code",
+                "private_server_access_code",
+                "private_server_browser_link",
+                "private_server_owner_id",
+                "private_server_place_id",
+                "private_server_actual_place_id",
+                "private_server_root_place_id",
+                "private_server_universe_id",
+                "private_server_game_name",
+                "private_server_market_allowlist_hash",
+                "private_server_market_allowlist_error",
+            ):
+                profile[key] = ""
+            profile["private_server_friends_allowed"] = False
+            profile["private_server_market_users_synced"] = 0
+            profile["private_server_market_users_failed"] = []
+            profile["private_server_synced_at"] = 0
+            changed = True
+            print(col(
+                f"Wrong private-server root place {actual_place_id} != requested {place_id}; "
+                "cleared and skipped.",
+                RED,
+            ))
+            results.append((pkg, f"WRONG PLACE {actual_place_id}"))
+            continue
         owner_note = str(usable.get("owner_id") or "-")
+        root_note = str(usable.get("root_place_id") or "-")
         code_note = "link" if usable.get("link_code") else ("access" if usable.get("access_code") else "no-code")
         print(col(
             f"Private server check: id={cut(usable.get('id', '-'), 12)} "
-            f"owner={owner_note} cookie_user={user_id or '-'} code={code_note}",
+            f"owner={owner_note} root={root_note} cookie_user={user_id or '-'} code={code_note}",
             DIM,
         ))
         if usable.get("id"):
@@ -25797,8 +25901,9 @@ def auto_fetch_private_servers(
                 f"https://www.roblox.com/private-server/configure/{usable.get('id')}",
                 DIM,
             ))
-        link = build_private_server_link(place_id, usable, cfg)
         browser_link = str(usable.get("browser_link") or "").strip()
+        has_explicit_join_code = bool(usable.get("link_code") or usable.get("access_code"))
+        link = build_private_server_link(place_id, usable, cfg) if has_explicit_join_code else ""
         if usable.get("link_code"):
             code_text = str(usable.get("link_code") or "")
             print(col(
@@ -25813,6 +25918,12 @@ def auto_fetch_private_servers(
                     f"Share link code: {share_code[:6]}...{share_code[-6:] if len(share_code) > 6 else share_code}",
                     DIM,
                 ))
+        if browser_link and not has_explicit_join_code:
+            print(col(
+                "Roblox returned only a browser share link, not an explicit private join code; "
+                "auto route will not use it.",
+                YELLOW,
+            ))
 
         # One-time permission sync can still run when Roblox lists an existing
         # server without returning its join code. Specific Market users are
@@ -25856,7 +25967,11 @@ def auto_fetch_private_servers(
         profile["private_server_access_code"] = usable.get("access_code", "") or profile.get("private_server_access_code", "")
         profile["private_server_browser_link"] = browser_link or profile.get("private_server_browser_link", "")
         profile["private_server_owner_id"] = str(usable.get("owner_id") or user_id or "")
-        profile["private_server_place_id"] = str(place_id or profile.get("private_server_place_id") or "")
+        profile["private_server_place_id"] = str(actual_place_id or place_id or profile.get("private_server_place_id") or "")
+        profile["private_server_actual_place_id"] = str(actual_place_id or "")
+        profile["private_server_root_place_id"] = str(actual_place_id or "")
+        profile["private_server_universe_id"] = str(usable.get("universe_id") or universe_id or "")
+        profile["private_server_game_name"] = str(usable.get("game_name") or game_name or "")
         profile["private_server_friends_allowed"] = bool(friends_ok)
         profile["private_server_permissions_error"] = "" if friends_ok else str(friends_err or "")[:300]
         profile["private_server_permissions_synced_at"] = now()
@@ -28964,11 +29079,15 @@ def diagnose_hatcher_private_server_proof(cfg=None):
     server_id = str(profile.get("private_server_id") or saved_item.get("id") or "").strip()
     saved_owner_id = str(profile.get("private_server_owner_id") or saved_item.get("owner_id") or "").strip()
     saved_place_id = str(profile.get("private_server_place_id") or saved_item.get("place_id") or "").strip()
-    place_id = str(
-        profile.get("private_server_place_id")
-        or hcfg.get("expected_place_id")
-        or "126884695634066"
+    saved_actual_place_id = str(
+        profile.get("private_server_actual_place_id")
+        or profile.get("private_server_root_place_id")
+        or saved_item.get("root_place_id")
+        or ""
     ).strip()
+    saved_universe_id = str(profile.get("private_server_universe_id") or saved_item.get("universe_id") or "").strip()
+    saved_game_name = str(profile.get("private_server_game_name") or saved_item.get("game_name") or "").strip()
+    place_id = str(hcfg.get("expected_place_id") or "126884695634066").strip()
     saved_link = str(profile.get("server_link") or "").strip()
     browser_link = str(
         profile.get("private_server_browser_link")
@@ -29021,7 +29140,10 @@ def diagnose_hatcher_private_server_proof(cfg=None):
         ["Saved server id", server_id or "-"],
         ["Saved owner id", saved_owner_id or "-"],
         ["Saved place id", saved_place_id or "-"],
-        ["Place id", place_id or "-"],
+        ["Saved actual place", saved_actual_place_id or "-"],
+        ["Saved universe", saved_universe_id or "-"],
+        ["Saved game", cut(saved_game_name or "-", 60)],
+        ["Expected place", place_id or "-"],
         ["Saved route", short_link(saved_link) or "-"],
         ["Saved share", short_link(browser_link) or "-"],
         ["Launch route", short_link(launch_route) or "-"],
@@ -29051,9 +29173,16 @@ def diagnose_hatcher_private_server_proof(cfg=None):
         perm_err = "missing server id"
 
     owner = str((metadata or {}).get("owner_id") or "-")
+    api_root_place = str((metadata or {}).get("root_place_id") or "-")
+    api_universe_id = str((metadata or {}).get("universe_id") or "-")
+    api_game_name = str((metadata or {}).get("game_name") or "-")
     rows.extend([
         ["API owner id", owner],
         ["Owner matches cookie", "YES" if owner != "-" and user_id and owner == str(user_id) else "NO/UNKNOWN"],
+        ["API root place", api_root_place],
+        ["API universe", api_universe_id],
+        ["API game", cut(api_game_name, 60)],
+        ["API place matches", "YES" if api_root_place != "-" and api_root_place == str(place_id) else "NO/UNKNOWN"],
         ["API link code", "YES" if (metadata or {}).get("link_code") else "NO"],
         ["API browser link", short_link((metadata or {}).get("browser_link", "")) or "-"],
         ["Permissions API", "OK" if not perm_err else cut(perm_err, 80)],
