@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.78.7-dev-wrong-place-retry"
+__version__ = "V4.79.0-dev-queue-upgrade-core"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8822,6 +8822,57 @@ def _queue_position(open_queue, pkg):
     return 0
 
 
+def _queue_mode_priority(mode):
+    value = str(mode or "hard").strip().lower()
+    if value in {"hard_force", "force", "exact_pid", "exact-pid"}:
+        return 40
+    if value in {"hard", "restart"}:
+        return 30
+    if value in {"route", "deep_link", "deeplink"}:
+        return 20
+    if value in {"soft", "reuse", "task"}:
+        return 10
+    return 0
+
+
+def _merge_queue_duplicate(existing, target, reason, force=False, skip_if_alive=False, mode="hard", front=False, bypass_manual=False, metadata=None):
+    """Upgrade a pending queue item when a stronger duplicate arrives."""
+    existing["duplicate_seen_at"] = now()
+    existing["duplicate_count"] = int(existing.get("duplicate_count", 0) or 0) + 1
+    existing["duplicate_reason"] = str(reason or "")
+    existing["duplicate_mode"] = str(mode or "hard")
+
+    old_mode = str(existing.get("mode") or "hard")
+    new_mode = str(mode or "hard")
+    stronger = _queue_mode_priority(new_mode) > _queue_mode_priority(old_mode)
+    if force and not bool(existing.get("force", False)):
+        stronger = True
+    if bypass_manual and not bool(existing.get("bypass_manual", False)):
+        stronger = True
+
+    if stronger:
+        existing["target"] = target
+        existing["reason"] = reason
+        existing["force"] = bool(force)
+        existing["skip_if_alive"] = bool(skip_if_alive)
+        existing["mode"] = new_mode
+        existing["bypass_manual"] = bool(bypass_manual)
+        existing["upgraded_at"] = now()
+        existing["upgraded_from_mode"] = old_mode
+        existing["upgraded_reason"] = str(reason or "")
+        if isinstance(metadata, dict):
+            existing.update(metadata)
+        return True
+
+    if isinstance(metadata, dict):
+        for key, value in metadata.items():
+            if key.startswith("note_") or key in {"solver_result", "disconnect_recovery_stage"}:
+                existing[key] = value
+    if front:
+        existing["front_duplicate_seen"] = True
+    return False
+
+
 def exact_pid_recovery_metadata(extra=None):
     """Shared metadata for one-clone exact-PID kill/open recovery."""
     merged = {
@@ -8914,10 +8965,20 @@ def _queue_open(open_queue, tab, target, reason, force=False, skip_if_alive=Fals
     pkg = tab.get("package")
     existing = _queue_latest_for_package(open_queue, pkg)
     if existing is not None:
-        existing["duplicate_seen_at"] = now()
-        existing["duplicate_count"] = int(existing.get("duplicate_count", 0) or 0) + 1
-        existing["duplicate_reason"] = str(reason or "")
-        existing["duplicate_mode"] = str(mode or "hard")
+        upgraded = _merge_queue_duplicate(
+            existing,
+            target,
+            reason,
+            force=force,
+            skip_if_alive=skip_if_alive,
+            mode=mode,
+            front=front,
+            bypass_manual=bypass_manual,
+            metadata=metadata,
+        )
+        if upgraded:
+            log_activity(f"queue upgraded -> {mode}: {reason}", pkg, YELLOW)
+            return False, "already queued; upgraded"
         return False, "already queued"
     item = {
         "tab": tab,
