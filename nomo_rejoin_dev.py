@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.77.6-dev-hatcher-link-rebuild"
+__version__ = "V4.77.7-dev-option6-vip-refresh"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -16077,10 +16077,57 @@ def hatcher_status_screen(hcfg, last_msg=""):
     print(col("Type Q + ENTER to stop / return to Hatching Mode menu", DIM))
 
 
-def hatcher_profile_private_link(prof, hcfg=None):
+def hatcher_profile_private_link(prof, hcfg=None, cfg=None, refresh_vip=False):
     """Return the safest current private route for a Hatcher/Booster profile."""
     prof = prof if isinstance(prof, dict) else {}
     hcfg = load_hatcher_config() if hcfg is None else hcfg
+    if refresh_vip:
+        server_id = str(prof.get("private_server_id") or "").strip()
+        package = str(prof.get("package") or "").strip()
+        if server_id and package:
+            cache = load_cookie_cache()
+            cookie, username, _user_id, status, note = private_server_cookie_preflight(
+                package,
+                cfg or load_config(),
+                cache,
+            )
+            if cookie:
+                fresh = fetch_private_server_metadata(cookie, server_id)
+                if fresh:
+                    merged = _merge_private_server_item({
+                        "id": server_id,
+                        "link_code": str(prof.get("private_server_link_code") or ""),
+                        "access_code": str(prof.get("private_server_access_code") or ""),
+                        "browser_link": str(prof.get("private_server_browser_link") or ""),
+                        "name": str(prof.get("hatcher_name") or "NOMO Hatcher"),
+                        "active": True,
+                    }, fresh)
+                    prof["private_server_link_code"] = str(merged.get("link_code") or "")
+                    prof["private_server_access_code"] = str(merged.get("access_code") or "")
+                    prof["private_server_browser_link"] = str(merged.get("browser_link") or "")
+                    prof["server_link"] = build_private_server_link(
+                        str(
+                            prof.get("private_server_place_id")
+                            or hcfg.get("expected_place_id")
+                            or "126884695634066"
+                        ),
+                        merged,
+                    ) or prof.get("server_link", "")
+                    print(col(
+                        f"{short_pkg(package)} VIP metadata refreshed as {username or package}.",
+                        GREEN,
+                    ))
+                else:
+                    print(col(
+                        f"{short_pkg(package)} VIP metadata refresh failed; using saved code.",
+                        YELLOW,
+                    ))
+            else:
+                print(col(
+                    f"{short_pkg(package)} VIP refresh skipped: {status} {note}",
+                    YELLOW,
+                ))
+
     expected_place = str(
         prof.get("private_server_place_id")
         or prof.get("place_id")
@@ -16102,8 +16149,13 @@ def hatcher_profile_private_link(prof, hcfg=None):
     return str(prof.get("server_link") or "").strip()
 
 
-def hatcher_profile_to_tab(prof):
-    private_link = hatcher_profile_private_link(prof)
+def hatcher_profile_to_tab(prof, hcfg=None, cfg=None, refresh_vip=False):
+    private_link = hatcher_profile_private_link(
+        prof,
+        hcfg=hcfg,
+        cfg=cfg,
+        refresh_vip=refresh_vip,
+    )
     return {
         "enabled": prof.get("enabled", True),
         "package": prof.get("package", ""),
@@ -17500,7 +17552,12 @@ def open_all_hatcher_tabs_once(
             )
             continue
 
-        tabs.append(hatcher_profile_to_tab(profile))
+        tabs.append(hatcher_profile_to_tab(
+            profile,
+            hcfg=hcfg,
+            cfg=cfg,
+            refresh_vip=True,
+        ))
 
     if skipped:
         print(col("Skipped selected packages:", YELLOW))
@@ -17521,6 +17578,12 @@ def open_all_hatcher_tabs_once(
         )
         pause()
         return False
+
+    hcfg["hatchers"] = [
+        normalize_hatcher_profile(profile, index)
+        for index, profile in enumerate(hatcher_profiles(hcfg, enabled_only=False))
+    ]
+    save_hatcher_config(hcfg)
 
     run_startup_cache_cleanup(
         cfg,
