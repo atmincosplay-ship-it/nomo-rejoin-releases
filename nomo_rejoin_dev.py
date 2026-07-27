@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.79.1-dev-requeue-collapse-core"
+__version__ = "V4.79.2-dev-mode-entry-core"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -32710,10 +32710,20 @@ def rejoin_only_menu(cfg):
 
 
 
-def start_rejoin(cfg):
-    if active_rejoin_mode(cfg) == "rejoin_only":
+def start_active_rejoin_mode(cfg):
+    """Start the currently selected mode through one shared entrypoint."""
+    mode = active_rejoin_mode(cfg)
+    if mode == "hatcher":
+        return start_hatcher_safe_rejoiner(cfg)
+    if mode == "booster":
+        return start_booster_safe_rejoiner(cfg)
+    if mode == "rejoin_only":
         return start_rejoin_only(cfg)
     return _nomo_start_market_rejoin_original(cfg)
+
+
+def start_rejoin(cfg):
+    return start_active_rejoin_mode(cfg)
 
 
 
@@ -35338,12 +35348,7 @@ def main():
             )
 
             try:
-                if mode == "hatcher":
-                    start_hatcher_safe_rejoiner(cfg)
-                elif mode == "booster":
-                    start_booster_safe_rejoiner(cfg)
-                else:
-                    start_rejoin(cfg)
+                start_active_rejoin_mode(cfg)
             finally:
                 reset_terminal()
                 drain_stdin()
