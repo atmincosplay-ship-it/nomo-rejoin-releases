@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.80.1-dev-android-524-hold"
+__version__ = "V4.80.2-dev-route-core"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -5171,6 +5171,48 @@ def pet_color(pets, cfg):
     if p >= int(cfg["ready_market_at"]):
         return GREEN
     return YELLOW
+
+
+def market_pet_route_decision(pets, target, cfg, rt_tab):
+    """Shared Market restock/return decision.
+
+    This intentionally does not decide stale-state recovery; it only covers the
+    pet-count route rules used after state is readable.
+    """
+    try:
+        pets = int(pets)
+    except Exception:
+        pets = 0
+    target = str(target or "")
+    restock_below = _int_cfg(cfg.get("restock_below", 50), 50)
+    ready_market_at = _int_cfg(cfg.get("ready_market_at", 200), 200)
+    idle_min = _int_cfg(cfg.get("idle_min_pet_to_market", 1), 1)
+    idle_seconds = _int_cfg(cfg.get("idle_no_gain_seconds", 900), 900)
+    idle_no_gain = now() - _int_cfg((rt_tab or {}).get("last_gain_ts", now()), now())
+
+    if pets < restock_below and target != "restock":
+        return {
+            "action": "restock",
+            "queue_reason": f"pets<{restock_below}",
+            "display_reason": f"pets {pets} < {restock_below}",
+        }
+    if pets >= ready_market_at and target != "market":
+        return {
+            "action": "market",
+            "queue_reason": f"pets>={ready_market_at}",
+            "display_reason": f"pets {pets} >= {ready_market_at}",
+        }
+    if target == "restock" and pets >= idle_min and idle_no_gain >= idle_seconds:
+        return {
+            "action": "market",
+            "queue_reason": "idle no gain",
+            "display_reason": f"restock idle {format_age(idle_no_gain)} >= {format_age(idle_seconds)}",
+        }
+    return {
+        "action": "stay",
+        "queue_reason": "",
+        "display_reason": f"target {target}",
+    }
 
 
 def onoff(flag):
@@ -13293,29 +13335,26 @@ def _nomo_start_market_rejoin_original(cfg):
                     if pets > last_pet:
                         rt_tab["last_gain_ts"] = now()
                     rt_tab["last_pet_count"] = pets
-                    idle_no_gain = now() - int(rt_tab.get("last_gain_ts", now()))
 
-                    if pets < int(cfg["restock_below"]) and target != "restock":
+                    route_decision = market_pet_route_decision(pets, target, cfg, rt_tab)
+                    route_action = route_decision["action"]
+                    if route_action == "restock":
                         added, _ = core.queue_route_retry(
-                            tab, "restock", f"pets<{cfg['restock_below']}",
+                            tab, "restock", route_decision["queue_reason"],
                             metadata=skip_solver_route_metadata(),
                         )
                         note = "restock queued" if added else "already queued"
                         status = "Queued" if added else status
-                    elif pets >= int(cfg["ready_market_at"]) and target != "market":
+                    elif route_action == "market":
                         added, _ = core.queue_route_retry(
-                            tab, "market", f"pets>={cfg['ready_market_at']}",
+                            tab, "market", route_decision["queue_reason"],
                             metadata=skip_solver_route_metadata(),
                         )
-                        note = "market queued" if added else "already queued"
-                        status = "Queued" if added else status
-                    elif (target == "restock" and pets >= int(cfg["idle_min_pet_to_market"])
-                          and idle_no_gain >= int(cfg["idle_no_gain_seconds"])):
-                        added, _ = core.queue_route_retry(
-                            tab, "market", "idle no gain",
-                            metadata=skip_solver_route_metadata(),
+                        note = (
+                            "idle queued"
+                            if route_decision["queue_reason"] == "idle no gain" and added
+                            else ("market queued" if added else "already queued")
                         )
-                        note = "idle queued" if added else "already queued"
                         status = "Queued" if added else status
 
                     # Scheduled server hop never runs during a manual Booster hold.
@@ -20819,27 +20858,14 @@ def explain_market_route_for_tab(tab, cfg, rt):
     pets = int(state.get("pet_count", 0) or 0)
     age = int(state.get("age", 999999) or 999999)
     stale_after = int(cfg.get("state_stale_seconds", 180) or 180)
-    restock_below = int(cfg.get("restock_below", 50) or 50)
-    ready_market_at = int(cfg.get("ready_market_at", 200) or 200)
-    idle_min = int(cfg.get("idle_min_pet_to_market", 1) or 1)
-    idle_seconds = int(cfg.get("idle_no_gain_seconds", 900) or 900)
-    idle_no_gain = now() - int(rt_tab.get("last_gain_ts", now()) or now())
 
     if age > stale_after:
         action = "recover"
         reason = f"state old {format_age(age)} > {format_age(stale_after)}"
-    elif pets < restock_below and target != "restock":
-        action = "restock"
-        reason = f"pets {pets} < {restock_below}"
-    elif pets >= ready_market_at and target != "market":
-        action = "market"
-        reason = f"pets {pets} >= {ready_market_at}"
-    elif target == "restock" and pets >= idle_min and idle_no_gain >= idle_seconds:
-        action = "market"
-        reason = f"restock idle {format_age(idle_no_gain)} >= {format_age(idle_seconds)}"
     else:
-        action = "stay"
-        reason = f"target {target}"
+        route_decision = market_pet_route_decision(pets, target, cfg, rt_tab)
+        action = route_decision["action"]
+        reason = route_decision["display_reason"]
 
     return {
         "user": user,
