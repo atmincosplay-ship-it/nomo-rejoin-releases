@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.80.3-dev-private-proof"
+__version__ = "V4.80.4-dev-captcha-isolate"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -10115,6 +10115,25 @@ def api_precheck_before_rejoin(tab, rt_tab, cfg, reason="queued rejoin"):
     return disconnect_ui_api_precheck(tab, rt_tab, cfg, reason, require_disconnect_toggle=False)
 
 
+def recovery_manual_hold_active(rt_tab, cfg):
+    """Return True when a package must stay isolated for manual/verification cooldown."""
+    t = now()
+    retry_at = int(rt_tab.get("captcha_ui_retry_at", 0) or 0)
+    if retry_at > t:
+        return True, f"verification cooldown {format_age(retry_at - t)}"
+
+    if manual_login_blocked(rt_tab, cfg):
+        note = str(
+            rt_tab.get("manual_login_reason")
+            or rt_tab.get("manual_login_detail")
+            or rt_tab.get("note")
+            or "manual verification hold"
+        )
+        return True, cut(note, 80)
+
+    return False, ""
+
+
 
 def _queue_disconnect_ui_rejoin(open_queue, tab, target, rt_tab, cfg, core=None):
     if not cfg.get("disconnect_ui_rejoin_enabled", True):
@@ -10127,6 +10146,15 @@ def _queue_disconnect_ui_rejoin(open_queue, tab, target, rt_tab, cfg, core=None)
     hold_until = int(rt_tab.get("disconnect_ui_hold_until", 0) or 0)
     if hold_until > t:
         return False, f"kick recovery hold {max(1, hold_until - t)}s"
+
+    manual_hold, manual_note = recovery_manual_hold_active(rt_tab, cfg)
+    if manual_hold:
+        pkg = str((tab or {}).get("package", "") or "")
+        rt_tab["disconnect_ui_recovery_active"] = False
+        rt_tab["disconnect_ui_recovery_stage"] = "manual_hold"
+        rt_tab["last_disconnect_ui_open"] = 0
+        rt_tab["note"] = manual_note
+        return False, manual_note
 
     # While one recovery sequence owns this popup, the dashboard must not create
     # another generation. The flag is persisted in runtime, though, so an update,
@@ -12162,6 +12190,10 @@ def wait_until_fresh_after_open(
                     == "captcha_or_face_lock"
                 )
                 rt_tab["captcha_ui_retry_at"] = now() + retry_after
+                rt_tab["disconnect_ui_recovery_active"] = False
+                rt_tab["disconnect_ui_recovery_stage"] = "manual_hold"
+                rt_tab["disconnect_ui_hold_until"] = rt_tab["captcha_ui_retry_at"]
+                rt_tab["last_disconnect_ui_open"] = 0
                 hold_reason = (
                     "captcha or face lock remains after one recovery"
                     if is_auth_529
@@ -12212,6 +12244,10 @@ def wait_until_fresh_after_open(
                     state
                 )
                 rt_tab["captcha_ui_retry_at"] = now() + retry_after
+                rt_tab["disconnect_ui_recovery_active"] = False
+                rt_tab["disconnect_ui_recovery_stage"] = "manual_hold"
+                rt_tab["disconnect_ui_hold_until"] = rt_tab["captcha_ui_retry_at"]
+                rt_tab["last_disconnect_ui_open"] = 0
                 mark_manual_login_block(
                     rt_tab,
                     "challenge remains after one recovery",
@@ -12887,6 +12923,17 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
 
         if fresh_msg == "solver result":
             core.poll_solver_jobs()
+
+        if fresh_msg == "manual challenge":
+            cooldown_until = int(rt_tab.get("captcha_ui_retry_at", 0) or 0)
+            if cooldown_until > now():
+                rt_tab["disconnect_ui_hold_until"] = cooldown_until
+            rt_tab["disconnect_ui_recovery_active"] = False
+            rt_tab["disconnect_ui_recovery_stage"] = "manual_hold"
+            rt_tab["last_disconnect_ui_open"] = 0
+            core.cancel(pkg)
+            core.save()
+            return True
 
         if not fresh_ok and fresh_msg not in (
             "stop",
