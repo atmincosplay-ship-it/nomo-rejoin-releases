@@ -751,7 +751,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.80.2-dev-route-core"
+__version__ = "V4.80.3-dev-private-proof"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -6380,10 +6380,13 @@ def set_hatcher_servers(main_cfg=None):
             raw = converted
         else:
             print(col(f"Auto-convert failed: {convert_err}", YELLOW))
-            fallback = roblox_server_share_deep_link(raw)
-            if fallback:
-                print(col("Saving Roblox app share route as fallback.", YELLOW))
-                raw = fallback
+            print(col(
+                "Not saved. Share links must resolve to a real privateServerLinkCode/linkCode "
+                "or accessCode before NOMO will use them for Hatcher/Booster private routing.",
+                RED,
+            ))
+            pause()
+            return
 
     (
         normalized,
@@ -6416,19 +6419,15 @@ def set_hatcher_servers(main_cfg=None):
             )
             pause()
             return
-        if str(raw).lower().startswith("roblox://navigation/share_links?"):
-            normalized = raw
-            print(col("Saved share route fallback. Prefer auto-fetch when possible.", YELLOW))
-        else:
-            print(
-                col(
-                    "Rejected: placeId/share-only links can join public. "
-                    "Use linkCode/privateServerLinkCode or accessCode.",
-                    RED,
-                )
+        print(
+            col(
+                "Rejected: placeId/share-only links can join public or the wrong server. "
+                "Use a proven linkCode/privateServerLinkCode/accessCode route, or run auto-fetch.",
+                RED,
             )
-            pause()
-            return
+        )
+        pause()
+        return
 
     for profile in selected_profiles:
         profile["server_link"] = normalized
@@ -29530,14 +29529,43 @@ def diagnose_hatcher_private_server_proof(cfg=None):
             print(prefix + chunk)
     print("")
     print(col("Interpretation:", CYAN))
-    if owner != "-" and user_id and owner != str(user_id) and not member_ok:
-        print(col("- This package is not the private-server owner and is not visible in permissions. 524 is expected.", RED))
+    if api_root_place != "-" and str(place_id) and api_root_place != str(place_id):
+        print(col(
+            f"- WRONG PLACE: saved server is for root place {api_root_place}, expected {place_id}. "
+            "NOMO should clear/refetch this before using it.",
+            RED,
+        ))
+    elif launch_kind == "share":
+        print(col(
+            "- UNSAFE ROUTE: launch is still a browser share route, not a proven linkCode/accessCode. "
+            "Run auto-fetch again; hatcher private routing should not rely on this.",
+            RED,
+        ))
+    elif launch_kind == "-":
+        print(col(
+            "- NO JOIN CODE: server may exist, but NOMO has no private join/access code to launch safely.",
+            RED,
+        ))
+    elif owner != "-" and user_id and owner != str(user_id) and not member_ok:
+        print(col(
+            "- 524 EXPECTED: this package is not the owner and is not visible in permissions.",
+            RED,
+        ))
     elif owner != "-" and user_id and owner == str(user_id):
-        print(col("- Cookie user owns the server. If this still gets 524, Roblox app/private-server policy is rejecting the join after API success.", YELLOW))
+        print(col(
+            "- OWNER OK: cookie user owns the server. If this still gets 524, Roblox app/private-server policy is rejecting after API success.",
+            YELLOW,
+        ))
     elif member_ok or configure_has_user:
-        print(col("- Cookie user is visible in permissions. If this still gets 524, the final app route or Roblox privacy policy is suspect.", YELLOW))
+        print(col(
+            "- PERMISSION OK: cookie user is visible in permissions. If this still gets 524, suspect the final app route or Roblox privacy policy.",
+            YELLOW,
+        ))
     else:
-        print(col("- Proof is incomplete. The next step is compare this table with the browser configure page.", YELLOW))
+        print(col(
+            "- PROOF INCOMPLETE: compare this table with the browser configure page before trusting the route.",
+            YELLOW,
+        ))
     pause()
 
 
