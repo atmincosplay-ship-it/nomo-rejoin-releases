@@ -502,10 +502,9 @@
 # - Keeps V4.58.2 legacy AutoExec cleanup, setup mode lock, and solver every-open.
 #
 # V4.58.2 — AUTOSETUP LEGACY AUTOEXEC CLEANUP
-# - Option 13 disables obsolete AutoExec Lua files before installing current files.
-# - Stops old gag/gap pet-counter loaders and Hatching.lua from running beside NOMO.
-# - HATCHER/BOOSTER/LOCAL also disable a leftover nomo_market_loader.lua.
-# - Files are renamed to .disabled_v4582.bak instead of permanently deleted.
+# - Legacy AutoExec cleanup is now opt-in and OFF by default.
+# - Option 13 preserves existing AutoExec scripts from Pandora, Exo, and other hubs.
+# - If manually enabled, cleanup only touches clear old NOMO/GAG setup filenames.
 # - Keeps V4.58.1 mode lock, solver-every-open, and updater header fix.
 #
 # V4.58 — SETUP MODE LOCK + SOLVER EVERY OPEN
@@ -751,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.80.4-dev-captcha-isolate"
+__version__ = "V4.80.5-dev-safe-autoexec"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1159,6 +1158,11 @@ DEFAULT_CONFIG = {
     # explicitly chooses Delta Global.
     "executor_storage_mode": "auto",
     "delta_global_lock_package_mapping": True,
+
+    # Preserve all existing executor AutoExec files by default. Older NOMO
+    # setup builds renamed some legacy files to .disabled_v4582.bak; that
+    # cleanup is now opt-in so Pandora/Exo/custom loaders are never touched.
+    "setup_cleanup_legacy_autoexec_enabled": False,
 
     # Device-wide Delta key manager. One accepted FREE_ key is shared by every
     # Delta clone on the same Redfinger. Renewal can only begin after Delta
@@ -23322,8 +23326,9 @@ AUTOEXEC_BOOSTER_PROBE_FILE = "nomo_booster_probe.lua"
 AUTOEXEC_MARKET_LOADER_FILE = "nomo_market_loader.lua"
 _AUTOEXEC_ALLOWED_SUFFIXES = {".lua", ".luau", ".txt"}
 
-# Obsolete names created by older NOMO/GAG setup versions. Delta executes every
-# root Autoexecute Lua, so these must be disabled rather than left beside NOMO.
+# Obsolete names created by older NOMO/GAG setup versions. This list must stay
+# narrow: never include generic names like autoexec.lua, loader.lua, init.lua,
+# or any third-party hub filename. Cleanup is opt-in and off by default.
 LEGACY_SETUP_AUTOEXEC_NAMES = {
     "gag_pet_counter_loader.lua",
     "gap_pet_counter_loader.lua",
@@ -28671,13 +28676,11 @@ def _legacy_setup_disabled_path(path):
 
 
 def _setup_legacy_autoexec_names_for_role(role):
-    role = str(role or "").strip().lower()
-    names = set(LEGACY_SETUP_AUTOEXEC_NAMES)
-    if role != "market":
-        names.add(AUTOEXEC_MARKET_LOADER_FILE.lower())
-    if role != "booster":
-        names.add(AUTOEXEC_BOOSTER_PROBE_FILE.lower())
-    return names
+    # Keep this intentionally independent of role. Earlier builds disabled
+    # nomo_market_loader.lua / nomo_booster_probe.lua when switching roles, but
+    # shared executor folders can contain several intentionally installed
+    # loaders. Preserve them unless the user removes them manually.
+    return set(LEGACY_SETUP_AUTOEXEC_NAMES)
 
 
 def _setup_cleanup_legacy_autoexec_for_packages(
@@ -28687,6 +28690,9 @@ def _setup_cleanup_legacy_autoexec_for_packages(
     role,
 ):
     """Disable obsolete root AutoExec scripts for Option 13 packages."""
+    if not bool(cfg.get("setup_cleanup_legacy_autoexec_enabled", False)):
+        return []
+
     tabs_by_pkg = {
         str(tab.get("package") or ""): tab
         for tab in autoexec_tabs(cfg)
@@ -28772,6 +28778,15 @@ def _setup_cleanup_legacy_autoexec_for_packages(
 
 
 def _print_setup_legacy_autoexec_cleanup(results):
+    if not results:
+        print(
+            col(
+                "Legacy AutoExec cleanup: skipped; existing AutoExec scripts preserved.",
+                GREEN,
+            )
+        )
+        return
+
     disabled_count = sum(
         len(item.get("disabled", []))
         for item in results
@@ -29920,9 +29935,8 @@ def new_redfinger_setup_wizard(cfg=None):
                 bcfg[key] = cfg.get(key)
         save_booster_config(bcfg)
 
-    # V4.58.2: disable legacy root AutoExec Lua before writing the current
-    # loader. Otherwise Delta executes obsolete Pastebin/Hatching scripts
-    # beside nomo_pet_counter.lua on every Roblox launch.
+    # Preserve existing AutoExec files by default. Legacy cleanup is opt-in so
+    # third-party loaders or custom scripts are not renamed during setup.
     clear()
     banner("SETUP: LEGACY AUTOEXEC CLEANUP", cfg)
     cleanup_results = _setup_cleanup_legacy_autoexec_for_packages(
@@ -30264,6 +30278,8 @@ def new_redfinger_setup_wizard(cfg=None):
     print(
         f"Legacy Lua : "
         f"{col(str(cleanup_disabled_count) + ' disabled', GREEN if cleanup_disabled_count else DIM)}"
+        if cleanup_results
+        else f"Legacy Lua : {col('preserved / cleanup skipped', GREEN)}"
     )
     print("")
     print(
