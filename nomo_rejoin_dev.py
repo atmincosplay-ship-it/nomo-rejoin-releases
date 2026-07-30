@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.80.6-dev-share-route-safe"
+__version__ = "V4.80.7-dev-default-gag-loader"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -23101,7 +23101,113 @@ end
 if game.PlaceId == 126884695634066 then
     -- Grow a Garden
     print("grow a garden")
-    loadstring(game:HttpGet("https://pastebin.com/raw/PJYuhuuk", true))()
+    local Players = game:GetService("Players")
+    local HttpService = game:GetService("HttpService")
+
+    local KEY_URL = "https://nomo-key.atmincosplay.workers.dev/key"
+    local userId = tostring(Players.LocalPlayer.UserId)
+    local loginFile = userId .. "_exologin.json"
+
+    local function clean(value)
+        if type(value) ~= "string" then
+            return nil
+        end
+
+        value = value:match("^%s*(.-)%s*$")
+
+        if value == "" or value == "KEY_NOT_AVAILABLE" then
+            return nil
+        end
+
+        return value
+    end
+
+    local function saveLoginFile(key)
+        if not writefile then
+            return
+        end
+
+        local data = {
+            token = key,
+            type = "work.ink"
+        }
+
+        pcall(function()
+            writefile(loginFile, HttpService:JSONEncode(data))
+        end)
+    end
+
+    local function readLoginFile()
+        if not isfile or not readfile or not isfile(loginFile) then
+            return nil
+        end
+
+        local ok, content = pcall(readfile, loginFile)
+        if not ok then
+            return nil
+        end
+
+        local decodedOk, data = pcall(function()
+            return HttpService:JSONDecode(content)
+        end)
+
+        if decodedOk and type(data) == "table" then
+            return clean(data.token)
+        end
+
+        return nil
+    end
+
+    local key
+
+    for attempt = 1, 3 do
+        local ok, result = pcall(function()
+            return game:HttpGet(KEY_URL, true)
+        end)
+
+        if ok then
+            key = clean(result)
+
+            if key then
+                saveLoginFile(key)
+                break
+            end
+        end
+
+        task.wait(2)
+    end
+
+    if not key then
+        key = readLoginFile()
+    end
+
+    assert(key, "Could not fetch or load Exotic Hub key")
+
+    getgenv().exo_key = key
+    task.wait(5)
+    loadstring(game:HttpGet("https://exotichub.app/auto.lua", true))()
+
+    pcall(function()
+        game:GetService("RunService"):Set3dRenderingEnabled(true)
+    end)
+
+    pcall(function()
+        if setfpscap then
+            setfpscap(5)
+        end
+    end)
+
+    pcall(function()
+        local s = settings()
+        s.Rendering.QualityLevel = Enum.QualityLevel.Level01
+        s.Physics.PhysicsEnvironmentalThrottle = Enum.EnviromentalPhysicsThrottle.Always
+        s.Physics.AllowSleep = true
+    end)
+
+    pcall(function()
+        local userSettings = UserSettings():GetService("UserGameSettings")
+        userSettings.MasterVolume = 0
+    end)
 
 elseif game.PlaceId == 129954712878723 then
     -- Trade World / Market
@@ -29980,12 +30086,12 @@ def new_redfinger_setup_wizard(cfg=None):
         )
 
     market_loader_results = []
-    if role == "market":
+    if role in ("market", "hatcher"):
         clear()
-        banner("SETUP: MARKET / GAG LOADER", cfg)
-        print(col("Install/update NOMO Market/GAG loader: YES (automatic)", GREEN))
+        banner("SETUP: MARKET / HATCHER GAG LOADER", cfg)
+        print(col("Install/update NOMO GAG/Market loader: YES (automatic)", GREEN))
         print(col("The loader waits for game load and selects Grow a Garden or Trade World by PlaceId.", DIM))
-        _print_autoexec_full_paths(selected_tabs, cfg, "Market/GAG loader destination path(s)")
+        _print_autoexec_full_paths(selected_tabs, cfg, "GAG/Market loader destination path(s)")
         market_loader_results = _setup_install_market_loader_for_packages(cfg, selected, "1")
 
     mode_ok = False
@@ -30317,9 +30423,9 @@ def new_redfinger_setup_wizard(cfg=None):
                 f"{note}"
             )
 
-    if role == "market":
+    if role in ("market", "hatcher"):
         print("")
-        print(col("Market / GAG loader:", BOLD))
+        print(col("GAG / Market loader:", BOLD))
         for pkg, ok, note in market_loader_results:
             print(f"  {short_pkg(pkg):<10} {col('OK' if ok else 'FAILED', GREEN if ok else RED)}  {note}")
 
