@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.80.5-dev-safe-autoexec"
+__version__ = "V4.80.6-dev-share-route-safe"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1626,6 +1626,7 @@ DEFAULT_CONFIG = {
     "prefer_experience_start_links": True,
     "prefer_https_game_links": False,
     "private_server_prefer_share_link": True,
+    "private_server_allow_share_only_route": True,
     "soft_hop_enabled": True,
     "soft_hop_fallback_hard": False,
     "soft_hop_wait_fresh_seconds": 240,
@@ -2387,6 +2388,8 @@ def apply_update_migrations(cfg):
     # Save the launch style values instead of requiring a Termux patch every update.
     set_cfg("prefer_experience_start_links", True)
     set_cfg("prefer_https_game_links", False)
+    if "private_server_allow_share_only_route" not in cfg:
+        set_cfg("private_server_allow_share_only_route", True)
 
     # Stale-safe defaults: don't wait too long on alive-old-state.
     if _int_cfg(cfg.get("state_stale_seconds"), 999999) > 180:
@@ -3803,6 +3806,19 @@ def is_roblox_server_share_link(link):
             return True
 
     return False
+
+
+def is_roblox_server_share_route(link):
+    raw = str(link or "").strip()
+    if not raw:
+        return False
+    if is_roblox_server_share_link(raw):
+        return True
+    low = raw.lower()
+    return (
+        low.startswith("roblox://navigation/share_links")
+        and re.search(r"(?:[?&])(?:code|shareCode)=", raw, flags=re.I) is not None
+    )
 
 
 def roblox_server_share_deep_link(link):
@@ -6376,7 +6392,8 @@ def set_hatcher_servers(main_cfg=None):
     if not raw:
         return
 
-    if is_roblox_server_share_link(raw):
+    share_browser_link = raw if is_roblox_server_share_link(raw) else ""
+    if share_browser_link:
         print(col("Roblox share link detected; trying to convert it...", CYAN))
         converted, convert_err = resolve_roblox_server_share_link(raw)
         if converted:
@@ -6385,12 +6402,11 @@ def set_hatcher_servers(main_cfg=None):
         else:
             print(col(f"Auto-convert failed: {convert_err}", YELLOW))
             print(col(
-                "Not saved. Share links must resolve to a real privateServerLinkCode/linkCode "
-                "or accessCode before NOMO will use them for Hatcher/Booster private routing.",
-                RED,
+                "Saving it as a Roblox share route instead. This matches source-style behavior, "
+                "but Option 21 proof cannot fully verify it until Roblox resolves the invite.",
+                YELLOW,
             ))
-            pause()
-            return
+            raw = roblox_server_share_deep_link(raw) or raw
 
     (
         normalized,
@@ -6408,21 +6424,11 @@ def set_hatcher_servers(main_cfg=None):
         ),
     )
 
-    if not normalized or not (
+    share_only_route = is_roblox_server_share_route(raw) or is_roblox_server_share_route(share_browser_link)
+    if (not normalized or not (
         link_code
         or access_code
-    ):
-        if is_roblox_server_share_link(raw):
-            print(
-                col(
-                    "Rejected: Roblox share?code links are invite codes. "
-                    "Open that link in a browser first, then paste the converted "
-                    "roblox.com/games/...privateServerLinkCode=... URL.",
-                    RED,
-                )
-            )
-            pause()
-            return
+    )) and not share_only_route:
         print(
             col(
                 "Rejected: placeId/share-only links can join public or the wrong server. "
@@ -6432,9 +6438,13 @@ def set_hatcher_servers(main_cfg=None):
         )
         pause()
         return
+    if share_only_route and not (link_code or access_code):
+        normalized = roblox_server_share_deep_link(share_browser_link or raw) or raw
 
     for profile in selected_profiles:
         profile["server_link"] = normalized
+        if share_browser_link:
+            profile["private_server_browser_link"] = share_browser_link
 
     hcfg["hatchers"] = profiles
     save_hatcher_config(hcfg)
@@ -6724,7 +6734,8 @@ def set_private_server(cfg):
     link = input("\nPaste MARKET restock/private-server link for selected package(s):\n> ").strip()
     if not link:
         return
-    if is_roblox_server_share_link(link):
+    share_browser_link = link if is_roblox_server_share_link(link) else ""
+    if share_browser_link:
         print(col("Roblox share link detected; trying to convert it...", CYAN))
         converted, convert_err = resolve_roblox_server_share_link(link)
         if converted:
@@ -6733,18 +6744,19 @@ def set_private_server(cfg):
         else:
             print(col(f"Auto-convert failed: {convert_err}", YELLOW))
             print(col(
-                "Open the share link in a browser first, then paste the converted "
-                "roblox.com/games/...privateServerLinkCode=... URL.",
-                RED,
+                "Saving it as a Roblox share route instead. If Roblox cannot resolve "
+                "that invite on Android, use auto-fetch or paste a direct linkCode route.",
+                YELLOW,
             ))
-            pause()
-            return
+            link = roblox_server_share_deep_link(link) or link
     normalized, _place_id, link_code, access_code = normalized_private_route_link(
         link,
         default_place_id=str(cfg.get("place_id") or "126884695634066"),
     )
     if normalized and (link_code or access_code):
         link = normalized
+    elif is_roblox_server_share_route(link) or is_roblox_server_share_route(share_browser_link):
+        link = roblox_server_share_deep_link(share_browser_link or link) or link
     for tab in chosen_tabs:
         tab["restock_link"] = link
     if len(chosen_tabs) == len(cfg.get("tabs", [])):
@@ -16485,11 +16497,11 @@ def hatcher_profile_private_link(prof, hcfg=None, cfg=None, refresh_vip=False):
 
     browser_link = str(prof.get("private_server_browser_link") or "").strip()
     runtime_cfg = cfg or load_config()
-    if runtime_cfg.get("private_server_allow_share_only_route", False) and is_roblox_server_share_link(browser_link):
+    if runtime_cfg.get("private_server_allow_share_only_route", False) and is_roblox_server_share_route(browser_link):
         return roblox_server_share_deep_link(browser_link) or browser_link
 
     saved_route = str(prof.get("server_link") or "").strip()
-    if is_roblox_server_share_link(saved_route) or "/share-links" in saved_route.lower():
+    if is_roblox_server_share_route(saved_route) or "/share-links" in saved_route.lower():
         return "" if not runtime_cfg.get("private_server_allow_share_only_route", False) else saved_route
     return saved_route
 
@@ -25352,7 +25364,7 @@ def _private_server_item_from_profile(profile):
     universe_id = str(profile.get("private_server_universe_id") or "").strip()
     game_name = str(profile.get("private_server_game_name") or "").strip()
     saved_link = str(profile.get("server_link") or "").strip()
-    if not browser_link and is_roblox_server_share_link(saved_link):
+    if not browser_link and is_roblox_server_share_route(saved_link):
         browser_link = saved_link
 
     # Recover codes from both current and older saved link formats.
@@ -25523,8 +25535,8 @@ def normalized_private_route_link(
         or record.get("link")
         or ""
     ).strip()
-    share_link = raw if is_roblox_server_share_link(raw) else browser_link
-    if is_roblox_server_share_link(share_link):
+    share_link = raw if is_roblox_server_share_route(raw) else browser_link
+    if is_roblox_server_share_route(share_link):
         route = roblox_server_share_deep_link(share_link) or share_link
         if route:
             return route, place_id, "", ""
@@ -25625,11 +25637,11 @@ def build_private_server_link(place_id, item, cfg=None):
             f"roblox://placeId={place_id}"
             f"&accessCode={urllib.parse.quote(access, safe='')}"
         )
-    if cfg.get("private_server_prefer_share_link", True) and is_roblox_server_share_link(browser_link):
+    if cfg.get("private_server_prefer_share_link", True) and is_roblox_server_share_route(browser_link):
         share_route = roblox_server_share_deep_link(browser_link)
         if share_route:
             return share_route
-    if is_roblox_server_share_link(browser_link):
+    if is_roblox_server_share_route(browser_link):
         return roblox_server_share_deep_link(browser_link) or browser_link
     return ""
 
@@ -29273,8 +29285,8 @@ def run_private_server_fetch_shared(
             and (
                 link_code
                 or access_code
-                or is_roblox_server_share_link(link)
-                or is_roblox_server_share_link(browser_link)
+                or is_roblox_server_share_route(link)
+                or is_roblox_server_share_route(browser_link)
             )
         )
 
