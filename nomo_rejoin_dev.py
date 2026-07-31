@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.80.12-dev-quiet-activity"
+__version__ = "V4.80.14-dev-solver-unavailable-retry"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -9347,14 +9347,16 @@ class RejoinCore:
         )
 
     def queue_solver_busy_retry(self, tab, target):
+        reason = str(((tab or {}).get("runtime") or {}).get("solver_retry_reason") or "SERVER_BUSY")
         return self.queue_exact_pid_recovery(
             tab,
             target,
-            "solver SERVER_BUSY retry",
+            f"solver {reason} retry",
             skip_if_alive=False,
             bypass_manual=True,
             metadata={
                 "solver_busy_retry": True,
+                "solver_retry_reason": reason,
                 "bypass_recheck": True,
             },
         )
@@ -10652,7 +10654,7 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
 
 
 def maybe_queue_solver_busy_retry(open_queue, tab, target, rt_tab, cfg, health, core=None):
-    """Retry SERVER_BUSY only by opening the package again after cooldown.
+    """Retry temporary solver-provider failures by opening the package again after cooldown.
 
     Never contact the provider from a healthy middle session. The provider call
     remains inside wait-after-open and therefore happens once for that retry open.
@@ -10665,28 +10667,30 @@ def maybe_queue_solver_busy_retry(open_queue, tab, target, rt_tab, cfg, health, 
     if health.get("clean_fresh"):
         rt_tab["solver_busy_retry_pending"] = False
         rt_tab["solver_busy_retry_at"] = 0
-        rt_tab["note"] = "fresh state; solver busy retry cancelled"
+        rt_tab["solver_retry_reason"] = ""
+        rt_tab["note"] = "fresh state; solver retry cancelled"
         return None
 
+    retry_reason = str(rt_tab.get("solver_retry_reason") or "SERVER_BUSY")
     retry_at = int(rt_tab.get("solver_busy_retry_at", 0) or 0)
     if retry_at <= 0 or now() < retry_at:
         left = max(1, retry_at - now()) if retry_at else 600
-        return health.get("status", "Loading"), f"solver busy; retry rejoin in {format_age(left)}", True
+        return health.get("status", "Loading"), f"solver {retry_reason}; retry rejoin in {format_age(left)}", True
 
     pkg = str((tab or {}).get("package", "") or "")
     if solver_job_running(pkg):
         return "Solving", solver_job_note(pkg), True
     if core.has(pkg):
-        return "Queued", "solver busy retry already queued", True
+        return "Queued", f"solver {retry_reason} retry already queued", True
 
     added, _ = core.queue_solver_busy_retry(tab, target)
     if added:
         rt_tab["solver_busy_retry_pending"] = False
         rt_tab["solver_busy_retry_at"] = 0
-        rt_tab["note"] = "SERVER_BUSY retry rejoin queued"
-        log_activity("SERVER_BUSY cooldown done; retry rejoin queued", pkg, YELLOW)
-        return "Queued", "SERVER_BUSY retry rejoin queued", True
-    return health.get("status", "Loading"), "SERVER_BUSY retry queue failed", True
+        rt_tab["note"] = f"solver {retry_reason} retry rejoin queued"
+        log_activity(f"solver {retry_reason} cooldown done; retry rejoin queued", pkg, YELLOW)
+        return "Queued", f"solver {retry_reason} retry rejoin queued", True
+    return health.get("status", "Loading"), f"solver {retry_reason} retry queue failed", True
 
 
 def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, health, core=None):
@@ -12373,6 +12377,7 @@ def wait_until_fresh_after_open(
             clear_disconnect_ui_incident(rt_tab)
             rt_tab["solver_busy_retry_pending"] = False
             rt_tab["solver_busy_retry_at"] = 0
+            rt_tab["solver_retry_reason"] = ""
             rt_tab["solver_no_captcha_trusted_rejoins"] = 0
             core.save()
             log_activity("fresh clean state - rejoin complete", pkg, GREEN)
@@ -12996,7 +13001,8 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
             if rt_tab.get("solver_busy_retry_pending"):
                 retry_at = int(rt_tab.get("solver_busy_retry_at", 0) or 0)
                 left = max(1, retry_at - now()) if retry_at else 600
-                rt_tab["note"] = f"SERVER_BUSY; waiting {format_age(left)} for retry rejoin"
+                retry_reason = str(rt_tab.get("solver_retry_reason") or "SERVER_BUSY")
+                rt_tab["note"] = f"solver {retry_reason}; waiting {format_age(left)} for retry rejoin"
                 core.save()
                 return True
 
@@ -26553,6 +26559,21 @@ def solver_response_status(data):
     ).strip().upper()
 
 
+def solver_response_provider_unavailable(data):
+    if not isinstance(data, dict):
+        return False
+    status = solver_response_status(data)
+    if status in {"SOLVER_ERROR", "PROVIDER_ERROR", "SERVICE_UNAVAILABLE", "UNAVAILABLE"}:
+        return True
+    http_status = int(data.get("http_status") or 0)
+    text = (
+        str(data.get("error") or "")
+        + " "
+        + str(data.get("message") or "")
+    ).lower()
+    return http_status in {502, 503, 504} or "service is not available" in text or "unavailable" in text
+
+
 def _solver_probe_worker(package, tab, cookie, cfg_snapshot, place_id):
     details = []
     locally_detected = False
@@ -26854,6 +26875,8 @@ def start_solver_job(tab, cfg, rt, rt_tab, reason, force=False, phase="solve", o
 def _solver_error_text(response):
     if isinstance(response, dict):
         value = response.get("error") or response.get("message") or response.get("status") or response
+        if response.get("http_status") and response.get("status") and response.get("message"):
+            value = f"HTTP {response.get('http_status')}: {response.get('status')} - {response.get('message')}"
     else:
         value = response
     return cut(str(value or "unknown solver error"), 180)
@@ -26950,6 +26973,7 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
                 clear_captcha_ui_runtime(rt_tab)
                 rt_tab["solver_busy_retry_pending"] = False
                 rt_tab["solver_busy_retry_at"] = 0
+                rt_tab["solver_retry_reason"] = ""
                 rt_tab["solver_state"] = "success" if solved_result else "clear"
                 rt_tab["solver_last_success"] = now()
                 rt_tab["solver_last_error"] = ""
@@ -26976,7 +27000,32 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
             rt_tab["solver_state"] = "failed"
             rt_tab["solver_last_error"] = err
 
-            if status_code in {"SERVER_BUSY", "BUSY", "RATE_LIMITED", "TOO_MANY_REQUESTS"}:
+            if solver_response_provider_unavailable(response):
+                retry_after = max(600, int(cfg.get("solver_min_resubmit_seconds", 600) or 600))
+                rt_tab["solver_busy_retry_pending"] = True
+                rt_tab["solver_busy_retry_at"] = now() + retry_after
+                rt_tab["solver_retry_reason"] = "SOLVER_UNAVAILABLE"
+                rt_tab["note"] = f"solver unavailable; retry provider in {format_age(retry_after)}"
+                if cfg.get("solver_preflight_open_on_failure", True):
+                    if queued_item is not None:
+                        queued_item["solver_preflight_waiting"] = False
+                        queued_item["solver_preflight_done"] = True
+                        queued_item["solver_result"] = "SOLVER_UNAVAILABLE"
+                        queued_item["skip_solver_once"] = True
+                        queued_item["skip_solver_probe"] = True
+                    log_activity(
+                        f"solver provider unavailable before open; original rejoin continues once: {cut(err, 70)}",
+                        pkg,
+                        YELLOW,
+                    )
+                else:
+                    core.remove_generation(pkg, generation)
+                    log_activity(
+                        f"solver provider unavailable before open; retry in {format_age(retry_after)}",
+                        pkg,
+                        YELLOW,
+                    )
+            elif status_code in {"SERVER_BUSY", "BUSY", "RATE_LIMITED", "TOO_MANY_REQUESTS"}:
                 retry_after = max(
                     600,
                     int(cfg.get("solver_preflight_server_busy_retry_seconds", 600) or 600),
@@ -26984,12 +27033,14 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
                 core.remove_generation(pkg, generation)
                 rt_tab["solver_busy_retry_pending"] = True
                 rt_tab["solver_busy_retry_at"] = now() + retry_after
+                rt_tab["solver_retry_reason"] = "SERVER_BUSY"
                 rt_tab["note"] = f"SERVER_BUSY; retry rejoin in {format_age(retry_after)}"
                 log_activity(f"solver SERVER_BUSY before open; retry in {format_age(retry_after)}", pkg, YELLOW)
             elif status_code in {"INVALID_COOKIES", "INVALID_COOKIE", "UNAUTHORIZED", "AUTH_FAILED"}:
                 core.remove_generation(pkg, generation)
                 rt_tab["solver_busy_retry_pending"] = False
                 rt_tab["solver_busy_retry_at"] = 0
+                rt_tab["solver_retry_reason"] = ""
                 mark_manual_login_block(
                     rt_tab,
                     "invalid package cookie",
@@ -27058,6 +27109,7 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
             clear_captcha_ui_runtime(rt_tab)
             rt_tab["solver_busy_retry_pending"] = False
             rt_tab["solver_busy_retry_at"] = 0
+            rt_tab["solver_retry_reason"] = ""
             rt_tab["solver_state"] = "clear"
             rt_tab["solver_last_success"] = now()
             rt_tab["solver_last_error"] = ""
@@ -27081,6 +27133,7 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
             clear_captcha_ui_runtime(rt_tab)
             rt_tab["solver_busy_retry_pending"] = False
             rt_tab["solver_busy_retry_at"] = 0
+            rt_tab["solver_retry_reason"] = ""
             rt_tab["solver_state"] = "success" if solved_result else "clear"
             rt_tab["solver_last_success"] = now()
             rt_tab["solver_last_error"] = ""
@@ -27127,15 +27180,24 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
         rt_tab["solver_state"] = "failed"
         rt_tab["solver_last_error"] = err
 
-        if status_code in {"SERVER_BUSY", "BUSY", "RATE_LIMITED", "TOO_MANY_REQUESTS"}:
+        if solver_response_provider_unavailable(response):
             retry_after = max(600, int(cfg.get("solver_min_resubmit_seconds", 600) or 600))
             rt_tab["solver_busy_retry_pending"] = True
             rt_tab["solver_busy_retry_at"] = now() + retry_after
+            rt_tab["solver_retry_reason"] = "SOLVER_UNAVAILABLE"
+            rt_tab["note"] = f"solver unavailable; retry provider in {format_age(retry_after)}"
+            log_activity(f"solver provider unavailable; retry provider in {format_age(retry_after)}", pkg, YELLOW)
+        elif status_code in {"SERVER_BUSY", "BUSY", "RATE_LIMITED", "TOO_MANY_REQUESTS"}:
+            retry_after = max(600, int(cfg.get("solver_min_resubmit_seconds", 600) or 600))
+            rt_tab["solver_busy_retry_pending"] = True
+            rt_tab["solver_busy_retry_at"] = now() + retry_after
+            rt_tab["solver_retry_reason"] = "SERVER_BUSY"
             rt_tab["note"] = f"SERVER_BUSY; retry rejoin in {format_age(retry_after)}"
             log_activity("solver SERVER_BUSY; retry rejoin scheduled in 10m", pkg, YELLOW)
         elif status_code in {"INVALID_COOKIES", "INVALID_COOKIE", "UNAUTHORIZED", "AUTH_FAILED"}:
             rt_tab["solver_busy_retry_pending"] = False
             rt_tab["solver_busy_retry_at"] = 0
+            rt_tab["solver_retry_reason"] = ""
             mark_manual_login_block(
                 rt_tab,
                 "invalid package cookie",
@@ -27266,7 +27328,19 @@ def solve_captcha(cookie, cfg, place_id=None):
             body = e.read().decode("utf-8", "replace")
         except Exception:
             body = ""
-        return False, {"success": False, "error": f"HTTP {e.code}: {cut(body, 240)}"}
+        try:
+            data = json.loads(body) if body else {}
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        data.setdefault("success", False)
+        data["http_status"] = e.code
+        if not data.get("error"):
+            data["error"] = f"HTTP {e.code}: {cut(body, 240)}"
+        elif not str(data.get("error", "")).startswith("HTTP "):
+            data["error"] = f"HTTP {e.code}: {cut(str(data.get('error')), 220)}"
+        return False, data
     except Exception as e:
         return False, {"success": False, "error": str(e)}
 
@@ -28597,7 +28671,11 @@ def solver_menu(cfg):
                         print(col(f"Cookie status: {status} - likely expired.", RED))
                 else:
                     error = resp.get("error", resp) if isinstance(resp, dict) else resp
-                    print(col(f"Solver failed: {error}", RED))
+                    if solver_response_provider_unavailable(resp):
+                        print(col(f"Solver provider unavailable: {error}", YELLOW))
+                        print(col("This is not an account/cookie bug; retry later.", YELLOW))
+                    else:
+                        print(col(f"Solver failed: {error}", RED))
             except Exception as e:
                 print(col(f"Error: {e}", RED))
             pause()
@@ -28618,7 +28696,11 @@ def solver_menu(cfg):
                         print(col(f"Cookie status: {status} - likely expired.", RED))
                 else:
                     error = resp.get('error', resp) if isinstance(resp, dict) else resp
-                    print(col(f"Solver failed: {error}", RED))
+                    if solver_response_provider_unavailable(resp):
+                        print(col(f"Solver provider unavailable: {error}", YELLOW))
+                        print(col("This is not an account/cookie bug; retry later.", YELLOW))
+                    else:
+                        print(col(f"Solver failed: {error}", RED))
             else:
                 print(col("No cookie provided.", RED))
             pause()
