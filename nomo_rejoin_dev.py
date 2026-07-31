@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.80.16-dev-booster-label-clean"
+__version__ = "V4.80.17-dev-booster-wording-clean"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -14859,8 +14859,8 @@ def booster_config_menu(cfg):
         banner("BOOSTER MODE CONFIG", cfg)
         print(
             col(
-                "Booster uses the literal Hatcher route; "
-                "only reporting is different.",
+                "Booster uses the shared keep-alive route; "
+                "dashboard/reporting are Booster-specific.",
                 DIM,
             )
         )
