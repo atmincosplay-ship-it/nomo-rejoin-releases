@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.80.9-dev-queue-display"
+__version__ = "V4.80.10-dev-startup-unblock"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -17314,23 +17314,29 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
         cur_hcfg = load_hatcher_config()
         return cur_hcfg, [hatcher_profile_to_tab(p) for p in hatcher_profiles(cur_hcfg, enabled_only=True)]
 
-    # AUTO USERNAME RESOLVE: line up config names with the accounts actually
-    # logged in (cookie -> Roblox API, fallback freshest state file) so state
-    # files match without the manual "get username" step.
-    try:
-        if resolve_usernames_auto(cfg, hcfg, rt, force=True, quiet=True):
-            save_hatcher_config(hcfg)
-    except Exception:
-        pass
+    # Optional network/API sync must not block the live hatcher watchdog. Manual
+    # menu actions can still refresh usernames/permissions when needed.
+    if cfg.get("hatcher_watch_optional_startup_sync", False):
+        try:
+            if resolve_usernames_auto(cfg, hcfg, rt, force=True, quiet=True):
+                save_hatcher_config(hcfg)
+        except Exception:
+            pass
+    else:
+        print(col("[DEBUG] startup username sync skipped for fast watch boot", DIM))
 
     hcfg, tabs = current_tabs()
 
-    # V4.20: additive D1 Market allowlist sync on Hatcher startup.
-    try:
-        auto_sync_hatcher_market_allowlist(cfg, hcfg, force=False, reason="startup", quiet=True)
-        hcfg, tabs = current_tabs()
-    except Exception as exc:
-        log_activity(f"allowlist startup check failed: {cut(exc, 80)}", "", YELLOW)
+    # V4.80.10: do not run allowlist sync during live watchdog startup. A slow
+    # Roblox/API response here can freeze the whole Termux UI before the table.
+    if cfg.get("hatcher_watch_optional_startup_sync", False):
+        try:
+            auto_sync_hatcher_market_allowlist(cfg, hcfg, force=False, reason="startup", quiet=True)
+            hcfg, tabs = current_tabs()
+        except Exception as exc:
+            log_activity(f"allowlist startup check failed: {cut(exc, 80)}", "", YELLOW)
+    else:
+        print(col("[DEBUG] startup allowlist sync skipped for fast watch boot", DIM))
 
     # Startup: queue every package that truly needs an open, in profile order.
     # Fresh packages are untouched. A running PID with a state already older than
@@ -17397,21 +17403,25 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
         loops += 1
         core.self_heal()
         core.poll_solver_jobs()
-        # Periodic auto username re-resolve (rate-limited inside the function).
-        try:
-            if resolve_usernames_auto(cfg, hcfg, rt, force=False, quiet=True):
-                save_hatcher_config(hcfg)
-        except Exception:
-            pass
+        # Optional network/API sync is intentionally disabled by default in the
+        # live watchdog loop. Rejoin recovery should keep drawing the table even
+        # if Roblox/GitHub/Cloudflare is slow.
+        if cfg.get("hatcher_watch_optional_periodic_sync", False):
+            try:
+                if resolve_usernames_auto(cfg, hcfg, rt, force=False, quiet=True):
+                    save_hatcher_config(hcfg)
+            except Exception:
+                pass
         hcfg, tabs = current_tabs()
-        try:
-            sync_result = auto_sync_hatcher_market_allowlist(
-                cfg, hcfg, force=False, reason="periodic", quiet=True
-            )
-            if sync_result.get("checked"):
-                hcfg, tabs = current_tabs()
-        except Exception as exc:
-            log_activity(f"allowlist periodic check failed: {cut(exc, 80)}", "", YELLOW)
+        if cfg.get("hatcher_watch_optional_periodic_sync", False):
+            try:
+                sync_result = auto_sync_hatcher_market_allowlist(
+                    cfg, hcfg, force=False, reason="periodic", quiet=True
+                )
+                if sync_result.get("checked"):
+                    hcfg, tabs = current_tabs()
+            except Exception as exc:
+                log_activity(f"allowlist periodic check failed: {cut(exc, 80)}", "", YELLOW)
         rows = []
         report_state_cache = {}
 
