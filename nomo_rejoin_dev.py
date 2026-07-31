@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.80.7-dev-default-gag-loader"
+__version__ = "V4.80.9-dev-queue-display"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -9977,10 +9977,12 @@ def _queue_hatcher_alive_old_state_hard(open_queue, tab, rt_tab, hcfg, cfg, age_
         },
     )
     if not added:
-        if int(rt_tab.get("hatcher_alive_old_state_hard_last", 0) or 0) <= 0:
-            rt_tab["hatcher_alive_old_state_hard_last"] = t
-            rt_tab["hatcher_alive_old_state_hard_age"] = age_i
-            rt_tab["hatcher_alive_old_state_hard_reason"] = str(reason or "alive old state")
+        # A duplicate means the package is already waiting for the one allowed
+        # exact-PID recovery. Stamp the cooldown anyway so dashboard refreshes do
+        # not rediscover and restate the same recovery every loop.
+        rt_tab["hatcher_alive_old_state_hard_last"] = t
+        rt_tab["hatcher_alive_old_state_hard_age"] = age_i
+        rt_tab["hatcher_alive_old_state_hard_reason"] = str(reason or "alive old state")
         return False, "already queued", True
 
     # Start the cooldown at queue-time. If Android/API/preflight blocks the
@@ -10812,8 +10814,10 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
                 target,
                 f"{mode} alive old state {format_age(age)}",
             )
-            return ("Queued" if added else "Stale"), \
-                   (f"old {format_age(age)} kill+open" if added else "already queued"), True
+            if added:
+                return "Queued", f"old {format_age(age)} kill+open", True
+            status, note = core.queue_display(pkg, "Queued", "already queued")
+            return status, note, True
 
         # stale but under trigger -> just report, don't act yet
         return ("Ingame" if alive else "Stale"), f"stale a{age}/t{trigger}/s{stale_limit} rc{int(bool(cfg.get('rejoin_if_crash', True)))}", True
@@ -10827,8 +10831,10 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
             target,
             f"{mode} alive no-state hard",
         )
-        return ("Queued" if added else "No state"), \
-               ("no-state kill+open" if added else "already queued"), True
+        if added:
+            return "Queued", "no-state kill+open", True
+        status, note = core.queue_display(pkg, "Queued", "already queued")
+        return status, note, True
 
     # dead -> kill + open
     added, _ = core.queue_crash_recovery(
@@ -10836,8 +10842,10 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
         target,
         f"{mode} crash/dead",
     )
-    return ("Queued" if added else "Offline"), \
-           ("crash kill+open" if added else "already queued"), True
+    if added:
+        return "Queued", "crash kill+open", True
+    status, note = core.queue_display(pkg, "Queued", "already queued")
+    return status, note, True
 
 
 def manual_login_blocked(rt_tab, cfg):
@@ -13405,19 +13413,21 @@ def _nomo_start_market_rejoin_original(cfg):
                             tab, "restock", route_decision["queue_reason"],
                             metadata=skip_solver_route_metadata(),
                         )
-                        note = "restock queued" if added else "already queued"
-                        status = "Queued" if added else status
+                        if added:
+                            note = "restock queued"
+                            status = "Queued"
+                        else:
+                            status, note = core.queue_display(pkg, "Queued", "already queued")
                     elif route_action == "market":
                         added, _ = core.queue_route_retry(
                             tab, "market", route_decision["queue_reason"],
                             metadata=skip_solver_route_metadata(),
                         )
-                        note = (
-                            "idle queued"
-                            if route_decision["queue_reason"] == "idle no gain" and added
-                            else ("market queued" if added else "already queued")
-                        )
-                        status = "Queued" if added else status
+                        if added:
+                            note = "idle queued" if route_decision["queue_reason"] == "idle no gain" else "market queued"
+                            status = "Queued"
+                        else:
+                            status, note = core.queue_display(pkg, "Queued", "already queued")
 
                     # Scheduled server hop never runs during a manual Booster hold.
                     if (
@@ -16737,7 +16747,7 @@ def start_hatcher_reporter(main_cfg=None):
                     )
                     if hard_action:
                         note = hard_note
-                        status = "Queued" if hard_added else "Stale"
+                        status = "Queued" if (hard_added or hard_note == "already queued") else "Stale"
                     elif str(hard_note).startswith("invalid old state ignored"):
                         note = hard_note
                         status = "Online"
@@ -17536,7 +17546,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                     )
                     if hard_action:
                         note = hard_note
-                        status = "Queued" if hard_added else "Stale"
+                        status = "Queued" if (hard_added or hard_note == "already queued") else "Stale"
                     elif str(hard_note).startswith("invalid old state ignored"):
                         note = hard_note
                         status = "Online"
