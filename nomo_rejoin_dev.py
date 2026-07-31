@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.80.10-dev-startup-unblock"
+__version__ = "V4.80.11-dev-explicit-fast-watch"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1184,6 +1184,11 @@ DEFAULT_CONFIG = {
     "delta_key_wait_max_seconds": 21600,
     "delta_key_restart_after_apply": True,
     "delta_key_restart_delay_seconds": 8,
+
+    # Keep the live hatcher watchdog fast. These optional network syncs can be
+    # run from the setup menus, but should not block Option 1/table startup.
+    "hatcher_watch_optional_startup_sync": False,
+    "hatcher_watch_optional_periodic_sync": False,
     "delta_key_client_name": "platoboost webclient",
     "delta_key_client_version": "5.3.2",
 
