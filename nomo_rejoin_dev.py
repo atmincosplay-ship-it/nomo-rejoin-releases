@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.80.17-dev-booster-wording-clean"
+__version__ = "V4.80.18-dev-live-text-clean"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -14771,7 +14771,7 @@ def _booster_hatcher_dashboard_adapter(
 
 
 def start_booster_safe_rejoiner(main_cfg=None):
-    """Exact Hatcher cold start with Booster-only output adapters."""
+    """Shared keep-alive start with Booster-only output adapters."""
     cfg = dict(load_config())
     if isinstance(main_cfg, dict):
         cfg.update(main_cfg)
@@ -14831,7 +14831,7 @@ def start_booster_safe_rejoiner(main_cfg=None):
 def booster_server_link_menu(cfg):
     print(
         col(
-            "Booster uses the exact Hatcher private-link editor.",
+            "Booster uses the shared private-link editor.",
             GREEN,
         )
     )
@@ -17210,7 +17210,6 @@ def should_queue_hatcher_teleport_rejoin(rt_tab, hcfg, cfg, problem_code):
 def start_hatcher_safe_rejoiner(main_cfg=None):
     global _STOP_REQUESTED
     _STOP_REQUESTED = False
-    print(col("[DEBUG] start_hatcher_safe_rejoiner() called", CYAN))
     cfg = dict(load_config())
     if isinstance(main_cfg, dict):
         cfg.update(main_cfg)
