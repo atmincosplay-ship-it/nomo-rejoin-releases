@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.80.15-dev-route-default-align"
+__version__ = "V4.80.16-dev-booster-label-clean"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -14735,7 +14735,7 @@ def _booster_hatcher_dashboard_adapter(
             value
             for value in (
                 str(row.get("note") or "").strip(),
-                "REAL Hatcher core",
+                "shared keep-alive core",
                 probe_note,
             )
             if value
@@ -14762,8 +14762,8 @@ def _booster_hatcher_dashboard_adapter(
     )
     print(
         col(
-            "  Routing: literal Hatcher loop; "
-            "only dashboard/report are Booster.",
+            "  Core: shared keep-alive engine; "
+            "Booster dashboard/report/probe adapters active.",
             GREEN,
         )
     )
