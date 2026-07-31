@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.80.11-dev-explicit-fast-watch"
+__version__ = "V4.80.12-dev-quiet-activity"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -2082,16 +2082,24 @@ def log_activity(action, pkg="", color=None):
     pkg_s = str(pkg or "")
     action_s = str(action or "")
     low = action_s.lower()
-    if low.startswith("queued ") and "already queued" not in low:
+    noisy = (
+        low.startswith("queued ")
+        or "already queued" in low
+        or "old state recovery" in low
+        or "package held" in low
+        or "solver before open" in low
+    )
+    dedupe_seconds = 90 if noisy else 0
+    if dedupe_seconds > 0:
         t = now()
         key = (pkg_s, action_s)
         last_emit = int(_ACTIVITY_DEDUPE.get(key, 0) or 0)
-        if last_emit and t - last_emit < 45:
+        if last_emit and t - last_emit < dedupe_seconds:
             return
         _ACTIVITY_DEDUPE[key] = t
         if len(_ACTIVITY_DEDUPE) > 300:
             for old_key, old_ts in list(_ACTIVITY_DEDUPE.items()):
-                if t - int(old_ts or 0) > 300:
+                if t - int(old_ts or 0) > 600:
                     _ACTIVITY_DEDUPE.pop(old_key, None)
     if color is None:
         try:
