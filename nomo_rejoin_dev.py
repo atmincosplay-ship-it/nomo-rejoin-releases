@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.80.18-dev-live-text-clean"
+__version__ = "V4.80.19-dev-startup-noise-clean"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -17341,7 +17341,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
         except Exception:
             pass
     else:
-        print(col("[DEBUG] startup username sync skipped for fast watch boot", DIM))
+        pass
 
     hcfg, tabs = current_tabs()
 
@@ -17354,7 +17354,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
         except Exception as exc:
             log_activity(f"allowlist startup check failed: {cut(exc, 80)}", "", YELLOW)
     else:
-        print(col("[DEBUG] startup allowlist sync skipped for fast watch boot", DIM))
+        pass
 
     # Startup: queue every package that truly needs an open, in profile order.
     # Fresh packages are untouched. A running PID with a state already older than
