@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.80.14-dev-solver-unavailable-retry"
+__version__ = "V4.80.15-dev-route-default-align"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -5220,7 +5220,7 @@ def market_pet_route_decision(pets, target, cfg, rt_tab):
     restock_below = _int_cfg(cfg.get("restock_below", 50), 50)
     ready_market_at = _int_cfg(cfg.get("ready_market_at", 200), 200)
     idle_min = _int_cfg(cfg.get("idle_min_pet_to_market", 1), 1)
-    idle_seconds = _int_cfg(cfg.get("idle_no_gain_seconds", 900), 900)
+    idle_seconds = _int_cfg(cfg.get("idle_no_gain_seconds", 300), 300)
     idle_no_gain = now() - _int_cfg((rt_tab or {}).get("last_gain_ts", now()), now())
 
     if pets < restock_below and target != "restock":
@@ -20992,7 +20992,7 @@ def route_explain_menu(cfg, pause_at_end=True):
 
     clear()
     banner("ROUTE EXPLAIN", cfg)
-    print(col("Read-only. Shows current route mode and what NOMO would do next.", DIM))
+    print(col("Read-only. Shows each package mode and what NOMO would do next.", DIM))
     print("")
 
     if not tabs:
@@ -21028,7 +21028,13 @@ def route_explain_menu(cfg, pause_at_end=True):
         cfg,
     )
     print("")
-    print(col(f"Rules: <{cfg.get('restock_below', 50)} restock | >={cfg.get('ready_market_at', 200)} market | old state recovers.", DIM))
+    idle_seconds = _int_cfg(cfg.get("idle_no_gain_seconds", 300), 300)
+    print(col(
+        f"Rules: <{cfg.get('restock_below', 50)} restock | "
+        f">={cfg.get('ready_market_at', 200)} market | "
+        f"restock idle {format_age(idle_seconds)} returns market | old state recovers.",
+        DIM,
+    ))
     if pause_at_end:
         pause()
 
