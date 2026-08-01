@@ -9962,6 +9962,10 @@ def _queue_hatcher_alive_old_state_hard(open_queue, tab, rt_tab, hcfg, cfg, age_
     pkg = str((tab or {}).get("package", "") or "")
     if pkg and solver_job_running(pkg):
         return False, "solver running", False
+    manual_hold, manual_note = recovery_manual_hold_active(rt_tab, cfg)
+    if manual_hold:
+        rt_tab["note"] = manual_note
+        return False, manual_note, False
     if not enabled:
         return False, "old-state hard disabled", False
     try:
@@ -12783,6 +12787,16 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
     """The actual target-only open -> wait-for-fresh cycle for one package."""
     if core is None:
         core = RejoinCore(open_queue, cfg, rt)
+    manual_hold, manual_note = recovery_manual_hold_active(rt_tab, cfg)
+    if manual_hold and not (
+        item.get("auth_result_recovery")
+        or item.get("solver_recovery")
+        or item.get("manual_auth_open")
+    ):
+        rt_tab["note"] = manual_note
+        core.save()
+        log_activity(f"open held by manual verification: {cut(manual_note, 70)}", pkg, YELLOW)
+        return False, manual_note
     display_mode = str(mode or "hard")
     if _alive_recovery_soft_allowed(reason, package_alive(pkg, cfg, fresh=True), cfg):
         display_mode = "alive-soft-first"
