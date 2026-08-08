@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.80.19-dev-startup-noise-clean"
+__version__ = "V4.80.20-dev-solver-no-reopen"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1335,10 +1335,10 @@ DEFAULT_CONFIG = {
     "solver_preflight_every_open": True,
     "solver_no_captcha_trust_seconds": 3600,
     "solver_no_captcha_max_trusted_rejoins": 3,
-    # When the provider itself errors/times out (not INVALID_COOKIES/SERVER_BUSY),
-    # still perform the original required rejoin once. No second solver request is
-    # made for that generation.
-    "solver_preflight_open_on_failure": True,
+    # If the provider itself errors/times out, retry the provider later instead
+    # of opening Roblox anyway. Opening anyway is what can make Noka move other
+    # clone windows around or drop a sibling clone.
+    "solver_preflight_open_on_failure": False,
     "solver_preflight_server_busy_retry_seconds": 600,
     "solver_endpoint": "https://solver.wintercode.dev",
     "solver_api_key": "",
@@ -1362,10 +1362,10 @@ DEFAULT_CONFIG = {
     # package has produced no state for solver_probe_after_seconds, allow the
     # configured provider to make the authoritative check once for that open.
     "solver_provider_probe_on_no_state": True,
-    "solver_rejoin_on_success": True,
-    # On these cloned clients, NO_CAPTCHA can still leave Roblox trapped behind
-    # the 529 auth wrapper. Both provider-clear results get one recovery open.
-    "solver_rejoin_on_no_captcha": True,
+    "solver_rejoin_on_success": False,
+    # Solver retries are package-local now. Do not reopen Roblox just because the
+    # provider returned NO_CAPTCHA/CAPTCHA_SUCCESS after the package is already up.
+    "solver_rejoin_on_no_captcha": False,
     # After CAPTCHA_SUCCESS, allow one clean rejoin. If that rejoin
     # still produces no fresh state, isolate only that package instead of
     # entering another solver/homepage hard-retry loop.
@@ -2469,12 +2469,10 @@ def apply_update_migrations(cfg):
     set_cfg("solver_probe_stale_state_enabled", False)
     if "solver_provider_probe_on_no_state" not in cfg:
         set_cfg("solver_provider_probe_on_no_state", True)
-    if "solver_rejoin_on_success" not in cfg:
-        set_cfg("solver_rejoin_on_success", True)
-    # V4.58.28: provider NO_CAPTCHA and CAPTCHA_SUCCESS both get exactly
-    # one recovery open. This clears the clone's 529 auth wrapper without loops.
-    if cfg.get("solver_rejoin_on_no_captcha") is not True:
-        set_cfg("solver_rejoin_on_no_captcha", True)
+    # V4.80.20: solver results should not reopen the Roblox package after it is
+    # already running. Reopening one clone can disturb sibling Noka windows.
+    set_cfg("solver_rejoin_on_success", False)
+    set_cfg("solver_rejoin_on_no_captcha", False)
     # V4.80: preflight is useful, but a recent NO_CAPTCHA answer is trusted for
     # a bounded window to avoid provider spam during normal rejoin retries.
     if cfg.get("solver_once_per_rejoin") is not True:
@@ -2485,8 +2483,7 @@ def apply_update_migrations(cfg):
         set_cfg("solver_no_captcha_trust_seconds", 3600)
     if _int_cfg(cfg.get("solver_no_captcha_max_trusted_rejoins"), 0) < 1:
         set_cfg("solver_no_captcha_max_trusted_rejoins", 3)
-    if "solver_preflight_open_on_failure" not in cfg:
-        set_cfg("solver_preflight_open_on_failure", True)
+    set_cfg("solver_preflight_open_on_failure", False)
     if _int_cfg(cfg.get("solver_preflight_server_busy_retry_seconds"), 0) < 600:
         set_cfg("solver_preflight_server_busy_retry_seconds", 600)
     if "manual_hold_after_solver_rejoin_timeout" not in cfg:
@@ -27166,10 +27163,12 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
             # disturb another clone's queued recovery.
             core.cancel(pkg)
 
-            # This is a post-open provider result. The current Roblox task can
-            # already be trapped behind 529, so both clear statuses get exactly
-            # one hard recovery. The recovery item skips solver and probe.
-            should_rejoin = True
+            # This is a post-open provider result. Keep it package-local: do not
+            # PID-stop/reopen Roblox just because the solver answered. On Noka,
+            # that recovery can disturb sibling clone windows. The existing
+            # session either continues loading, or normal stale-state recovery
+            # handles it later.
+            should_rejoin = False
 
             if should_rejoin:
                 rt_tab["note"] = f"{result_label} - rejoin queued"
@@ -27185,8 +27184,8 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
                 if not added:
                     rt_tab["note"] = f"{result_label} - already queued"
             else:
-                rt_tab["note"] = f"{result_label} - one recovery required"
-                activity = f"solver {result_label}; one recovery required"
+                rt_tab["note"] = f"{result_label} - no reopen"
+                activity = f"solver {result_label}; no package reopen"
                 if detail:
                     activity += " - " + cut(detail, 70)
                 log_activity(activity, pkg, GREEN)
