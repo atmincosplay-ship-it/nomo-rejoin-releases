@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.80.22-dev-timed-auth-holds"
+__version__ = "V4.80.23-dev-option6-open-check"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -6852,6 +6852,49 @@ def manual_restart_tabs_via_queue(
 
 
 
+def verify_option6_open_results(cfg, tabs, label="tabs"):
+    """Best-effort confirmation after option 6 queues/open attempts."""
+    tabs = list(tabs or [])
+    if not tabs:
+        return False
+
+    wait_seconds(5, {})
+
+    ok_count = 0
+    print("")
+    print(col(f"Open check for {len(tabs)} {label}:", CYAN))
+    for tab in tabs:
+        pkg = str((tab or {}).get("package", "") or "")
+        if not pkg:
+            continue
+
+        alive = package_alive(pkg, cfg, fresh=True)
+        visible, visible_note = package_visible_window(pkg, cfg)
+
+        if alive and visible is False:
+            note = "PID alive, window not visible/minimized"
+            color = YELLOW
+        elif alive:
+            note = "OPEN OK"
+            color = GREEN
+        else:
+            note = "OPEN NOT CONFIRMED"
+            color = RED
+
+        if alive:
+            ok_count += 1
+
+        extra = ""
+        if visible is None:
+            extra = f" ({visible_note})"
+        print(f"  {short_pkg(pkg):<10} {col(note + extra, color)}")
+
+    all_ok = ok_count == len(tabs)
+    color = GREEN if all_ok else YELLOW
+    print(col(f"Open check: {ok_count}/{len(tabs)} package(s) alive.", color))
+    return all_ok
+
+
 def open_all_tabs_once(cfg, selected_packages=None):
     wanted = set(selected_packages or [])
     enabled_tabs = [
@@ -6892,7 +6935,7 @@ def open_all_tabs_once(cfg, selected_packages=None):
         target_for_tab,
         "manual force restart",
     )
-    print(col("\nDone opening tabs.", GREEN))
+    verify_option6_open_results(cfg, enabled_tabs, "market tab(s)")
     pause()
 
 def show_config_value(key, value):
@@ -18124,12 +18167,7 @@ def open_all_hatcher_tabs_once(
         "manual hatcher/booster force restart",
     )
 
-    print(
-        col(
-            "\nDone opening Hatcher/Booster tabs.",
-            GREEN if ok else YELLOW,
-        )
-    )
+    verify_option6_open_results(cfg, tabs, "Hatcher/Booster tab(s)")
     pause()
     return bool(ok)
 
