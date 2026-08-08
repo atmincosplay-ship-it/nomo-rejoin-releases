@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.80.29-dev-solver-provider-retry"
+__version__ = "V4.80.30-dev-provider-retry-unlock"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -10756,7 +10756,7 @@ def maybe_queue_solver_busy_retry(open_queue, tab, target, rt_tab, cfg, health, 
     retry_at = int(rt_tab.get("solver_busy_retry_at", 0) or 0)
     if retry_at <= 0 or now() < retry_at:
         left = max(1, retry_at - now()) if retry_at else 600
-        return health.get("status", "Loading"), f"solver {retry_reason}; retry rejoin in {format_age(left)}", True
+        return "Waiting", f"solver {retry_reason}; retry rejoin in {format_age(left)}", True
 
     pkg = str((tab or {}).get("package", "") or "")
     if solver_job_running(pkg):
@@ -10965,7 +10965,13 @@ def manual_login_blocked(rt_tab, cfg, pkg=None):
             "solver_retry_reason": rt_tab.get("solver_retry_reason"),
         }
         if solver_response_retry_later(manual_text):
-            apply_solver_retry_later(pkg, rt_tab, cfg, "PROVIDER_RETRY")
+            rt_tab["manual_login_needed"] = False
+            rt_tab["manual_login_reason"] = ""
+            rt_tab["manual_login_detail"] = ""
+            rt_tab["manual_login_retry_at"] = 0
+            rt_tab["manual_login_retry_seconds"] = 0
+            if not rt_tab.get("solver_busy_retry_pending"):
+                apply_solver_retry_later(pkg, rt_tab, cfg, "PROVIDER_RETRY")
             return False
     return bool(rt_tab.get("manual_login_needed", False))
 
@@ -26821,7 +26827,7 @@ def solver_response_retry_later(data):
 
 
 def apply_solver_retry_later(pkg, rt_tab, cfg, reason="PROVIDER_RETRY", retry_seconds=None):
-    retry_after = max(
+    requested_after = max(
         600,
         int(retry_seconds or cfg.get("solver_min_resubmit_seconds", 600) or 600),
     )
@@ -26833,8 +26839,13 @@ def apply_solver_retry_later(pkg, rt_tab, cfg, reason="PROVIDER_RETRY", retry_se
     rt_tab["manual_login_detail"] = ""
     rt_tab["manual_login_retry_at"] = 0
     rt_tab["manual_login_retry_seconds"] = 0
+    existing_at = int(rt_tab.get("solver_busy_retry_at", 0) or 0)
+    if rt_tab.get("solver_busy_retry_pending") and existing_at > now():
+        retry_after = max(1, existing_at - now())
+    else:
+        retry_after = requested_after
+        rt_tab["solver_busy_retry_at"] = now() + retry_after
     rt_tab["solver_busy_retry_pending"] = True
-    rt_tab["solver_busy_retry_at"] = now() + retry_after
     rt_tab["solver_busy_retry_seconds"] = retry_after
     rt_tab["solver_retry_reason"] = reason
     rt_tab["note"] = f"solver retry later; retry provider in {format_age(retry_after)}"
