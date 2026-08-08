@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.80.20-dev-solver-no-reopen"
+__version__ = "V4.80.22-dev-timed-auth-holds"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1370,6 +1370,11 @@ DEFAULT_CONFIG = {
     # still produces no fresh state, isolate only that package instead of
     # entering another solver/homepage hard-retry loop.
     "manual_hold_after_solver_rejoin_timeout": True,
+    # Manual/auth holds should pause a package, not strand it forever. Solver
+    # service errors retry sooner; invalid/challenged account states retry later
+    # without repeatedly reopening the clone.
+    "manual_auth_retry_seconds": 3600,
+    "solver_failure_retry_seconds": 600,
 
     "active_rejoin_mode": "market",
     "market_mode_enabled": True,
@@ -10080,6 +10085,7 @@ def disconnect_ui_api_precheck(tab, rt_tab, cfg, reason="kick popup", require_di
         return False, detail
 
     if blocked is True:
+        retry_seconds = max(600, int(cfg.get("manual_auth_retry_seconds", 3600) or 3600))
         rt_tab["disconnect_ui_api_last_status"] = "challenge"
         mark_manual_login_block(
             rt_tab,
@@ -10087,9 +10093,14 @@ def disconnect_ui_api_precheck(tab, rt_tab, cfg, reason="kick popup", require_di
             detail or f"{reason}; api challenge",
             f"{reason}; api challenge hold",
             t,
+            retry_seconds,
         )
-        set_hold(pkg, "api challenge")
-        log_activity(f"{reason}; API challenge before rejoin - package held", pkg, YELLOW)
+        set_hold(pkg, "api challenge", retry_seconds)
+        log_activity(
+            f"{reason}; API challenge before rejoin - retry in {format_age(retry_seconds)}",
+            pkg,
+            YELLOW,
+        )
         return True, rt_tab["note"]
 
     detail_l = detail.lower()
@@ -10119,6 +10130,7 @@ def disconnect_ui_api_precheck(tab, rt_tab, cfg, reason="kick popup", require_di
             log_activity(f"{reason}; API invalid/expired but app alive - not held", pkg, YELLOW)
             return False, rt_tab["note"]
         rt_tab["disconnect_ui_api_last_status"] = api_status
+        retry_seconds = max(600, int(cfg.get("manual_auth_retry_seconds", 3600) or 3600))
         manual_reason = "api user moderated" if api_status == "moderated" else "api invalid/expired"
         mark_manual_login_block(
             rt_tab,
@@ -10126,10 +10138,15 @@ def disconnect_ui_api_precheck(tab, rt_tab, cfg, reason="kick popup", require_di
             detail or f"{reason}; {manual_reason}",
             f"{reason}; {manual_reason} hold",
             t,
+            retry_seconds,
         )
-        set_hold(pkg, manual_reason)
+        set_hold(pkg, manual_reason, retry_seconds)
         maybe_open_manual_auth_package(tab, cfg, rt_tab, manual_reason)
-        log_activity(f"{reason}; {manual_reason} before rejoin - package held", pkg, RED)
+        log_activity(
+            f"{reason}; {manual_reason} before rejoin - retry in {format_age(retry_seconds)}",
+            pkg,
+            RED,
+        )
         return True, rt_tab["note"]
 
     rt_tab["disconnect_ui_api_last_status"] = "error"
@@ -10157,6 +10174,9 @@ def recovery_manual_hold_active(rt_tab, cfg):
         return True, f"verification cooldown {format_age(retry_at - t)}"
 
     if manual_login_blocked(rt_tab, cfg):
+        manual_retry_at = int(rt_tab.get("manual_login_retry_at", 0) or 0)
+        if manual_retry_at > t:
+            return True, f"manual/auth cooldown {format_age(manual_retry_at - t)}"
         note = str(
             rt_tab.get("manual_login_reason")
             or rt_tab.get("manual_login_detail")
@@ -10501,16 +10521,22 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
         if not int(rt_tab.get("face_lock_detected_at", 0) or 0):
             rt_tab["face_lock_detected_at"] = now()
         if cfg.get("face_lock_auto_hold", True):
+            retry_seconds = max(600, int(cfg.get("manual_auth_retry_seconds", 3600) or 3600))
             mark_manual_login_block(
                 rt_tab,
                 "face_lock",
                 detail,
                 "account locked; use Recovery Tools",
                 int(rt_tab.get("face_lock_detected_at", now()) or now()),
+                retry_seconds,
             )
             if first_hit:
-                set_hold(pkg, "face_lock")
-                log_activity("FACE LOCK detected; package held for manual verification", pkg, RED)
+                set_hold(pkg, "face_lock", retry_seconds)
+                log_activity(
+                    f"FACE LOCK detected; package held, retry in {format_age(retry_seconds)}",
+                    pkg,
+                    RED,
+                )
         return {
             "pkg": pkg, "user": tab.get("user_name", pkg), "alive": bool(raw_alive),
             "state": state, "state_err": err, "fresh": False, "clean_fresh": False,
@@ -10869,6 +10895,13 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
 def manual_login_blocked(rt_tab, cfg):
     if not cfg.get("login_challenge_skip_blocked_packages", True):
         return False
+    retry_at = int(rt_tab.get("manual_login_retry_at", 0) or 0)
+    if retry_at > 0 and retry_at <= now():
+        clear_manual_login_block(rt_tab)
+        rt_tab["manual_login_retry_at"] = 0
+        rt_tab["manual_login_retry_seconds"] = 0
+        rt_tab["note"] = "manual/auth hold expired; retry allowed"
+        return False
     return bool(rt_tab.get("manual_login_needed", False))
 
 
@@ -10879,13 +10912,15 @@ def clear_manual_login_block(rt_tab):
     rt_tab["manual_login_reason"] = ""
     rt_tab["manual_login_detail"] = ""
     rt_tab["manual_login_detected_at"] = 0
+    rt_tab["manual_login_retry_at"] = 0
+    rt_tab["manual_login_retry_seconds"] = 0
     clear_face_lock_runtime(rt_tab)
     rt_tab.pop("solver_attempted", None)  # legacy V3.80 field
     rt_tab["note"] = "manual login cleared"
     return True
 
 
-def mark_manual_login_block(rt_tab, reason, detail="", note="", detected_at=None):
+def mark_manual_login_block(rt_tab, reason, detail="", note="", detected_at=None, retry_seconds=None):
     """Central setter for auth/manual holds.
 
     Keeping these fields written together prevents future modes from creating a
@@ -10895,6 +10930,14 @@ def mark_manual_login_block(rt_tab, reason, detail="", note="", detected_at=None
     rt_tab["manual_login_reason"] = str(reason or "manual login")
     rt_tab["manual_login_detail"] = str(detail or reason or "manual login")
     rt_tab["manual_login_detected_at"] = int(detected_at or now())
+    if retry_seconds:
+        try:
+            retry_seconds = max(1, int(retry_seconds))
+        except Exception:
+            retry_seconds = 0
+    retry_seconds = int(retry_seconds or 0)
+    rt_tab["manual_login_retry_seconds"] = retry_seconds
+    rt_tab["manual_login_retry_at"] = int(now()) + retry_seconds if retry_seconds > 0 else 0
     rt_tab["note"] = str(note or rt_tab["manual_login_detail"])
     return True
 
@@ -12026,7 +12069,8 @@ def detect_and_mark_manual_login(tab, cfg, rt, rt_tab, reason):
 
     # If solver failed/not enabled, or this is a non-CAPTCHA gate, mark manual hold.
     detail = f"{reason}; " + "; ".join(x for x in details if x)
-    mark_manual_login_block(rt_tab, reason, detail, "")
+    retry_seconds = max(600, int(cfg.get("manual_auth_retry_seconds", 3600) or 3600))
+    mark_manual_login_block(rt_tab, reason, detail, "", None, retry_seconds)
     low_detail = detail.lower()
     if (
         "529" in low_detail
@@ -12042,6 +12086,9 @@ def detect_and_mark_manual_login(tab, cfg, rt, rt_tab, reason):
         rt_tab["note"] = "join captcha/manual"
     else:
         rt_tab["note"] = "needs manual login"
+    hold_pkg = str((tab or {}).get("package", "") or "")
+    if hold_pkg:
+        set_hold(hold_pkg, rt_tab.get("manual_login_reason", reason), retry_seconds)
     maybe_open_manual_auth_package(tab, cfg, rt_tab, reason)
     send_login_challenge_alert(cfg, tab, rt_tab, detail)
     save_runtime(rt)
@@ -12246,10 +12293,11 @@ def wait_until_fresh_after_open(
                     if is_auth_529
                     else "verification hold after one recovery"
                 )
-                mark_manual_login_block(rt_tab, hold_reason, detail, hold_note)
+                mark_manual_login_block(rt_tab, hold_reason, detail, hold_note, None, retry_after)
                 set_hold(
                     pkg,
                     rt_tab["manual_login_reason"],
+                    retry_after,
                 )
                 core.save()
                 log_activity(
@@ -12295,10 +12343,13 @@ def wait_until_fresh_after_open(
                     "challenge remains after one recovery",
                     challenge_detail,
                     "CAPTCHA HOLD after one recovery",
+                    None,
+                    retry_after,
                 )
                 set_hold(
                     pkg,
                     rt_tab["manual_login_reason"],
+                    retry_after,
                 )
                 core.save()
                 log_activity(
@@ -12514,15 +12565,22 @@ def solver_preflight_before_open(open_queue, item, tab, rt_tab, pkg, target, cfg
             core.save()
             return "ready", item
 
+        retry_seconds = max(600, int(cfg.get("manual_auth_retry_seconds", 3600) or 3600))
         mark_manual_login_block(
             rt_tab,
             "invalid or missing package cookie",
             str(note),
             str(note),
+            None,
+            retry_seconds,
         )
-        set_hold(pkg, str(note))
+        set_hold(pkg, str(note), retry_seconds)
         maybe_open_manual_auth_package(tab, cfg, rt_tab, "solver preflight invalid/missing cookie")
-        log_activity(f"solver preflight blocked open: {cut(note, 80)}", pkg, RED)
+        log_activity(
+            f"solver preflight blocked open; retry in {format_age(retry_seconds)}: {cut(note, 80)}",
+            pkg,
+            RED,
+        )
         core.save()
         return "handled", None
 
@@ -13023,16 +13081,19 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
             # Redfinger window layout. Isolate this package and continue others.
             if item.get("solver_recovery") and cfg.get("manual_hold_after_solver_rejoin_timeout", True):
                 solver_result = str(item.get("solver_result", "solver clear") or "solver clear")
+                retry_seconds = max(600, int(cfg.get("manual_auth_retry_seconds", 3600) or 3600))
                 core.cancel(pkg)
                 mark_manual_login_block(
                     rt_tab,
                     "join blocked after solver recovery",
                     f"{solver_result}; {fresh_msg}; no fresh state after recovery",
                     f"{solver_result} but still no state - check homepage/age gate",
+                    None,
+                    retry_seconds,
                 )
-                set_hold(pkg, "join blocked after solver recovery")
+                set_hold(pkg, "join blocked after solver recovery", retry_seconds)
                 log_activity(
-                    f"{solver_result} recovery still no state; package held (no more hard loop)",
+                    f"{solver_result} recovery still no state; retry in {format_age(retry_seconds)}",
                     pkg, RED,
                 )
                 core.save()
@@ -13218,7 +13279,8 @@ def api_check_package(package, cache=None, cfg=None):
                     return
                 else:
                     print(col(f"[SOLVER] Still challenged after solving: {status2}", YELLOW))
-                    set_hold(package, "challenge")
+                    retry_seconds = max(600, int((cfg or {}).get("solver_failure_retry_seconds", 600) or 600))
+                    set_hold(package, "challenge", retry_seconds)
                     rt = load_runtime()
                     rt_tab = get_runtime_tab(rt, package)
                     mark_manual_login_block(
@@ -13226,13 +13288,16 @@ def api_check_package(package, cache=None, cfg=None):
                         "challenge after solve",
                         "solver failed to clear challenge",
                         "needs manual login",
+                        None,
+                        retry_seconds,
                     )
                     save_runtime(rt)
-                    print(col(f"  {package}: CHALLENGE detected (placed on hold)", YELLOW))
+                    print(col(f"  {package}: CHALLENGE detected (retry in {format_age(retry_seconds)})", YELLOW))
                     return
             else:
                 print(col(f"[SOLVER] Failed: {msg}", RED))
-                set_hold(package, "challenge")
+                retry_seconds = max(600, int((cfg or {}).get("solver_failure_retry_seconds", 600) or 600))
+                set_hold(package, "challenge", retry_seconds)
                 rt = load_runtime()
                 rt_tab = get_runtime_tab(rt, package)
                 mark_manual_login_block(
@@ -13240,12 +13305,15 @@ def api_check_package(package, cache=None, cfg=None):
                     "solver failed",
                     msg,
                     "needs manual login",
+                    None,
+                    retry_seconds,
                 )
                 save_runtime(rt)
-                print(col(f"  {package}: CHALLENGE detected (placed on hold)", YELLOW))
+                print(col(f"  {package}: solver failed (retry in {format_age(retry_seconds)})", YELLOW))
                 return
         else:
-            set_hold(package, "challenge")
+            retry_seconds = max(600, int((cfg or {}).get("manual_auth_retry_seconds", 3600) or 3600))
+            set_hold(package, "challenge", retry_seconds)
             rt = load_runtime()
             rt_tab = get_runtime_tab(rt, package)
             mark_manual_login_block(
@@ -13253,12 +13321,15 @@ def api_check_package(package, cache=None, cfg=None):
                 "api challenge",
                 "challenge detected, solver disabled",
                 "needs manual login",
+                None,
+                retry_seconds,
             )
             save_runtime(rt)
-            print(col(f"  {package}: CHALLENGE detected (placed on hold)", YELLOW))
+            print(col(f"  {package}: CHALLENGE detected (retry in {format_age(retry_seconds)})", YELLOW))
     elif status == "invalid":
-        set_hold(package, "invalid")
-        print(col(f"  {package}: Invalid/Expired cookie (placed on hold)", RED))
+        retry_seconds = max(600, int((cfg or {}).get("manual_auth_retry_seconds", 3600) or 3600))
+        set_hold(package, "invalid", retry_seconds)
+        print(col(f"  {package}: Invalid/Expired cookie (retry in {format_age(retry_seconds)})", RED))
     else:
         print(col(f"  {package}: Unknown status: {status}", RED))
 
@@ -15016,7 +15087,7 @@ def normalize_hatcher_profile(prof, idx=0):
     return base
 
 
-def set_hold(package, reason):
+def set_hold(package, reason, retry_seconds=None):
     hold = {}
     hold_file = BASE_DIR / "captcha_hold.json"
     if hold_file.exists():
@@ -15025,7 +15096,18 @@ def set_hold(package, reason):
                 hold = json.load(f)
         except:
             pass
-    hold[package] = {"reason": reason, "timestamp": time.time()}
+    retry_at = 0
+    if retry_seconds:
+        try:
+            retry_at = int(time.time()) + max(1, int(retry_seconds))
+        except Exception:
+            retry_at = 0
+    hold[package] = {
+        "reason": reason,
+        "timestamp": time.time(),
+        "retry_at": retry_at,
+        "retry_seconds": int(retry_seconds or 0),
+    }
     with open(hold_file, "w") as f:
         json.dump(hold, f, indent=2)
 
@@ -15057,7 +15139,16 @@ def is_on_hold(package):
     try:
         with open(hold_file) as f:
             hold = json.load(f)
-        return package in hold
+        item = hold.get(package)
+        if not item:
+            return False
+        retry_at = int(item.get("retry_at", 0) or 0)
+        if retry_at > 0 and retry_at <= int(time.time()):
+            del hold[package]
+            with open(hold_file, "w") as f:
+                json.dump(hold, f, indent=2)
+            return False
+        return True
     except Exception:
         return False
 
@@ -15068,7 +15159,17 @@ def get_hold_reason(package):
     try:
         with open(hold_file) as f:
             hold = json.load(f)
-        return hold.get(package, {}).get("reason")
+        item = hold.get(package, {})
+        retry_at = int(item.get("retry_at", 0) or 0)
+        if retry_at > 0:
+            left = retry_at - int(time.time())
+            if left <= 0:
+                del hold[package]
+                with open(hold_file, "w") as f:
+                    json.dump(hold, f, indent=2)
+                return None
+            return f"{item.get('reason')} | retry in {format_age(left)}"
+        return item.get("reason")
     except:
         return None
 
@@ -26911,14 +27012,16 @@ def handle_detected_solver_challenge(tab, cfg, rt, rt_tab, reason, core=None):
         return "Solving", note
 
     # Disabled, missing credentials/cookie, or cooldown after a failed attempt.
+    retry_seconds = max(600, int(cfg.get("solver_failure_retry_seconds", 600) or 600))
     mark_manual_login_block(
         rt_tab,
         "captcha/login challenge",
         str(reason or note),
         note,
         int(rt_tab.get("manual_login_detected_at", 0) or 0) or now(),
+        retry_seconds,
     )
-    set_hold(pkg, note)
+    set_hold(pkg, note, retry_seconds)
     if core is not None:
         core.save()
     else:
@@ -27057,14 +27160,21 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
                 rt_tab["solver_busy_retry_pending"] = False
                 rt_tab["solver_busy_retry_at"] = 0
                 rt_tab["solver_retry_reason"] = ""
+                retry_seconds = max(600, int(cfg.get("manual_auth_retry_seconds", 3600) or 3600))
                 mark_manual_login_block(
                     rt_tab,
                     "invalid package cookie",
                     err,
                     "INVALID_COOKIES - refresh account cookie",
+                    None,
+                    retry_seconds,
                 )
-                set_hold(pkg, "solver rejected invalid/expired package cookie")
-                log_activity("solver INVALID_COOKIES before open; package held", pkg, RED)
+                set_hold(pkg, "solver rejected invalid/expired package cookie", retry_seconds)
+                log_activity(
+                    f"solver INVALID_COOKIES before open; retry in {format_age(retry_seconds)}",
+                    pkg,
+                    RED,
+                )
             elif cfg.get("solver_preflight_open_on_failure", True):
                 rt_tab["note"] = f"solver error; opening once: {cut(err, 60)}"
                 if queued_item is not None:
@@ -27076,14 +27186,21 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
                 log_activity(f"solver error before open; original rejoin continues once: {cut(err, 70)}", pkg, YELLOW)
             else:
                 core.remove_generation(pkg, generation)
+                retry_seconds = max(600, int(cfg.get("solver_failure_retry_seconds", 600) or 600))
                 mark_manual_login_block(
                     rt_tab,
                     "solver failed before rejoin",
                     err,
                     f"solver failed before open: {cut(err, 70)}",
+                    None,
+                    retry_seconds,
                 )
-                set_hold(pkg, f"solver failed before open: {err}")
-                log_activity(f"solver failed before open; package held: {cut(err, 70)}", pkg, RED)
+                set_hold(pkg, f"solver failed before open: {err}", retry_seconds)
+                log_activity(
+                    f"solver failed before open; retry in {format_age(retry_seconds)}: {cut(err, 70)}",
+                    pkg,
+                    RED,
+                )
             changed = True
             continue
 
@@ -27216,14 +27333,17 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
             rt_tab["solver_busy_retry_pending"] = False
             rt_tab["solver_busy_retry_at"] = 0
             rt_tab["solver_retry_reason"] = ""
+            retry_seconds = max(600, int(cfg.get("manual_auth_retry_seconds", 3600) or 3600))
             mark_manual_login_block(
                 rt_tab,
                 "invalid package cookie",
                 err,
                 "INVALID_COOKIES - refresh account cookie",
+                None,
+                retry_seconds,
             )
-            set_hold(pkg, "solver rejected invalid/expired package cookie")
-            log_activity("solver INVALID_COOKIES; not retrying", pkg, RED)
+            set_hold(pkg, "solver rejected invalid/expired package cookie", retry_seconds)
+            log_activity(f"solver INVALID_COOKIES; retry in {format_age(retry_seconds)}", pkg, RED)
         elif str(job.get("phase", "")) == "probe" and not job.get("detected"):
             # Provider/network error during a one-shot post-open probe is not
             # proof of CAPTCHA and must not place the account on manual hold.
@@ -27234,15 +27354,22 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
                 pkg, YELLOW,
             )
         else:
+            retry_seconds = max(600, int(cfg.get("solver_failure_retry_seconds", 600) or 600))
             mark_manual_login_block(
                 rt_tab,
                 "solver failed",
                 err,
                 f"solver failed: {cut(err, 80)}",
+                None,
+                retry_seconds,
             )
-            set_hold(pkg, f"solver failed: {err}")
+            set_hold(pkg, f"solver failed: {err}", retry_seconds)
             send_login_challenge_alert(cfg, tab, rt_tab, rt_tab["note"])
-            log_activity(f"solver failed: {cut(err, 100)}", pkg, RED)
+            log_activity(
+                f"solver failed; retry in {format_age(retry_seconds)}: {cut(err, 100)}",
+                pkg,
+                RED,
+            )
         changed = True
 
     if changed:
