@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.80.31-dev-solver-soft-open"
+__version__ = "V4.80.32-dev-option6-route-nudge"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -6848,6 +6848,62 @@ def manual_restart_tabs_via_queue(
 
     save_runtime(rt)
     return True
+
+
+
+def nudge_option6_routes(cfg, tabs, target_for_tab, label="tabs"):
+    """Send the selected deep link again after Option 6 opens the clone.
+
+    Some Noka/App Cloner builds keep a warm Roblox task alive but drop the
+    first deep link, leaving the clone on the Roblox home page. A soft resend
+    of the exact saved route is enough to steer that already-open task without
+    stopping other clones.
+    """
+    tabs = list(tabs or [])
+    if not tabs:
+        return 0
+
+    wait_seconds(8, {})
+
+    rt = load_runtime()
+    nudged = 0
+    print("")
+    print(col(f"Route nudge for {len(tabs)} {label}:", CYAN))
+    for tab in tabs:
+        pkg = str((tab or {}).get("package", "") or "")
+        if not pkg:
+            continue
+
+        rt_tab = rt.get(pkg) if isinstance(rt, dict) else None
+        target = (
+            target_for_tab(tab, rt)
+            if callable(target_for_tab)
+            else str(target_for_tab or "market")
+        )
+        link = target_link(tab, cfg, target, rt_tab, rt)
+        if not link:
+            print(f"  {short_pkg(pkg):<10} {col('NO ROUTE', RED)}")
+            continue
+
+        ok, note = open_roblox(
+            pkg,
+            link,
+            cfg,
+            soft=True,
+            rt_tab=rt_tab,
+            reason="option6 route nudge",
+            require_stop=False,
+            skip_force_stop=True,
+        )
+        if ok:
+            nudged += 1
+            print(f"  {short_pkg(pkg):<10} {col('ROUTE SENT', GREEN)} {cut(note, 50)}")
+        else:
+            print(f"  {short_pkg(pkg):<10} {col('ROUTE FAILED', RED)} {cut(note, 50)}")
+        wait_seconds(1, {})
+
+    save_runtime(rt)
+    return nudged
 
 
 
@@ -18186,6 +18242,13 @@ def open_all_hatcher_tabs_once(
         tabs,
         "hatcher",
         "manual hatcher/booster force restart",
+    )
+
+    nudge_option6_routes(
+        cfg,
+        tabs,
+        "hatcher",
+        "Hatcher/Booster tab(s)",
     )
 
     verify_option6_open_results(cfg, tabs, "Hatcher/Booster tab(s)")
