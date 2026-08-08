@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.80.23-dev-option6-open-check"
+__version__ = "V4.80.24-dev-option6-visible-check"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -6872,16 +6872,27 @@ def verify_option6_open_results(cfg, tabs, label="tabs"):
         visible, visible_note = package_visible_window(pkg, cfg)
 
         if alive and visible is False:
-            note = "PID alive, window not visible/minimized"
-            color = YELLOW
-        elif alive:
+            print(f"  {short_pkg(pkg):<10} {col('PID alive, window hidden; nudging launcher', YELLOW)}")
+            open_package_launcher(pkg, cfg)
+            wait_seconds(2, {})
+            _WINDOW_DUMP_CACHE["ts"] = 0
+            alive = package_alive(pkg, cfg, fresh=True)
+            visible, visible_note = package_visible_window(pkg, cfg)
+
+        if alive and visible is False:
+            note = "NOT VISIBLE"
+            color = RED
+        elif alive and visible is True:
             note = "OPEN OK"
             color = GREEN
+        elif alive:
+            note = "PID alive, visibility unknown"
+            color = YELLOW
         else:
             note = "OPEN NOT CONFIRMED"
             color = RED
 
-        if alive:
+        if alive and visible is not False:
             ok_count += 1
 
         extra = ""
@@ -6891,7 +6902,7 @@ def verify_option6_open_results(cfg, tabs, label="tabs"):
 
     all_ok = ok_count == len(tabs)
     color = GREEN if all_ok else YELLOW
-    print(col(f"Open check: {ok_count}/{len(tabs)} package(s) alive.", color))
+    print(col(f"Open check: {ok_count}/{len(tabs)} package(s) visible/alive.", color))
     return all_ok
 
 
