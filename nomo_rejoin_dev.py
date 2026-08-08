@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.80.27-dev-solver-cooldown-unblock"
+__version__ = "V4.80.29-dev-solver-provider-retry"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -10018,7 +10018,7 @@ def _queue_hatcher_alive_old_state_hard(open_queue, tab, rt_tab, hcfg, cfg, age_
     pkg = str((tab or {}).get("package", "") or "")
     if pkg and solver_job_running(pkg):
         return False, "solver running", False
-    manual_hold, manual_note = recovery_manual_hold_active(rt_tab, cfg)
+    manual_hold, manual_note = recovery_manual_hold_active(rt_tab, cfg, pkg)
     if manual_hold:
         rt_tab["note"] = manual_note
         return False, manual_note, False
@@ -10220,14 +10220,14 @@ def api_precheck_before_rejoin(tab, rt_tab, cfg, reason="queued rejoin"):
     return disconnect_ui_api_precheck(tab, rt_tab, cfg, reason, require_disconnect_toggle=False)
 
 
-def recovery_manual_hold_active(rt_tab, cfg):
+def recovery_manual_hold_active(rt_tab, cfg, pkg=None):
     """Return True when a package must stay isolated for manual/verification cooldown."""
     t = now()
     retry_at = int(rt_tab.get("captcha_ui_retry_at", 0) or 0)
     if retry_at > t:
         return True, f"verification cooldown {format_age(retry_at - t)}"
 
-    if manual_login_blocked(rt_tab, cfg):
+    if manual_login_blocked(rt_tab, cfg, pkg):
         manual_retry_at = int(rt_tab.get("manual_login_retry_at", 0) or 0)
         if manual_retry_at > t:
             return True, f"manual/auth cooldown {format_age(manual_retry_at - t)}"
@@ -10255,9 +10255,9 @@ def _queue_disconnect_ui_rejoin(open_queue, tab, target, rt_tab, cfg, core=None)
     if hold_until > t:
         return False, f"kick recovery hold {max(1, hold_until - t)}s"
 
-    manual_hold, manual_note = recovery_manual_hold_active(rt_tab, cfg)
+    pkg = str((tab or {}).get("package", "") or "")
+    manual_hold, manual_note = recovery_manual_hold_active(rt_tab, cfg, pkg)
     if manual_hold:
-        pkg = str((tab or {}).get("package", "") or "")
         rt_tab["disconnect_ui_recovery_active"] = False
         rt_tab["disconnect_ui_recovery_stage"] = "manual_hold"
         rt_tab["last_disconnect_ui_open"] = 0
@@ -10646,7 +10646,7 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
         # Do not let an old popup cooldown delay a later, unrelated Error 288.
         rt_tab["disconnect_ui_since"] = 0
         rt_tab["last_disconnect_ui_open"] = 0
-        if manual_login_blocked(rt_tab, cfg):
+        if manual_login_blocked(rt_tab, cfg, pkg):
             clear_manual_login_block(rt_tab)
             clear_hold(pkg)
     visible_window = None
@@ -10654,7 +10654,7 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
     if raw_alive:
         visible_window, visible_note = package_visible_window(pkg, cfg)
 
-    if manual_login_blocked(rt_tab, cfg) and not state_login_challenge_detail(state):
+    if manual_login_blocked(rt_tab, cfg, pkg) and not state_login_challenge_detail(state):
         face_locked = str(rt_tab.get("manual_login_reason", "") or "") == "face_lock" or bool(rt_tab.get("face_lock_detected"))
         return {
             "pkg": pkg, "user": tab.get("user_name", pkg), "alive": bool(raw_alive),
@@ -10946,7 +10946,7 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
     return status, note, True
 
 
-def manual_login_blocked(rt_tab, cfg):
+def manual_login_blocked(rt_tab, cfg, pkg=None):
     if not cfg.get("login_challenge_skip_blocked_packages", True):
         return False
     retry_at = int(rt_tab.get("manual_login_retry_at", 0) or 0)
@@ -10964,14 +10964,8 @@ def manual_login_blocked(rt_tab, cfg):
             "solver_last_error": rt_tab.get("solver_last_error"),
             "solver_retry_reason": rt_tab.get("solver_retry_reason"),
         }
-        if solver_response_provider_cooldown(manual_text):
-            retry_after = max(600, int(cfg.get("solver_min_resubmit_seconds", 600) or 600))
-            clear_manual_login_block(rt_tab)
-            rt_tab["solver_busy_retry_pending"] = True
-            rt_tab["solver_busy_retry_at"] = now() + retry_after
-            rt_tab["solver_busy_retry_seconds"] = retry_after
-            rt_tab["solver_retry_reason"] = "PROVIDER_COOLDOWN"
-            rt_tab["note"] = f"solver cooldown; retry provider in {format_age(retry_after)}"
+        if solver_response_retry_later(manual_text):
+            apply_solver_retry_later(pkg, rt_tab, cfg, "PROVIDER_RETRY")
             return False
     return bool(rt_tab.get("manual_login_needed", False))
 
@@ -12167,7 +12161,7 @@ def detect_and_mark_manual_login(tab, cfg, rt, rt_tab, reason):
 
 
 def maybe_detect_manual_login(tab, cfg, rt, rt_tab, reason, min_interval=60):
-    if manual_login_blocked(rt_tab, cfg):
+    if manual_login_blocked(rt_tab, cfg, tab.get("package") or tab.get("pkg")):
         return True, "already marked"
 
     last = int(rt_tab.get("manual_login_last_detect_check", 0) or 0)
@@ -12179,7 +12173,7 @@ def maybe_detect_manual_login(tab, cfg, rt, rt_tab, reason, min_interval=60):
 
 
 def maybe_clear_manual_login_prejoin(tab, cfg, rt, rt_tab, min_interval=120):
-    if not manual_login_blocked(rt_tab, cfg):
+    if not manual_login_blocked(rt_tab, cfg, tab.get("package") or tab.get("pkg")):
         return True, "not manual"
 
     last = int(rt_tab.get("manual_login_last_recover_check", 0) or 0)
@@ -12692,7 +12686,7 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
     # an older persisted manual-login hold discard the recovery item. Kick items
     # are allowed to perform one target-only restart even when that stale flag exists.
     if (
-        manual_login_blocked(rt_tab, cfg)
+        manual_login_blocked(rt_tab, cfg, pkg)
         and not item.get("bypass_manual")
         and not item.get("disconnect_recovery")
         and not item.get("recovery_must_open_once")
@@ -12913,7 +12907,7 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
     """The actual target-only open -> wait-for-fresh cycle for one package."""
     if core is None:
         core = RejoinCore(open_queue, cfg, rt)
-    manual_hold, manual_note = recovery_manual_hold_active(rt_tab, cfg)
+    manual_hold, manual_note = recovery_manual_hold_active(rt_tab, cfg, pkg)
     if manual_hold and not (
         item.get("auth_result_recovery")
         or item.get("solver_recovery")
@@ -13366,21 +13360,14 @@ def api_check_package(package, cache=None, cfg=None):
                     print(col(f"  {package}: CHALLENGE detected (retry in {format_age(retry_seconds)})", YELLOW))
                     return
             else:
-                print(col(f"[SOLVER] Failed: {msg}", RED))
                 retry_seconds = max(600, int((cfg or {}).get("solver_failure_retry_seconds", 600) or 600))
-                set_hold(package, "challenge", retry_seconds)
                 rt = load_runtime()
                 rt_tab = get_runtime_tab(rt, package)
-                mark_manual_login_block(
-                    rt_tab,
-                    "solver failed",
-                    msg,
-                    "needs manual login",
-                    None,
-                    retry_seconds,
-                )
+                retry_reason = "PROVIDER_RETRY" if solver_response_retry_later(msg) else "SOLVER_ERROR"
+                retry_after = apply_solver_retry_later(package, rt_tab, cfg or {}, retry_reason, retry_seconds)
                 save_runtime(rt)
-                print(col(f"  {package}: solver failed (retry in {format_age(retry_seconds)})", YELLOW))
+                print(col(f"[SOLVER] Retry later: {msg}", YELLOW))
+                print(col(f"  {package}: solver retry in {format_age(retry_after)}", YELLOW))
                 return
         else:
             retry_seconds = max(600, int((cfg or {}).get("manual_auth_retry_seconds", 3600) or 3600))
@@ -13620,7 +13607,7 @@ def _nomo_start_market_rejoin_original(cfg):
                                 note = "hop queued"
 
             due_refresh, refresh_left = periodic_hard_refresh_due(rt_tab, cfg)
-            if due_refresh and not rj_handled and not manual_login_blocked(rt_tab, cfg) and core.idle_for(pkg):
+            if due_refresh and not rj_handled and not manual_login_blocked(rt_tab, cfg, pkg) and core.idle_for(pkg):
                 added, _ = core.queue_hard_retry(tab, target, "periodic hard refresh")
                 if added:
                     mark_periodic_hard_refresh(rt_tab)
@@ -13639,7 +13626,7 @@ def _nomo_start_market_rejoin_original(cfg):
                 else:
                     status = "Waiting"
                     note = f"queue #{qpos}; {note}".strip("; ")
-            elif manual_login_blocked(rt_tab, cfg):
+            elif manual_login_blocked(rt_tab, cfg, pkg):
                 status = "Manual"
                 note = rt_tab.get("manual_login_reason") or rt_tab.get("note") or "needs manual login"
 
@@ -16996,7 +16983,7 @@ def start_hatcher_reporter(main_cfg=None):
             if not tab.get("server_link") or str(tab.get("server_link")).startswith("YOUR_"):
                 status = "No server"
                 note = "server_link missing"
-            elif manual_login_blocked(rt_tab, cfg):
+            elif manual_login_blocked(rt_tab, cfg, pkg):
                 status = "Manual"
                 note = rt_tab.get("note") or "needs manual login"
             elif not alive and cfg.get("rejoin_if_crash", True):
@@ -17017,7 +17004,7 @@ def start_hatcher_reporter(main_cfg=None):
                     status = "Offline"
 
             due_refresh, refresh_left = periodic_hard_refresh_due(rt_tab, cfg)
-            if due_refresh and not manual_login_blocked(rt_tab, cfg) and core.idle_for(pkg, include_solver=False):
+            if due_refresh and not manual_login_blocked(rt_tab, cfg, pkg) and core.idle_for(pkg, include_solver=False):
                 added, _ = core.queue_hard_retry(tab, "hatcher", "periodic hard refresh")
                 if added:
                     mark_periodic_hard_refresh(rt_tab)
@@ -17025,7 +17012,7 @@ def start_hatcher_reporter(main_cfg=None):
                     note = "periodic hard queued"
 
             status, note = core.queue_display(pkg, status, note)
-            if manual_login_blocked(rt_tab, cfg) and not core.has(pkg):
+            if manual_login_blocked(rt_tab, cfg, pkg) and not core.has(pkg):
                 status = "Manual"
                 note = rt_tab.get("manual_login_reason") or rt_tab.get("note") or "needs manual login"
 
@@ -17937,7 +17924,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
             # gets its normal turn; its queued generation performs one solver check before opening.
 
             due_refresh, refresh_left = periodic_hard_refresh_due(rt_tab, cfg)
-            if due_refresh and captcha_action is None and not manual_login_blocked(rt_tab, cfg) and core.idle_for(pkg):
+            if due_refresh and captcha_action is None and not manual_login_blocked(rt_tab, cfg, pkg) and core.idle_for(pkg):
                 added, _ = core.queue_hard_retry(tab, "hatcher", "periodic hard refresh")
                 if added:
                     mark_periodic_hard_refresh(rt_tab)
@@ -17945,7 +17932,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                     note = "periodic hard queued"
 
             status, note = core.queue_display(pkg, status, note)
-            if manual_login_blocked(rt_tab, cfg) and not core.has(pkg):
+            if manual_login_blocked(rt_tab, cfg, pkg) and not core.has(pkg):
                 status = "Manual"
                 note = rt_tab.get("manual_login_reason") or rt_tab.get("note") or "needs manual login"
 
@@ -26805,6 +26792,7 @@ def solver_response_provider_cooldown(data):
     text = solver_response_text_blob(data)
     cache_refresh_denied = (
         "cache flagged refresh denied" in text
+        or "cookie flagged refresh denied" in text
         or ("refresh denied" in text and ("cache" in text or "flagged" in text))
     )
     return (
@@ -26814,6 +26802,43 @@ def solver_response_provider_cooldown(data):
         or "rate limit" in text
         or "too many requests" in text
     )
+
+
+def solver_response_retry_later(data):
+    http_status = solver_response_http_status(data)
+    text = solver_response_text_blob(data)
+    return (
+        solver_response_provider_cooldown(data)
+        or solver_response_provider_unavailable(data)
+        or "cookie flagged refresh denied" in text
+        or "cache flagged refresh denied" in text
+        or "flagged refresh" in text
+        or ("refresh denied" in text and ("cookie" in text or "cache" in text or "flagged" in text))
+        or (http_status == 401 and ("refresh" in text or "flagged" in text or "solver" in text or "provider" in text))
+        or "provider cooldown" in text
+        or "temporarily" in text
+    )
+
+
+def apply_solver_retry_later(pkg, rt_tab, cfg, reason="PROVIDER_RETRY", retry_seconds=None):
+    retry_after = max(
+        600,
+        int(retry_seconds or cfg.get("solver_min_resubmit_seconds", 600) or 600),
+    )
+    clear_manual_login_block(rt_tab)
+    if pkg:
+        clear_hold(pkg)
+    rt_tab["manual_login_needed"] = False
+    rt_tab["manual_login_reason"] = ""
+    rt_tab["manual_login_detail"] = ""
+    rt_tab["manual_login_retry_at"] = 0
+    rt_tab["manual_login_retry_seconds"] = 0
+    rt_tab["solver_busy_retry_pending"] = True
+    rt_tab["solver_busy_retry_at"] = now() + retry_after
+    rt_tab["solver_busy_retry_seconds"] = retry_after
+    rt_tab["solver_retry_reason"] = reason
+    rt_tab["note"] = f"solver retry later; retry provider in {format_age(retry_after)}"
+    return retry_after
 
 
 def _solver_probe_worker(package, tab, cookie, cfg_snapshot, place_id):
@@ -27244,46 +27269,14 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
             rt_tab["solver_state"] = "failed"
             rt_tab["solver_last_error"] = err
 
-            if solver_response_provider_cooldown(response):
-                retry_after = max(600, int(cfg.get("solver_min_resubmit_seconds", 600) or 600))
+            if solver_response_retry_later(response):
                 core.remove_generation(pkg, generation)
-                clear_manual_login_block(rt_tab)
-                clear_hold(pkg)
-                rt_tab["solver_busy_retry_pending"] = True
-                rt_tab["solver_busy_retry_at"] = now() + retry_after
-                rt_tab["solver_busy_retry_seconds"] = retry_after
-                rt_tab["solver_retry_reason"] = "PROVIDER_COOLDOWN"
-                rt_tab["note"] = f"solver cooldown; retry provider in {format_age(retry_after)}"
+                retry_after = apply_solver_retry_later(pkg, rt_tab, cfg, "PROVIDER_RETRY")
                 log_activity(
-                    f"solver provider cooldown before open; retry in {format_age(retry_after)}: {cut(err, 70)}",
+                    f"solver provider retry before open; retry in {format_age(retry_after)}: {cut(err, 70)}",
                     pkg,
                     YELLOW,
                 )
-            elif solver_response_provider_unavailable(response):
-                retry_after = max(600, int(cfg.get("solver_min_resubmit_seconds", 600) or 600))
-                rt_tab["solver_busy_retry_pending"] = True
-                rt_tab["solver_busy_retry_at"] = now() + retry_after
-                rt_tab["solver_retry_reason"] = "SOLVER_UNAVAILABLE"
-                rt_tab["note"] = f"solver unavailable; retry provider in {format_age(retry_after)}"
-                if cfg.get("solver_preflight_open_on_failure", True):
-                    if queued_item is not None:
-                        queued_item["solver_preflight_waiting"] = False
-                        queued_item["solver_preflight_done"] = True
-                        queued_item["solver_result"] = "SOLVER_UNAVAILABLE"
-                        queued_item["skip_solver_once"] = True
-                        queued_item["skip_solver_probe"] = True
-                    log_activity(
-                        f"solver provider unavailable before open; original rejoin continues once: {cut(err, 70)}",
-                        pkg,
-                        YELLOW,
-                    )
-                else:
-                    core.remove_generation(pkg, generation)
-                    log_activity(
-                        f"solver provider unavailable before open; retry in {format_age(retry_after)}",
-                        pkg,
-                        YELLOW,
-                    )
             elif status_code in {"SERVER_BUSY", "BUSY", "RATE_LIMITED", "TOO_MANY_REQUESTS"}:
                 retry_after = max(
                     600,
@@ -27327,19 +27320,11 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
             else:
                 core.remove_generation(pkg, generation)
                 retry_seconds = max(600, int(cfg.get("solver_failure_retry_seconds", 600) or 600))
-                mark_manual_login_block(
-                    rt_tab,
-                    "solver failed before rejoin",
-                    err,
-                    f"solver failed before open: {cut(err, 70)}",
-                    None,
-                    retry_seconds,
-                )
-                set_hold(pkg, f"solver failed before open: {err}", retry_seconds)
+                retry_after = apply_solver_retry_later(pkg, rt_tab, cfg, "SOLVER_ERROR", retry_seconds)
                 log_activity(
-                    f"solver failed before open; retry in {format_age(retry_seconds)}: {cut(err, 70)}",
+                    f"solver error before open; retry in {format_age(retry_after)}: {cut(err, 70)}",
                     pkg,
-                    RED,
+                    YELLOW,
                 )
             changed = True
             continue
@@ -27509,20 +27494,12 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
             )
         else:
             retry_seconds = max(600, int(cfg.get("solver_failure_retry_seconds", 600) or 600))
-            mark_manual_login_block(
-                rt_tab,
-                "solver failed",
-                err,
-                f"solver failed: {cut(err, 80)}",
-                None,
-                retry_seconds,
-            )
-            set_hold(pkg, f"solver failed: {err}", retry_seconds)
-            send_login_challenge_alert(cfg, tab, rt_tab, rt_tab["note"])
+            retry_reason = "PROVIDER_RETRY" if solver_response_retry_later(response) else "SOLVER_ERROR"
+            retry_after = apply_solver_retry_later(pkg, rt_tab, cfg, retry_reason, retry_seconds)
             log_activity(
-                f"solver failed; retry in {format_age(retry_seconds)}: {cut(err, 100)}",
+                f"solver retry later; retry in {format_age(retry_after)}: {cut(err, 100)}",
                 pkg,
-                RED,
+                YELLOW,
             )
         changed = True
 
@@ -28970,10 +28947,14 @@ def solver_menu(cfg):
                         print(col(f"Cookie status: {status} - likely expired.", RED))
                 else:
                     error = resp.get("error", resp) if isinstance(resp, dict) else resp
-                    if solver_response_provider_cooldown(resp):
+                    if solver_response_retry_later(resp):
+                        retry_after = max(600, int(cfg.get("solver_min_resubmit_seconds", 600) or 600))
+                        print(col(f"Solver provider retry later: {error}", YELLOW))
+                        print(col(f"NOMO will retry after {format_age(retry_after)}; no manual login needed.", YELLOW))
+                    elif solver_response_provider_cooldown(resp):
                         retry_after = max(600, int(cfg.get("solver_min_resubmit_seconds", 600) or 600))
                         print(col(f"Solver provider cooldown: {error}", YELLOW))
-                        print(col(f"NOMO will retry after {format_age(retry_after)}; do not reopen package for this.", YELLOW))
+                        print(col(f"NOMO will retry after {format_age(retry_after)}; no manual login needed.", YELLOW))
                     elif solver_response_provider_unavailable(resp):
                         print(col(f"Solver provider unavailable: {error}", YELLOW))
                         print(col("This is not an account/cookie bug; retry later.", YELLOW))
@@ -28999,10 +28980,14 @@ def solver_menu(cfg):
                         print(col(f"Cookie status: {status} - likely expired.", RED))
                 else:
                     error = resp.get('error', resp) if isinstance(resp, dict) else resp
-                    if solver_response_provider_cooldown(resp):
+                    if solver_response_retry_later(resp):
+                        retry_after = max(600, int(cfg.get("solver_min_resubmit_seconds", 600) or 600))
+                        print(col(f"Solver provider retry later: {error}", YELLOW))
+                        print(col(f"NOMO will retry after {format_age(retry_after)}; no manual login needed.", YELLOW))
+                    elif solver_response_provider_cooldown(resp):
                         retry_after = max(600, int(cfg.get("solver_min_resubmit_seconds", 600) or 600))
                         print(col(f"Solver provider cooldown: {error}", YELLOW))
-                        print(col(f"NOMO will retry after {format_age(retry_after)}; do not reopen package for this.", YELLOW))
+                        print(col(f"NOMO will retry after {format_age(retry_after)}; no manual login needed.", YELLOW))
                     elif solver_response_provider_unavailable(resp):
                         print(col(f"Solver provider unavailable: {error}", YELLOW))
                         print(col("This is not an account/cookie bug; retry later.", YELLOW))
