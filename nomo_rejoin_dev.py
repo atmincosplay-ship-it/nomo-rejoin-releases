@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.80.30-dev-provider-retry-unlock"
+__version__ = "V4.80.31-dev-solver-soft-open"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -27281,24 +27281,33 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
             rt_tab["solver_last_error"] = err
 
             if solver_response_retry_later(response):
-                core.remove_generation(pkg, generation)
-                retry_after = apply_solver_retry_later(pkg, rt_tab, cfg, "PROVIDER_RETRY")
+                rt_tab["solver_busy_retry_pending"] = False
+                rt_tab["solver_busy_retry_at"] = 0
+                rt_tab["solver_retry_reason"] = ""
+                rt_tab["note"] = f"solver provider busy; opening anyway: {cut(err, 55)}"
+                if queued_item is not None:
+                    queued_item["solver_preflight_waiting"] = False
+                    queued_item["solver_preflight_done"] = True
+                    queued_item["solver_result"] = "PROVIDER_RETRY_SOFT_OPEN"
+                    queued_item["skip_solver_once"] = True
+                    queued_item["skip_solver_probe"] = True
                 log_activity(
-                    f"solver provider retry before open; retry in {format_age(retry_after)}: {cut(err, 70)}",
+                    f"solver provider retry before open; original rejoin continues once: {cut(err, 70)}",
                     pkg,
                     YELLOW,
                 )
             elif status_code in {"SERVER_BUSY", "BUSY", "RATE_LIMITED", "TOO_MANY_REQUESTS"}:
-                retry_after = max(
-                    600,
-                    int(cfg.get("solver_preflight_server_busy_retry_seconds", 600) or 600),
-                )
-                core.remove_generation(pkg, generation)
-                rt_tab["solver_busy_retry_pending"] = True
-                rt_tab["solver_busy_retry_at"] = now() + retry_after
-                rt_tab["solver_retry_reason"] = "SERVER_BUSY"
-                rt_tab["note"] = f"SERVER_BUSY; retry rejoin in {format_age(retry_after)}"
-                log_activity(f"solver SERVER_BUSY before open; retry in {format_age(retry_after)}", pkg, YELLOW)
+                rt_tab["solver_busy_retry_pending"] = False
+                rt_tab["solver_busy_retry_at"] = 0
+                rt_tab["solver_retry_reason"] = ""
+                rt_tab["note"] = "solver SERVER_BUSY; opening anyway"
+                if queued_item is not None:
+                    queued_item["solver_preflight_waiting"] = False
+                    queued_item["solver_preflight_done"] = True
+                    queued_item["solver_result"] = "SERVER_BUSY_SOFT_OPEN"
+                    queued_item["skip_solver_once"] = True
+                    queued_item["skip_solver_probe"] = True
+                log_activity("solver SERVER_BUSY before open; original rejoin continues once", pkg, YELLOW)
             elif status_code in {"INVALID_COOKIES", "INVALID_COOKIE", "UNAUTHORIZED", "AUTH_FAILED"}:
                 core.remove_generation(pkg, generation)
                 rt_tab["solver_busy_retry_pending"] = False
