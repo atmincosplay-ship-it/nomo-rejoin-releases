@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.80.24-dev-option6-visible-check"
+__version__ = "V4.80.25-dev-solver-429-cooldown"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -26736,8 +26736,39 @@ def solver_response_provider_unavailable(data):
         str(data.get("error") or "")
         + " "
         + str(data.get("message") or "")
+        + " "
+        + str(data.get("status") or "")
     ).lower()
-    return http_status in {502, 503, 504} or "service is not available" in text or "unavailable" in text
+    return (
+        http_status in {429, 502, 503, 504}
+        or "cache flagged refresh denied" in text
+        or "rate limit" in text
+        or "too many requests" in text
+        or "service is not available" in text
+        or "unavailable" in text
+    )
+
+
+def solver_response_provider_cooldown(data):
+    if isinstance(data, dict):
+        http_status = int(data.get("http_status") or 0)
+        text = (
+            str(data.get("error") or "")
+            + " "
+            + str(data.get("message") or "")
+            + " "
+            + str(data.get("status") or "")
+        ).lower()
+    else:
+        http_status = 0
+        text = str(data or "").lower()
+    return (
+        http_status == 429
+        or "http 429" in text
+        or "cache flagged refresh denied" in text
+        or "rate limit" in text
+        or "too many requests" in text
+    )
 
 
 def _solver_probe_worker(package, tab, cookie, cfg_snapshot, place_id):
@@ -27168,7 +27199,19 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
             rt_tab["solver_state"] = "failed"
             rt_tab["solver_last_error"] = err
 
-            if solver_response_provider_unavailable(response):
+            if solver_response_provider_cooldown(response):
+                retry_after = max(600, int(cfg.get("solver_min_resubmit_seconds", 600) or 600))
+                core.remove_generation(pkg, generation)
+                rt_tab["solver_busy_retry_pending"] = True
+                rt_tab["solver_busy_retry_at"] = now() + retry_after
+                rt_tab["solver_retry_reason"] = "PROVIDER_COOLDOWN"
+                rt_tab["note"] = f"solver cooldown; retry provider in {format_age(retry_after)}"
+                log_activity(
+                    f"solver provider cooldown before open; retry in {format_age(retry_after)}: {cut(err, 70)}",
+                    pkg,
+                    YELLOW,
+                )
+            elif solver_response_provider_unavailable(response):
                 retry_after = max(600, int(cfg.get("solver_min_resubmit_seconds", 600) or 600))
                 rt_tab["solver_busy_retry_pending"] = True
                 rt_tab["solver_busy_retry_at"] = now() + retry_after
@@ -27364,7 +27407,18 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
         rt_tab["solver_state"] = "failed"
         rt_tab["solver_last_error"] = err
 
-        if solver_response_provider_unavailable(response):
+        if solver_response_provider_cooldown(response):
+            retry_after = max(600, int(cfg.get("solver_min_resubmit_seconds", 600) or 600))
+            rt_tab["solver_busy_retry_pending"] = True
+            rt_tab["solver_busy_retry_at"] = now() + retry_after
+            rt_tab["solver_retry_reason"] = "PROVIDER_COOLDOWN"
+            rt_tab["note"] = f"solver cooldown; retry provider in {format_age(retry_after)}"
+            log_activity(
+                f"solver provider cooldown; retry provider in {format_age(retry_after)}: {cut(err, 70)}",
+                pkg,
+                YELLOW,
+            )
+        elif solver_response_provider_unavailable(response):
             retry_after = max(600, int(cfg.get("solver_min_resubmit_seconds", 600) or 600))
             rt_tab["solver_busy_retry_pending"] = True
             rt_tab["solver_busy_retry_at"] = now() + retry_after
@@ -28865,7 +28919,11 @@ def solver_menu(cfg):
                         print(col(f"Cookie status: {status} - likely expired.", RED))
                 else:
                     error = resp.get("error", resp) if isinstance(resp, dict) else resp
-                    if solver_response_provider_unavailable(resp):
+                    if solver_response_provider_cooldown(resp):
+                        retry_after = max(600, int(cfg.get("solver_min_resubmit_seconds", 600) or 600))
+                        print(col(f"Solver provider cooldown: {error}", YELLOW))
+                        print(col(f"NOMO will retry after {format_age(retry_after)}; do not reopen package for this.", YELLOW))
+                    elif solver_response_provider_unavailable(resp):
                         print(col(f"Solver provider unavailable: {error}", YELLOW))
                         print(col("This is not an account/cookie bug; retry later.", YELLOW))
                     else:
@@ -28890,7 +28948,11 @@ def solver_menu(cfg):
                         print(col(f"Cookie status: {status} - likely expired.", RED))
                 else:
                     error = resp.get('error', resp) if isinstance(resp, dict) else resp
-                    if solver_response_provider_unavailable(resp):
+                    if solver_response_provider_cooldown(resp):
+                        retry_after = max(600, int(cfg.get("solver_min_resubmit_seconds", 600) or 600))
+                        print(col(f"Solver provider cooldown: {error}", YELLOW))
+                        print(col(f"NOMO will retry after {format_age(retry_after)}; do not reopen package for this.", YELLOW))
+                    elif solver_response_provider_unavailable(resp):
                         print(col(f"Solver provider unavailable: {error}", YELLOW))
                         print(col("This is not an account/cookie bug; retry later.", YELLOW))
                     else:
