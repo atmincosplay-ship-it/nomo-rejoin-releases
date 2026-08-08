@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.80.25-dev-solver-429-cooldown"
+__version__ = "V4.80.27-dev-solver-cooldown-unblock"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -10956,6 +10956,23 @@ def manual_login_blocked(rt_tab, cfg):
         rt_tab["manual_login_retry_seconds"] = 0
         rt_tab["note"] = "manual/auth hold expired; retry allowed"
         return False
+    if rt_tab.get("manual_login_needed"):
+        manual_text = {
+            "reason": rt_tab.get("manual_login_reason"),
+            "detail": rt_tab.get("manual_login_detail"),
+            "note": rt_tab.get("note"),
+            "solver_last_error": rt_tab.get("solver_last_error"),
+            "solver_retry_reason": rt_tab.get("solver_retry_reason"),
+        }
+        if solver_response_provider_cooldown(manual_text):
+            retry_after = max(600, int(cfg.get("solver_min_resubmit_seconds", 600) or 600))
+            clear_manual_login_block(rt_tab)
+            rt_tab["solver_busy_retry_pending"] = True
+            rt_tab["solver_busy_retry_at"] = now() + retry_after
+            rt_tab["solver_busy_retry_seconds"] = retry_after
+            rt_tab["solver_retry_reason"] = "PROVIDER_COOLDOWN"
+            rt_tab["note"] = f"solver cooldown; retry provider in {format_age(retry_after)}"
+            return False
     return bool(rt_tab.get("manual_login_needed", False))
 
 
@@ -26725,23 +26742,57 @@ def solver_response_status(data):
     ).strip().upper()
 
 
+def solver_response_text_blob(data, limit=6000):
+    """Collect provider error text from nested JSON without printing secrets."""
+    parts = []
+    secret_keys = ("cookie", "roblosecurity", "token", "api_key", "x-api-key", "authorization", "key")
+
+    def add(value, depth=0):
+        if value is None or depth > 5 or len(parts) > 160:
+            return
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                key_text = str(key)
+                if any(secret in key_text.lower() for secret in secret_keys):
+                    continue
+                parts.append(key_text)
+                add(nested, depth + 1)
+            return
+        if isinstance(value, (list, tuple)):
+            for nested in list(value)[:24]:
+                add(nested, depth + 1)
+            return
+        parts.append(str(value))
+
+    add(data)
+    return " ".join(parts)[:limit].lower()
+
+
+def solver_response_http_status(data):
+    if not isinstance(data, dict):
+        return 0
+    for key in ("http_status", "status_code", "code"):
+        try:
+            value = int(data.get(key) or 0)
+        except Exception:
+            value = 0
+        if value >= 100:
+            return value
+    return 0
+
+
 def solver_response_provider_unavailable(data):
     if not isinstance(data, dict):
         return False
     status = solver_response_status(data)
     if status in {"SOLVER_ERROR", "PROVIDER_ERROR", "SERVICE_UNAVAILABLE", "UNAVAILABLE"}:
         return True
-    http_status = int(data.get("http_status") or 0)
-    text = (
-        str(data.get("error") or "")
-        + " "
-        + str(data.get("message") or "")
-        + " "
-        + str(data.get("status") or "")
-    ).lower()
+    http_status = solver_response_http_status(data)
+    text = solver_response_text_blob(data)
     return (
         http_status in {429, 502, 503, 504}
         or "cache flagged refresh denied" in text
+        or "refresh denied" in text
         or "rate limit" in text
         or "too many requests" in text
         or "service is not available" in text
@@ -26750,22 +26801,16 @@ def solver_response_provider_unavailable(data):
 
 
 def solver_response_provider_cooldown(data):
-    if isinstance(data, dict):
-        http_status = int(data.get("http_status") or 0)
-        text = (
-            str(data.get("error") or "")
-            + " "
-            + str(data.get("message") or "")
-            + " "
-            + str(data.get("status") or "")
-        ).lower()
-    else:
-        http_status = 0
-        text = str(data or "").lower()
+    http_status = solver_response_http_status(data)
+    text = solver_response_text_blob(data)
+    cache_refresh_denied = (
+        "cache flagged refresh denied" in text
+        or ("refresh denied" in text and ("cache" in text or "flagged" in text))
+    )
     return (
         http_status == 429
         or "http 429" in text
-        or "cache flagged refresh denied" in text
+        or cache_refresh_denied
         or "rate limit" in text
         or "too many requests" in text
     )
@@ -27202,8 +27247,11 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
             if solver_response_provider_cooldown(response):
                 retry_after = max(600, int(cfg.get("solver_min_resubmit_seconds", 600) or 600))
                 core.remove_generation(pkg, generation)
+                clear_manual_login_block(rt_tab)
+                clear_hold(pkg)
                 rt_tab["solver_busy_retry_pending"] = True
                 rt_tab["solver_busy_retry_at"] = now() + retry_after
+                rt_tab["solver_busy_retry_seconds"] = retry_after
                 rt_tab["solver_retry_reason"] = "PROVIDER_COOLDOWN"
                 rt_tab["note"] = f"solver cooldown; retry provider in {format_age(retry_after)}"
                 log_activity(
@@ -27409,8 +27457,11 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
 
         if solver_response_provider_cooldown(response):
             retry_after = max(600, int(cfg.get("solver_min_resubmit_seconds", 600) or 600))
+            clear_manual_login_block(rt_tab)
+            clear_hold(pkg)
             rt_tab["solver_busy_retry_pending"] = True
             rt_tab["solver_busy_retry_at"] = now() + retry_after
+            rt_tab["solver_busy_retry_seconds"] = retry_after
             rt_tab["solver_retry_reason"] = "PROVIDER_COOLDOWN"
             rt_tab["note"] = f"solver cooldown; retry provider in {format_age(retry_after)}"
             log_activity(
