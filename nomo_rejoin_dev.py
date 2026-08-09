@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.80.39 — CLOUDFLARE RATE GUARD
+# - Cloudflare 429 / Error 1027 now starts one persistent 6-hour backend hold
+#   shared by reads and writes on this device. During the hold no Worker request
+#   is sent; local rejoin/routing/state logic continues normally.
+# - Market restock no longer force-bypasses the existing Hatcher read cache when
+#   Cloudflare is active. JSONBin behavior is unchanged.
+# - The Hatcher cache preserves the last good Cloudflare /hatchers payload on
+#   fetch failure and also caches failures, preventing retry spirals.
+# - Cloudflare Hatcher no_state telemetry no longer deletes a good backend record.
+#   disabled/no_server tombstones are sent once per status change, not every minute.
+# - Deferred/rate-limited Hatcher uploads are not marked as successfully reported,
+#   so the pending change is retried after the backend hold expires.
+#
 # V4.58.50 — DELTA REJOIN TAKEOVER FIX
 # - The normal Market/Hatcher/Booster/Rejoin Only loops now pause their queued
 #   package recoveries while a device-key renewal is active.
@@ -750,7 +763,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.80.38-dev-restock-private-guard"
+__version__ = "V4.80.39-cloudflare-rate-guard"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -825,7 +838,9 @@ HATCHER_CONFIG_FILE = BASE_DIR / "hatcher_reporter_config.json"
 HATCHER_RUNTIME_FILE = BASE_DIR / "hatcher_reporter_runtime.json"
 BOOSTER_CONFIG_FILE = BASE_DIR / "booster_reporter_config.json"
 BOOSTER_RUNTIME_FILE = BASE_DIR / "booster_reporter_runtime.json"
-CLOUDFLARE_UPLOAD_COOLDOWN_SECONDS = 10 * 60
+# Shared Cloudflare rate-limit hold. Kept in the existing Hatcher runtime section
+# so every Market/Hatcher/Booster backend caller on this device sees the same hold.
+CLOUDFLARE_UPLOAD_COOLDOWN_SECONDS = 6 * 60 * 60
 CLOUDFLARE_UPLOAD_HOLD_KEY = "cloudflare_upload_hold_until"
 CLOUDFLARE_UPLOAD_REASON_KEY = "cloudflare_upload_hold_reason"
 
@@ -7868,13 +7883,42 @@ def get_jsonbin_cache(rt):
 def read_hatchers_cached(cfg, rt, force=False):
     cache = get_jsonbin_cache(rt)
     cache_age = now() - int(cache.get("ts", 0) or 0)
-    cache_seconds = int(cfg.get("jsonbin_cache_seconds", 20))
+    cache_seconds = max(30, int(cfg.get("jsonbin_cache_seconds", 20) or 20))
+    is_cloudflare = backend_provider(cfg) == "cloudflare"
 
-    if not force and cache.get("data") is not None and cache_age < cache_seconds:
-        return cache.get("data"), cache.get("err")
+    if not force and cache_age < cache_seconds:
+        if cache.get("data") is not None:
+            # A previous failed refresh may have left last_error behind. The last
+            # good payload is still intentionally usable until normal stale checks.
+            return cache.get("data"), None
+        if is_cloudflare and cache.get("last_error"):
+            # Cache the failure too; do not let multiple Market routes retry the
+            # same unavailable Worker inside the normal cache window.
+            return None, str(cache.get("last_error"))
 
     data, err = backend_read_hatchers(cfg)
     cache["ts"] = now()
+
+    if is_cloudflare:
+        if data is not None and not err:
+            cache["data"] = data
+            cache["err"] = None
+            cache["last_error"] = ""
+            cache["last_good_ts"] = now()
+            save_runtime(rt)
+            return data, None
+
+        # Never destroy a previously good Cloudflare pool just because one fetch
+        # failed. Keep it and let pick_jsonbin_hatcher() apply its existing
+        # per-record stale_seconds check.
+        cache["last_error"] = str(err or "Cloudflare read failed")
+        cache["err"] = None if cache.get("data") is not None else cache["last_error"]
+        save_runtime(rt)
+        if cache.get("data") is not None:
+            return cache.get("data"), None
+        return None, cache["last_error"]
+
+    # Preserve the old JSONBin behavior exactly.
     cache["data"] = data
     cache["err"] = err
     save_runtime(rt)
@@ -8762,7 +8806,13 @@ def resolve_restock_link(tab, rt_tab, cfg, rt=None):
     backend_label = shared_backend_label(cfg)
 
     if cfg.get("jsonbin_hatchers_enabled", False) and rt is not None:
-        force_fresh = bool(cfg.get("jsonbin_force_refresh_on_restock_route", True))
+        # Cloudflare uses the persisted/shared read cache. Keep the legacy
+        # force-refresh switch only for JSONBin so Market restock bursts cannot
+        # bypass the Worker cache across many accounts.
+        force_fresh = (
+            backend_provider(cfg) != "cloudflare"
+            and bool(cfg.get("jsonbin_force_refresh_on_restock_route", True))
+        )
         link, hatcher, err = pick_jsonbin_hatcher(cfg, rt, force=force_fresh)
 
         if link and is_private_restock_route(link):
@@ -15740,6 +15790,49 @@ def cloudflare_headers(cfg):
     return headers
 
 
+def _cloudflare_is_rate_limited(message):
+    text = str(message or "").lower()
+    return (
+        "http 429" in text
+        or "error code: 1027" in text
+        or '"code":1027' in text
+        or '"code": 1027' in text
+        or "too many requests" in text
+        or "rate limit" in text
+        or "rate-limited" in text
+    )
+
+
+def _cloudflare_hold_state():
+    rt = load_json(HATCHER_RUNTIME_FILE, {})
+    if not isinstance(rt, dict):
+        rt = {}
+    try:
+        hold_until = float(rt.get(CLOUDFLARE_UPLOAD_HOLD_KEY) or 0)
+    except Exception:
+        hold_until = 0
+    return rt, hold_until
+
+
+def _cloudflare_set_rate_limit_hold(reason):
+    rt, current_until = _cloudflare_hold_state()
+    target_until = time.time() + CLOUDFLARE_UPLOAD_COOLDOWN_SECONDS
+    # Do not shorten an existing hold. A repeated real 429 may extend it, but
+    # local blocked calls never reach the Worker and therefore never call this.
+    rt[CLOUDFLARE_UPLOAD_HOLD_KEY] = max(float(current_until or 0), target_until)
+    rt[CLOUDFLARE_UPLOAD_REASON_KEY] = str(reason or "rate limited")[:300]
+    save_json(HATCHER_RUNTIME_FILE, rt)
+
+
+def _cloudflare_active_hold_message():
+    rt, hold_until = _cloudflare_hold_state()
+    left = int(max(0, hold_until - time.time()))
+    if left <= 0:
+        return ""
+    reason = cut(rt.get(CLOUDFLARE_UPLOAD_REASON_KEY, "rate limited"), 90)
+    return f"cloudflare cooldown active {left}s; local cached state preserved ({reason})"
+
+
 def cloudflare_request(cfg, method, path, payload=None):
     base = cloudflare_base_url(cfg)
     if is_placeholder_value(base):
@@ -15748,6 +15841,10 @@ def cloudflare_request(cfg, method, path, payload=None):
     secret = str(cfg.get("cloudflare_secret", "") or "").strip()
     if is_placeholder_value(secret):
         return None, "missing Cloudflare secret"
+
+    hold_msg = _cloudflare_active_hold_message()
+    if hold_msg:
+        return None, hold_msg
 
     timeout = int(cfg.get("cloudflare_timeout_seconds", cfg.get("jsonbin_timeout_seconds", 8)) or 8)
     url = base + path
@@ -15769,14 +15866,31 @@ def cloudflare_request(cfg, method, path, payload=None):
         if not text.strip():
             return {}, None
 
-        return json.loads(text), None
+        # Some Cloudflare limit responses arrive as HTML/text instead of a clean
+        # HTTPError. Detect them before JSON parsing so the Worker is backed off.
+        if _cloudflare_is_rate_limited(text):
+            msg = "cloudflare rate limited: " + cut(text, 180)
+            _cloudflare_set_rate_limit_hold(msg)
+            return None, msg
+
+        data = json.loads(text)
+        if isinstance(data, dict) and data.get("ok") is False:
+            server_error = str(data.get("error") or data.get("message") or "")
+            if _cloudflare_is_rate_limited(server_error):
+                msg = "cloudflare rate limited: " + cut(server_error, 180)
+                _cloudflare_set_rate_limit_hold(msg)
+                return None, msg
+        return data, None
 
     except urllib.error.HTTPError as e:
         try:
             text = e.read().decode("utf-8", "replace")
         except Exception:
             text = str(e)
-        return None, f"http {e.code}: {cut(text, 180)}"
+        msg = f"http {e.code}: {cut(text, 180)}"
+        if _cloudflare_is_rate_limited(msg):
+            _cloudflare_set_rate_limit_hold(msg)
+        return None, msg
 
     except Exception as e:
         return None, str(e)
@@ -16032,15 +16146,7 @@ def cloudflare_update_removed_hatcher(cfg, name, status="disabled"):
 
 def cloudflare_update_hatchers(cfg, updates, removes):
     def is_cloudflare_upload_rate_limited(message):
-        text = str(message or "").lower()
-        return (
-            "http 429" in text
-            or "error code: 1027" in text
-            or '"code":1027' in text
-            or "too many requests" in text
-            or "rate limit" in text
-            or "rate-limited" in text
-        )
+        return _cloudflare_is_rate_limited(message)
 
     def short_duration(seconds):
         seconds = max(0, int(seconds))
@@ -16336,6 +16442,28 @@ def update_hatcher_runtime(profile_name, hcfg, entry):
     save_hatcher_runtime(rt)
 
 
+def _cloudflare_hatcher_tombstone_entry(entry, status):
+    tombstone = dict(entry or {})
+    tombstone["enabled"] = False
+    tombstone["status"] = str(status or "disabled")
+    tombstone["server_link"] = ""
+    tombstone["pet_count"] = 0
+    tombstone["egg_total"] = 0
+    tombstone["eggs"] = {}
+    return tombstone
+
+
+def _cloudflare_hatcher_tombstone_due(hcfg, profile_name, tombstone, force=False):
+    # Tombstones are event records, not heartbeats: once a given disabled/no_server
+    # state was sent successfully, do not POST it again every reporter interval.
+    if force:
+        return True
+    rt = load_hatcher_runtime()
+    sig = hatcher_signature(hcfg, tombstone)
+    last_sig = str(rt.get("last_signature", {}).get(profile_name, ""))
+    return sig != last_sig
+
+
 
 
 HATCHER_TRANSITION_NORMAL = "normal"
@@ -16427,6 +16555,7 @@ def hatcher_report_once(hcfg, force=True, state_cache=None, main_runtime=None):
     if hatcher_backend_missing(hcfg):
         return False, "Backend missing: set Global backend config"
 
+    provider = backend_provider(hcfg)
     profiles = hatcher_profiles(hcfg, enabled_only=False)
     if not profiles:
         return False, "no hatcher profiles"
@@ -16434,6 +16563,7 @@ def hatcher_report_once(hcfg, force=True, state_cache=None, main_runtime=None):
     updates = []
     removes = []
     skips = []
+    cloudflare_remove_runtime_entries = {}
 
     hrt = load_hatcher_runtime()
     current_profile_names = {
@@ -16516,7 +16646,26 @@ def hatcher_report_once(hcfg, force=True, state_cache=None, main_runtime=None):
             rt_tab.get("hatcher_transition_resume_report_pending")
         )
 
-        # Do not publish template/incomplete hatcher slots.
+        # Cloudflare: a temporary missing state must never delete the last good
+        # Hatcher route. Let the existing D1 stale timer age it out naturally.
+        if provider == "cloudflare" and status == "no_state":
+            skips.append(f"{name}:no_state-preserve")
+            continue
+
+        # Cloudflare disabled/no_server records are tombstones. Send them once per
+        # actual status/signature change instead of once per 60-second report.
+        if provider == "cloudflare" and status in ["disabled", "no_server"]:
+            tombstone = _cloudflare_hatcher_tombstone_entry(entry, status)
+            if _cloudflare_hatcher_tombstone_due(
+                hcfg, name, tombstone, force=bool(force)
+            ):
+                removes.append((name, status))
+                cloudflare_remove_runtime_entries[name] = tombstone
+            else:
+                skips.append(f"{name}:{status}-unchanged")
+            continue
+
+        # Preserve the original JSONBin/template behavior outside Cloudflare.
         if status in ["disabled", "no_server", "no_state"]:
             removes.append((name, status))
             skips.append(f"{name}:{status}")
@@ -16548,8 +16697,6 @@ def hatcher_report_once(hcfg, force=True, state_cache=None, main_runtime=None):
     if not updates and not removes:
         return True, "no update: " + (", ".join(skips[:4]) or "unchanged")
 
-    provider = backend_provider(hcfg)
-
     if provider == "cloudflare":
         update_pairs = [
             (name, entry)
@@ -16561,17 +16708,30 @@ def hatcher_report_once(hcfg, force=True, state_cache=None, main_runtime=None):
                 ", ".join(skips[:4]) or "none"
             ) + ")"
 
+        # Pass (name, status) tuples so the Worker receives the real tombstone
+        # reason instead of every removal silently becoming "disabled".
         ok, msg = cloudflare_update_hatchers(
-            hcfg, update_pairs, remove_names
+            hcfg, update_pairs, removes
         )
         if not ok:
             return False, f"cloudflare update: {msg}"
+
+        # cloudflare_update_hatchers intentionally returns OK while a persistent
+        # rate-limit hold is active. Do not stamp signatures for data that was not
+        # actually sent, otherwise the change would be lost after cooldown.
+        msg_lower = str(msg or "").lower()
+        if "cooldown" in msg_lower or "rate limited" in msg_lower:
+            return True, msg
 
         for name, eff, entry, why, action, pkg in updates:
             update_hatcher_runtime(name, hcfg, entry)
             hatcher_transition_backend_mark_success(
                 runtime, pkg, action
             )
+        for name, status in removes:
+            tombstone = cloudflare_remove_runtime_entries.get(name)
+            if tombstone is not None:
+                update_hatcher_runtime(name, hcfg, tombstone)
         save_runtime(runtime)
 
         parts = []
