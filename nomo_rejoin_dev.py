@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.1 — EXOTIC LOGIN FORMAT FIX
+# - Existing <UID>_exologin.json files preserve their current type/extra fields;
+#   only token is updated. New/shared login data defaults to type="lootlabs".
+# - Invalid/non-object existing login JSON is left untouched instead of overwritten.
+#
+# V4.81.0 — EXOTIC KEY MANAGER
+# - Integrates the Exotic Hub 24-hour key writer into NOMO; no second Flask/Termux
+#   process is required. Exactly one device is the writer; the others are readers.
+# - Reader devices cache the shared key locally and update UID_exologin.json files;
+#   normal Roblox rejoins no longer call the key Worker.
+# - Writer timing and pending uploads survive NOMO restarts; slow network/key work
+#   runs in a background thread and never blocks the rejoin loop.
+# - Hatcher AutoExec writes per-UID Exotic execution status so failures are visible.
+#
 # V4.80.39 — CLOUDFLARE RATE GUARD
 # - Cloudflare 429 / Error 1027 now starts one persistent 6-hour backend hold
 #   shared by reads and writes on this device. During the hold no Worker request
@@ -763,7 +777,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.80.39-cloudflare-rate-guard"
+__version__ = "V4.81.1-exotic-login-format-fix"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -785,6 +799,11 @@ DELTA_KEY_DEFAULT_LICENSE_FILE = DELTA_GLOBAL_ROOT / "Internals" / "Cache" / "li
 DELTA_WORKSPACE_DEFAULT_IMPORT_ZIP = Path("/storage/emulated/0/Download/config.zip")
 DELTA_WORKSPACE_EXPORT_DIR = BASE_DIR / "workspace_exports"
 DELTA_WORKSPACE_BACKUP_DIR = BASE_DIR / "workspace_backups"
+
+EXOTIC_KEY_STATE_FILE = BASE_DIR / "exotic_key_state.json"
+EXOTIC_KEY_SHARED_RELATIVE = Path("Nomo") / "exotic_key.json"
+EXOTIC_STATUS_FOLDER_RELATIVE = Path("Nomo")
+DEFAULT_EXOTIC_KEY_WORKER_URL = "https://nomo-key.atmincosplay.workers.dev"
 
 APK_DOWNLOAD_DIR = Path("/storage/emulated/0/Download/NOMO_APK")
 APK_LOCAL_DEFAULT_DIR = Path("/storage/emulated/0/")
@@ -1186,6 +1205,24 @@ DEFAULT_CONFIG = {
     # Delta clone on the same Redfinger. Renewal can only begin after Delta
     # exposes the expired-key panel, so NOMO never attempts an early refresh.
     "delta_key_manager_enabled": True,
+
+    # Exotic shared key: exactly one device enables writer mode; all other
+    # Hatcher devices are lightweight readers. Roblox uses local files only.
+    "exotic_key_manager_enabled": True,
+    "exotic_key_reader_enabled": True,
+    "exotic_key_writer_enabled": False,
+    "exotic_key_worker_url": DEFAULT_EXOTIC_KEY_WORKER_URL,
+    "exotic_key_write_secret": "",
+    "exotic_key_read_token": "",
+    "exotic_key_sync_interval_seconds": 3600,
+    "exotic_key_reader_retry_seconds": 1800,
+    "exotic_key_rate_limit_backoff_seconds": 21600,
+    "exotic_key_expiry_seconds": 86400,
+    "exotic_key_refresh_buffer_seconds": 900,
+    "exotic_key_writer_retry_seconds": 600,
+    "exotic_key_status_warn_after_seconds": 180,
+    "exotic_key_status_show_ok": False,
+
     "delta_key_browser_package": "mark.via.gq",
     "delta_key_license_path": str(DELTA_KEY_DEFAULT_LICENSE_FILE),
     "delta_key_copy_x_ratio": 0.84,
@@ -7760,6 +7797,7 @@ def config_settings(cfg):
         print("6. Cache cleanup")
         print("7. Config template tools")
         print("8. Workspace / config sync")
+        print("9. Exotic key sync / writer")
         print("0. Save/back")
         print(col("Tip: on true/false settings, choose it and press ENTER to toggle.", DIM))
 
@@ -7782,7 +7820,7 @@ def config_settings(cfg):
             continue
 
         if ch == "9":
-            edit_config_group(cfg, "COOKIE WEBHOOK", [("cookie_webhook_url", "webhook_url")])
+            exotic_key_settings_menu(cfg)
             cfg = load_config()
             continue
 
@@ -13857,6 +13895,11 @@ def _nomo_start_market_rejoin_original(cfg):
         # Device-wide Delta key watcher is idle while the key is valid. At the
         # stored expiry it visually checks one alive clone only, and acts only
         # while this rejoin queue is idle.
+        try:
+            exotic_key_manager_tick(cfg)
+        except Exception as exc:
+            log_activity(f"Exotic key manager tick failed: {cut(exc, 90)}", "", YELLOW)
+
         delta_key_result = ""
         try:
             delta_key_result = delta_key_auto_monitor_tick(
@@ -17393,6 +17436,12 @@ def start_hatcher_reporter(main_cfg=None):
                 status = "Manual"
                 note = rt_tab.get("manual_login_reason") or rt_tab.get("note") or "needs manual login"
 
+            exotic_note = exotic_status_note_for_username(display_user, cfg)
+            if exotic_note:
+                note = (exotic_note + "; " + str(note or "")).strip("; ")
+                if ("FAILED" in exotic_note or "KEY_MISSING" in exotic_note or "KEY MISSING" in exotic_note):
+                    status = "Exotic fail"
+
             update_clone_session(rt_tab, status, cfg)
             rows.append({
                 "user": display_user,
@@ -18357,6 +18406,11 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
             f"  Hatcher: old state {format_age(_old_sec)}..{format_age(_old_max)} => exact-PID restart affected tab only; above max ignored.",
             GREEN,
         ))
+
+        try:
+            exotic_key_manager_tick(cfg)
+        except Exception as exc:
+            log_activity(f"Exotic key manager tick failed: {cut(exc, 90)}", "", YELLOW)
 
         delta_key_result = ""
         try:
@@ -23686,99 +23740,830 @@ task.spawn(function()
 end)
 '''
 
+# ============================================================
+# EXOTIC HUB SHARED KEY MANAGER
+# ============================================================
+
+_EXOTIC_KEY_JOB_LOCK = threading.Lock()
+_EXOTIC_KEY_JOB = {"running": False, "mode": "", "started_at": 0}
+_EXOTIC_KEY_LAST_TICK = 0
+_EXOTIC_STATUS_CACHE = {"ts": 0, "items": []}
+
+
+def _exotic_clean_key(value):
+    value = str(value or "").strip()
+    if not value or value == "KEY_NOT_AVAILABLE":
+        return ""
+    if not value.startswith("FREE_"):
+        return ""
+    if len(value) > 512 or any(ch.isspace() for ch in value):
+        return ""
+    return value
+
+
+def load_exotic_key_state():
+    state = load_json(EXOTIC_KEY_STATE_FILE, {})
+    return state if isinstance(state, dict) else {}
+
+
+def save_exotic_key_state(state):
+    state = dict(state or {})
+    state["saved_at"] = now()
+    save_json(EXOTIC_KEY_STATE_FILE, state)
+
+
+def _exotic_workspace_roots():
+    roots = []
+    for root in (DELTA_GLOBAL_WORKSPACE_DIR, ARCEUS_GLOBAL_WORKSPACE_DIR):
+        if root not in roots:
+            roots.append(root)
+    for index in range(1, 13):
+        root = Path(f"/storage/emulated/0/RobloxClone{index:03d}/Arceus X/Workspace")
+        if root not in roots:
+            roots.append(root)
+    return roots
+
+
+def _atomic_json_file(path, payload):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    try:
+        tmp.write_text(encoded, encoding="utf-8")
+        os.replace(str(tmp), str(path))
+    except Exception:
+        path.write_text(encoded, encoding="utf-8")
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+
+
+def sync_exotic_key_to_local_workspaces(key, source="nomo"):
+    """Persist one shared key and update every existing UID_exologin.json."""
+    key = _exotic_clean_key(key)
+    if not key:
+        return False, "invalid Exotic key", 0, 0
+
+    shared_written = 0
+    uid_updated = 0
+    payload = {
+        "token": key,
+        "type": "lootlabs",
+        "synced_at": now(),
+        "source": str(source or "nomo"),
+    }
+
+    for root in _exotic_workspace_roots():
+        try:
+            if not root.exists():
+                continue
+            shared_path = root / EXOTIC_KEY_SHARED_RELATIVE
+            existing_shared = load_json(shared_path, {})
+            existing_key = _exotic_clean_key(
+                (existing_shared or {}).get("token") if isinstance(existing_shared, dict) else ""
+            )
+            if existing_key != key or not shared_path.exists():
+                _atomic_json_file(shared_path, payload)
+                shared_written += 1
+
+            try:
+                login_files = list(root.glob("*_exologin.json"))
+            except Exception:
+                login_files = []
+            for login_file in login_files:
+                try:
+                    # Preserve Exotic's existing per-UID schema exactly. Only a
+                    # valid JSON object is edited; malformed/unknown files are
+                    # deliberately left untouched instead of being rewritten.
+                    try:
+                        raw_login = login_file.read_text(encoding="utf-8")
+                        current = json.loads(raw_login)
+                    except Exception:
+                        continue
+                    if not isinstance(current, dict):
+                        continue
+                    if _exotic_clean_key(current.get("token")) == key:
+                        continue
+                    current["token"] = key
+                    if not str(current.get("type") or "").strip():
+                        current["type"] = "lootlabs"
+                    _atomic_json_file(login_file, current)
+                    uid_updated += 1
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    return True, "local Exotic key synced", shared_written, uid_updated
+
+
+def _exotic_worker_base(cfg):
+    return str(cfg.get("exotic_key_worker_url", DEFAULT_EXOTIC_KEY_WORKER_URL) or "").strip().rstrip("/")
+
+
+def _exotic_rate_limited_text(value):
+    low = str(value or "").lower()
+    return any(marker in low for marker in (
+        "http 429", "error code: 1027", '"code":1027',
+        "too many requests", "rate limit", "rate-limited",
+    ))
+
+
+def _exotic_cloud_read(cfg):
+    base = _exotic_worker_base(cfg)
+    if not base.startswith("https://"):
+        return "", "invalid Exotic key Worker URL"
+    url = base + "/key"
+    token = str(cfg.get("exotic_key_read_token", "") or "").strip()
+    if token:
+        url += "?token=" + urllib.parse.quote(token, safe="")
+    req = urllib.request.Request(url, headers={"User-Agent": "NOMO-Rejoin/ExoticKey"}, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            body = resp.read().decode("utf-8", "replace").strip()
+        key = _exotic_clean_key(body)
+        if not key:
+            if _exotic_rate_limited_text(body):
+                return "", "Cloudflare rate limit 429/1027"
+            return "", "Worker returned no valid FREE_ key"
+        return key, ""
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8", "replace")
+        except Exception:
+            body = str(exc)
+        return "", f"HTTP {exc.code}: {cut(body, 160)}"
+    except Exception as exc:
+        return "", str(exc)
+
+
+def _exotic_cloud_write(cfg, key):
+    key = _exotic_clean_key(key)
+    base = _exotic_worker_base(cfg)
+    secret = str(cfg.get("exotic_key_write_secret", "") or "").strip()
+    if not key:
+        return False, "invalid Exotic key"
+    if not base.startswith("https://"):
+        return False, "invalid Exotic key Worker URL"
+    if not secret:
+        return False, "writer secret missing"
+    expiry = max(3600, int(cfg.get("exotic_key_expiry_seconds", 86400) or 86400))
+    payload = json.dumps({
+        "key": key,
+        "expires_in_seconds": expiry,
+        "source": "nomo_rejoin_writer",
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        base + "/admin/key",
+        data=payload,
+        method="PUT",
+        headers={
+            "Authorization": "Bearer " + secret,
+            "Content-Type": "application/json",
+            "User-Agent": "NOMO-Rejoin/ExoticKeyWriter",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            body = resp.read().decode("utf-8", "replace")
+            code = int(resp.getcode() or 0)
+        if code not in (200, 201):
+            return False, f"HTTP {code}: {cut(body, 160)}"
+        return True, "uploaded"
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8", "replace")
+        except Exception:
+            body = str(exc)
+        return False, f"HTTP {exc.code}: {cut(body, 160)}"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _exotic_generate_key_from_site(cfg):
+    """Generate one FREE_ key using the supplied key_automation flow."""
+    import http.cookiejar
+
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    first = urllib.request.Request("https://exotichub.app/getnewkeyads", headers=headers, method="GET")
+    with opener.open(first, timeout=15) as resp:
+        resp.read()
+
+    session_req = urllib.request.Request(
+        "https://exotichub.app/gensessionads",
+        data=b"{}",
+        method="POST",
+        headers={
+            **headers,
+            "Content-Type": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+        },
+    )
+    with opener.open(session_req, timeout=15) as resp:
+        session_data = json.loads(resp.read().decode("utf-8", "replace"))
+    if not isinstance(session_data, dict) or not session_data.get("success"):
+        return "", "gensessionads failed"
+    fallback_url = str(session_data.get("fallback_url") or "").strip()
+    if not fallback_url.startswith("http"):
+        return "", "gensessionads returned no fallback_url"
+
+    time.sleep(1)
+    page_req = urllib.request.Request(fallback_url, headers=headers, method="GET")
+    with opener.open(page_req, timeout=15) as resp:
+        page = resp.read().decode("utf-8", "replace")
+    match = re.search(r'<div id="keyBox"[^>]*>\s*(FREE_[^<]+)\s*</div>', page, flags=re.I | re.S)
+    if not match:
+        return "", "key not found in Exotic page"
+    key = _exotic_clean_key(html.unescape(match.group(1)).strip())
+    if not key:
+        return "", "invalid generated key"
+    return key, ""
+
+
+def _exotic_reader_job(cfg_snapshot):
+    state = load_exotic_key_state()
+    key, err = _exotic_cloud_read(cfg_snapshot)
+    t = now()
+    if not key:
+        state["last_cloud_error"] = str(err)
+        state["last_cloud_check_at"] = t
+        backoff = (
+            max(3600, int(cfg_snapshot.get("exotic_key_rate_limit_backoff_seconds", 21600) or 21600))
+            if _exotic_rate_limited_text(err)
+            else max(300, int(cfg_snapshot.get("exotic_key_reader_retry_seconds", 1800) or 1800))
+        )
+        state["next_cloud_check_at"] = t + backoff
+        save_exotic_key_state(state)
+        log_activity(f"Exotic key reader failed; retry {format_age(backoff)}: {cut(err, 90)}", "", YELLOW)
+        return
+
+    changed = _exotic_clean_key(state.get("key")) != key
+    state["key"] = key
+    state["key_source"] = "cloud_reader"
+    state["last_cloud_check_at"] = t
+    state["last_cloud_ok_at"] = t
+    state["last_cloud_error"] = ""
+    state["next_cloud_check_at"] = t + max(300, int(cfg_snapshot.get("exotic_key_sync_interval_seconds", 3600) or 3600))
+    if changed:
+        state["key_changed_at"] = t
+        state["first_seen_at"] = t
+    save_exotic_key_state(state)
+    ok, _note, shared_count, uid_count = sync_exotic_key_to_local_workspaces(key, source="cloud_reader")
+    if changed:
+        log_activity(f"Exotic key changed; local sync shared={shared_count} uid={uid_count}", "", GREEN if ok else YELLOW)
+
+
+def _exotic_writer_job(cfg_snapshot, mode):
+    state = load_exotic_key_state()
+    t = now()
+    retry = max(300, int(cfg_snapshot.get("exotic_key_writer_retry_seconds", 600) or 600))
+
+    if mode == "upload":
+        key = _exotic_clean_key(state.get("key"))
+        if not key:
+            mode = "generate"
+        else:
+            ok, note = _exotic_cloud_write(cfg_snapshot, key)
+            state["last_writer_attempt_at"] = t
+            if ok:
+                state["cloud_pending"] = False
+                state["last_cloud_upload_at"] = t
+                state["last_cloud_error"] = ""
+                state["next_writer_retry_at"] = 0
+                save_exotic_key_state(state)
+                log_activity("Exotic writer: pending key uploaded to Cloudflare", "", GREEN)
+                return
+            state["cloud_pending"] = True
+            state["last_cloud_error"] = str(note)
+            state["next_writer_retry_at"] = t + retry
+            save_exotic_key_state(state)
+            log_activity(f"Exotic writer upload failed: {cut(note, 100)}", "", YELLOW)
+            return
+
+    if mode == "generate":
+        try:
+            key, err = _exotic_generate_key_from_site(cfg_snapshot)
+        except Exception as exc:
+            key, err = "", str(exc)
+        state = load_exotic_key_state()
+        t = now()
+        state["last_writer_attempt_at"] = t
+        if not key:
+            state["last_writer_error"] = str(err)
+            state["next_writer_retry_at"] = t + retry
+            save_exotic_key_state(state)
+            log_activity(f"Exotic writer generation failed; retry {format_age(retry)}: {cut(err, 100)}", "", RED)
+            return
+
+        expiry = max(3600, int(cfg_snapshot.get("exotic_key_expiry_seconds", 86400) or 86400))
+        buffer_seconds = max(60, min(expiry - 60, int(cfg_snapshot.get("exotic_key_refresh_buffer_seconds", 900) or 900)))
+        state.update({
+            "key": key,
+            "key_source": "local_writer",
+            "generated_at": t,
+            "expires_at": t + expiry,
+            "refresh_at": t + expiry - buffer_seconds,
+            "key_changed_at": t,
+            "first_seen_at": t,
+            "last_writer_error": "",
+            "next_writer_retry_at": 0,
+            "cloud_pending": True,
+        })
+        save_exotic_key_state(state)
+        ok_local, _note, shared_count, uid_count = sync_exotic_key_to_local_workspaces(key, source="local_writer")
+        log_activity(f"Exotic writer generated new key; local sync shared={shared_count} uid={uid_count}", "", GREEN if ok_local else YELLOW)
+
+        ok, note = _exotic_cloud_write(cfg_snapshot, key)
+        state = load_exotic_key_state()
+        state["last_writer_attempt_at"] = now()
+        if ok:
+            state["cloud_pending"] = False
+            state["last_cloud_upload_at"] = now()
+            state["last_cloud_error"] = ""
+            state["next_writer_retry_at"] = 0
+            log_activity("Exotic writer uploaded new key to Cloudflare", "", GREEN)
+        else:
+            state["cloud_pending"] = True
+            state["last_cloud_error"] = str(note)
+            state["next_writer_retry_at"] = now() + retry
+            log_activity(f"Exotic writer generated locally but Cloudflare upload failed: {cut(note, 100)}", "", YELLOW)
+        save_exotic_key_state(state)
+
+
+def _exotic_key_job_wrapper(cfg_snapshot, mode):
+    try:
+        if mode == "read":
+            _exotic_reader_job(cfg_snapshot)
+        else:
+            _exotic_writer_job(cfg_snapshot, mode)
+    except Exception as exc:
+        log_activity(f"Exotic key background job failed: {cut(exc, 110)}", "", RED)
+    finally:
+        with _EXOTIC_KEY_JOB_LOCK:
+            _EXOTIC_KEY_JOB["running"] = False
+            _EXOTIC_KEY_JOB["mode"] = ""
+
+
+def _start_exotic_key_job(cfg, mode):
+    with _EXOTIC_KEY_JOB_LOCK:
+        if _EXOTIC_KEY_JOB.get("running"):
+            return False
+        _EXOTIC_KEY_JOB["running"] = True
+        _EXOTIC_KEY_JOB["mode"] = str(mode)
+        _EXOTIC_KEY_JOB["started_at"] = now()
+    thread = threading.Thread(
+        target=_exotic_key_job_wrapper,
+        args=(dict(cfg or {}), str(mode)),
+        name="nomo-exotic-key-" + str(mode),
+        daemon=True,
+    )
+    thread.start()
+    return True
+
+
+def exotic_key_manager_tick(cfg, force_read=False, force_generate=False):
+    """One non-blocking device key-manager tick; safe every dashboard loop."""
+    global _EXOTIC_KEY_LAST_TICK
+    if not bool(cfg.get("exotic_key_manager_enabled", True)):
+        return "disabled"
+    t = now()
+    if not force_read and not force_generate and t - int(_EXOTIC_KEY_LAST_TICK or 0) < 5:
+        return "idle"
+    _EXOTIC_KEY_LAST_TICK = t
+
+    state = load_exotic_key_state()
+    local_key = _exotic_clean_key(state.get("key"))
+    last_local_sync = int(state.get("last_local_sync_at", 0) or 0)
+    if local_key and (t - last_local_sync >= 3600 or force_read or force_generate):
+        _ok, _note, shared_count, uid_count = sync_exotic_key_to_local_workspaces(
+            local_key, source=str(state.get("key_source") or "persisted")
+        )
+        state["last_local_sync_at"] = t
+        state["last_local_shared_writes"] = shared_count
+        state["last_local_uid_updates"] = uid_count
+        save_exotic_key_state(state)
+
+    writer = bool(cfg.get("exotic_key_writer_enabled", False))
+    reader = bool(cfg.get("exotic_key_reader_enabled", True))
+
+    if writer:
+        if not str(cfg.get("exotic_key_write_secret", "") or "").strip():
+            return "writer_secret_missing"
+        if force_generate:
+            return "writer_started" if _start_exotic_key_job(cfg, "generate") else "writer_busy"
+        retry_at = int(state.get("next_writer_retry_at", 0) or 0)
+        if retry_at > t:
+            return "writer_retry_wait"
+        if state.get("cloud_pending") and local_key:
+            return "upload_started" if _start_exotic_key_job(cfg, "upload") else "writer_busy"
+        refresh_at = int(state.get("refresh_at", 0) or 0)
+        if not local_key or refresh_at <= 0 or t >= refresh_at:
+            return "writer_started" if _start_exotic_key_job(cfg, "generate") else "writer_busy"
+        return "writer_ok"
+
+    if not reader:
+        return "reader_disabled"
+    next_check = int(state.get("next_cloud_check_at", 0) or 0)
+    if force_read or next_check <= 0 or t >= next_check:
+        return "reader_started" if _start_exotic_key_job(cfg, "read") else "reader_busy"
+    return "reader_ok"
+
+
+def _exotic_status_files():
+    global _EXOTIC_STATUS_CACHE
+    t = now()
+    if t - int(_EXOTIC_STATUS_CACHE.get("ts", 0) or 0) < 5:
+        return list(_EXOTIC_STATUS_CACHE.get("items", []))
+    items = []
+    seen = set()
+    for root in _exotic_workspace_roots():
+        folder = root / EXOTIC_STATUS_FOLDER_RELATIVE
+        try:
+            if not folder.exists():
+                continue
+            paths = list(folder.glob("exotic_status_*.json"))
+        except Exception:
+            paths = []
+        for path in paths:
+            if str(path) in seen:
+                continue
+            seen.add(str(path))
+            payload = load_json(path, {})
+            if isinstance(payload, dict):
+                payload = dict(payload)
+                payload["_path"] = str(path)
+                items.append(payload)
+    _EXOTIC_STATUS_CACHE = {"ts": t, "items": items}
+    return list(items)
+
+
+def exotic_status_for_username(username):
+    wanted = str(username or "").strip().lower()
+    if not wanted:
+        return None
+    best = None
+    best_ts = -1
+    for payload in _exotic_status_files():
+        if str(payload.get("username") or "").strip().lower() != wanted:
+            continue
+        try:
+            ts = int(payload.get("ts", 0) or 0)
+        except Exception:
+            ts = 0
+        if ts >= best_ts:
+            best = payload
+            best_ts = ts
+    if not best:
+        return None
+    result = dict(best)
+    result["age"] = max(0, now() - max(0, best_ts)) if best_ts > 0 else 999999
+    return result
+
+
+def exotic_status_note_for_username(username, cfg):
+    status = exotic_status_for_username(username)
+    if not status:
+        return ""
+    stage = str(status.get("stage") or "").strip().upper()
+    age = int(status.get("age", 999999) or 999999)
+    err = cut(str(status.get("error") or ""), 70)
+    failures = {
+        "KEY_MISSING",
+        "EXOTIC_DOWNLOAD_FAILED",
+        "EXOTIC_COMPILE_FAILED",
+        "EXOTIC_RUNTIME_FAILED",
+    }
+    if stage in failures:
+        return "EXOTIC " + stage.replace("EXOTIC_", "") + (f": {err}" if err else "")
+    warn_after = max(60, int(cfg.get("exotic_key_status_warn_after_seconds", 180) or 180))
+    if stage and stage != "EXOTIC_STARTED" and age >= warn_after:
+        return f"EXOTIC {stage} stuck {format_age(age)}"
+    if stage == "EXOTIC_STARTED" and bool(cfg.get("exotic_key_status_show_ok", False)):
+        return f"Exotic OK {format_age(age)}"
+    return ""
+
+
+def exotic_key_import_legacy_config(cfg):
+    candidates = [
+        BASE_DIR / "key_cloudflare.json",
+        Path("/storage/emulated/0/Download/key_cloudflare.json"),
+        Path("/storage/emulated/0/key_cloudflare.json"),
+    ]
+    for path in candidates:
+        try:
+            if not path.exists():
+                continue
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                continue
+            secret = str(data.get("write_secret") or "").strip()
+            worker = str(data.get("worker_url") or "").strip()
+            token = str(data.get("read_token") or "").strip()
+            if worker:
+                cfg["exotic_key_worker_url"] = worker.rstrip("/")
+            if secret:
+                cfg["exotic_key_write_secret"] = secret
+            if token:
+                cfg["exotic_key_read_token"] = token
+            if secret:
+                cfg["exotic_key_writer_enabled"] = True
+            save_config(cfg)
+            return True, str(path)
+        except Exception:
+            continue
+    return False, "legacy key_cloudflare.json not found"
+
+
+def exotic_key_settings_menu(cfg):
+    while True:
+        cfg = load_config()
+        state = load_exotic_key_state()
+        clear()
+        banner("EXOTIC KEY MANAGER", cfg)
+        writer = bool(cfg.get("exotic_key_writer_enabled", False))
+        print(col("THIS DEVICE = WRITER" if writer else "THIS DEVICE = READER", YELLOW if writer else GREEN))
+        print(col("Enable writer on exactly ONE Redfinger/device.", DIM))
+        print("")
+        key = _exotic_clean_key(state.get("key"))
+        print(f"Local key:       {mask_secret(key) if key else '-'}")
+        print(f"Key source:      {state.get('key_source', '-')}")
+        print(f"Generated at:    {state.get('generated_at', '-')}")
+        print(f"Refresh at:      {state.get('refresh_at', '-')}")
+        print(f"Cloud pending:   {bool(state.get('cloud_pending', False))}")
+        print(f"Last cloud err:  {cut(state.get('last_cloud_error', ''), 90) or '-'}")
+        print("")
+        print("1. Toggle key manager")
+        print("2. Toggle reader")
+        print("3. Toggle THIS DEVICE as writer")
+        print("4. Set Worker URL")
+        print("5. Set writer secret")
+        print("6. Set reader interval seconds")
+        print("7. Sync/read Cloudflare now")
+        print("8. Generate + publish NEW key now (writer only)")
+        print("9. Import legacy key_cloudflare.json")
+        print("10. Re-sync saved key to local UID files")
+        print("0. Back")
+        drain_stdin()
+        ch = input("\nChoose: ").strip()
+        if ch == "0":
+            return
+        if ch == "1":
+            cfg["exotic_key_manager_enabled"] = not bool(cfg.get("exotic_key_manager_enabled", True))
+            save_config(cfg)
+        elif ch == "2":
+            cfg["exotic_key_reader_enabled"] = not bool(cfg.get("exotic_key_reader_enabled", True))
+            save_config(cfg)
+        elif ch == "3":
+            enable = not bool(cfg.get("exotic_key_writer_enabled", False))
+            if enable:
+                print(col("Only ONE device may be the writer.", YELLOW))
+                if not _setup_yes_no("Make this device the Exotic key writer?", default=False):
+                    continue
+            cfg["exotic_key_writer_enabled"] = enable
+            save_config(cfg)
+        elif ch == "4":
+            raw = input(f"Worker URL [{cfg.get('exotic_key_worker_url')}]: ").strip()
+            if raw:
+                cfg["exotic_key_worker_url"] = raw.rstrip("/")
+                save_config(cfg)
+        elif ch == "5":
+            secret = getpass.getpass("Exotic key Worker WRITE secret: ").strip()
+            if secret:
+                cfg["exotic_key_write_secret"] = secret
+                save_config(cfg)
+                print(col("Writer secret saved locally.", GREEN))
+                time.sleep(1)
+        elif ch == "6":
+            raw = input(f"Reader interval seconds [{cfg.get('exotic_key_sync_interval_seconds', 3600)}]: ").strip()
+            if raw.isdigit():
+                cfg["exotic_key_sync_interval_seconds"] = max(300, int(raw))
+                save_config(cfg)
+        elif ch == "7":
+            result = exotic_key_manager_tick(cfg, force_read=True)
+            print(col(f"Key sync: {result}", CYAN))
+            print(col("Background request started; watch Activity/this menu state.", DIM))
+            time.sleep(2)
+        elif ch == "8":
+            if not bool(cfg.get("exotic_key_writer_enabled", False)):
+                print(col("Writer is disabled on this device.", RED))
+                pause()
+                continue
+            result = exotic_key_manager_tick(cfg, force_generate=True)
+            print(col(f"Writer refresh: {result}", CYAN))
+            print(col("Generation runs in background; rejoin remains responsive.", DIM))
+            time.sleep(2)
+        elif ch == "9":
+            ok, note = exotic_key_import_legacy_config(cfg)
+            print(col(note, GREEN if ok else YELLOW))
+            pause()
+        elif ch == "10":
+            state = load_exotic_key_state()
+            key = _exotic_clean_key(state.get("key"))
+            if not key:
+                print(col("No saved local Exotic key.", RED))
+            else:
+                ok, note, shared, uids = sync_exotic_key_to_local_workspaces(key, "manual")
+                print(col(f"{note}; shared={shared} uid={uids}", GREEN if ok else RED))
+            pause()
+
+
+def upgrade_known_nomo_market_loader_once(cfg):
+    """Upgrade only our known old loader; preserve every unrelated AutoExec file."""
+    marker = "-- NOMO Market / GAG loader"
+    old_worker = "https://nomo-key.atmincosplay.workers.dev/key"
+    changed = 0
+    seen = set()
+    for tab in autoexec_tabs(cfg):
+        for path in autoexec_paths_for_tab(tab, "1", filename=AUTOEXEC_MARKET_LOADER_FILE):
+            if str(path) in seen:
+                continue
+            seen.add(str(path))
+            try:
+                if not path.exists():
+                    continue
+                old = path.read_text(encoding="utf-8", errors="ignore")
+                if marker not in old or old_worker not in old:
+                    continue
+                backup = path.with_suffix(path.suffix + ".v48039.bak")
+                if not backup.exists():
+                    shutil.copy2(path, backup)
+                tmp = path.with_suffix(path.suffix + ".tmp")
+                tmp.write_text(MARKET_LOADER_AUTOEXEC_TEMPLATE, encoding="utf-8")
+                os.replace(str(tmp), str(path))
+                changed += 1
+            except Exception:
+                continue
+    return changed
+
+
 MARKET_LOADER_AUTOEXEC_TEMPLATE = r'''-- NOMO Market / GAG loader
 if not game:IsLoaded() then
     game.Loaded:Wait()
 end
 
 if game.PlaceId == 126884695634066 then
-    -- Grow a Garden
+    -- Grow a Garden / Hatcher
     print("grow a garden")
     local Players = game:GetService("Players")
     local HttpService = game:GetService("HttpService")
 
-    local KEY_URL = "https://nomo-key.atmincosplay.workers.dev/key"
-    local userId = tostring(Players.LocalPlayer.UserId)
+    local player = Players.LocalPlayer or Players.PlayerAdded:Wait()
+    local userId = tostring(player.UserId)
     local loginFile = userId .. "_exologin.json"
+    local sharedFolder = "Nomo"
+    local sharedKeyFile = sharedFolder .. "/exotic_key.json"
+    local statusFile = sharedFolder .. "/exotic_status_" .. userId .. ".json"
+    local keySource = ""
 
     local function clean(value)
         if type(value) ~= "string" then
             return nil
         end
-
         value = value:match("^%s*(.-)%s*$")
-
         if value == "" or value == "KEY_NOT_AVAILABLE" then
             return nil
         end
-
         return value
     end
 
-    local function saveLoginFile(key)
-        if not writefile then
-            return
-        end
-
-        local data = {
-            token = key,
-            type = "work.ink"
-        }
-
+    local function ensureFolder(folder)
         pcall(function()
-            writefile(loginFile, HttpService:JSONEncode(data))
+            if type(isfolder) == "function" then
+                if not isfolder(folder) and type(makefolder) == "function" then
+                    makefolder(folder)
+                end
+            elseif type(makefolder) == "function" then
+                makefolder(folder)
+            end
         end)
     end
 
-    local function readLoginFile()
-        if not isfile or not readfile or not isfile(loginFile) then
+    local function epochNow()
+        local ok, value = pcall(function()
+            return DateTime.now().UnixTimestamp
+        end)
+        if ok and type(value) == "number" then
+            return math.floor(value)
+        end
+        local ok2, value2 = pcall(os.time)
+        if ok2 and type(value2) == "number" then
+            return math.floor(value2)
+        end
+        return 0
+    end
+
+    local function writeStatus(stage, err)
+        if type(writefile) ~= "function" then
+            return
+        end
+        ensureFolder(sharedFolder)
+        local payload = {
+            uid = userId,
+            username = player.Name,
+            display_name = player.DisplayName,
+            place_id = tostring(game.PlaceId or ""),
+            job_id = tostring(game.JobId or ""),
+            ts = epochNow(),
+            stage = tostring(stage or "UNKNOWN"),
+            ok = stage == "EXOTIC_STARTED",
+            key_source = keySource,
+            error = tostring(err or ""),
+        }
+        pcall(function()
+            writefile(statusFile, HttpService:JSONEncode(payload))
+        end)
+    end
+
+    local function saveLoginFile(key)
+        if type(writefile) ~= "function" then
+            return false
+        end
+        local data = {
+            token = key,
+            type = "lootlabs"
+        }
+        local ok = pcall(function()
+            writefile(loginFile, HttpService:JSONEncode(data))
+        end)
+        return ok
+    end
+
+    local function readJsonToken(path)
+        if type(isfile) ~= "function" or type(readfile) ~= "function" then
             return nil
         end
-
-        local ok, content = pcall(readfile, loginFile)
+        if not isfile(path) then
+            return nil
+        end
+        local ok, content = pcall(readfile, path)
         if not ok then
             return nil
         end
-
         local decodedOk, data = pcall(function()
             return HttpService:JSONDecode(content)
         end)
-
         if decodedOk and type(data) == "table" then
-            return clean(data.token)
+            return clean(data.token or data.key)
         end
-
         return nil
     end
 
-    local key
+    writeStatus("LOADER_STARTED", "")
 
-    for attempt = 1, 3 do
-        local ok, result = pcall(function()
-            return game:HttpGet(KEY_URL, true)
-        end)
-
-        if ok then
-            key = clean(result)
-
-            if key then
-                saveLoginFile(key)
-                break
-            end
-        end
-
-        task.wait(2)
+    local key = readJsonToken(loginFile)
+    if key then
+        keySource = "uid_exologin"
     end
 
     if not key then
-        key = readLoginFile()
+        key = readJsonToken(sharedKeyFile)
+        if key then
+            keySource = "device_shared_local"
+            saveLoginFile(key)
+        end
     end
 
-    assert(key, "Could not fetch or load Exotic Hub key")
+    if not key then
+        writeStatus("KEY_MISSING", "No local UID or shared Exotic key")
+        warn("[NOMO EXOTIC] local key missing; NOMO Termux key sync is required")
+        return
+    end
 
     getgenv().exo_key = key
+    writeStatus("KEY_READY", "")
     task.wait(5)
-    loadstring(game:HttpGet("https://exotichub.app/auto.lua", true))()
+
+    local downloadOk, sourceOrErr = pcall(function()
+        return game:HttpGet("https://exotichub.app/auto.lua", true)
+    end)
+    if not downloadOk or type(sourceOrErr) ~= "string" or sourceOrErr == "" then
+        writeStatus("EXOTIC_DOWNLOAD_FAILED", tostring(sourceOrErr))
+        warn("[NOMO EXOTIC] download failed:", tostring(sourceOrErr))
+        return
+    end
+    writeStatus("EXOTIC_DOWNLOADED", "")
+
+    local chunk, compileErr = loadstring(sourceOrErr)
+    if type(chunk) ~= "function" then
+        writeStatus("EXOTIC_COMPILE_FAILED", tostring(compileErr))
+        warn("[NOMO EXOTIC] compile failed:", tostring(compileErr))
+        return
+    end
+
+    writeStatus("EXOTIC_EXECUTING", "")
+    local runOk, runErr = pcall(chunk)
+    if not runOk then
+        writeStatus("EXOTIC_RUNTIME_FAILED", tostring(runErr))
+        warn("[NOMO EXOTIC] runtime failed:", tostring(runErr))
+        return
+    end
+    writeStatus("EXOTIC_STARTED", "")
 
     pcall(function()
         game:GetService("RunService"):Set3dRenderingEnabled(true)
@@ -33599,6 +34384,11 @@ def start_rejoin_only(cfg):
         _rejoin_only_print_dashboard(rows, cfg)
         _rejoin_only_save_runtime(runtime)
 
+        try:
+            exotic_key_manager_tick(cfg)
+        except Exception as exc:
+            log_activity(f"Exotic key manager tick failed: {cut(exc, 90)}", "", YELLOW)
+
         delta_key_result = ""
         try:
             delta_key_result = delta_key_auto_monitor_tick(
@@ -36472,6 +37262,16 @@ def advanced_tools_menu(cfg):
 def main():
     cfg = load_config()
     nomo_auto_repair_launchers_once(cfg)
+    try:
+        upgraded = upgrade_known_nomo_market_loader_once(cfg)
+        if upgraded:
+            log_activity(f"AutoExec Exotic-local loader upgraded: {upgraded} file(s)", "", GREEN)
+    except Exception as exc:
+        log_activity(f"AutoExec Exotic loader upgrade skipped: {cut(exc, 90)}", "", YELLOW)
+    try:
+        exotic_key_manager_tick(cfg)
+    except Exception as exc:
+        log_activity(f"Exotic key manager startup failed: {cut(exc, 90)}", "", YELLOW)
 
     while True:
         reset_terminal()
