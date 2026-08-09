@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.80.33-dev-solver-soft-open"
+__version__ = "V4.80.34-dev-restock-fallback"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8928,6 +8928,15 @@ def open_target(tab, rt_tab, cfg, target, reason, force=False, rt=None, mode="ha
         return False, "cooldown"
 
     link = core.target_link(tab, target, rt_tab) if core is not None else target_link(tab, cfg, target, rt_tab, rt)
+    resolved_target = target
+    resolved_reason = reason
+
+    if not link and target == "restock":
+        fallback_link = core.target_link(tab, "hatcher", rt_tab) if core is not None else target_link(tab, cfg, "hatcher", rt_tab, rt)
+        if fallback_link:
+            link = fallback_link
+            resolved_target = "hatcher"
+            resolved_reason = f"{reason} via hatcher"
 
     if not link:
         rt_tab["note"] = "no restock link" if target == "restock" else "no link"
@@ -8949,15 +8958,15 @@ def open_target(tab, rt_tab, cfg, target, reason, force=False, rt=None, mode="ha
             cfg,
             soft=False,
             rt_tab=rt_tab,
-            reason=reason,
+            reason=resolved_reason,
             mode="hard",
-            target=target,
+            target=resolved_target,
             require_stop=True,
         )
-        rt_tab["target"] = target
+        rt_tab["target"] = resolved_target
         rt_tab["last_open"] = now()
         rt_tab["last_open_mode"] = open_policy["record_mode"]
-        rt_tab["note"] = reason
+        rt_tab["note"] = resolved_reason
         if target == "restock":
             rt_tab["last_gain_ts"] = now()
         return ok, note
@@ -8972,16 +8981,16 @@ def open_target(tab, rt_tab, cfg, target, reason, force=False, rt=None, mode="ha
         cfg,
         soft=open_policy["soft"],
         rt_tab=rt_tab,
-        reason=reason,
+        reason=resolved_reason,
         mode=open_policy["core_mode"],
-        target=target,
+        target=resolved_target,
         require_stop=open_policy["require_stop"],
     )
 
-    rt_tab["target"] = target
+    rt_tab["target"] = resolved_target
     rt_tab["last_open"] = now()
     rt_tab["last_open_mode"] = open_policy["record_mode"]
-    rt_tab["note"] = reason
+    rt_tab["note"] = resolved_reason
 
     if target == "restock":
         rt_tab["last_gain_ts"] = now()
