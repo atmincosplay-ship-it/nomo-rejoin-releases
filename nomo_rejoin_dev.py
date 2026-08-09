@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.80.34-dev-restock-fallback"
+__version__ = "V4.80.38-dev-restock-private-guard"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8755,14 +8755,14 @@ def market_booster_pool_menu(cfg):
 
 
 def resolve_restock_link(tab, rt_tab, cfg, rt=None):
-    fallback = tab.get("restock_link") or cfg.get("restock_link")
+    fallback, fallback_source = restock_fallback_link(tab, cfg)
     backend_label = shared_backend_label(cfg)
 
     if cfg.get("jsonbin_hatchers_enabled", False) and rt is not None:
         force_fresh = bool(cfg.get("jsonbin_force_refresh_on_restock_route", True))
         link, hatcher, err = pick_jsonbin_hatcher(cfg, rt, force=force_fresh)
 
-        if link:
+        if link and is_private_restock_route(link):
             rt_tab["last_hatcher"] = hatcher.get("name") if hatcher else backend_label
             rt_tab["last_hatcher_pets"] = hatcher.get("pets") if hatcher else ""
             rt_tab["last_hatcher_age"] = hatcher.get("age") if hatcher else ""
@@ -8775,13 +8775,24 @@ def resolve_restock_link(tab, rt_tab, cfg, rt=None):
                 )
             return link, route_note
 
+        if link:
+            rt_tab["last_hatcher"] = hatcher.get("name") if hatcher else backend_label
+            rt_tab["last_hatcher_pets"] = hatcher.get("pets") if hatcher else ""
+            rt_tab["last_hatcher_age"] = hatcher.get("age") if hatcher else ""
+            rt_tab["jsonbin_last_error"] = "shared route rejected: not private"
+            if fallback:
+                return fallback, fallback_source
+            return "", f"{backend_label}:rejected non-private restock route"
+
         rt_tab["jsonbin_last_error"] = err
 
         action = str(cfg.get("jsonbin_no_hatcher_action", "stay_market") or "stay_market").strip().lower()
         if action not in ["fallback_restock", "fallback", "restock"]:
+            if fallback:
+                return fallback, fallback_source
             return "", f"{backend_label}:{err};stay_market"
 
-    return fallback, "config"
+    return fallback, fallback_source
 
 # ============================================================
 # REJOIN LOOP
@@ -8804,6 +8815,49 @@ def can_open(rt_tab, cfg):
     return now() - int(rt_tab.get("last_open", 0)) >= int(cfg.get("min_seconds_between_reopen", 60))
 
 
+def is_private_restock_route(value):
+    raw = str(value or "").strip()
+    if not raw:
+        return False
+
+    lower = raw.lower()
+    if any(key in lower for key in ["privateserverlinkcode=", "linkcode=", "accesscode="]):
+        return True
+
+    if ("roblox.com/share?" in lower or "roblox.com/share-links?" in lower) and "code=" in lower:
+        return "type=server" in lower or "type%3dserver" in lower
+
+    return False
+
+
+def profile_private_route_or_empty(tab, cfg):
+    """Return this package's own safe hatcher private route when one is known."""
+    try:
+        link = hatcher_profile_private_link(tab, cfg=cfg, refresh_vip=False)
+        if is_private_restock_route(link):
+            return str(link).strip()
+    except Exception:
+        pass
+    return ""
+
+
+def restock_fallback_link(tab, cfg):
+    """Return the best local restock route when the shared hatcher list is empty."""
+    private = profile_private_route_or_empty(tab, cfg)
+    if private:
+        return private, "profile-private"
+
+    tab_link = tab.get("restock_link")
+    if is_private_restock_route(tab_link):
+        return str(tab_link).strip(), "tab-private"
+
+    cfg_link = cfg.get("restock_link")
+    if is_private_restock_route(cfg_link):
+        return str(cfg_link).strip(), "config-private"
+
+    return "", "missing-private-restock"
+
+
 def target_link(tab, cfg, target, rt_tab=None, rt=None):
     if target == "booster":
         if rt_tab is not None:
@@ -8816,18 +8870,24 @@ def target_link(tab, cfg, target, rt_tab=None, rt=None):
 
     if target == "hatcher":
         # Hatcher and Booster never fall back to Market/public routing.
-        return (
-            tab.get("server_link")
-            or tab.get("restock_link")
-            or ""
-        )
+        private = profile_private_route_or_empty(tab, cfg)
+        if private:
+            return private
+
+        for key in ["server_link", "restock_link"]:
+            link = tab.get(key)
+            if is_private_restock_route(link):
+                return str(link).strip()
+
+        return ""
 
     if target == "restock":
         if rt_tab is not None:
             link, source = resolve_restock_link(tab, rt_tab, cfg, rt)
             rt_tab["restock_source"] = source
             return link
-        return tab.get("restock_link") or cfg.get("restock_link")
+        link, _source = restock_fallback_link(tab, cfg)
+        return link
 
     return cfg.get("market_link")
 
@@ -12312,9 +12372,12 @@ def test_login_challenge_detection_menu(cfg):
         tab = next((t for t in cfg.get("tabs", []) if t.get("package") == pkg), None) or {"package": pkg, "user_name": pkg}
         open_first = input("Bring package to foreground before testing? (y/N): ").strip().lower() == "y"
         if open_first:
-            link = tab.get("server_link") or tab.get("restock_link") or cfg.get("market_link") or DEFAULT_MARKET_LINK
-            open_roblox(pkg, link, cfg, soft=True, reason="manual login detection test")
-            time.sleep(2)
+            link = target_link(tab, cfg, "hatcher") or target_link(tab, cfg, "restock")
+            if link:
+                open_roblox(pkg, link, cfg, soft=True, reason="manual login detection test")
+                time.sleep(2)
+            else:
+                print(col("No private route available; skipped foreground open.", YELLOW))
         cookie = get_cookie_from_package(pkg) or cached_cookie_for_package(pkg)
         api_hit, api_detail = roblox_cookie_detection(cookie) if cookie else (None, "no cookie")
         ui_hit, ui_detail = ui_login_challenge_detection(tab, cfg)
