@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.2 — EXOTIC KEY MANAGER STATUS UI
+# - Key Manager menu now shows Manager/Reader/Writer state separately.
+# - Writer readiness explicitly reports READY/BLOCKED/RATE-LIMITED/BUSY.
+# - Enabling Writer automatically enables the Key Manager.
+# - Writer secret is shown as MISSING / SET-UNVERIFIED / VERIFIED / REJECTED.
+# - Cloudflare 429/1027 write failures now use the same persistent 6-hour backoff.
+# - Manual writer generation reports clear blocked reasons instead of just disabled.
+#
 # V4.81.1 — EXOTIC LOGIN FORMAT FIX
 # - Existing <UID>_exologin.json files preserve their current type/extra fields;
 #   only token is updated. New/shared login data defaults to type="lootlabs".
@@ -777,7 +785,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.1-exotic-login-format-fix"
+__version__ = "V4.81.2-exotic-key-manager-status-ui"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -24008,6 +24016,7 @@ def _exotic_reader_job(cfg_snapshot):
     state["key_source"] = "cloud_reader"
     state["last_cloud_check_at"] = t
     state["last_cloud_ok_at"] = t
+    state["worker_read_verified_at"] = t
     state["last_cloud_error"] = ""
     state["next_cloud_check_at"] = t + max(300, int(cfg_snapshot.get("exotic_key_sync_interval_seconds", 3600) or 3600))
     if changed:
@@ -24036,14 +24045,25 @@ def _exotic_writer_job(cfg_snapshot, mode):
                 state["last_cloud_upload_at"] = t
                 state["last_cloud_error"] = ""
                 state["next_writer_retry_at"] = 0
+                state["writer_secret_status"] = "verified"
+                state["writer_secret_verified_at"] = t
                 save_exotic_key_state(state)
                 log_activity("Exotic writer: pending key uploaded to Cloudflare", "", GREEN)
                 return
             state["cloud_pending"] = True
             state["last_cloud_error"] = str(note)
-            state["next_writer_retry_at"] = t + retry
+            write_backoff = (
+                max(3600, int(cfg_snapshot.get("exotic_key_rate_limit_backoff_seconds", 21600) or 21600))
+                if _exotic_rate_limited_text(note)
+                else retry
+            )
+            state["next_writer_retry_at"] = t + write_backoff
+            note_low = str(note or "").lower()
+            if "http 401" in note_low or "http 403" in note_low or "unauthorized" in note_low or "forbidden" in note_low:
+                state["writer_secret_status"] = "rejected"
+                state["writer_secret_verified_at"] = 0
             save_exotic_key_state(state)
-            log_activity(f"Exotic writer upload failed: {cut(note, 100)}", "", YELLOW)
+            log_activity(f"Exotic writer upload failed; retry {format_age(write_backoff)}: {cut(note, 100)}", "", YELLOW)
             return
 
     if mode == "generate":
@@ -24083,16 +24103,32 @@ def _exotic_writer_job(cfg_snapshot, mode):
         state = load_exotic_key_state()
         state["last_writer_attempt_at"] = now()
         if ok:
+            uploaded_at = now()
             state["cloud_pending"] = False
-            state["last_cloud_upload_at"] = now()
+            state["last_cloud_upload_at"] = uploaded_at
             state["last_cloud_error"] = ""
             state["next_writer_retry_at"] = 0
+            state["writer_secret_status"] = "verified"
+            state["writer_secret_verified_at"] = uploaded_at
             log_activity("Exotic writer uploaded new key to Cloudflare", "", GREEN)
         else:
+            failed_at = now()
             state["cloud_pending"] = True
             state["last_cloud_error"] = str(note)
-            state["next_writer_retry_at"] = now() + retry
-            log_activity(f"Exotic writer generated locally but Cloudflare upload failed: {cut(note, 100)}", "", YELLOW)
+            write_backoff = (
+                max(3600, int(cfg_snapshot.get("exotic_key_rate_limit_backoff_seconds", 21600) or 21600))
+                if _exotic_rate_limited_text(note)
+                else retry
+            )
+            state["next_writer_retry_at"] = failed_at + write_backoff
+            note_low = str(note or "").lower()
+            if "http 401" in note_low or "http 403" in note_low or "unauthorized" in note_low or "forbidden" in note_low:
+                state["writer_secret_status"] = "rejected"
+                state["writer_secret_verified_at"] = 0
+            log_activity(
+                f"Exotic writer generated locally but Cloudflare upload failed; retry {format_age(write_backoff)}: {cut(note, 100)}",
+                "", YELLOW
+            )
         save_exotic_key_state(state)
 
 
@@ -24273,11 +24309,73 @@ def exotic_key_import_legacy_config(cfg):
                 cfg["exotic_key_read_token"] = token
             if secret:
                 cfg["exotic_key_writer_enabled"] = True
+                cfg["exotic_key_manager_enabled"] = True
             save_config(cfg)
             return True, str(path)
         except Exception:
             continue
     return False, "legacy key_cloudflare.json not found"
+
+
+def _exotic_menu_time(value):
+    try:
+        ts = int(value or 0)
+    except Exception:
+        ts = 0
+    if ts <= 0:
+        return "-"
+    try:
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(ts)
+
+
+def _exotic_menu_wait(value):
+    try:
+        ts = int(value or 0)
+    except Exception:
+        ts = 0
+    if ts <= 0:
+        return "-"
+    left = ts - now()
+    if left <= 0:
+        return "NOW"
+    return "in " + format_age(left)
+
+
+def _exotic_writer_readiness(cfg, state):
+    manager = bool(cfg.get("exotic_key_manager_enabled", True))
+    writer = bool(cfg.get("exotic_key_writer_enabled", False))
+    secret = str(cfg.get("exotic_key_write_secret", "") or "").strip()
+    worker = _exotic_worker_base(cfg)
+    if not writer:
+        return "OFF", DIM
+    if not manager:
+        return "BLOCKED - KEY MANAGER OFF", RED
+    if not worker.startswith("https://"):
+        return "BLOCKED - WORKER URL INVALID", RED
+    if not secret:
+        return "BLOCKED - WRITER SECRET MISSING", RED
+    with _EXOTIC_KEY_JOB_LOCK:
+        running = bool(_EXOTIC_KEY_JOB.get("running"))
+        mode = str(_EXOTIC_KEY_JOB.get("mode") or "").upper()
+    if running:
+        return f"BUSY - {mode or 'BACKGROUND JOB'}", CYAN
+    retry_at = int(state.get("next_writer_retry_at", 0) or 0)
+    if retry_at > now():
+        err = str(state.get("last_cloud_error") or state.get("last_writer_error") or "")
+        if _exotic_rate_limited_text(err):
+            return f"CLOUD RATE-LIMITED - RETRY {_exotic_menu_wait(retry_at)}", YELLOW
+        return f"RETRY WAIT - {_exotic_menu_wait(retry_at)}", YELLOW
+    key = _exotic_clean_key(state.get("key"))
+    if not key:
+        return "READY - NEW KEY WILL GENERATE", GREEN
+    if bool(state.get("cloud_pending", False)):
+        return "READY - LOCAL KEY OK, CLOUD UPLOAD PENDING", YELLOW
+    refresh_at = int(state.get("refresh_at", 0) or 0)
+    if refresh_at <= 0 or refresh_at <= now():
+        return "READY - KEY REFRESH DUE NOW", GREEN
+    return f"ACTIVE - NEXT GENERATION {_exotic_menu_wait(refresh_at)}", GREEN
 
 
 def exotic_key_settings_menu(cfg):
@@ -24286,25 +24384,71 @@ def exotic_key_settings_menu(cfg):
         state = load_exotic_key_state()
         clear()
         banner("EXOTIC KEY MANAGER", cfg)
+
+        manager = bool(cfg.get("exotic_key_manager_enabled", True))
+        reader = bool(cfg.get("exotic_key_reader_enabled", True))
         writer = bool(cfg.get("exotic_key_writer_enabled", False))
-        print(col("THIS DEVICE = WRITER" if writer else "THIS DEVICE = READER", YELLOW if writer else GREEN))
-        print(col("Enable writer on exactly ONE Redfinger/device.", DIM))
-        print("")
+        worker = _exotic_worker_base(cfg)
+        secret_set = bool(str(cfg.get("exotic_key_write_secret", "") or "").strip())
+        secret_status = str(state.get("writer_secret_status") or "").strip().lower()
+        verified_at = int(state.get("writer_secret_verified_at", 0) or 0)
         key = _exotic_clean_key(state.get("key"))
-        print(f"Local key:       {mask_secret(key) if key else '-'}")
-        print(f"Key source:      {state.get('key_source', '-')}")
-        print(f"Generated at:    {state.get('generated_at', '-')}")
-        print(f"Refresh at:      {state.get('refresh_at', '-')}")
-        print(f"Cloud pending:   {bool(state.get('cloud_pending', False))}")
-        print(f"Last cloud err:  {cut(state.get('last_cloud_error', ''), 90) or '-'}")
+
+        with _EXOTIC_KEY_JOB_LOCK:
+            job_running = bool(_EXOTIC_KEY_JOB.get("running"))
+            job_mode = str(_EXOTIC_KEY_JOB.get("mode") or "").upper()
+
+        ready_text, ready_color = _exotic_writer_readiness(cfg, state)
+        role = "WRITER" if writer else "READER"
+
+        print(col(f"ROLE:            {role}", YELLOW if writer else GREEN))
+        print(f"Key manager:     {col('ON', GREEN) if manager else col('OFF', RED)}")
+        reader_text = "ON"
+        if not reader:
+            reader_text = "OFF"
+        elif writer:
+            reader_text = "ON (standby while Writer is active)"
+        print(f"Cloud reader:    {reader_text}")
+        print(f"Writer mode:     {col('ON', GREEN) if writer else col('OFF', DIM)}")
+        if writer:
+            print("Auto writer:     " + col(ready_text, ready_color))
         print("")
-        print("1. Toggle key manager")
-        print("2. Toggle reader")
-        print("3. Toggle THIS DEVICE as writer")
+
+        print(f"Worker URL:      {worker or '-'}")
+        if not secret_set:
+            secret_line = col("MISSING", RED)
+        elif secret_status == "verified" and verified_at > 0:
+            secret_line = col("SET + VERIFIED", GREEN) + f" ({_exotic_menu_time(verified_at)})"
+        elif secret_status == "rejected":
+            secret_line = col("SET BUT REJECTED", RED)
+        else:
+            secret_line = col("SET - not verified yet", YELLOW)
+        print(f"Writer secret:   {secret_line}")
+        print(f"Background job:  {job_mode if job_running else 'IDLE'}")
+        print("")
+
+        print(f"Local key:       {mask_secret(key) if key else '-'}")
+        print(f"Key source:      {state.get('key_source', '-') or '-'}")
+        print(f"Generated:       {_exotic_menu_time(state.get('generated_at'))}")
+        print(f"Expires:         {_exotic_menu_time(state.get('expires_at'))}")
+        print(f"Auto refresh:    {_exotic_menu_time(state.get('refresh_at'))} ({_exotic_menu_wait(state.get('refresh_at'))})")
+        print(f"Cloud pending:   {'YES' if bool(state.get('cloud_pending', False)) else 'NO'}")
+        if writer:
+            print(f"Writer retry:    {_exotic_menu_wait(state.get('next_writer_retry_at'))}")
+        else:
+            print(f"Next cloud read: {_exotic_menu_wait(state.get('next_cloud_check_at'))}")
+        print(f"Last cloud OK:   {_exotic_menu_time(state.get('last_cloud_ok_at') or state.get('last_cloud_upload_at'))}")
+        print(f"Last cloud err:  {cut(state.get('last_cloud_error', ''), 90) or '-'}")
+        print(f"Last writer err: {cut(state.get('last_writer_error', ''), 90) or '-'}")
+        print("")
+
+        print(f"1. Key manager: {'ON' if manager else 'OFF'}  [toggle]")
+        print(f"2. Cloud reader: {'ON' if reader else 'OFF'}  [toggle]")
+        print(f"3. Writer mode: {'ON' if writer else 'OFF'}  [toggle THIS DEVICE]")
         print("4. Set Worker URL")
-        print("5. Set writer secret")
+        print(f"5. Set writer secret ({'SET' if secret_set else 'MISSING'})")
         print("6. Set reader interval seconds")
-        print("7. Sync/read Cloudflare now")
+        print("7. Test/sync Cloudflare READ now")
         print("8. Generate + publish NEW key now (writer only)")
         print("9. Import legacy key_cloudflare.json")
         print("10. Re-sync saved key to local UID files")
@@ -24314,7 +24458,12 @@ def exotic_key_settings_menu(cfg):
         if ch == "0":
             return
         if ch == "1":
-            cfg["exotic_key_manager_enabled"] = not bool(cfg.get("exotic_key_manager_enabled", True))
+            new_value = not bool(cfg.get("exotic_key_manager_enabled", True))
+            if not new_value and writer:
+                print(col("Writer mode will remain configured but automatic generation/sync will be SUSPENDED.", YELLOW))
+                if not _setup_yes_no("Turn the Exotic Key Manager OFF?", default=False):
+                    continue
+            cfg["exotic_key_manager_enabled"] = new_value
             save_config(cfg)
         elif ch == "2":
             cfg["exotic_key_reader_enabled"] = not bool(cfg.get("exotic_key_reader_enabled", True))
@@ -24325,42 +24474,87 @@ def exotic_key_settings_menu(cfg):
                 print(col("Only ONE device may be the writer.", YELLOW))
                 if not _setup_yes_no("Make this device the Exotic key writer?", default=False):
                     continue
+                cfg["exotic_key_manager_enabled"] = True
             cfg["exotic_key_writer_enabled"] = enable
             save_config(cfg)
+            print(col(
+                "Writer ON; Key Manager automatically ON." if enable else "Writer OFF; this device will use reader mode when reader is enabled.",
+                GREEN if enable else CYAN,
+            ))
+            time.sleep(1)
         elif ch == "4":
             raw = input(f"Worker URL [{cfg.get('exotic_key_worker_url')}]: ").strip()
             if raw:
                 cfg["exotic_key_worker_url"] = raw.rstrip("/")
                 save_config(cfg)
+                state = load_exotic_key_state()
+                state["writer_secret_status"] = "unverified"
+                state["writer_secret_verified_at"] = 0
+                save_exotic_key_state(state)
         elif ch == "5":
             secret = getpass.getpass("Exotic key Worker WRITE secret: ").strip()
             if secret:
                 cfg["exotic_key_write_secret"] = secret
                 save_config(cfg)
-                print(col("Writer secret saved locally.", GREEN))
-                time.sleep(1)
+                state = load_exotic_key_state()
+                state["writer_secret_status"] = "unverified"
+                state["writer_secret_verified_at"] = 0
+                save_exotic_key_state(state)
+                print(col("Writer secret saved. It becomes VERIFIED after the first successful Cloudflare PUT.", GREEN))
+                time.sleep(1.5)
         elif ch == "6":
             raw = input(f"Reader interval seconds [{cfg.get('exotic_key_sync_interval_seconds', 3600)}]: ").strip()
             if raw.isdigit():
                 cfg["exotic_key_sync_interval_seconds"] = max(300, int(raw))
                 save_config(cfg)
         elif ch == "7":
+            if not manager:
+                print(col("BLOCKED: Key Manager is OFF. Toggle option 1 ON first.", RED))
+                pause()
+                continue
             result = exotic_key_manager_tick(cfg, force_read=True)
-            print(col(f"Key sync: {result}", CYAN))
-            print(col("Background request started; watch Activity/this menu state.", DIM))
+            labels = {
+                "reader_started": "Cloudflare READ started in background",
+                "reader_busy": "A key-manager background job is already running",
+                "writer_started": "Writer generation started (writer role takes priority over reader)",
+                "writer_busy": "Writer background job already running",
+                "writer_secret_missing": "BLOCKED: writer secret missing",
+            }
+            print(col(labels.get(result, f"Key sync result: {result}"), CYAN if "BLOCKED" not in labels.get(result, "") else RED))
             time.sleep(2)
         elif ch == "8":
-            if not bool(cfg.get("exotic_key_writer_enabled", False)):
-                print(col("Writer is disabled on this device.", RED))
+            if not writer:
+                print(col("BLOCKED: Writer mode is OFF on this device. Toggle option 3 first.", RED))
+                pause()
+                continue
+            if not manager:
+                print(col("BLOCKED: Key Manager is OFF. Toggle option 1 ON first.", RED))
+                pause()
+                continue
+            if not worker.startswith("https://"):
+                print(col("BLOCKED: Worker URL is missing/invalid. Set option 4 first.", RED))
+                pause()
+                continue
+            if not secret_set:
+                print(col("BLOCKED: Writer secret is missing. Set option 5 first.", RED))
                 pause()
                 continue
             result = exotic_key_manager_tick(cfg, force_generate=True)
-            print(col(f"Writer refresh: {result}", CYAN))
-            print(col("Generation runs in background; rejoin remains responsive.", DIM))
+            labels = {
+                "writer_started": "NEW KEY generation started in background",
+                "writer_busy": "Writer is already busy; no duplicate generation started",
+                "writer_secret_missing": "BLOCKED: writer secret missing",
+                "disabled": "BLOCKED: Key Manager is OFF",
+            }
+            text = labels.get(result, f"Writer result: {result}")
+            print(col(text, RED if text.startswith("BLOCKED") else CYAN))
+            print(col("Refresh this menu in a few seconds to see Generated/Cloud/Secret verification status.", DIM))
             time.sleep(2)
         elif ch == "9":
             ok, note = exotic_key_import_legacy_config(cfg)
             print(col(note, GREEN if ok else YELLOW))
+            if ok:
+                print(col("Imported writer secret => Writer ON + Key Manager ON.", GREEN))
             pause()
         elif ch == "10":
             state = load_exotic_key_state()
