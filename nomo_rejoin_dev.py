@@ -750,7 +750,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.80.32-dev-option6-route-nudge"
+__version__ = "V4.80.33-dev-solver-soft-open"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -11047,6 +11047,26 @@ def clear_manual_login_block(rt_tab):
     return True
 
 
+def clear_solver_runtime_block(rt_tab):
+    """Clear provider retry flags without treating them like a login hold."""
+    if not isinstance(rt_tab, dict):
+        return False
+    changed = False
+    defaults = {
+        "solver_busy_retry_pending": False,
+        "solver_busy_retry_at": 0,
+        "solver_busy_retry_seconds": 0,
+        "solver_retry_reason": "",
+    }
+    for key, value in defaults.items():
+        if rt_tab.get(key) != value:
+            rt_tab[key] = value
+            changed = True
+    if rt_tab.pop("solver_attempted", None) is not None:
+        changed = True
+    return changed
+
+
 def mark_manual_login_block(rt_tab, reason, detail="", note="", detected_at=None, retry_seconds=None):
     """Central setter for auth/manual holds.
 
@@ -13195,12 +13215,9 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                 return True
 
             if rt_tab.get("solver_busy_retry_pending"):
-                retry_at = int(rt_tab.get("solver_busy_retry_at", 0) or 0)
-                left = max(1, retry_at - now()) if retry_at else 600
                 retry_reason = str(rt_tab.get("solver_retry_reason") or "SERVER_BUSY")
-                rt_tab["note"] = f"solver {retry_reason}; waiting {format_age(left)} for retry rejoin"
-                core.save()
-                return True
+                clear_solver_runtime_block(rt_tab)
+                rt_tab["note"] = f"solver {retry_reason}; opening without solver"
 
             # V3.87: A provider clear gets exactly one recovery open. If that
             # package still cannot create fresh state, another hard retry cannot
