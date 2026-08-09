@@ -825,6 +825,9 @@ HATCHER_CONFIG_FILE = BASE_DIR / "hatcher_reporter_config.json"
 HATCHER_RUNTIME_FILE = BASE_DIR / "hatcher_reporter_runtime.json"
 BOOSTER_CONFIG_FILE = BASE_DIR / "booster_reporter_config.json"
 BOOSTER_RUNTIME_FILE = BASE_DIR / "booster_reporter_runtime.json"
+CLOUDFLARE_UPLOAD_COOLDOWN_SECONDS = 10 * 60
+CLOUDFLARE_UPLOAD_HOLD_KEY = "cloudflare_upload_hold_until"
+CLOUDFLARE_UPLOAD_REASON_KEY = "cloudflare_upload_hold_reason"
 
 # --------------------------------------------------------------------------
 # UNIFIED CONFIG FILE
@@ -16028,12 +16031,72 @@ def cloudflare_update_removed_hatcher(cfg, name, status="disabled"):
 
 
 def cloudflare_update_hatchers(cfg, updates, removes):
+    def is_cloudflare_upload_rate_limited(message):
+        text = str(message or "").lower()
+        return (
+            "http 429" in text
+            or "error code: 1027" in text
+            or '"code":1027' in text
+            or "too many requests" in text
+            or "rate limit" in text
+            or "rate-limited" in text
+        )
+
+    def short_duration(seconds):
+        seconds = max(0, int(seconds))
+        minutes, sec = divmod(seconds, 60)
+        if minutes:
+            return f"{minutes}m{sec:02d}s"
+        return f"{sec}s"
+
+    def get_upload_hold():
+        rt = load_json(HATCHER_RUNTIME_FILE, {})
+        try:
+            hold_until = float(rt.get(CLOUDFLARE_UPLOAD_HOLD_KEY) or 0)
+        except Exception:
+            hold_until = 0
+        return rt, hold_until
+
+    def set_upload_hold(reason):
+        rt = load_json(HATCHER_RUNTIME_FILE, {})
+        rt[CLOUDFLARE_UPLOAD_HOLD_KEY] = time.time() + CLOUDFLARE_UPLOAD_COOLDOWN_SECONDS
+        rt[CLOUDFLARE_UPLOAD_REASON_KEY] = str(reason or "rate limited")
+        save_json(HATCHER_RUNTIME_FILE, rt)
+
+    def clear_upload_hold():
+        rt = load_json(HATCHER_RUNTIME_FILE, {})
+        changed = False
+        for key in (CLOUDFLARE_UPLOAD_HOLD_KEY, CLOUDFLARE_UPLOAD_REASON_KEY):
+            if key in rt:
+                rt.pop(key, None)
+                changed = True
+        if changed:
+            save_json(HATCHER_RUNTIME_FILE, rt)
+
+    def rate_limit_ok(message):
+        set_upload_hold(message)
+        return True, (
+            "cloudflare upload rate limited; cooldown "
+            f"{short_duration(CLOUDFLARE_UPLOAD_COOLDOWN_SECONDS)}; local route/state preserved"
+        )
+
+    has_work = bool(updates or removes)
+    if has_work:
+        rt, hold_until = get_upload_hold()
+        now = time.time()
+        if hold_until > now:
+            reason = cut(rt.get(CLOUDFLARE_UPLOAD_REASON_KEY, "rate limited"), 90)
+            left = short_duration(hold_until - now)
+            return True, f"cloudflare upload cooldown {left}; local route/state preserved ({reason})"
+
     sent = 0
     removed = 0
 
     for name, entry in updates or []:
         ok, msg = cloudflare_update_one_hatcher(cfg, name, entry)
         if not ok:
+            if is_cloudflare_upload_rate_limited(msg):
+                return rate_limit_ok(msg)
             return False, f"{name}: {msg}"
         sent += 1
 
@@ -16047,9 +16110,12 @@ def cloudflare_update_hatchers(cfg, updates, removes):
 
         ok, msg = cloudflare_update_removed_hatcher(cfg, name, status)
         if not ok:
+            if is_cloudflare_upload_rate_limited(msg):
+                return rate_limit_ok(msg)
             return False, f"remove {name}: {msg}"
         removed += 1
 
+    clear_upload_hold()
     return True, f"updated cloudflare sent={sent} removed={removed}"
 
 
