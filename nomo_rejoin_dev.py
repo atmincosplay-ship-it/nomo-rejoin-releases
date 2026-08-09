@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.3 — SOLVER HARD PROVIDER GATE
+# - Automatic solver submissions now obey the >=10-minute per-package provider
+#   interval even when pre-open uses force=True; force can no longer bypass it.
+# - The gate honors both last-submit and next-submit timestamps and reserves the
+#   provider slot before the background request starts, surviving NOMO restarts.
+# - A rejoin blocked only by provider cooldown still performs its original one
+#   exact-PID recovery without submitting the provider again for that generation.
+# - Post-open challenge probes use the same next-submit-aware cooldown check.
+# - Manual Solver Test remains an explicit manual action and is unchanged.
+#
 # V4.81.2 — EXOTIC KEY MANAGER STATUS UI
 # - Key Manager menu now shows Manager/Reader/Writer state separately.
 # - Writer readiness explicitly reports READY/BLOCKED/RATE-LIMITED/BUSY.
@@ -785,7 +795,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.2-exotic-key-manager-status-ui"
+__version__ = "V4.81.3-solver-hard-provider-gate"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -28298,6 +28308,29 @@ def _solver_probe_worker(package, tab, cookie, cfg_snapshot, place_id):
                 job["finished_at"] = now()
 
 
+def solver_provider_cooldown_left(rt_tab, cfg, at=None):
+    """Return seconds until this package may automatically hit the provider again."""
+    current = int(at or now())
+    min_submit = max(600, int(cfg.get("solver_min_resubmit_seconds", 600) or 600))
+    next_submit = int(rt_tab.get("solver_provider_next_submit_at", 0) or 0)
+    if next_submit > current:
+        return max(1, next_submit - current)
+    last_submit = int(rt_tab.get("solver_provider_last_submit_at", 0) or 0)
+    if last_submit > 0 and current - last_submit < min_submit:
+        return max(1, min_submit - (current - last_submit))
+    return 0
+
+
+def reserve_solver_provider_submit(rt_tab, cfg, submitted_at=None, status="SUBMITTED"):
+    """Persist an automatic provider slot before the background HTTP request starts."""
+    submitted = int(submitted_at or now())
+    min_submit = max(600, int(cfg.get("solver_min_resubmit_seconds", 600) or 600))
+    rt_tab["solver_provider_last_submit_at"] = submitted
+    rt_tab["solver_provider_next_submit_at"] = submitted + min_submit
+    rt_tab["solver_provider_last_status"] = str(status or "SUBMITTED")
+    return submitted
+
+
 def start_challenge_probe_job(tab, cfg, rt, rt_tab, probe_token=0, reason="wait-after-open no fresh state"):
     """Start one background provider check for one actual open generation.
 
@@ -28319,10 +28352,8 @@ def start_challenge_probe_job(tab, cfg, rt, rt_tab, probe_token=0, reason="wait-
         if previous_token == token:
             return False, "captcha already checked this rejoin"
 
-    min_submit = max(600, int(cfg.get("solver_min_resubmit_seconds", 600) or 600))
-    last_submit = int(rt_tab.get("solver_provider_last_submit_at", 0) or 0)
-    if last_submit > 0 and now() - last_submit < min_submit:
-        left = max(1, min_submit - (now() - last_submit))
+    left = solver_provider_cooldown_left(rt_tab, cfg)
+    if left > 0:
         # Mark this open generation as checked so the wait loop does not keep
         # asking every few seconds during the same rejoin.
         if token:
@@ -28449,6 +28480,13 @@ def start_solver_job(tab, cfg, rt, rt_tab, reason, force=False, phase="solve", o
             YELLOW,
         )
 
+    # V4.81.3: force=True means "run the pre-open solver path now"; it must never
+    # mean "ignore the provider's minimum interval". This is package-local, so a
+    # recent NokaA request never blocks NokaB.
+    provider_left = solver_provider_cooldown_left(rt_tab, cfg)
+    if provider_left > 0:
+        return False, f"provider cooldown {format_age(provider_left)}"
+
     place_id = solver_place_id_for_tab(tab, cfg)
     timeout = max(15, int(cfg.get("solver_timeout_seconds", 180) or 180))
     target = str(target_override or rt_tab.get("target", "") or ("hatcher" if (tab or {}).get("server_link") else "market"))
@@ -28471,11 +28509,15 @@ def start_solver_job(tab, cfg, rt, rt_tab, reason, force=False, phase="solve", o
         "timeout": timeout,
         "done": False,
         "ok": False,
+        "provider_probed": True,
         "response": None,
     }
     with _SOLVER_LOCK:
         _SOLVER_JOBS[pkg] = job
 
+    # Reserve and persist the provider slot before the thread starts. If NOMO or
+    # Termux dies while the request is in flight, restart still honors the gate.
+    reserve_solver_provider_submit(rt_tab, cfg, job["started_at"], status="SUBMITTED")
     rt_tab["solver_state"] = "running"
     rt_tab["solver_started_at"] = job["started_at"]
     rt_tab["solver_last_attempt"] = job["started_at"]
