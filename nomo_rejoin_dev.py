@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.42 — OPTION 6 FORCE-REOPEN SEMANTICS RESTORE
+# - Option 6 is again an explicit operator force-reopen: selected packages hard-reopen once regardless
+#   of healthy/Home/CAPTCHA/face-lock/manual-hold status, while still using exact-PID sibling safety.
+# - Market Option 6 stages the newest validated Market source first, then reopens the selected clone so
+#   AutoExec actually re-executes the staged/current Market script immediately.
+# - Manual Option 6 supersedes that package's old queued recovery/solver generation and clears stale
+#   auth/CAPTCHA holds; after the one hard open, the normal Option 1 Home/no-state recovery chain owns retries.
+# - The old 5-minute repeat restriction is replaced by a short accidental double-submit debounce only.
+#
 # V4.81.41 — MARKET SAFE REFRESH / MULTI-SOURCE LOADER GUARD
 # - Market Option 6 no longer hard-restarts a healthy Noka/App Cloner clone. It stages the
 #   latest validated Market source in Workspace and leaves the healthy Android task untouched.
@@ -1032,7 +1041,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.41-market-safe-refresh-multisource-loader-guard"
+__version__ = "V4.81.42-option6-force-reopen-semantics-restore"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -7883,18 +7892,43 @@ def manual_force_restart_tab(tab, rt_tab, cfg, target, reason, rt=None):
 
 
 
+def _option6_supersede_solver_job(package):
+    """Ignore any solver result that belongs to the screen/session being manually restarted."""
+    pkg = str(package or "")
+    if not pkg:
+        return False
+    try:
+        with _SOLVER_LOCK:
+            job = _SOLVER_JOBS.get(pkg)
+            if not job:
+                return False
+            job["superseded_by_manual_option6"] = True
+            job["superseded_at"] = now()
+            return True
+    except Exception:
+        return False
+
+
 def manual_restart_tabs_via_queue(
     cfg,
     tabs,
     target_for_tab,
     reason,
 ):
-    """Option 6 restart path using the same one-generation solver gate."""
+    """Explicit Option 6 force-reopen using the shared Option 1 recovery core.
+
+    Operator intent wins over health/CAPTCHA/face-lock/manual-hold state.  We
+    still preserve single-flight, exact-PID sibling verification, and the
+    normal post-open Option 1 recovery chain.
+    """
     rt = load_runtime()
     open_queue, core = make_rejoin_core(cfg, rt)
     tabs = list(tabs or [])
 
-    repeat_guard = max(60, int(cfg.get("option6_repeat_guard_seconds", 300) or 300))
+    # Only prevent an accidental double ENTER/click.  This is not a health or
+    # recovery cooldown: a deliberate Option 6 request after a few seconds is
+    # allowed even if the package is healthy, challenged, or manually held.
+    debounce = max(0, int(cfg.get("option6_double_submit_guard_seconds", 8) or 8))
     queued_count = 0
 
     for tab in tabs:
@@ -7905,53 +7939,74 @@ def manual_restart_tabs_via_queue(
         request_at = now()
         rt_tab["last_option6_request_at"] = request_at
         rt_tab["last_option6_request_reason"] = str(reason or "")
-        last_option6 = int(rt_tab.get("last_option6_restart_at", 0) or 0)
-        if last_option6 > 0 and request_at - last_option6 < repeat_guard:
-            remain = max(1, repeat_guard - (request_at - last_option6))
-            rt_tab["last_option6_request_result"] = "blocked_repeat"
-            rt_tab["last_option6_request_detail"] = f"repeat guard {format_age(remain)}"
-            rt_tab["note"] = f"Option 6 repeat blocked {format_age(remain)}"
+
+        last_request = int(rt_tab.get("last_option6_force_request_at", 0) or 0)
+        if debounce > 0 and last_request > 0 and request_at - last_request < debounce:
+            remain = max(1, debounce - (request_at - last_request))
+            rt_tab["last_option6_request_result"] = "blocked_double_submit"
+            rt_tab["last_option6_request_detail"] = f"double-submit guard {remain}s"
+            rt_tab["note"] = f"Option 6 double-submit blocked {remain}s"
             print(col(
-                f"  {short_pkg(pkg):<10} BLOCKED - repeat guard {format_age(remain)}",
+                f"  {short_pkg(pkg):<10} BLOCKED - accidental double-submit {remain}s",
                 YELLOW,
             ))
-            log_activity(
-                f"Option 6 repeat blocked for App Cloner safety; retry in {format_age(remain)}",
-                pkg,
-                YELLOW,
-            )
             continue
+
+        rt_tab["last_option6_force_request_at"] = request_at
+
         target = (
             target_for_tab(tab, rt)
             if callable(target_for_tab)
             else str(target_for_tab or "market")
         )
-        # V4.81.37: Option 6 may still make the one explicit manual hard
-        # restart requested by the user, but after that it must behave exactly
-        # like the normal Option 1 recovery chain.  In particular, DO NOT set
-        # no_hard_fallback here: that flag also suppresses the safe route-retry
-        # stages and forces the user to press Option 6 again, creating another
-        # App-Cloner hard launch.
-        #
-        # Reset only the current Home/join-failure generation so a previous
-        # failed cycle cannot make this new manual request jump straight to a
-        # second hard fallback.  The core owns all later route/hard escalation.
+
+        # Option 6 is an explicit operator override.  Remove only this package's
+        # older recovery generation and ignore any solver result for the screen
+        # we are about to destroy.  Never touch sibling packages.
+        core.cancel(pkg)
+        _option6_supersede_solver_job(pkg)
+        try:
+            clear_hold(pkg)
+        except Exception:
+            pass
+        try:
+            clear_manual_login_block(rt_tab)
+        except Exception:
+            pass
+        try:
+            clear_captcha_ui_runtime(rt_tab)
+        except Exception:
+            pass
+
+        # A manual force request must not be cancelled because the package is
+        # healthy or because API/solver preflight sees the old challenge.  After
+        # this one hard open, normal Option 1 post-open detection/recovery resumes.
         rt_tab["homepage_join_fail_count"] = 0
         rt_tab["homepage_hard_retries"] = 0
-        rt_tab["last_option6_recovery_chain"] = "option1"
+        rt_tab["last_option6_recovery_chain"] = "option1_after_forced_open"
         added, note = core.queue_hard_retry(
             tab,
             target,
             reason,
             metadata={
                 "manual_option6": True,
+                "manual_option6_force_override": True,
                 "option6_normal_recovery_chain": True,
+                "bypass_api_precheck": True,
+                "skip_solver_once": True,
+                "skip_solver_probe": True,
+                "solver_preflight_done": True,
+                "bypass_recheck": True,
             },
         )
         if added:
             queued_count += 1
-            rt_tab["last_option6_request_result"] = "queued"
+            rt_tab["last_option6_request_result"] = "queued_force"
             rt_tab["last_option6_request_detail"] = str(target or "")
+            print(col(
+                f"  {short_pkg(pkg):<10} FORCE REOPEN QUEUED -> {target}",
+                CYAN,
+            ))
         else:
             rt_tab["last_option6_request_result"] = "queue_skipped"
             rt_tab["last_option6_request_detail"] = str(note or "")
@@ -7959,11 +8014,6 @@ def manual_restart_tabs_via_queue(
                 f"  {short_pkg(pkg):<10} NO ATTEMPT - {cut(note, 60)}",
                 YELLOW,
             ))
-            log_activity(
-                f"manual restart queue skipped: {note}",
-                pkg,
-                YELLOW,
-            )
 
     if queued_count <= 0:
         save_runtime(rt)
@@ -7975,7 +8025,6 @@ def manual_restart_tabs_via_queue(
 
     save_runtime(rt)
     return True
-
 
 
 def nudge_option6_routes(cfg, tabs, target_for_tab, label="tabs"):
@@ -8010,7 +8059,7 @@ def verify_option6_open_results(cfg, tabs, label="tabs"):
         request_detail = str(rt_tab.get("last_option6_request_detail", "") or "")
         recent_request = request_at > 0 and now() - request_at <= 180
 
-        if recent_request and request_result == "blocked_repeat":
+        if recent_request and request_result in {"blocked_repeat", "blocked_double_submit"}:
             print(f"  {short_pkg(pkg):<10} {col('BLOCKED - ' + cut(request_detail, 58), YELLOW)}")
             continue
         if recent_request and request_result == "queue_skipped":
@@ -8234,12 +8283,11 @@ def _market_option6_healthy_noka(tab, cfg):
 
 
 def open_all_tabs_once(cfg, selected_packages=None):
-    """Market Option 6: safe refresh + Option-1 recovery only for unhealthy targets.
+    """Market Option 6: stage newest source, then force-reopen selected package(s).
 
-    Healthy Noka/App Cloner packages are deliberately not hard-restarted because
-    real-device tests showed that force-refreshing one live floating clone can
-    make sibling clone tasks disappear. We still stage the newest Market source
-    so the next normal/natural rejoin activates it.
+    Unlike V4.81.41, a healthy Market clone is not left running.  Option 6 is
+    explicit operator intent to restart the selected Roblox package now so
+    AutoExec re-executes the current/staged Market script.
     """
     wanted = set(selected_packages or [])
     enabled_tabs = [
@@ -8254,13 +8302,13 @@ def open_all_tabs_once(cfg, selected_packages=None):
         return
 
     clear()
-    banner("OPTION 6: SAFE MARKET REFRESH", cfg)
+    banner("OPTION 6: FORCE REOPEN + MARKET REFRESH", cfg)
     print(col(
-        "Market Option 6 stages the newest script first. Healthy Noka clones are NOT force-restarted.",
+        "Selected package(s) WILL be hard-reopened once regardless of current status.",
         CYAN,
     ))
     print(col(
-        "Dead/Home/stale targets use the normal Option 1 recovery chain. Cache cleanup is skipped for App Cloner safety.",
+        "Latest Market source is staged first; then the normal Option 1 recovery chain handles Home/no-state.",
         DIM,
     ))
     print("")
@@ -8271,72 +8319,34 @@ def open_all_tabs_once(cfg, selected_packages=None):
     else:
         print(col(f"Market candidate: FAILED ({cut(staged_note, 120)})", YELLOW))
 
-    restart_tabs = []
-    skipped_healthy = []
-    rt = load_runtime()
-
-    for tab in enabled_tabs:
-        pkg = str(tab.get("package") or "")
-        if not pkg:
-            continue
-
-        if _is_noka_clone_package(pkg):
-            healthy, detail = _market_option6_healthy_noka(tab, cfg)
-            if healthy:
-                rt_tab = get_runtime_tab(rt, pkg)
-                rt_tab["last_option6_request_at"] = now()
-                rt_tab["last_option6_request_reason"] = "safe market refresh"
-                rt_tab["last_option6_request_result"] = "staged_healthy"
-                rt_tab["last_option6_request_detail"] = staged_version or "candidate staged"
-                rt_tab["note"] = (
-                    f"Market {staged_version or 'candidate'} staged; "
-                    "healthy Noka left running"
-                )
-                skipped_healthy.append(tab)
-                print(
-                    f"  {short_pkg(pkg):<10} "
-                    + col("SAFE REFRESH STAGED - healthy Noka left running", GREEN)
-                )
-                continue
-            print(
-                f"  {short_pkg(pkg):<10} "
-                + col("RECOVERY NEEDED - " + cut(detail, 70), YELLOW)
-            )
-
-        restart_tabs.append(tab)
-
-    save_runtime(rt)
-
-    if skipped_healthy:
-        print("")
-        print(col(
-            "Healthy Noka clone(s) were not Android-restarted. The staged Market version activates on their next normal rejoin.",
-            CYAN,
-        ))
-
-    if not restart_tabs:
-        print(col("No unsafe/failed Market target needs Android recovery.", GREEN))
-        pause()
-        return
-
-    print("")
-    print(col(
-        "Unhealthy target(s) now enter the same Option 1 recovery queue.",
-        CYAN,
-    ))
+    run_startup_cache_cleanup(
+        cfg,
+        selected_packages=[str(tab.get("package") or "") for tab in enabled_tabs],
+        reason="Option 6 Market force restart",
+        show_screen=False,
+        setting_key="clear_cache_before_option6_restart",
+        screen_title="OPTION 6: CACHE CLEANUP",
+    )
 
     def target_for_tab(tab, runtime):
         rt_tab = get_runtime_tab(runtime, tab.get("package"))
         return str(rt_tab.get("target", "market") or "market")
 
-    manual_restart_tabs_via_queue(
+    print("")
+    print(col(
+        "Force-reopening selected Market target(s) through the shared Option 1 recovery core.",
+        CYAN,
+    ))
+
+    ok = manual_restart_tabs_via_queue(
         cfg,
-        restart_tabs,
+        enabled_tabs,
         target_for_tab,
-        "manual safe market recovery",
+        "manual market force restart",
     )
-    verify_option6_open_results(cfg, restart_tabs, "market recovery target(s)")
+    verify_option6_open_results(cfg, enabled_tabs, "market tab(s)")
     pause()
+    return bool(ok)
 
 
 def show_config_value(key, value):
@@ -14926,6 +14936,7 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
         item.get("auth_result_recovery")
         or item.get("solver_recovery")
         or item.get("manual_auth_open")
+        or item.get("manual_option6_force_override")
     ):
         rt_tab["note"] = manual_note
         core.save()
@@ -31597,6 +31608,13 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
     min_submit = max(600, int(cfg.get("solver_min_resubmit_seconds", 600) or 600))
     for pkg, job in completed:
         rt_tab = get_runtime_tab(rt, pkg)
+        if job.get("superseded_by_manual_option6"):
+            rt_tab["solver_state"] = "superseded"
+            rt_tab["solver_last_error"] = ""
+            rt_tab["note"] = "solver result ignored after manual Option 6 force reopen"
+            log_activity("solver result ignored; superseded by manual Option 6 force reopen", pkg, DIM)
+            changed = True
+            continue
         tab = dict(job.get("tab") or {"package": pkg})
         target = str(job.get("target", "market") or "market")
         response = job.get("response")
