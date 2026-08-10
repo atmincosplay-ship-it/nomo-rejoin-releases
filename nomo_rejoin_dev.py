@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.20 — COOKIE + LUA CACHE DURABILITY
+# - cookie_cache.json now uses lock-protected read/merge/write + last-good recovery, so concurrent
+#   solver/private-server/cookie-tool updates cannot erase another package's cached cookie.
+# - Pet Counter AutoExec uses a per-UID last-good Lua cache and promotes GitHub source only after
+#   successful compile/startup; legacy shared cache remains a one-time compatibility fallback.
+# - Booster AutoExec gets the same per-UID validated last-good behavior. Known old NOMO counter/
+#   booster loaders auto-upgrade safely, with backups stored outside executor AutoExec.
+#
 # V4.81.19 — CRITICAL LOCAL STATE DURABILITY
-# - captcha_hold.json is now lock-protected, atomic, and backed by captcha_hold.json.last_good.
-#   Concurrent solver failures cannot overwrite another package's cooldown; unreadable primary+backup
-#   fails closed so automatic provider calls stay blocked until the hold file is explicitly cleared.
-# - exotic_key_state.json now has last-good recovery. Writer mode fails closed when both copies are
-#   unreadable, preventing an accidental replacement-key generation from corrupted local state.
-# - delta_key_runtime.json now has last-good recovery. Automatic Delta renewal/restart actions pause
-#   when both copies are unreadable instead of treating lost runtime state as a fresh/expired device.
+# - captcha_hold.json is lock-protected, atomic, and backed by captcha_hold.json.last_good.
+# - exotic_key_state.json and delta_key_runtime.json use last-good recovery and fail closed when
+#   both copies are unreadable.
 #
 # V4.81.18 — EXOTIC WRITER / LAST-GOOD CACHE GUARD
 # - Writer devices periodically verify the cloud key against their local authoritative key.
@@ -916,7 +920,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.19-critical-local-state-durability"
+__version__ = "V4.81.20-cookie-lua-cache-durability"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -2819,6 +2823,46 @@ def _protected_json_clear(path):
             "status": "missing", "error": "", "at": int(time.time())
         }
 
+
+
+# V4.81.20: cookie_cache.json is touched by solver threads, private-server tools,
+# and cookie import/export. Protect the whole read->merge->write operation so one
+# package refresh cannot erase another package's cookie entry.
+def _cookie_cache_read():
+    data = _protected_json_read_dict(COOKIE_CACHE, {})
+    return dict(data) if isinstance(data, dict) else {}
+
+
+def _cookie_cache_merge_entries(entries):
+    """Merge package entries into the freshest on-disk cache under one lock."""
+    if not isinstance(entries, dict):
+        return False
+    lock = _protected_json_lock(COOKIE_CACHE)
+    with lock:
+        cache = _protected_json_read_dict(COOKIE_CACHE, {})
+        health = _protected_json_health(COOKIE_CACHE)
+        if health.get("status") == "corrupt":
+            return False
+        cache = dict(cache) if isinstance(cache, dict) else {}
+        for pkg, value in entries.items():
+            pkg = str(pkg or "").strip()
+            if not pkg:
+                continue
+            if isinstance(value, dict):
+                current = cache.get(pkg) if isinstance(cache.get(pkg), dict) else {}
+                current = dict(current)
+                current.update(value)
+                cache[pkg] = current
+            else:
+                cache[pkg] = value
+        return _protected_json_write_dict(COOKIE_CACHE, cache)
+
+
+def _cookie_cache_update_entry(pkg, updates):
+    pkg = str(pkg or "").strip()
+    if not pkg or not isinstance(updates, dict):
+        return False
+    return _cookie_cache_merge_entries({pkg: dict(updates)})
 
 
 NOMO_CONFIG_MIGRATION_VERSION = 4681
@@ -11927,15 +11971,9 @@ def maybe_open_manual_auth_package(tab, cfg, rt_tab, reason="manual auth"):
 
 
 def cached_cookie_for_package(pkg):
-    if not COOKIE_CACHE.exists():
-        return ""
-    try:
-        with open(COOKIE_CACHE) as f:
-            cache = json.load(f)
-        ent = cache.get(pkg, {}) if isinstance(cache, dict) else {}
-        return str(ent.get("cookie", "") or "").strip()
-    except Exception:
-        return ""
+    cache = _cookie_cache_read()
+    ent = cache.get(pkg, {}) if isinstance(cache, dict) else {}
+    return str(ent.get("cookie", "") or "").strip()
 
 
 def refresh_cached_cookie_for_package(pkg):
@@ -11966,11 +12004,8 @@ def refresh_cached_cookie_for_package(pkg):
     except Exception:
         pass
     cache[pkg] = ent
-    try:
-        with open(COOKIE_CACHE, "w", encoding="utf-8") as f:
-            json.dump(cache, f, indent=2)
-    except Exception as exc:
-        return cookie, f"cookie refreshed but cache save failed: {exc}"
+    if not _cookie_cache_merge_entries({pkg: ent}):
+        return cookie, "cookie refreshed but protected cache save was blocked"
     return cookie, "cookie refreshed"
 
 
@@ -25806,6 +25841,61 @@ def upgrade_known_nomo_market_loader_once(cfg):
     return changed
 
 
+def upgrade_known_nomo_aux_loaders_once(cfg):
+    """Upgrade known NOMO Pet Counter / Booster loaders in-place.
+
+    Existing global Arceus AutoExec files do not automatically change when the
+    Python generator changes. Keep this narrow to exact NOMO filenames+markers
+    and use the external-backup writer so AutoExec never accumulates .bak files.
+    """
+    specs = [
+        (
+            AUTOEXEC_PET_COUNTER_FILE,
+            "-- NOMO Pet Counter updater/loader",
+            r"-- NOMO Pet Counter loader revision (\d+)",
+            2,
+            pet_counter_autoexec_source,
+            "pet-counter",
+        ),
+        (
+            AUTOEXEC_BOOSTER_PROBE_FILE,
+            "-- NOMO Booster scanner updater/loader",
+            r"-- NOMO Booster loader revision (\d+)",
+            2,
+            booster_probe_autoexec_source,
+            "booster",
+        ),
+    ]
+    changed = 0
+    seen = set()
+    for tab in autoexec_tabs(cfg):
+        for filename, marker_text, rev_pattern, target_revision, source_fn, tag in specs:
+            for path in autoexec_paths_for_tab(tab, "1", filename=filename):
+                key = str(path)
+                if key in seen:
+                    continue
+                seen.add(key)
+                try:
+                    if not path.exists():
+                        continue
+                    old = path.read_text(encoding="utf-8", errors="ignore")
+                    if marker_text not in old:
+                        continue
+                    match = re.search(rev_pattern, old)
+                    old_revision = int(match.group(1)) if match else 0
+                    if old_revision >= target_revision:
+                        continue
+                    _write_nomo_autoexec_text(
+                        path,
+                        source_fn(),
+                        backup_tag=f"pre-{tag}-rev{target_revision}",
+                    )
+                    changed += 1
+                except Exception:
+                    continue
+    return changed
+
+
 MARKET_LOADER_AUTOEXEC_TEMPLATE = r'''-- NOMO Market / GAG loader
 -- NOMO Market loader revision 6
 if not game:IsLoaded() then
@@ -26423,145 +26513,38 @@ def _lua_long_string(text):
 
 
 def pet_counter_autoexec_source():
-    """Build GitHub-latest -> cache -> embedded-v4.0 AutoExec loader."""
+    """Build remote -> per-UID last-good -> embedded AutoExec loader.
+
+    V4.81.20 only promotes a remote counter to cache after it compiles and its
+    startup chunk returns successfully. Global Arceus workspaces therefore no
+    longer make four accounts race on one shared cache file.
+    """
     remote_url = json.dumps(NOMO_PET_COUNTER_URL)
     embedded = _lua_long_string(PET_COUNTER_FALLBACK_TEMPLATE)
 
     return f'''-- NOMO Pet Counter updater/loader
--- Priority: GitHub latest -> local cache -> embedded stable v3.9 fallback
+-- NOMO Pet Counter loader revision 2
+-- Priority: GitHub latest -> per-UID last-good -> legacy cache -> embedded stable v3.9
 
+local Players = game:GetService(\"Players\")
+local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
 local COUNTER_URL = {remote_url}
-local CACHE_FOLDER = "nomo_rejoiner"
-local CACHE_FILE = CACHE_FOLDER .. "/nomo_pet_counter_cache.lua"
+local CACHE_FOLDER = \"nomo_rejoiner\"
+local CACHE_FILE = CACHE_FOLDER .. \"/nomo_pet_counter_cache_\" .. tostring(LocalPlayer.UserId or \"unknown\") .. \".lua\"
+local LEGACY_CACHE_FILE = CACHE_FOLDER .. \"/nomo_pet_counter_cache.lua\"
 local EMBEDDED_FALLBACK = {embedded}
 
 local function validCounterSource(text)
-    return type(text) == "string"
+    return type(text) == \"string\"
         and #text > 1000
-        and string.find(text, "NOMO PET COUNTER", 1, true) ~= nil
-        and string.find(text, "NOMO_PET_COUNTER", 1, true) ~= nil
+        and string.find(text, \"NOMO PET COUNTER\", 1, true) ~= nil
+        and string.find(text, \"NOMO_PET_COUNTER\", 1, true) ~= nil
 end
 
 local function ensureCacheFolder()
-    if type(makefolder) ~= "function" then
-        return
-    end
-
+    if type(makefolder) ~= \"function\" then return end
     pcall(function()
-        if type(isfolder) == "function" then
-            if not isfolder(CACHE_FOLDER) then
-                makefolder(CACHE_FOLDER)
-            end
-        else
-            makefolder(CACHE_FOLDER)
-        end
-    end)
-end
-
-local function saveCache(text)
-    if type(writefile) ~= "function" or not validCounterSource(text) then
-        return
-    end
-
-    ensureCacheFolder()
-    pcall(function()
-        writefile(CACHE_FILE, text)
-    end)
-end
-
-local function readCache()
-    if type(readfile) ~= "function" then
-        return nil
-    end
-
-    local ok, text = pcall(function()
-        if type(isfile) == "function" and not isfile(CACHE_FILE) then
-            return nil
-        end
-        return readfile(CACHE_FILE)
-    end)
-
-    if ok and validCounterSource(text) then
-        return text
-    end
-    return nil
-end
-
-local selectedSource = nil
-local selectedName = ""
-
-local remoteOk, remoteText = pcall(function()
-    return game:HttpGet(COUNTER_URL, true)
-end)
-
-if remoteOk and validCounterSource(remoteText) then
-    selectedSource = remoteText
-    selectedName = "github"
-    saveCache(remoteText)
-end
-
-if not selectedSource then
-    local cached = readCache()
-    if cached then
-        selectedSource = cached
-        selectedName = "cache"
-    end
-end
-
-if not selectedSource then
-    selectedSource = EMBEDDED_FALLBACK
-    selectedName = "embedded-v4.0"
-end
-
-local chunk, compileError = loadstring(selectedSource)
-if not chunk and selectedName ~= "embedded-v4.0" then
-    warn("[NOMO COUNTER LOADER] " .. selectedName
-        .. " compile failed; using embedded v4.0:", tostring(compileError))
-    selectedSource = EMBEDDED_FALLBACK
-    selectedName = "embedded-v4.0"
-    chunk, compileError = loadstring(selectedSource)
-end
-
-if not chunk then
-    warn("[NOMO COUNTER LOADER] unable to compile counter:", tostring(compileError))
-    return
-end
-
-print("[NOMO COUNTER LOADER] source = " .. selectedName)
-local runOk, runError = pcall(chunk)
-if not runOk then
-    warn("[NOMO COUNTER LOADER] runtime error:", tostring(runError))
-end
-'''
-
-BOOSTER_PROBE_FALLBACK_TEMPLATE = '--========================================================--\n--                  NOMO BOOSTER PROBE\n--             v0.1.1 PETDATA CONTAINER FIX\n--========================================================--\n-- PURPOSE:\n--   Validate the real Grow a Garden pet schema before Booster mode is merged\n--   into NOMO REJOIN or the stable v3.9 pet counter.\n--\n-- SAFETY:\n--   - Does not teleport or rejoin.\n--   - Does not call Cloudflare or any web endpoint.\n--   - Does not modify <username>_state.json.\n--   - Does not stop/replace NOMO PET COUNTER.\n--   - Reads DataService once every 10 seconds by default.\n--\n-- OUTPUT:\n--   nomo_rejoiner/<username>_booster_probe.json\n--\n-- VALUABLE RULE:\n--   age >= 500\n--   OR\n--   truncated age-1 base weight >= 6.00 kg\n--\n-- AGE-1 BASE WEIGHT:\n--   BaseWeight is treated as age-0.\n--   age1 = BaseWeight * 1.1\n--   displayed/compared after truncating to two decimals, never rounding up.\n--========================================================--\n\nlocal Players = game:GetService("Players")\nlocal HttpService = game:GetService("HttpService")\nlocal ReplicatedStorage = game:GetService("ReplicatedStorage")\n\nlocal LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()\n\n-- Stop only an older Booster probe. The normal NOMO counter is untouched.\ndo\n    local old = getgenv().NOMO_BOOSTER_PROBE\n    if type(old) == "table" then\n        old.Enabled = false\n        old.Stop = true\n    end\n    task.wait(0.25)\nend\n\ngetgenv().NOMO_BOOSTER_PROBE = getgenv().NOMO_BOOSTER_PROBE or {}\nlocal Config = getgenv().NOMO_BOOSTER_PROBE\n\nConfig.Enabled = true\nConfig.Stop = false\nConfig.Version = "v0.1-phase1-safe"\nConfig.Revision = "v0.1.1-petdata-container-fix"\n\nConfig.WriteFolder = Config.WriteFolder or "nomo_rejoiner"\nConfig.ScanEvery = math.max(5, tonumber(Config.ScanEvery or 10) or 10)\nConfig.MinAge = math.max(0, tonumber(Config.MinAge or 500) or 500)\nConfig.MinAge1BaseWeightKg = math.max(\n    0,\n    tonumber(Config.MinAge1BaseWeightKg or 6.00) or 6.00\n)\nConfig.MaxValuablePets = math.max(\n    1,\n    math.floor(tonumber(Config.MaxValuablePets or 250) or 250)\n)\nConfig.MaxSamplePets = math.max(\n    1,\n    math.floor(tonumber(Config.MaxSamplePets or 12) or 12)\n)\nConfig.MaxObservedKeys = math.max(\n    10,\n    math.floor(tonumber(Config.MaxObservedKeys or 100) or 100)\n)\nConfig.ExpectedPlaceId = tonumber(\n    Config.ExpectedPlaceId or 126884695634066\n) or 126884695634066\nConfig.OnlyScanExpectedPlace = Config.OnlyScanExpectedPlace ~= false\nConfig.Debug = Config.Debug == true\n\n-- Optional username allow-list:\n--   getgenv().NOMO_BOOSTER_PROBE.AllowedUsernames = {\n--       ["nomoboost1"] = true,\n--   }\n-- Empty/nil means all usernames on the test device.\nif type(Config.AllowedUsernames) ~= "table" then\n    Config.AllowedUsernames = {}\nend\n\nlocal function sanitizeName(value)\n    value = tostring(value or "")\n    value = string.gsub(value, "[^%w_]", "_")\n    if value == "" then\n        value = "unknown"\n    end\n    return value\nend\n\nlocal safeUser = sanitizeName(LocalPlayer.Name)\nConfig.WriteFile = Config.WriteFile\n    or (Config.WriteFolder .. "/" .. safeUser .. "_booster_probe.json")\n\nlocal function usernameAllowed()\n    if next(Config.AllowedUsernames) == nil then\n        return true\n    end\n    return Config.AllowedUsernames[LocalPlayer.Name] == true\nend\n\nlocal function safeMakeFolder(folder)\n    if type(writefile) ~= "function" then\n        return false, "writefile unavailable"\n    end\n\n    pcall(function()\n        if type(isfolder) == "function" then\n            if not isfolder(folder) and type(makefolder) == "function" then\n                makefolder(folder)\n            end\n        elseif type(makefolder) == "function" then\n            makefolder(folder)\n        end\n    end)\n\n    return true\nend\n\nlocal function safeWrite(path, text)\n    if type(writefile) ~= "function" then\n        return false, "writefile unavailable"\n    end\n\n    local tmp = path .. ".tmp"\n    local ok, err = pcall(function()\n        writefile(tmp, text)\n    end)\n\n    if not ok then\n        local directOk, directErr = pcall(function()\n            writefile(path, text)\n        end)\n        return directOk, directOk and nil or tostring(directErr or err)\n    end\n\n    local copied = pcall(function()\n        local content = readfile(tmp)\n        writefile(path, content)\n    end)\n\n    pcall(function()\n        if type(delfile) == "function" then\n            delfile(tmp)\n        end\n    end)\n\n    if not copied then\n        return false, "atomic copy failed"\n    end\n    return true\nend\n\nlocal MIN_VALID_EPOCH = 1600000000\n\nlocal function realEpoch()\n    local ok1, value1 = pcall(os.time)\n    if ok1 and type(value1) == "number" and value1 >= MIN_VALID_EPOCH then\n        return math.floor(value1)\n    end\n\n    local ok2, value2 = pcall(function()\n        return DateTime.now().UnixTimestamp\n    end)\n    if ok2 and type(value2) == "number" and value2 >= MIN_VALID_EPOCH then\n        return math.floor(value2)\n    end\n\n    local ok3, value3 = pcall(tick)\n    if ok3 and type(value3) == "number" and value3 >= MIN_VALID_EPOCH then\n        return math.floor(value3)\n    end\n\n    local ok4, value4 = pcall(function()\n        return workspace:GetServerTimeNow()\n    end)\n    if ok4 and type(value4) == "number" and value4 >= MIN_VALID_EPOCH then\n        return math.floor(value4)\n    end\n\n    return nil\nend\n\nlocal epochAnchor = realEpoch()\nlocal clockAnchor = os.clock()\n\nlocal function now()\n    local current = realEpoch()\n    if current then\n        epochAnchor = current\n        clockAnchor = os.clock()\n        return current\n    end\n\n    if epochAnchor then\n        return math.floor(\n            epochAnchor + math.max(0, os.clock() - clockAnchor)\n        )\n    end\n\n    return math.floor(MIN_VALID_EPOCH + os.clock())\nend\n\nlocal function toNumber(value)\n    local number = tonumber(value)\n    if type(number) ~= "number" then\n        return nil\n    end\n    if number ~= number or number == math.huge or number == -math.huge then\n        return nil\n    end\n    return number\nend\n\nlocal function truncateTwo(value)\n    value = toNumber(value)\n    if not value then\n        return nil\n    end\n    return math.floor(value * 100) / 100\nend\n\nlocal function firstValue(containers, names)\n    for _, item in ipairs(containers) do\n        local container = item\n        local path = ""\n\n        if type(item) == "table" and item.Value ~= nil then\n            container = item.Value\n            path = tostring(item.Path or "")\n        end\n\n        if type(container) == "table" then\n            for _, name in ipairs(names) do\n                local value = container[name]\n                if value ~= nil then\n                    local field = tostring(name)\n                    if path ~= "" then\n                        field = path .. "." .. field\n                    end\n                    return value, field\n                end\n            end\n        end\n    end\n    return nil, ""\nend\n\nlocal function entryContainers(entry)\n    if type(entry) ~= "table" then\n        return {}\n    end\n\n    -- Never create a sparse array here. ipairs() stops at the first nil.\n    local containers = {}\n\n    local function add(value, path)\n        if type(value) == "table" then\n            table.insert(containers, {\n                Value = value,\n                Path = tostring(path or ""),\n            })\n        end\n    end\n\n    add(entry, "")\n    add(entry.PetData, "PetData")\n    add(entry.Data, "Data")\n    add(entry.Properties, "Properties")\n    add(entry.Info, "Info")\n\n    return containers\nend\n\nlocal function scalarKeyList(entry, output, prefix)\n    if type(entry) ~= "table" then\n        return\n    end\n\n    prefix = tostring(prefix or "")\n\n    for key, value in pairs(entry) do\n        if type(key) == "string" then\n            local valueType = type(value)\n            if valueType ~= "function"\n                and valueType ~= "thread"\n                and valueType ~= "userdata" then\n                local observed = key\n                if prefix ~= "" then\n                    observed = prefix .. "." .. key\n                end\n                output[observed] = true\n            end\n        end\n    end\nend\n\nlocal function countTable(value)\n    local count = 0\n    if type(value) == "table" then\n        for _ in pairs(value) do\n            count += 1\n        end\n    end\n    return count\nend\n\nlocal function cleanString(value)\n    if value == nil then\n        return ""\n    end\n    return tostring(value)\nend\n\nlocal function collectTextValues(value, output, depth)\n    output = output or {}\n    depth = depth or 0\n\n    if depth > 3 then\n        return output\n    end\n\n    if type(value) == "string" then\n        local text = tostring(value)\n        text = string.gsub(text, "^%s+", "")\n        text = string.gsub(text, "%s+$", "")\n\n        if text ~= ""\n            and text ~= "Normal"\n            and text ~= "None"\n            and text ~= "Unknown" then\n            output[text] = true\n        end\n    elseif type(value) == "table" then\n        for key, item in pairs(value) do\n            if type(item) == "string" then\n                collectTextValues(item, output, depth + 1)\n            elseif item == true and tostring(key or "") ~= "" then\n                collectTextValues(tostring(key), output, depth + 1)\n            elseif type(item) == "table" then\n                collectTextValues(item, output, depth + 1)\n            end\n        end\n    end\n\n    return output\nend\n\nlocal function mutationInfo(entry)\n    local pd = type(entry.PetData) == "table"\n        and entry.PetData\n        or {}\n\n    local mutationMap = {}\n    local sources = {\n        {"MutationType", entry.MutationType},\n        {"Mutation", entry.Mutation},\n        {"Mutations", entry.Mutations},\n        {"MutationData", entry.MutationData},\n        {"AppliedMutations", entry.AppliedMutations},\n        {"ActiveMutations", entry.ActiveMutations},\n        {"PetData.MutationType", pd.MutationType},\n        {"PetData.Mutation", pd.Mutation},\n        {"PetData.Mutations", pd.Mutations},\n        {"PetData.MutationData", pd.MutationData},\n        {"PetData.AppliedMutations", pd.AppliedMutations},\n        {"PetData.ActiveMutations", pd.ActiveMutations},\n    }\n\n    local sourceField = ""\n    for _, item in ipairs(sources) do\n        if item[2] ~= nil and sourceField == "" then\n            sourceField = item[1]\n        end\n        collectTextValues(item[2], mutationMap, 0)\n    end\n\n    for _, key in ipairs({"Rainbow", "Gold", "Golden", "Shiny"}) do\n        if entry[key] == true or pd[key] == true then\n            mutationMap[key] = true\n            if sourceField == "" then\n                sourceField = entry[key] == true\n                    and key\n                    or ("PetData." .. key)\n            end\n        end\n    end\n\n    local names = {}\n    for name in pairs(mutationMap) do\n        table.insert(names, tostring(name))\n    end\n    table.sort(names)\n\n    if #names == 0 then\n        return "Normal", {}, (\n            sourceField ~= ""\n            and sourceField\n            or "default:Normal"\n        )\n    end\n\n    return table.concat(names, ", "), names, sourceField\nend\n\nlocal function parsePet(uuidKey, entry, observedKeys)\n    if type(entry) ~= "table" then\n        return nil, "entry_not_table"\n    end\n\n    scalarKeyList(entry, observedKeys, "")\n    scalarKeyList(entry.PetData, observedKeys, "PetData")\n    scalarKeyList(entry.Data, observedKeys, "Data")\n    scalarKeyList(entry.Properties, observedKeys, "Properties")\n    scalarKeyList(entry.Info, observedKeys, "Info")\n\n    local containers = entryContainers(entry)\n\n    local uuidValue = firstValue(\n        containers,\n        {"UUID", "Uuid", "uuid", "PetUUID", "PET_UUID", "Id", "ID"}\n    )\n    local nameValue, nameField = firstValue(\n        containers,\n        {"PetType", "PetName", "Name", "Type", "Species"}\n    )\n    local ageValue, ageField = firstValue(\n        containers,\n        {"Level", "Age", "PetAge"}\n    )\n    local baseWeightValue, baseWeightField = firstValue(\n        containers,\n        {\n            "BaseWeight",\n            "BaseWeightKg",\n            "BaseWeightKG",\n            "BaseWeight_kg",\n            "BaseWeightInKg",\n        }\n    )\n    local hatchedFromValue = firstValue(\n        containers,\n        {"HatchedFrom", "EggType", "SourceEgg"}\n    )\n    local favoriteValue = firstValue(\n        containers,\n        {"IsFavorite", "Favorite", "Favorited"}\n    )\n    local boostsValue = firstValue(\n        containers,\n        {"Boosts", "PetBoosts"}\n    )\n\n    local mutationText, mutationList, mutationField = mutationInfo(entry)\n\n    local uuid = cleanString(uuidValue)\n    if uuid == "" then\n        uuid = cleanString(uuidKey)\n    end\n\n    local name = cleanString(nameValue)\n    local age = toNumber(ageValue)\n    local rawBaseWeightAge0 = toNumber(baseWeightValue)\n\n    local baseWeightAge0 = nil\n    local baseWeightAge1 = nil\n\n    if rawBaseWeightAge0 then\n        baseWeightAge0 = truncateTwo(rawBaseWeightAge0)\n        baseWeightAge1 = truncateTwo(rawBaseWeightAge0 * 1.1)\n    end\n\n    local reasons = {}\n    if age and age >= Config.MinAge then\n        table.insert(reasons, "age")\n    end\n    if baseWeightAge1\n        and baseWeightAge1 >= Config.MinAge1BaseWeightKg then\n        table.insert(reasons, "weight")\n    end\n\n    return {\n        uuid = uuid,\n        name = name,\n        age = age,\n        base_weight_age0_kg = baseWeightAge0,\n        base_weight_age1_kg = baseWeightAge1,\n        mutation = mutationText,\n        mutations = mutationList,\n        hatched_from = cleanString(hatchedFromValue),\n        is_favorite = favoriteValue == true,\n        boost_count = countTable(boostsValue),\n        valuable = #reasons > 0,\n        valuable_reasons = reasons,\n\n        parsed_fields = {\n            name = nameField,\n            age = ageField,\n            base_weight = baseWeightField,\n            mutation = mutationField,\n        },\n    }, nil\nend\n\nlocal DataService = nil\nlocal function getDataService()\n    if DataService then\n        return DataService\n    end\n\n    local ok, result = pcall(function()\n        local modules = ReplicatedStorage:WaitForChild("Modules", 20)\n        local module = modules and modules:WaitForChild("DataService", 10)\n        return module and require(module)\n    end)\n\n    if ok and result then\n        DataService = result\n        return DataService\n    end\n\n    return nil\nend\n\nlocal function getPetInventory()\n    local service = getDataService()\n    if not service then\n        return nil, "DataService unavailable"\n    end\n\n    local ok, data = pcall(function()\n        return service:GetData()\n    end)\n    if not ok or type(data) ~= "table" then\n        return nil, "DataService:GetData failed"\n    end\n\n    local petsData = data.PetsData\n    local inventory = petsData and petsData.PetInventory\n    local petData = inventory and inventory.Data\n\n    if type(petData) ~= "table" then\n        return nil, "PetsData.PetInventory.Data missing"\n    end\n\n    return petData, nil\nend\n\nlocal function sortParsedPets(items)\n    table.sort(items, function(left, right)\n        local leftWeight = tonumber(left.base_weight_age1_kg) or -1\n        local rightWeight = tonumber(right.base_weight_age1_kg) or -1\n        if leftWeight ~= rightWeight then\n            return leftWeight > rightWeight\n        end\n\n        local leftAge = tonumber(left.age) or -1\n        local rightAge = tonumber(right.age) or -1\n        if leftAge ~= rightAge then\n            return leftAge > rightAge\n        end\n\n        local leftName = string.lower(tostring(left.name or ""))\n        local rightName = string.lower(tostring(right.name or ""))\n        if leftName ~= rightName then\n            return leftName < rightName\n        end\n\n        return tostring(left.uuid or "") < tostring(right.uuid or "")\n    end)\nend\n\nlocal WRITE_SEQ = 0\nlocal START_CLOCK = os.clock()\nlocal lastState = nil\n\nlocal function buildProbeState()\n    WRITE_SEQ += 1\n\n    local state = {\n        probe_version = Config.Version,\n        probe_revision = Config.Revision,\n        schema_version = 2,\n\n        username = LocalPlayer.Name,\n        display_name = LocalPlayer.DisplayName,\n        place_id = tostring(game.PlaceId or ""),\n        job_id = tostring(game.JobId or ""),\n        expected_place_id = tostring(Config.ExpectedPlaceId),\n        supported_place = tonumber(game.PlaceId) == Config.ExpectedPlaceId,\n\n        min_age = Config.MinAge,\n        min_age1_base_weight_kg = Config.MinAge1BaseWeightKg,\n        weight_mode = "BaseWeight age-0 multiplied by 1.1",\n        weight_precision = "truncate_2_decimals_no_rounding",\n\n        ts = now(),\n        write_seq = WRITE_SEQ,\n        script_uptime = math.floor(math.max(0, os.clock() - START_CLOCK)),\n        probe_alive = true,\n        probe_ready = false,\n        error = "",\n\n        inventory_entry_count = 0,\n        parsed_pet_count = 0,\n        valuable_pet_count = 0,\n        valuable_pets = {},\n        sample_pets = {},\n        observed_entry_keys = {},\n        missing_fields = {\n            name = 0,\n            age = 0,\n            base_weight = 0,\n            mutation = 0,\n            entry_not_table = 0,\n        },\n    }\n\n    if not usernameAllowed() then\n        state.error = "username not in AllowedUsernames"\n        return state\n    end\n\n    if Config.OnlyScanExpectedPlace\n        and tonumber(game.PlaceId) ~= Config.ExpectedPlaceId then\n        state.error = "outside expected Booster place"\n        return state\n    end\n\n    local petData, inventoryError = getPetInventory()\n    if not petData then\n        state.error = tostring(inventoryError or "pet inventory unavailable")\n        return state\n    end\n\n    local parsed = {}\n    local valuable = {}\n    local observedKeys = {}\n\n    for uuid, entry in pairs(petData) do\n        state.inventory_entry_count += 1\n\n        local pet, parseError = parsePet(uuid, entry, observedKeys)\n        if not pet then\n            if parseError == "entry_not_table" then\n                state.missing_fields.entry_not_table += 1\n            end\n        else\n            state.parsed_pet_count += 1\n\n            if pet.name == "" then\n                state.missing_fields.name += 1\n            end\n            if pet.age == nil then\n                state.missing_fields.age += 1\n            end\n            if pet.base_weight_age0_kg == nil then\n                state.missing_fields.base_weight += 1\n            end\n            if pet.mutation == "" then\n                state.missing_fields.mutation += 1\n            end\n\n            table.insert(parsed, pet)\n            if pet.valuable then\n                table.insert(valuable, pet)\n            end\n        end\n    end\n\n    sortParsedPets(parsed)\n    sortParsedPets(valuable)\n\n    for index = 1, math.min(#parsed, Config.MaxSamplePets) do\n        table.insert(state.sample_pets, parsed[index])\n    end\n\n    for index = 1, math.min(#valuable, Config.MaxValuablePets) do\n        table.insert(state.valuable_pets, valuable[index])\n    end\n\n    local keys = {}\n    for key in pairs(observedKeys) do\n        table.insert(keys, key)\n    end\n    table.sort(keys)\n\n    for index = 1, math.min(#keys, Config.MaxObservedKeys) do\n        table.insert(state.observed_entry_keys, keys[index])\n    end\n\n    state.valuable_pet_count = #valuable\n    state.valuable_pet_count_written = #state.valuable_pets\n    state.valuable_pet_list_truncated = #valuable > #state.valuable_pets\n    state.probe_ready = true\n    return state\nend\n\nlocal function writeProbeState(state)\n    safeMakeFolder(Config.WriteFolder)\n\n    local okEncode, encoded = pcall(function()\n        return HttpService:JSONEncode(state)\n    end)\n    if not okEncode then\n        return false, tostring(encoded)\n    end\n\n    local okWrite, writeError = safeWrite(Config.WriteFile, encoded)\n    if okWrite then\n        lastState = state\n    end\n    return okWrite, writeError\nend\n\nlocal function snapshot()\n    local state = buildProbeState()\n    local ok, err = writeProbeState(state)\n\n    if Config.Debug then\n        if ok then\n            print(\n                "[NOMO BOOSTER PROBE] wrote "\n                .. tostring(state.valuable_pet_count)\n                .. " valuable / "\n                .. tostring(state.parsed_pet_count)\n                .. " parsed"\n            )\n        else\n            warn("[NOMO BOOSTER PROBE] write failed:", tostring(err))\n        end\n    end\n\n    return state, ok, err\nend\n\ngetgenv().NOMO_BOOSTER_PROBE_STOP = function()\n    Config.Enabled = false\n    Config.Stop = true\n    print("[NOMO BOOSTER PROBE] stop requested")\nend\n\ngetgenv().NOMO_BOOSTER_PROBE_SNAPSHOT = function()\n    local state, ok, err = snapshot()\n    print(\n        "[NOMO BOOSTER PROBE] snapshot:",\n        ok and "written" or tostring(err)\n    )\n    return state\nend\n\ngetgenv().NOMO_BOOSTER_PROBE_DUMP = function()\n    local state = lastState or buildProbeState()\n    print(HttpService:JSONEncode(state))\n    return state\nend\n\nprint("========================================")\nprint("[NOMO BOOSTER PROBE] " .. Config.Version)\nprint("[NOMO BOOSTER PROBE] account = " .. LocalPlayer.Name)\nprint("[NOMO BOOSTER PROBE] writing -> " .. Config.WriteFile)\nprint(\n    "[NOMO BOOSTER PROBE] valuable = age >= "\n    .. tostring(Config.MinAge)\n    .. " OR age1 base >= "\n    .. string.format("%.2f", Config.MinAge1BaseWeightKg)\n    .. "kg"\n)\nprint("[NOMO BOOSTER PROBE] production counter/state untouched")\nprint("========================================")\n\npcall(snapshot)\n\ntask.spawn(function()\n    while Config.Enabled and not Config.Stop do\n        task.wait(Config.ScanEvery)\n\n        local ok, err = pcall(snapshot)\n        if not ok then\n            warn(\n                "[NOMO BOOSTER PROBE] loop error:",\n                tostring(err)\n            )\n        end\n    end\n\n    Config.Enabled = false\n    Config.Stop = true\n    print("[NOMO BOOSTER PROBE] stopped")\nend)\n'
-
-
-def booster_probe_autoexec_source():
-    "Build GitHub-latest -> cache -> embedded verified Booster scanner."
-    remote_url = json.dumps(NOMO_BOOSTER_PROBE_URL)
-    embedded = _lua_long_string(BOOSTER_PROBE_FALLBACK_TEMPLATE)
-
-    return f'''-- NOMO Booster scanner updater/loader
--- Priority: GitHub latest -> local cache -> embedded verified v0.1.1
-
-local PROBE_URL = {remote_url}
-local CACHE_FOLDER = "nomo_rejoiner"
-local CACHE_FILE = CACHE_FOLDER .. "/nomo_booster_probe_cache.lua"
-local EMBEDDED_FALLBACK = {embedded}
-
-local function validProbeSource(text)
-    return type(text) == "string"
-        and #text > 5000
-        and string.find(text, "NOMO BOOSTER PROBE", 1, true) ~= nil
-        and string.find(text, "NOMO_BOOSTER_PROBE", 1, true) ~= nil
-        and string.find(text, "v0.1.1-petdata-container-fix", 1, true) ~= nil
-end
-
-local function ensureCacheFolder()
-    if type(makefolder) ~= "function" then return end
-    pcall(function()
-        if type(isfolder) == "function" then
+        if type(isfolder) == \"function\" then
             if not isfolder(CACHE_FOLDER) then makefolder(CACHE_FOLDER) end
         else
             makefolder(CACHE_FOLDER)
@@ -26570,58 +26553,178 @@ local function ensureCacheFolder()
 end
 
 local function saveCache(text)
-    if type(writefile) ~= "function" or not validProbeSource(text) then return end
+    if type(writefile) ~= \"function\" or not validCounterSource(text) then return false end
     ensureCacheFolder()
-    pcall(function() writefile(CACHE_FILE, text) end)
+    local ok = pcall(function() writefile(CACHE_FILE, text) end)
+    return ok
 end
 
-local function readCache()
-    if type(readfile) ~= "function" then return nil end
+local function readCachePath(path)
+    if type(readfile) ~= \"function\" then return nil end
     local ok, text = pcall(function()
-        if type(isfile) == "function" and not isfile(CACHE_FILE) then return nil end
-        return readfile(CACHE_FILE)
+        if type(isfile) == \"function\" and not isfile(path) then return nil end
+        return readfile(path)
+    end)
+    if ok and validCounterSource(text) then return text end
+    return nil
+end
+
+local function runSource(text, name)
+    if not validCounterSource(text) then
+        return false, \"source validation failed\"
+    end
+    local chunk, compileError = loadstring(text)
+    if not chunk then
+        return false, \"compile failed: \" .. tostring(compileError)
+    end
+    print(\"[NOMO COUNTER LOADER] source = \" .. tostring(name))
+    local runOk, runError = pcall(chunk)
+    if not runOk then
+        return false, \"runtime failed: \" .. tostring(runError)
+    end
+    return true, \"ok\"
+end
+
+local remoteOk, remoteText = pcall(function()
+    return game:HttpGet(COUNTER_URL, true)
+end)
+if remoteOk and validCounterSource(remoteText) then
+    local ok, err = runSource(remoteText, \"github\")
+    if ok then
+        saveCache(remoteText)
+        return
+    end
+    warn(\"[NOMO COUNTER LOADER] remote rejected; keeping last-good:\", tostring(err))
+end
+
+local cached = readCachePath(CACHE_FILE)
+if cached then
+    local ok, err = runSource(cached, \"cache\")
+    if ok then return end
+    warn(\"[NOMO COUNTER LOADER] per-UID cache failed:\", tostring(err))
+end
+
+local legacy = readCachePath(LEGACY_CACHE_FILE)
+if legacy then
+    local ok, err = runSource(legacy, \"legacy-cache\")
+    if ok then
+        saveCache(legacy)
+        return
+    end
+    warn(\"[NOMO COUNTER LOADER] legacy cache failed:\", tostring(err))
+end
+
+local ok, err = runSource(EMBEDDED_FALLBACK, \"embedded-v3.9\")
+if not ok then
+    warn(\"[NOMO COUNTER LOADER] embedded fallback failed:\", tostring(err))
+end
+'''
+
+
+BOOSTER_PROBE_FALLBACK_TEMPLATE = '--========================================================--\n--                  NOMO BOOSTER PROBE\n--             v0.1.1 PETDATA CONTAINER FIX\n--========================================================--\n-- PURPOSE:\n--   Validate the real Grow a Garden pet schema before Booster mode is merged\n--   into NOMO REJOIN or the stable v3.9 pet counter.\n--\n-- SAFETY:\n--   - Does not teleport or rejoin.\n--   - Does not call Cloudflare or any web endpoint.\n--   - Does not modify <username>_state.json.\n--   - Does not stop/replace NOMO PET COUNTER.\n--   - Reads DataService once every 10 seconds by default.\n--\n-- OUTPUT:\n--   nomo_rejoiner/<username>_booster_probe.json\n--\n-- VALUABLE RULE:\n--   age >= 500\n--   OR\n--   truncated age-1 base weight >= 6.00 kg\n--\n-- AGE-1 BASE WEIGHT:\n--   BaseWeight is treated as age-0.\n--   age1 = BaseWeight * 1.1\n--   displayed/compared after truncating to two decimals, never rounding up.\n--========================================================--\n\nlocal Players = game:GetService("Players")\nlocal HttpService = game:GetService("HttpService")\nlocal ReplicatedStorage = game:GetService("ReplicatedStorage")\n\nlocal LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()\n\n-- Stop only an older Booster probe. The normal NOMO counter is untouched.\ndo\n    local old = getgenv().NOMO_BOOSTER_PROBE\n    if type(old) == "table" then\n        old.Enabled = false\n        old.Stop = true\n    end\n    task.wait(0.25)\nend\n\ngetgenv().NOMO_BOOSTER_PROBE = getgenv().NOMO_BOOSTER_PROBE or {}\nlocal Config = getgenv().NOMO_BOOSTER_PROBE\n\nConfig.Enabled = true\nConfig.Stop = false\nConfig.Version = "v0.1-phase1-safe"\nConfig.Revision = "v0.1.1-petdata-container-fix"\n\nConfig.WriteFolder = Config.WriteFolder or "nomo_rejoiner"\nConfig.ScanEvery = math.max(5, tonumber(Config.ScanEvery or 10) or 10)\nConfig.MinAge = math.max(0, tonumber(Config.MinAge or 500) or 500)\nConfig.MinAge1BaseWeightKg = math.max(\n    0,\n    tonumber(Config.MinAge1BaseWeightKg or 6.00) or 6.00\n)\nConfig.MaxValuablePets = math.max(\n    1,\n    math.floor(tonumber(Config.MaxValuablePets or 250) or 250)\n)\nConfig.MaxSamplePets = math.max(\n    1,\n    math.floor(tonumber(Config.MaxSamplePets or 12) or 12)\n)\nConfig.MaxObservedKeys = math.max(\n    10,\n    math.floor(tonumber(Config.MaxObservedKeys or 100) or 100)\n)\nConfig.ExpectedPlaceId = tonumber(\n    Config.ExpectedPlaceId or 126884695634066\n) or 126884695634066\nConfig.OnlyScanExpectedPlace = Config.OnlyScanExpectedPlace ~= false\nConfig.Debug = Config.Debug == true\n\n-- Optional username allow-list:\n--   getgenv().NOMO_BOOSTER_PROBE.AllowedUsernames = {\n--       ["nomoboost1"] = true,\n--   }\n-- Empty/nil means all usernames on the test device.\nif type(Config.AllowedUsernames) ~= "table" then\n    Config.AllowedUsernames = {}\nend\n\nlocal function sanitizeName(value)\n    value = tostring(value or "")\n    value = string.gsub(value, "[^%w_]", "_")\n    if value == "" then\n        value = "unknown"\n    end\n    return value\nend\n\nlocal safeUser = sanitizeName(LocalPlayer.Name)\nConfig.WriteFile = Config.WriteFile\n    or (Config.WriteFolder .. "/" .. safeUser .. "_booster_probe.json")\n\nlocal function usernameAllowed()\n    if next(Config.AllowedUsernames) == nil then\n        return true\n    end\n    return Config.AllowedUsernames[LocalPlayer.Name] == true\nend\n\nlocal function safeMakeFolder(folder)\n    if type(writefile) ~= "function" then\n        return false, "writefile unavailable"\n    end\n\n    pcall(function()\n        if type(isfolder) == "function" then\n            if not isfolder(folder) and type(makefolder) == "function" then\n                makefolder(folder)\n            end\n        elseif type(makefolder) == "function" then\n            makefolder(folder)\n        end\n    end)\n\n    return true\nend\n\nlocal function safeWrite(path, text)\n    if type(writefile) ~= "function" then\n        return false, "writefile unavailable"\n    end\n\n    local tmp = path .. ".tmp"\n    local ok, err = pcall(function()\n        writefile(tmp, text)\n    end)\n\n    if not ok then\n        local directOk, directErr = pcall(function()\n            writefile(path, text)\n        end)\n        return directOk, directOk and nil or tostring(directErr or err)\n    end\n\n    local copied = pcall(function()\n        local content = readfile(tmp)\n        writefile(path, content)\n    end)\n\n    pcall(function()\n        if type(delfile) == "function" then\n            delfile(tmp)\n        end\n    end)\n\n    if not copied then\n        return false, "atomic copy failed"\n    end\n    return true\nend\n\nlocal MIN_VALID_EPOCH = 1600000000\n\nlocal function realEpoch()\n    local ok1, value1 = pcall(os.time)\n    if ok1 and type(value1) == "number" and value1 >= MIN_VALID_EPOCH then\n        return math.floor(value1)\n    end\n\n    local ok2, value2 = pcall(function()\n        return DateTime.now().UnixTimestamp\n    end)\n    if ok2 and type(value2) == "number" and value2 >= MIN_VALID_EPOCH then\n        return math.floor(value2)\n    end\n\n    local ok3, value3 = pcall(tick)\n    if ok3 and type(value3) == "number" and value3 >= MIN_VALID_EPOCH then\n        return math.floor(value3)\n    end\n\n    local ok4, value4 = pcall(function()\n        return workspace:GetServerTimeNow()\n    end)\n    if ok4 and type(value4) == "number" and value4 >= MIN_VALID_EPOCH then\n        return math.floor(value4)\n    end\n\n    return nil\nend\n\nlocal epochAnchor = realEpoch()\nlocal clockAnchor = os.clock()\n\nlocal function now()\n    local current = realEpoch()\n    if current then\n        epochAnchor = current\n        clockAnchor = os.clock()\n        return current\n    end\n\n    if epochAnchor then\n        return math.floor(\n            epochAnchor + math.max(0, os.clock() - clockAnchor)\n        )\n    end\n\n    return math.floor(MIN_VALID_EPOCH + os.clock())\nend\n\nlocal function toNumber(value)\n    local number = tonumber(value)\n    if type(number) ~= "number" then\n        return nil\n    end\n    if number ~= number or number == math.huge or number == -math.huge then\n        return nil\n    end\n    return number\nend\n\nlocal function truncateTwo(value)\n    value = toNumber(value)\n    if not value then\n        return nil\n    end\n    return math.floor(value * 100) / 100\nend\n\nlocal function firstValue(containers, names)\n    for _, item in ipairs(containers) do\n        local container = item\n        local path = ""\n\n        if type(item) == "table" and item.Value ~= nil then\n            container = item.Value\n            path = tostring(item.Path or "")\n        end\n\n        if type(container) == "table" then\n            for _, name in ipairs(names) do\n                local value = container[name]\n                if value ~= nil then\n                    local field = tostring(name)\n                    if path ~= "" then\n                        field = path .. "." .. field\n                    end\n                    return value, field\n                end\n            end\n        end\n    end\n    return nil, ""\nend\n\nlocal function entryContainers(entry)\n    if type(entry) ~= "table" then\n        return {}\n    end\n\n    -- Never create a sparse array here. ipairs() stops at the first nil.\n    local containers = {}\n\n    local function add(value, path)\n        if type(value) == "table" then\n            table.insert(containers, {\n                Value = value,\n                Path = tostring(path or ""),\n            })\n        end\n    end\n\n    add(entry, "")\n    add(entry.PetData, "PetData")\n    add(entry.Data, "Data")\n    add(entry.Properties, "Properties")\n    add(entry.Info, "Info")\n\n    return containers\nend\n\nlocal function scalarKeyList(entry, output, prefix)\n    if type(entry) ~= "table" then\n        return\n    end\n\n    prefix = tostring(prefix or "")\n\n    for key, value in pairs(entry) do\n        if type(key) == "string" then\n            local valueType = type(value)\n            if valueType ~= "function"\n                and valueType ~= "thread"\n                and valueType ~= "userdata" then\n                local observed = key\n                if prefix ~= "" then\n                    observed = prefix .. "." .. key\n                end\n                output[observed] = true\n            end\n        end\n    end\nend\n\nlocal function countTable(value)\n    local count = 0\n    if type(value) == "table" then\n        for _ in pairs(value) do\n            count += 1\n        end\n    end\n    return count\nend\n\nlocal function cleanString(value)\n    if value == nil then\n        return ""\n    end\n    return tostring(value)\nend\n\nlocal function collectTextValues(value, output, depth)\n    output = output or {}\n    depth = depth or 0\n\n    if depth > 3 then\n        return output\n    end\n\n    if type(value) == "string" then\n        local text = tostring(value)\n        text = string.gsub(text, "^%s+", "")\n        text = string.gsub(text, "%s+$", "")\n\n        if text ~= ""\n            and text ~= "Normal"\n            and text ~= "None"\n            and text ~= "Unknown" then\n            output[text] = true\n        end\n    elseif type(value) == "table" then\n        for key, item in pairs(value) do\n            if type(item) == "string" then\n                collectTextValues(item, output, depth + 1)\n            elseif item == true and tostring(key or "") ~= "" then\n                collectTextValues(tostring(key), output, depth + 1)\n            elseif type(item) == "table" then\n                collectTextValues(item, output, depth + 1)\n            end\n        end\n    end\n\n    return output\nend\n\nlocal function mutationInfo(entry)\n    local pd = type(entry.PetData) == "table"\n        and entry.PetData\n        or {}\n\n    local mutationMap = {}\n    local sources = {\n        {"MutationType", entry.MutationType},\n        {"Mutation", entry.Mutation},\n        {"Mutations", entry.Mutations},\n        {"MutationData", entry.MutationData},\n        {"AppliedMutations", entry.AppliedMutations},\n        {"ActiveMutations", entry.ActiveMutations},\n        {"PetData.MutationType", pd.MutationType},\n        {"PetData.Mutation", pd.Mutation},\n        {"PetData.Mutations", pd.Mutations},\n        {"PetData.MutationData", pd.MutationData},\n        {"PetData.AppliedMutations", pd.AppliedMutations},\n        {"PetData.ActiveMutations", pd.ActiveMutations},\n    }\n\n    local sourceField = ""\n    for _, item in ipairs(sources) do\n        if item[2] ~= nil and sourceField == "" then\n            sourceField = item[1]\n        end\n        collectTextValues(item[2], mutationMap, 0)\n    end\n\n    for _, key in ipairs({"Rainbow", "Gold", "Golden", "Shiny"}) do\n        if entry[key] == true or pd[key] == true then\n            mutationMap[key] = true\n            if sourceField == "" then\n                sourceField = entry[key] == true\n                    and key\n                    or ("PetData." .. key)\n            end\n        end\n    end\n\n    local names = {}\n    for name in pairs(mutationMap) do\n        table.insert(names, tostring(name))\n    end\n    table.sort(names)\n\n    if #names == 0 then\n        return "Normal", {}, (\n            sourceField ~= ""\n            and sourceField\n            or "default:Normal"\n        )\n    end\n\n    return table.concat(names, ", "), names, sourceField\nend\n\nlocal function parsePet(uuidKey, entry, observedKeys)\n    if type(entry) ~= "table" then\n        return nil, "entry_not_table"\n    end\n\n    scalarKeyList(entry, observedKeys, "")\n    scalarKeyList(entry.PetData, observedKeys, "PetData")\n    scalarKeyList(entry.Data, observedKeys, "Data")\n    scalarKeyList(entry.Properties, observedKeys, "Properties")\n    scalarKeyList(entry.Info, observedKeys, "Info")\n\n    local containers = entryContainers(entry)\n\n    local uuidValue = firstValue(\n        containers,\n        {"UUID", "Uuid", "uuid", "PetUUID", "PET_UUID", "Id", "ID"}\n    )\n    local nameValue, nameField = firstValue(\n        containers,\n        {"PetType", "PetName", "Name", "Type", "Species"}\n    )\n    local ageValue, ageField = firstValue(\n        containers,\n        {"Level", "Age", "PetAge"}\n    )\n    local baseWeightValue, baseWeightField = firstValue(\n        containers,\n        {\n            "BaseWeight",\n            "BaseWeightKg",\n            "BaseWeightKG",\n            "BaseWeight_kg",\n            "BaseWeightInKg",\n        }\n    )\n    local hatchedFromValue = firstValue(\n        containers,\n        {"HatchedFrom", "EggType", "SourceEgg"}\n    )\n    local favoriteValue = firstValue(\n        containers,\n        {"IsFavorite", "Favorite", "Favorited"}\n    )\n    local boostsValue = firstValue(\n        containers,\n        {"Boosts", "PetBoosts"}\n    )\n\n    local mutationText, mutationList, mutationField = mutationInfo(entry)\n\n    local uuid = cleanString(uuidValue)\n    if uuid == "" then\n        uuid = cleanString(uuidKey)\n    end\n\n    local name = cleanString(nameValue)\n    local age = toNumber(ageValue)\n    local rawBaseWeightAge0 = toNumber(baseWeightValue)\n\n    local baseWeightAge0 = nil\n    local baseWeightAge1 = nil\n\n    if rawBaseWeightAge0 then\n        baseWeightAge0 = truncateTwo(rawBaseWeightAge0)\n        baseWeightAge1 = truncateTwo(rawBaseWeightAge0 * 1.1)\n    end\n\n    local reasons = {}\n    if age and age >= Config.MinAge then\n        table.insert(reasons, "age")\n    end\n    if baseWeightAge1\n        and baseWeightAge1 >= Config.MinAge1BaseWeightKg then\n        table.insert(reasons, "weight")\n    end\n\n    return {\n        uuid = uuid,\n        name = name,\n        age = age,\n        base_weight_age0_kg = baseWeightAge0,\n        base_weight_age1_kg = baseWeightAge1,\n        mutation = mutationText,\n        mutations = mutationList,\n        hatched_from = cleanString(hatchedFromValue),\n        is_favorite = favoriteValue == true,\n        boost_count = countTable(boostsValue),\n        valuable = #reasons > 0,\n        valuable_reasons = reasons,\n\n        parsed_fields = {\n            name = nameField,\n            age = ageField,\n            base_weight = baseWeightField,\n            mutation = mutationField,\n        },\n    }, nil\nend\n\nlocal DataService = nil\nlocal function getDataService()\n    if DataService then\n        return DataService\n    end\n\n    local ok, result = pcall(function()\n        local modules = ReplicatedStorage:WaitForChild("Modules", 20)\n        local module = modules and modules:WaitForChild("DataService", 10)\n        return module and require(module)\n    end)\n\n    if ok and result then\n        DataService = result\n        return DataService\n    end\n\n    return nil\nend\n\nlocal function getPetInventory()\n    local service = getDataService()\n    if not service then\n        return nil, "DataService unavailable"\n    end\n\n    local ok, data = pcall(function()\n        return service:GetData()\n    end)\n    if not ok or type(data) ~= "table" then\n        return nil, "DataService:GetData failed"\n    end\n\n    local petsData = data.PetsData\n    local inventory = petsData and petsData.PetInventory\n    local petData = inventory and inventory.Data\n\n    if type(petData) ~= "table" then\n        return nil, "PetsData.PetInventory.Data missing"\n    end\n\n    return petData, nil\nend\n\nlocal function sortParsedPets(items)\n    table.sort(items, function(left, right)\n        local leftWeight = tonumber(left.base_weight_age1_kg) or -1\n        local rightWeight = tonumber(right.base_weight_age1_kg) or -1\n        if leftWeight ~= rightWeight then\n            return leftWeight > rightWeight\n        end\n\n        local leftAge = tonumber(left.age) or -1\n        local rightAge = tonumber(right.age) or -1\n        if leftAge ~= rightAge then\n            return leftAge > rightAge\n        end\n\n        local leftName = string.lower(tostring(left.name or ""))\n        local rightName = string.lower(tostring(right.name or ""))\n        if leftName ~= rightName then\n            return leftName < rightName\n        end\n\n        return tostring(left.uuid or "") < tostring(right.uuid or "")\n    end)\nend\n\nlocal WRITE_SEQ = 0\nlocal START_CLOCK = os.clock()\nlocal lastState = nil\n\nlocal function buildProbeState()\n    WRITE_SEQ += 1\n\n    local state = {\n        probe_version = Config.Version,\n        probe_revision = Config.Revision,\n        schema_version = 2,\n\n        username = LocalPlayer.Name,\n        display_name = LocalPlayer.DisplayName,\n        place_id = tostring(game.PlaceId or ""),\n        job_id = tostring(game.JobId or ""),\n        expected_place_id = tostring(Config.ExpectedPlaceId),\n        supported_place = tonumber(game.PlaceId) == Config.ExpectedPlaceId,\n\n        min_age = Config.MinAge,\n        min_age1_base_weight_kg = Config.MinAge1BaseWeightKg,\n        weight_mode = "BaseWeight age-0 multiplied by 1.1",\n        weight_precision = "truncate_2_decimals_no_rounding",\n\n        ts = now(),\n        write_seq = WRITE_SEQ,\n        script_uptime = math.floor(math.max(0, os.clock() - START_CLOCK)),\n        probe_alive = true,\n        probe_ready = false,\n        error = "",\n\n        inventory_entry_count = 0,\n        parsed_pet_count = 0,\n        valuable_pet_count = 0,\n        valuable_pets = {},\n        sample_pets = {},\n        observed_entry_keys = {},\n        missing_fields = {\n            name = 0,\n            age = 0,\n            base_weight = 0,\n            mutation = 0,\n            entry_not_table = 0,\n        },\n    }\n\n    if not usernameAllowed() then\n        state.error = "username not in AllowedUsernames"\n        return state\n    end\n\n    if Config.OnlyScanExpectedPlace\n        and tonumber(game.PlaceId) ~= Config.ExpectedPlaceId then\n        state.error = "outside expected Booster place"\n        return state\n    end\n\n    local petData, inventoryError = getPetInventory()\n    if not petData then\n        state.error = tostring(inventoryError or "pet inventory unavailable")\n        return state\n    end\n\n    local parsed = {}\n    local valuable = {}\n    local observedKeys = {}\n\n    for uuid, entry in pairs(petData) do\n        state.inventory_entry_count += 1\n\n        local pet, parseError = parsePet(uuid, entry, observedKeys)\n        if not pet then\n            if parseError == "entry_not_table" then\n                state.missing_fields.entry_not_table += 1\n            end\n        else\n            state.parsed_pet_count += 1\n\n            if pet.name == "" then\n                state.missing_fields.name += 1\n            end\n            if pet.age == nil then\n                state.missing_fields.age += 1\n            end\n            if pet.base_weight_age0_kg == nil then\n                state.missing_fields.base_weight += 1\n            end\n            if pet.mutation == "" then\n                state.missing_fields.mutation += 1\n            end\n\n            table.insert(parsed, pet)\n            if pet.valuable then\n                table.insert(valuable, pet)\n            end\n        end\n    end\n\n    sortParsedPets(parsed)\n    sortParsedPets(valuable)\n\n    for index = 1, math.min(#parsed, Config.MaxSamplePets) do\n        table.insert(state.sample_pets, parsed[index])\n    end\n\n    for index = 1, math.min(#valuable, Config.MaxValuablePets) do\n        table.insert(state.valuable_pets, valuable[index])\n    end\n\n    local keys = {}\n    for key in pairs(observedKeys) do\n        table.insert(keys, key)\n    end\n    table.sort(keys)\n\n    for index = 1, math.min(#keys, Config.MaxObservedKeys) do\n        table.insert(state.observed_entry_keys, keys[index])\n    end\n\n    state.valuable_pet_count = #valuable\n    state.valuable_pet_count_written = #state.valuable_pets\n    state.valuable_pet_list_truncated = #valuable > #state.valuable_pets\n    state.probe_ready = true\n    return state\nend\n\nlocal function writeProbeState(state)\n    safeMakeFolder(Config.WriteFolder)\n\n    local okEncode, encoded = pcall(function()\n        return HttpService:JSONEncode(state)\n    end)\n    if not okEncode then\n        return false, tostring(encoded)\n    end\n\n    local okWrite, writeError = safeWrite(Config.WriteFile, encoded)\n    if okWrite then\n        lastState = state\n    end\n    return okWrite, writeError\nend\n\nlocal function snapshot()\n    local state = buildProbeState()\n    local ok, err = writeProbeState(state)\n\n    if Config.Debug then\n        if ok then\n            print(\n                "[NOMO BOOSTER PROBE] wrote "\n                .. tostring(state.valuable_pet_count)\n                .. " valuable / "\n                .. tostring(state.parsed_pet_count)\n                .. " parsed"\n            )\n        else\n            warn("[NOMO BOOSTER PROBE] write failed:", tostring(err))\n        end\n    end\n\n    return state, ok, err\nend\n\ngetgenv().NOMO_BOOSTER_PROBE_STOP = function()\n    Config.Enabled = false\n    Config.Stop = true\n    print("[NOMO BOOSTER PROBE] stop requested")\nend\n\ngetgenv().NOMO_BOOSTER_PROBE_SNAPSHOT = function()\n    local state, ok, err = snapshot()\n    print(\n        "[NOMO BOOSTER PROBE] snapshot:",\n        ok and "written" or tostring(err)\n    )\n    return state\nend\n\ngetgenv().NOMO_BOOSTER_PROBE_DUMP = function()\n    local state = lastState or buildProbeState()\n    print(HttpService:JSONEncode(state))\n    return state\nend\n\nprint("========================================")\nprint("[NOMO BOOSTER PROBE] " .. Config.Version)\nprint("[NOMO BOOSTER PROBE] account = " .. LocalPlayer.Name)\nprint("[NOMO BOOSTER PROBE] writing -> " .. Config.WriteFile)\nprint(\n    "[NOMO BOOSTER PROBE] valuable = age >= "\n    .. tostring(Config.MinAge)\n    .. " OR age1 base >= "\n    .. string.format("%.2f", Config.MinAge1BaseWeightKg)\n    .. "kg"\n)\nprint("[NOMO BOOSTER PROBE] production counter/state untouched")\nprint("========================================")\n\npcall(snapshot)\n\ntask.spawn(function()\n    while Config.Enabled and not Config.Stop do\n        task.wait(Config.ScanEvery)\n\n        local ok, err = pcall(snapshot)\n        if not ok then\n            warn(\n                "[NOMO BOOSTER PROBE] loop error:",\n                tostring(err)\n            )\n        end\n    end\n\n    Config.Enabled = false\n    Config.Stop = true\n    print("[NOMO BOOSTER PROBE] stopped")\nend)\n'
+
+
+def booster_probe_autoexec_source():
+    """Build remote -> per-UID last-good -> embedded verified Booster scanner."""
+    remote_url = json.dumps(NOMO_BOOSTER_PROBE_URL)
+    embedded = _lua_long_string(BOOSTER_PROBE_FALLBACK_TEMPLATE)
+
+    return f'''-- NOMO Booster scanner updater/loader
+-- NOMO Booster loader revision 2
+-- Priority: GitHub latest -> per-UID last-good -> legacy cache -> embedded verified v0.1.1
+
+local Players = game:GetService(\"Players\")
+local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
+local PROBE_URL = {remote_url}
+local CACHE_FOLDER = \"nomo_rejoiner\"
+local CACHE_FILE = CACHE_FOLDER .. \"/nomo_booster_probe_cache_\" .. tostring(LocalPlayer.UserId or \"unknown\") .. \".lua\"
+local LEGACY_CACHE_FILE = CACHE_FOLDER .. \"/nomo_booster_probe_cache.lua\"
+local EMBEDDED_FALLBACK = {embedded}
+
+local function validProbeSource(text)
+    return type(text) == \"string\"
+        and #text > 5000
+        and string.find(text, \"NOMO BOOSTER PROBE\", 1, true) ~= nil
+        and string.find(text, \"NOMO_BOOSTER_PROBE\", 1, true) ~= nil
+        and string.find(text, \"v0.1.1-petdata-container-fix\", 1, true) ~= nil
+end
+
+local function ensureCacheFolder()
+    if type(makefolder) ~= \"function\" then return end
+    pcall(function()
+        if type(isfolder) == \"function\" then
+            if not isfolder(CACHE_FOLDER) then makefolder(CACHE_FOLDER) end
+        else
+            makefolder(CACHE_FOLDER)
+        end
+    end)
+end
+
+local function saveCache(text)
+    if type(writefile) ~= \"function\" or not validProbeSource(text) then return false end
+    ensureCacheFolder()
+    local ok = pcall(function() writefile(CACHE_FILE, text) end)
+    return ok
+end
+
+local function readCachePath(path)
+    if type(readfile) ~= \"function\" then return nil end
+    local ok, text = pcall(function()
+        if type(isfile) == \"function\" and not isfile(path) then return nil end
+        return readfile(path)
     end)
     if ok and validProbeSource(text) then return text end
     return nil
 end
 
-local selectedSource = nil
-local selectedName = ""
+local function runSource(text, name)
+    if not validProbeSource(text) then
+        return false, \"source validation failed\"
+    end
+    local chunk, compileError = loadstring(text)
+    if not chunk then
+        return false, \"compile failed: \" .. tostring(compileError)
+    end
+    print(\"[NOMO BOOSTER LOADER] source = \" .. tostring(name))
+    local runOk, runError = pcall(chunk)
+    if not runOk then
+        return false, \"runtime failed: \" .. tostring(runError)
+    end
+    return true, \"ok\"
+end
+
 local remoteOk, remoteText = pcall(function()
     return game:HttpGet(PROBE_URL, true)
 end)
 if remoteOk and validProbeSource(remoteText) then
-    selectedSource = remoteText
-    selectedName = "github"
-    saveCache(remoteText)
-end
-if not selectedSource then
-    local cached = readCache()
-    if cached then
-        selectedSource = cached
-        selectedName = "cache"
+    local ok, err = runSource(remoteText, \"github\")
+    if ok then
+        saveCache(remoteText)
+        return
     end
-end
-if not selectedSource then
-    selectedSource = EMBEDDED_FALLBACK
-    selectedName = "embedded-v0.1.1"
+    warn(\"[NOMO BOOSTER LOADER] remote rejected; keeping last-good:\", tostring(err))
 end
 
-local chunk, compileError = loadstring(selectedSource)
-if not chunk and selectedName ~= "embedded-v0.1.1" then
-    warn("[NOMO BOOSTER LOADER] " .. selectedName .. " compile failed; using embedded scanner:", tostring(compileError))
-    selectedSource = EMBEDDED_FALLBACK
-    selectedName = "embedded-v0.1.1"
-    chunk, compileError = loadstring(selectedSource)
+local cached = readCachePath(CACHE_FILE)
+if cached then
+    local ok, err = runSource(cached, \"cache\")
+    if ok then return end
+    warn(\"[NOMO BOOSTER LOADER] per-UID cache failed:\", tostring(err))
 end
-if not chunk then
-    warn("[NOMO BOOSTER LOADER] unable to compile scanner:", tostring(compileError))
-    return
+
+local legacy = readCachePath(LEGACY_CACHE_FILE)
+if legacy then
+    local ok, err = runSource(legacy, \"legacy-cache\")
+    if ok then
+        saveCache(legacy)
+        return
+    end
+    warn(\"[NOMO BOOSTER LOADER] legacy cache failed:\", tostring(err))
 end
-print("[NOMO BOOSTER LOADER] source = " .. selectedName)
-local runOk, runError = pcall(chunk)
-if not runOk then
-    warn("[NOMO BOOSTER LOADER] runtime error:", tostring(runError))
+
+local ok, err = runSource(EMBEDDED_FALLBACK, \"embedded-v0.1.1\")
+if not ok then
+    warn(\"[NOMO BOOSTER LOADER] embedded fallback failed:\", tostring(err))
 end
 '''
 
@@ -27610,15 +27713,7 @@ def export_cookies(selected_packages=None):
     export_file = cookie_dir / "cookies.txt"
 
     cfg = load_config()
-    cache = {}
-    if COOKIE_CACHE.exists():
-        try:
-            with open(COOKIE_CACHE, "r", encoding="utf-8") as handle:
-                loaded = json.load(handle)
-                if isinstance(loaded, dict):
-                    cache = loaded
-        except Exception:
-            cache = {}
+    cache = _cookie_cache_read()
 
     cookie_lines = []
     missing = []
@@ -27665,11 +27760,8 @@ def export_cookies(selected_packages=None):
 
     export_file.write_text("\n".join(cookie_lines) + "\n", encoding="utf-8")
 
-    try:
-        with open(COOKIE_CACHE, "w", encoding="utf-8") as handle:
-            json.dump(cache, handle, indent=2)
-    except Exception as exc:
-        print(col(f"Cookie cache warning: {exc}", YELLOW))
+    if not _cookie_cache_merge_entries(cache):
+        print(col("Cookie cache warning: protected cache save was blocked", YELLOW))
 
     # Remove the old three user-facing export variants so the folder is not confusing.
     for old_name in ("cookie_export.txt", "cookie_auth.txt", "cookies_only.txt"):
@@ -29035,14 +29127,8 @@ def build_private_server_link(place_id, item, cfg=None):
 
 
 def load_cookie_cache():
-    """Load the cookie cache from JSON file."""
-    if not COOKIE_CACHE.exists():
-        return {}
-    try:
-        with open(COOKIE_CACHE) as f:
-            return json.load(f)
-    except Exception:
-        return {}
+    """Load the protected cookie cache."""
+    return _cookie_cache_read()
 
 
 def _hatcher_profile_for_package(hcfg, cfg, pkg, username=""):
@@ -29118,11 +29204,7 @@ def private_server_cookie_preflight(pkg, cfg, cache):
         "updated": now(),
     })
     cache[pkg] = entry
-    try:
-        with open(COOKIE_CACHE, "w", encoding="utf-8") as handle:
-            json.dump(cache, handle, indent=2)
-    except Exception:
-        pass
+    _cookie_cache_merge_entries({pkg: entry})
 
     note = f"{source} cookie"
     if state_user:
@@ -31611,22 +31693,11 @@ def _import_cookie_menu_impl(cfg, locked_mode):
         return inject_and_restart(pkg, cookie, cfg)
 
     def load_cache():
-        if COOKIE_CACHE.exists():
-            try:
-                with open(COOKIE_CACHE, "r", encoding="utf-8") as handle:
-                    data = json.load(handle)
-                    if isinstance(data, dict):
-                        return data
-            except Exception:
-                pass
-        return {}
+        return _cookie_cache_read()
 
     def write_cache(cache):
-        try:
-            with open(COOKIE_CACHE, "w", encoding="utf-8") as handle:
-                json.dump(cache, handle, indent=2)
-        except Exception as exc:
-            print(col(f"Could not save cache: {exc}", YELLOW))
+        if not _cookie_cache_merge_entries(cache):
+            print(col("Could not save protected cookie cache", YELLOW))
 
     def choose_local_cookie_file():
         cookie_dir = BASE_DIR / "cookies"
@@ -31858,8 +31929,8 @@ def ensure_cookie_for_package(pkg, cfg=None):
                         except:
                             pass
                     break
-        with open(COOKIE_CACHE, "w") as f:
-            json.dump(cache, f, indent=2)
+        if not _cookie_cache_merge_entries({pkg: cache[pkg]}):
+            return cookie
         return cookie
     return None
 
@@ -39337,6 +39408,9 @@ def main():
         upgraded = upgrade_known_nomo_market_loader_once(cfg)
         if upgraded:
             log_activity(f"AutoExec NOMO loader upgraded: {upgraded} file(s)", "", GREEN)
+        aux_upgraded = upgrade_known_nomo_aux_loaders_once(cfg)
+        if aux_upgraded:
+            log_activity(f"AutoExec NOMO counter/booster loader upgraded: {aux_upgraded} file(s)", "", GREEN)
         # The upgrade itself must never leave a staging/backup artifact behind.
         moved_after, cleanup_errors_after = cleanup_nomo_autoexec_backup_artifacts(cfg)
         if moved_after:
