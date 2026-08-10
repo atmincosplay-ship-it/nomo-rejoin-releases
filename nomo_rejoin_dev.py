@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
-# V4.81.44 — OPTION 6 ALIVE-NOKA ROUTE-ONLY SAFETY
-# - Option 6 still enters the shared Option 1 recovery core, but an already-ALIVE Noka/App-Cloner target
-#   is never auto-escalated from route retries into a delayed hard PID-stop. Route retries remain in-place.
-# - The Option 6 origin/safety marker is preserved across every queued route retry so later generations cannot
-#   silently become generic hard-fallback items. DEAD targets still use normal exact-PID/start recovery.
-# - This prevents the proven App-Cloner failure where C eventually joined after a hard fallback but A collapsed.
+# V4.81.46 — OPTION 6 RECT-SCOPED HOME DETECTOR
+# - App Cloner can expose Roblox UI nodes under a shared/original Android package name, so package-name-only
+#   uiautomator scoping can miss a visibly obvious Roblox Home screen. Home detection now falls back to UI
+#   node bounds inside the exact Option 16 saved rectangle for the selected clone.
+# - Keeps the existing strict Home signature (Search + Home + navigation cluster) and V4.81.45's route-only
+#   safety; this patch changes observation only, not Android launch/recovery behavior.
+#
+# V4.81.45 — OPTION 6 HOME-AWARE ROUTE RETRY
+# - Keeps V4.81.44's ALIVE-Noka route-only safety: no PID-stop hard fallback while the selected Noka clone lives.
+# - A package-scoped Roblox Home screen continuously visible for 45s ends that route attempt early instead of
+#   burning the full 240s soft-hop wait. Option 6 then tries the next safe route attempt.
+# - Bounds the manual generation to 3 total route attempts by default. Loading/joining screens still receive the
+#   normal longer wait; only a confidently visible Roblox Home page gets the early retry.
 #
 # V4.81.43 — OPTION 6 OPTION-1 ROUTE-FIRST RECOVERY
 # - Option 6 is again an explicit operator force-reopen: selected packages hard-reopen once regardless
@@ -1048,7 +1055,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.44-option6-alive-noka-route-only-safety"
+__version__ = "V4.81.46-option6-rect-scoped-home-detector"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -2140,6 +2147,11 @@ DEFAULT_CONFIG = {
     "soft_hop_enabled": True,
     "soft_hop_fallback_hard": False,
     "soft_hop_wait_fresh_seconds": 240,
+    # V4.81.45: Option 6 on an already-alive Noka clone stays route-only for
+    # sibling safety. If package-scoped Roblox Home is continuously visible,
+    # do not burn the full 4-minute route wait before trying the next route.
+    "option6_alive_noka_home_confirm_seconds": 45,
+    "option6_alive_noka_route_retry_limit": 3,
     "scheduled_hop_enabled": False,
     "scheduled_hop_interval_seconds": 600,
     "scheduled_hop_jitter_seconds": 30,
@@ -8040,6 +8052,16 @@ def manual_restart_tabs_via_queue(
         print(col("No Option 6 recovery action was queued.", YELLOW))
         return True
 
+    if any(
+        _is_noka_clone_package(str((tab or {}).get("package", "") or ""))
+        for tab in tabs
+    ):
+        print(col(
+            "Alive Noka safety: visible Roblox Home retries after 45s; "
+            "max 3 route attempts; no PID-stop while alive.",
+            DIM,
+        ))
+
     # Use the same spacing as the normal Option 1 queue rather than the old
     # Option-6 1-second drain loop.
     if not core.drain(delay_seconds=cfg.get("delay_between_open", 45)):
@@ -12955,6 +12977,7 @@ _ANDROID_UI_SNAPSHOT_CACHE = {
     "ts": 0,
     "by_pkg": {},
     "all_text": [],
+    "text_nodes": [],
     "error": "not captured",
 }
 _ANDROID_UI_DUMP_LOCK = threading.Lock()
@@ -12963,8 +12986,10 @@ _ANDROID_UI_DUMP_LOCK = threading.Lock()
 def _parse_android_ui_xml(xml_text):
     by_pkg = {}
     all_text = []
+    text_nodes = []
     node_re = re.compile(r'<node\b[^>]*>', re.I)
-    attr_re = re.compile(r'(text|content-desc|package)="([^"]*)"', re.I)
+    attr_re = re.compile(r'(text|content-desc|package|bounds)="([^"]*)"', re.I)
+    bounds_re = re.compile(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]')
 
     for node in node_re.findall(str(xml_text or "")):
         attrs = {k.lower(): html.unescape(v) for k, v in attr_re.findall(node)}
@@ -12977,7 +13002,18 @@ def _parse_android_ui_xml(xml_text):
         if pkg:
             by_pkg.setdefault(pkg, []).append(value)
 
-    return by_pkg, all_text
+        bounds = None
+        m = bounds_re.fullmatch(str(attrs.get("bounds", "") or "").strip())
+        if m:
+            try:
+                x1, y1, x2, y2 = (int(v) for v in m.groups())
+                if x2 > x1 and y2 > y1:
+                    bounds = [x1, y1, x2, y2]
+            except Exception:
+                bounds = None
+        text_nodes.append({"package": pkg, "text": value, "bounds": bounds})
+
+    return by_pkg, all_text, text_nodes
 
 
 def capture_android_ui_snapshot(cfg, force=False):
@@ -13023,15 +13059,17 @@ def capture_android_ui_snapshot(cfg, force=False):
             "ts": t,
             "by_pkg": {},
             "all_text": [],
+            "text_nodes": [],
             "error": "ui dump unavailable",
         }
         return _ANDROID_UI_SNAPSHOT_CACHE
 
-    by_pkg, all_text = _parse_android_ui_xml(out)
+    by_pkg, all_text, text_nodes = _parse_android_ui_xml(out)
     _ANDROID_UI_SNAPSHOT_CACHE = {
         "ts": t,
         "by_pkg": by_pkg,
         "all_text": all_text,
+        "text_nodes": text_nodes,
         "error": "" if (by_pkg or all_text) else "ui has no accessible text",
     }
     return _ANDROID_UI_SNAPSHOT_CACHE
@@ -13048,21 +13086,57 @@ def android_ui_text_for_package(pkg, cfg, force=False):
 
 
 def android_roblox_home_ui_detail(pkg, cfg, force=False):
-    """Return a high-confidence package-scoped Roblox Home/navigation signal.
+    """Return a high-confidence clone-scoped Roblox Home/navigation signal.
 
     App Cloner can keep an old in-game Lua heartbeat alive behind the visible
-    Roblox Home activity.  A fresh state.json therefore cannot by itself prove
+    Roblox Home activity. A fresh state.json therefore cannot by itself prove
     that the user-facing clone is actually in-game after a recovery.
 
-    This detector intentionally requires a cluster of Roblox Home navigation
-    labels from the *same package*; generic words such as Home/Search alone are
-    not enough.  It never uses unscoped text from sibling clones.
+    Some App Cloner builds expose uiautomator nodes under Roblox's shared/original
+    Android package name instead of the clone package. Package-name-only scoping
+    can therefore miss an obvious Home page. We first use exact package text, then
+    supplement it only with nodes whose bounds fall inside this clone's exact
+    Option 16 saved rectangle. We never use global/unscoped sibling text.
     """
     if not cfg.get("hatcher_home_ui_detection_enabled", True):
         return None
 
-    texts, _ = android_ui_text_for_package(str(pkg or ""), cfg, force=force)
-    values = [str(v or "").strip() for v in (texts or []) if str(v or "").strip()]
+    snapshot = capture_android_ui_snapshot(cfg, force=force)
+    by_pkg = snapshot.get("by_pkg", {}) if isinstance(snapshot, dict) else {}
+    values = []
+    for node_pkg, node_values in (by_pkg or {}).items():
+        if node_pkg == str(pkg or "") or node_pkg.startswith(str(pkg or "") + ":"):
+            values.extend(node_values if isinstance(node_values, list) else [str(node_values)])
+
+    # V4.81.46: App Cloner may report the wrong/shared package attribute. Fall
+    # back to the exact saved clone rectangle and collect only text physically
+    # inside that window. This stays layout-agnostic because Option 16 owns the
+    # rectangles for 2x2/3x2/5x2/etc.
+    rect = _loading_visual_rect_for_package(str(pkg or ""), cfg)
+    if rect and isinstance(snapshot, dict):
+        try:
+            rx1, ry1, rx2, ry2 = (int(v) for v in rect)
+        except Exception:
+            rx1 = ry1 = rx2 = ry2 = 0
+        if rx2 > rx1 and ry2 > ry1:
+            for node in snapshot.get("text_nodes", []) or []:
+                if not isinstance(node, dict):
+                    continue
+                bounds = node.get("bounds")
+                text = str(node.get("text", "") or "").strip()
+                if not text or not isinstance(bounds, (list, tuple)) or len(bounds) != 4:
+                    continue
+                try:
+                    x1, y1, x2, y2 = (int(v) for v in bounds)
+                except Exception:
+                    continue
+                cx = (x1 + x2) / 2.0
+                cy = (y1 + y2) / 2.0
+                if rx1 <= cx <= rx2 and ry1 <= cy <= ry2:
+                    values.append(text)
+
+    # Preserve order while removing duplicate accessibility labels.
+    values = list(dict.fromkeys(str(v or "").strip() for v in values if str(v or "").strip()))
     if not values:
         return None
 
@@ -14162,6 +14236,7 @@ def wait_until_fresh_after_open(
     expected_place_id="",
     expected_job_id="",
     core=None,
+    visible_home_fail_after_seconds=None,
 ):
     if not cfg.get("wait_fresh_after_open", True):
         return True, "fresh wait disabled"
@@ -14182,6 +14257,10 @@ def wait_until_fresh_after_open(
     )
     seen_alive_after_open = False
     process_missing_since = 0
+    visible_home_since = 0
+    visible_home_fail_after = max(
+        0, int(visible_home_fail_after_seconds or 0)
+    )
 
     # V3.81: never call the solver blindly here. A job is started below only
     # when the Lua state explicitly reports a join/login challenge.
@@ -14203,6 +14282,10 @@ def wait_until_fresh_after_open(
             if visible_home:
                 rt_tab["hatcher_visible_home_at"] = now()
                 rt_tab["hatcher_visible_home_hits"] = ",".join(visible_home.get("hits", [])[:8])
+                if visible_home_since <= 0:
+                    visible_home_since = now()
+            else:
+                visible_home_since = 0
 
         if process_status == "ALIVE":
             seen_alive_after_open = True
@@ -14398,6 +14481,24 @@ def wait_until_fresh_after_open(
         core.save()
 
         wait_fresh_screen(tab, cfg, elapsed, timeout, alive, state, err, status_note)
+
+        # V4.81.45: a package-scoped Roblox Home screen is stronger evidence
+        # than merely waiting out the whole soft-hop timeout. For the manual
+        # Option 6 ALIVE-Noka route-only generation, let a continuously visible
+        # Home page fail this *route attempt* early so the next safe route can
+        # be tried. This never PID-stops or launcher-prewarms the package.
+        if (
+            visible_home
+            and visible_home_fail_after > 0
+            and visible_home_since > 0
+            and now() - visible_home_since >= visible_home_fail_after
+        ):
+            rt_tab["note"] = (
+                f"Roblox Home confirmed {now() - visible_home_since}s; "
+                "ending route attempt early"
+            )
+            core.save()
+            return False, "Roblox Home visible"
 
         route_ok = True
         if fresh and (
@@ -15147,6 +15248,13 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
             expected_place_id=route_expected_place,
             expected_job_id=route_expected_job_id,
             core=core,
+            visible_home_fail_after_seconds=(
+                max(20, int(cfg.get("option6_alive_noka_home_confirm_seconds", 45) or 45))
+                if item.get("option6_alive_noka_route_only")
+                and _is_noka_clone_package(pkg)
+                and actual_open_mode == "route"
+                else None
+            ),
         )
         if actual_open_mode == "soft":
             rt_tab["note"] = "soft " + fresh_msg
@@ -15288,7 +15396,7 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
             if option6_alive_noka_route_only:
                 option6_route_limit = max(
                     failures_before_hard,
-                    int(cfg.get("option6_alive_noka_route_retry_limit", 4) or 4),
+                    int(cfg.get("option6_alive_noka_route_retry_limit", 3) or 3),
                 )
                 if join_fail_count < option6_route_limit:
                     retry_meta = {
