@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.24 — CAPTCHA STRICT VISUAL + BUBBLE ROUTE NUDGE GUARD
+# - Tightens automatic screenshot-only CAPTCHA detection: a generic white Roblox/Home panel plus a
+#   green avatar/game icon is no longer enough. Color-only CAPTCHA now requires a near-white challenge
+#   panel and a centered green-button signal before confirmations can start the provider.
+# - Bubble-only Hatcher recovery keeps the one exact-PID bootstrap, then uses two delayed in-place
+#   private-route nudges (no additional PID stop) so Roblox Home has time to finish booting before
+#   the saved Hatcher deep link is resent.
+#
 # V4.81.23 — BUBBLE HOME SECOND-INTENT RESCUE
 # - Bubble/minimized shell detection now accepts a stale package with no visible package window even
 #   when App Cloner leaves a ghost ActivityRecord after the floating window is X-closed.
@@ -935,7 +943,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.23-bubble-home-second-intent-rescue"
+__version__ = "V4.81.24-captcha-strict-bubble-route-nudge"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1660,6 +1668,8 @@ DEFAULT_CONFIG = {
     "captcha_visual_confirmations_required": 2,
     "captcha_visual_min_white_ratio": 0.42,
     "captcha_visual_min_green_ratio": 0.004,
+    "captcha_visual_strict_min_white_ratio": 0.85,
+    "captcha_visual_strict_center_green_ratio": 0.10,
     # Generic one-time floating layout mapping. Both CAPTCHA and face-lock
     # detectors read these exact package rectangles; runtime rejoin never moves them.
     "visual_layout_template": "auto",
@@ -1851,6 +1861,8 @@ DEFAULT_CONFIG = {
     # more in-place after a short delay if no fresh state has appeared.
     "bubble_rescue_second_intent_enabled": True,
     "bubble_rescue_second_intent_delay_seconds": 6,
+    "bubble_rescue_route_nudge_first_seconds": 15,
+    "bubble_rescue_route_nudge_second_seconds": 45,
 
     # Pool-wide stagger: minimum seconds between any two hard opens across ALL
     # clones. Spaces out restarts so reloads don't overlap (memory spikes) and
@@ -3135,6 +3147,22 @@ def apply_update_migrations(cfg):
         set_cfg("bubble_rescue_second_intent_enabled", True)
     if _int_cfg(cfg.get("bubble_rescue_second_intent_delay_seconds"), 0) <= 0:
         set_cfg("bubble_rescue_second_intent_delay_seconds", 6)
+    if _int_cfg(cfg.get("bubble_rescue_route_nudge_first_seconds"), 0) < 10:
+        set_cfg("bubble_rescue_route_nudge_first_seconds", 15)
+    if _int_cfg(cfg.get("bubble_rescue_route_nudge_second_seconds"), 0) < 20:
+        set_cfg("bubble_rescue_route_nudge_second_seconds", 45)
+    try:
+        strict_white = float(cfg.get("captcha_visual_strict_min_white_ratio", 0.0) or 0.0)
+    except Exception:
+        strict_white = 0.0
+    if strict_white < 0.85:
+        set_cfg("captcha_visual_strict_min_white_ratio", 0.85)
+    try:
+        strict_center_green = float(cfg.get("captcha_visual_strict_center_green_ratio", 0.0) or 0.0)
+    except Exception:
+        strict_center_green = 0.0
+    if strict_center_green < 0.10:
+        set_cfg("captcha_visual_strict_center_green_ratio", 0.10)
     if "login_challenge_detection_enabled" not in cfg:
         set_cfg("login_challenge_detection_enabled", True)
     if "login_challenge_api_detection_enabled" not in cfg:
@@ -12506,14 +12534,14 @@ def _capture_screencap_raw(cfg, timeout=10):
 
 
 def _visual_cell_metrics(frame, rect):
-    """Sample one app cell for a white panel and green Start Puzzle button."""
+    """Sample one app cell for a near-white verification panel + centered green button."""
     width = int(frame["width"])
     height = int(frame["height"])
     pixels = frame["pixels"]
     try:
         left, top, right, bottom = [int(x) for x in rect]
     except Exception:
-        return {"candidate": False, "white_ratio": 0.0, "green_ratio": 0.0, "samples": 0}
+        return {"candidate": False, "white_ratio": 0.0, "green_ratio": 0.0, "center_green_ratio": 0.0, "samples": 0}
     left = max(0, min(width - 1, left))
     right = max(left + 1, min(width, right))
     top = max(0, min(height - 1, top))
@@ -12521,7 +12549,7 @@ def _visual_cell_metrics(frame, rect):
     cw = right - left
     ch = bottom - top
     if cw < 80 or ch < 80:
-        return {"candidate": False, "white_ratio": 0.0, "green_ratio": 0.0, "samples": 0}
+        return {"candidate": False, "white_ratio": 0.0, "green_ratio": 0.0, "center_green_ratio": 0.0, "samples": 0}
     x1 = left + int(cw * 0.06)
     x2 = right - int(cw * 0.06)
     y1 = top + int(ch * 0.12)
@@ -12529,10 +12557,15 @@ def _visual_cell_metrics(frame, rect):
     step = max(4, min(10, min(cw, ch) // 45))
     white = total = 0
     green = green_total = 0
+    center_green = center_green_total = 0
     green_y1 = top + int(ch * 0.55)
     green_y2 = bottom - int(ch * 0.06)
     green_x1 = left + int(cw * 0.20)
     green_x2 = right - int(cw * 0.20)
+    center_y1 = top + int(ch * 0.60)
+    center_y2 = bottom - int(ch * 0.08)
+    center_x1 = left + int(cw * 0.31)
+    center_x2 = right - int(cw * 0.31)
     for y in range(y1, y2, step):
         row = y * width * 4
         for x in range(x1, x2, step):
@@ -12543,14 +12576,20 @@ def _visual_cell_metrics(frame, rect):
             total += 1
             if r >= 215 and g >= 215 and b >= 215 and max(r, g, b) - min(r, g, b) <= 38:
                 white += 1
+            is_green = bool(g >= 120 and g - r >= 22 and g - b >= 18)
             if green_x1 <= x < green_x2 and green_y1 <= y < green_y2:
                 green_total += 1
-                if g >= 120 and g - r >= 22 and g - b >= 18:
+                if is_green:
                     green += 1
+            if center_x1 <= x < center_x2 and center_y1 <= y < center_y2:
+                center_green_total += 1
+                if is_green:
+                    center_green += 1
     return {
         "candidate": False,
         "white_ratio": (white / total) if total else 0.0,
         "green_ratio": (green / green_total) if green_total else 0.0,
+        "center_green_ratio": (center_green / center_green_total) if center_green_total else 0.0,
         "samples": total,
     }
 
@@ -12607,11 +12646,17 @@ def capture_visual_captcha_snapshot(cfg, force=False):
 
     white_min = float(cfg.get("captcha_visual_min_white_ratio", 0.42) or 0.42)
     green_min = float(cfg.get("captcha_visual_min_green_ratio", 0.004) or 0.004)
+    strict_white_min = max(0.85, float(cfg.get("captcha_visual_strict_min_white_ratio", 0.85) or 0.85))
+    strict_center_green_min = max(0.10, float(cfg.get("captcha_visual_strict_center_green_ratio", 0.10) or 0.10))
     metrics = {}
     raw_candidates = {}
     for pkg, rect in cells.items():
         m = _visual_cell_metrics(frame, rect)
-        candidate = bool(m["white_ratio"] >= white_min and m["green_ratio"] >= green_min)
+        candidate = bool(
+            m["white_ratio"] >= max(white_min, strict_white_min)
+            and m["green_ratio"] >= green_min
+            and float(m.get("center_green_ratio", 0.0) or 0.0) >= strict_center_green_min
+        )
         m["candidate"] = candidate
         m["rect"] = list(rect)
         metrics[pkg] = m
@@ -12645,7 +12690,8 @@ def visual_captcha_detail(pkg, cfg, force=False, bypass_confirm=False):
         "title": "Roblox Verification",
         "text": (
             f"visual white={float(metrics.get('white_ratio', 0.0)):.3f} "
-            f"green={float(metrics.get('green_ratio', 0.0)):.3f}"
+            f"green={float(metrics.get('green_ratio', 0.0)):.3f} "
+            f"center={float(metrics.get('center_green_ratio', 0.0)):.3f}"
         ),
         "reason": "android_package_scoped_visual_captcha",
         "hits": ["visual verification panel", "green start-puzzle button"],
@@ -14089,71 +14135,88 @@ def market_booster_second_soft_intent(
 
 
 def hatcher_bubble_second_private_intent(tab, rt_tab, cfg, rt, target, reason, first_opened_at, core=None):
-    """Send one in-place Hatcher deep link after a bubble-only hard bootstrap.
-
-    App Cloner sometimes starts the selected Roblox package at Home after its
-    shell-only floating task is materialized and exact-PID stopped. The package
-    is alive at that point, so a second VIEW intent with CLEAR_TOP|SINGLE_TOP can
-    deliver the saved private/game route without another stop or another hard
-    recovery generation.
-    """
+    """Send two delayed in-place Hatcher route nudges after a bubble-only bootstrap."""
     if core is None:
         core = RejoinCore([], cfg, rt)
     if not cfg.get("bubble_rescue_second_intent_enabled", True):
-        return int(first_opened_at), "second intent disabled"
-
-    delay = max(1, int(cfg.get("bubble_rescue_second_intent_delay_seconds", 6) or 6))
-    for _ in range(delay):
-        if stop_requested():
-            return int(first_opened_at), "stop"
-        fresh, _state, _err = state_fresh_after_open(tab, cfg, first_opened_at)
-        if fresh:
-            return int(first_opened_at), "first intent already fresh"
-        if not wait_seconds(1, rt):
-            return int(first_opened_at), "stop"
+        return int(first_opened_at), "route nudges disabled"
 
     package = str((tab or {}).get("package", "") or "")
-    process_status, process_note = package_alive_status(package, cfg, fresh=True)
-    if process_status != "ALIVE":
-        return int(first_opened_at), f"second intent skipped: {process_status.lower()}"
+    first_at = max(10, int(cfg.get("bubble_rescue_route_nudge_first_seconds", 15) or 15))
+    second_at = max(first_at + 10, int(cfg.get("bubble_rescue_route_nudge_second_seconds", 45) or 45))
+    schedule = [first_at, second_at]
+    elapsed = 0
+    last_sent_at = int(first_opened_at)
+    sent_count = 0
 
-    link = target_link(tab, cfg, target, rt_tab, rt)
-    if not link:
-        return int(first_opened_at), "second intent skipped: no Hatcher link"
+    for nudge_index, target_elapsed in enumerate(schedule, 1):
+        wait_for = max(0, target_elapsed - elapsed)
+        for _ in range(wait_for):
+            if stop_requested():
+                return last_sent_at, "stop"
+            fresh, _state, _err = state_fresh_after_open(tab, cfg, first_opened_at)
+            if fresh:
+                return last_sent_at, ("first intent already fresh" if sent_count == 0 else f"fresh after route nudge {sent_count}")
+            if not wait_seconds(1, rt):
+                return last_sent_at, "stop"
+        elapsed = target_elapsed
 
-    log_activity(
-        "bubble rescue first launch has no fresh state; sending second Hatcher deep link in-place",
-        package,
-        YELLOW,
-    )
-    rt_tab["bubble_rescue_second_intent_at"] = now()
-    rt_tab["note"] = "bubble rescue second private intent"
-    core.save()
+        fresh, _state, _err = state_fresh_after_open(tab, cfg, first_opened_at)
+        if fresh:
+            return last_sent_at, ("first intent already fresh" if sent_count == 0 else f"fresh after route nudge {sent_count}")
 
-    # Critical safety property: soft=True + require_stop=False means this call can
-    # never exact-PID stop the target, and therefore cannot disturb siblings.
-    ok, note = open_roblox(
-        package,
-        link,
-        cfg,
-        soft=True,
-        rt_tab=rt_tab,
-        reason="bubble rescue second private intent",
-        require_stop=False,
-        skip_force_stop=True,
-    )
-    sent_at = now()
-    rt_tab["bubble_rescue_second_intent_ok"] = bool(ok)
-    rt_tab["bubble_rescue_second_intent_note"] = str(note or "")
-    if ok:
-        rt_tab["last_open"] = sent_at
-        log_activity("bubble rescue second Hatcher deep link sent in-place", package, GREEN)
+        process_status, _process_note = package_alive_status(package, cfg, fresh=True)
+        if process_status != "ALIVE":
+            return last_sent_at, f"route nudge skipped: {process_status.lower()}"
+
+        link = target_link(tab, cfg, target, rt_tab, rt)
+        if not link:
+            return last_sent_at, "route nudge skipped: no Hatcher link"
+
+        log_activity(
+            f"bubble rescue still has no fresh state; sending Hatcher route nudge {nudge_index}/2 in-place",
+            package,
+            YELLOW,
+        )
+        rt_tab["bubble_rescue_route_nudge_count"] = nudge_index
+        rt_tab["note"] = f"bubble rescue route nudge {nudge_index}/2"
         core.save()
-        return sent_at, "second Hatcher intent sent"
 
-    log_activity(f"bubble rescue second Hatcher deep link failed: {cut(note, 70)}", package, RED)
-    core.save()
-    return int(first_opened_at), f"second intent failed: {note}"
+        ok, note = open_roblox(
+            package,
+            link,
+            cfg,
+            soft=True,
+            rt_tab=rt_tab,
+            reason=f"bubble rescue Hatcher route nudge {nudge_index}",
+            require_stop=False,
+            skip_force_stop=True,
+        )
+        sent_at = now()
+        rt_tab[f"bubble_rescue_route_nudge_{nudge_index}_ok"] = bool(ok)
+        rt_tab[f"bubble_rescue_route_nudge_{nudge_index}_at"] = sent_at
+        rt_tab[f"bubble_rescue_route_nudge_{nudge_index}_note"] = str(note or "")
+        if not ok:
+            log_activity(
+                f"bubble rescue Hatcher route nudge {nudge_index}/2 failed: {cut(note, 70)}",
+                package,
+                RED,
+            )
+            core.save()
+            continue
+
+        sent_count += 1
+        last_sent_at = sent_at
+        rt_tab["last_open"] = sent_at
+        log_activity(
+            f"bubble rescue Hatcher route nudge {nudge_index}/2 sent in-place",
+            package,
+            GREEN,
+        )
+        core.save()
+
+    return last_sent_at, f"sent {sent_count} bubble route nudge(s)"
+
 
 def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_hard, cfg, rt, core=None):
     """The actual target-only open -> wait-for-fresh cycle for one package."""
