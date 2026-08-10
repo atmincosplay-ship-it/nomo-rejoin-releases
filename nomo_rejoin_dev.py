@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.10 — MARKET LAST-GOOD LOADER
+# - Market AutoExec now validates GitHub source before execution and keeps a last-good
+#   local cache under the executor Workspace (Nomo/market_last_good.lua).
+# - GitHub/network/validation/compile failures fall back to the last-good Market source
+#   instead of leaving the clone without NOMO Market after a rejoin.
+# - The cache is updated only after the downloaded Market script successfully starts,
+#   so HTTP error pages or broken source can never poison the last-good copy.
+# - Market runtime marker v3 reports market_source=github/cache and cache availability.
+#
 # V4.81.9 — AUTOEXEC BACKUP GUARD
 # - NOMO-owned AutoExec backups/disabled copies are removed from executor folders;
 #   backups now live under NOMO's own backup directory outside AutoExec.
@@ -860,7 +869,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.9-autoexec-backup-guard"
+__version__ = "V4.81.10-market-last-good-loader"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -24982,7 +24991,7 @@ def cleanup_nomo_autoexec_backup_artifacts(cfg):
 def upgrade_known_nomo_market_loader_once(cfg):
     """Upgrade only known NOMO loader generations; preserve unrelated/custom AutoExec."""
     marker = "-- NOMO Market / GAG loader"
-    target_revision = 3
+    target_revision = 4
     target_marker = f"-- NOMO Market loader revision {target_revision}"
     old_worker = "https://nomo-key.atmincosplay.workers.dev/key"
     local_key_marker = 'local sharedKeyFile = sharedFolder .. "/exotic_key.json"'
@@ -25024,7 +25033,7 @@ def upgrade_known_nomo_market_loader_once(cfg):
 
 
 MARKET_LOADER_AUTOEXEC_TEMPLATE = r'''-- NOMO Market / GAG loader
--- NOMO Market loader revision 3
+-- NOMO Market loader revision 4
 if not game:IsLoaded() then
     game.Loaded:Wait()
 end
@@ -25220,7 +25229,7 @@ if game.PlaceId == 126884695634066 then
 
 elseif game.PlaceId == 129954712878723 then
     -- Trade World / Market
-    -- NOMO Market runtime marker v2
+    -- NOMO Market runtime marker v3
     print("trade world")
 
     local Players = game:GetService("Players")
@@ -25230,8 +25239,10 @@ elseif game.PlaceId == 129954712878723 then
     local runtimeFolder = "Nomo"
     local runtimeFile = runtimeFolder .. "/market_runtime_" .. userId .. ".json"
     local marketUrl = "https://raw.githubusercontent.com/atmincosplay-ship-it/nomo-market/main/nomo_obsidian.lua"
+    local marketCacheFile = runtimeFolder .. "/market_last_good.lua"
     local loaderStartedAt = 0
     local marketVersion = "UNKNOWN"
+    local marketSourceName = "none"
 
     local function epochNow()
         local ok, value = pcall(function()
@@ -25296,9 +25307,12 @@ elseif game.PlaceId == 129954712878723 then
         local backoffUntil = tonumber(state and state.RemoteConfigBackoffUntil) or 0
         local source = tostring(state and state.SharedConfigSource or "")
         return {
-            marker_version = 2,
-            loader_version = "V4.81.9",
+            marker_version = 3,
+            loader_version = "V4.81.10",
             market_version = tostring(marketVersion or "UNKNOWN"),
+            market_source = tostring(marketSourceName or "none"),
+            market_cache_file = marketCacheFile,
+            market_cache_available = (type(isfile) == "function" and isfile(marketCacheFile)) or false,
             uid = userId,
             username = tostring(player.Name or ""),
             display_name = tostring(player.DisplayName or ""),
@@ -25337,32 +25351,109 @@ elseif game.PlaceId == 129954712878723 then
         end)
     end
 
+    local function validMarketSource(text)
+        if type(text) ~= "string" or #text < 20000 then
+            return false
+        end
+        return string.find(text, "NOMO MARKET SELLER LITE", 1, true) ~= nil
+            and string.find(text, "__NOMO_MARKET_V30_STATE", 1, true) ~= nil
+            and string.find(text, "RemoteConfigRefreshSeconds", 1, true) ~= nil
+            and text:match('local%s+VERSION%s*=%s*"[^"]+"') ~= nil
+    end
+
+    local function readMarketCache()
+        if type(readfile) ~= "function" then
+            return nil
+        end
+        local ok, text = pcall(function()
+            if type(isfile) == "function" and not isfile(marketCacheFile) then
+                return nil
+            end
+            return readfile(marketCacheFile)
+        end)
+        if ok and validMarketSource(text) then
+            return text
+        end
+        return nil
+    end
+
+    local function saveMarketCache(text)
+        if type(writefile) ~= "function" or not validMarketSource(text) then
+            return false
+        end
+        ensureRuntimeFolder()
+        return pcall(function()
+            writefile(marketCacheFile, text)
+        end)
+    end
+
     writeRuntime("LOADER_STARTED", "")
 
-    local downloadOk, marketSource = pcall(function()
+    local marketSource = nil
+    local marketChunk = nil
+    local sourceErr = ""
+
+    -- Prefer GitHub latest, but never trust raw HTTP text until it passes
+    -- NOMO markers + a Lua compile check. This prevents 404/error pages from
+    -- replacing or bypassing the last-good copy.
+    local downloadOk, remoteText = pcall(function()
         return game:HttpGet(marketUrl, true)
     end)
-    if not downloadOk or type(marketSource) ~= "string" or marketSource == "" then
-        writeRuntime("DOWNLOAD_FAILED", tostring(marketSource))
-        warn("[NOMO MARKET] download failed:", tostring(marketSource))
+    if downloadOk and validMarketSource(remoteText) then
+        local remoteChunk, remoteCompileErr = loadstring(remoteText)
+        if type(remoteChunk) == "function" then
+            marketSource = remoteText
+            marketChunk = remoteChunk
+            marketSourceName = "github"
+        else
+            sourceErr = "github compile failed: " .. tostring(remoteCompileErr)
+        end
+    elseif not downloadOk then
+        sourceErr = "github download failed: " .. tostring(remoteText)
+    else
+        sourceErr = "github source validation failed"
+    end
+
+    if not marketSource then
+        local cachedText = readMarketCache()
+        if cachedText then
+            local cachedChunk, cachedCompileErr = loadstring(cachedText)
+            if type(cachedChunk) == "function" then
+                marketSource = cachedText
+                marketChunk = cachedChunk
+                marketSourceName = "cache"
+                warn("[NOMO MARKET] GitHub unavailable/bad; using last-good cache:", tostring(sourceErr))
+            else
+                sourceErr = sourceErr .. " | cache compile failed: " .. tostring(cachedCompileErr)
+            end
+        else
+            sourceErr = sourceErr .. " | no valid last-good cache"
+        end
+    end
+
+    if not marketSource or type(marketChunk) ~= "function" then
+        writeRuntime("SOURCE_UNAVAILABLE", sourceErr)
+        warn("[NOMO MARKET] no usable Market source:", sourceErr)
         return
     end
 
     marketVersion = marketSource:match('local%s+VERSION%s*=%s*"([^"]+)"') or "UNKNOWN"
     writeRuntime("SOURCE_READY", "")
 
-    local marketChunk, compileErr = loadstring(marketSource)
-    if type(marketChunk) ~= "function" then
-        writeRuntime("COMPILE_FAILED", tostring(compileErr))
-        warn("[NOMO MARKET] compile failed:", tostring(compileErr))
-        return
-    end
-
     local runOk, runErr = pcall(marketChunk)
     if not runOk then
         writeRuntime("RUNTIME_FAILED", tostring(runErr))
-        warn("[NOMO MARKET] runtime failed:", tostring(runErr))
+        warn("[NOMO MARKET] " .. tostring(marketSourceName) .. " runtime failed:", tostring(runErr))
         return
+    end
+
+    -- Only a GitHub source that actually started successfully is allowed to
+    -- replace the cache. A bad download/compile/runtime can never poison it.
+    if marketSourceName == "github" then
+        local cacheOk = saveMarketCache(marketSource)
+        if not cacheOk then
+            warn("[NOMO MARKET] running GitHub source OK, but last-good cache write failed")
+        end
     end
 
     writeRuntime("MARKET_RUNNING", "")
@@ -25384,6 +25475,7 @@ elseif game.PlaceId == 129954712878723 then
             local running = state ~= nil and state.Running ~= false
             local signature = table.concat({
                 tostring(marketVersion),
+                tostring(marketSourceName),
                 tostring(refreshSeconds),
                 tostring(lastFetch),
                 tostring(backoffUntil),
