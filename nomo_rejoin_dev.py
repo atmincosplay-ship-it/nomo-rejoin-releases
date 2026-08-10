@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.19 — CRITICAL LOCAL STATE DURABILITY
+# - captcha_hold.json is now lock-protected, atomic, and backed by captcha_hold.json.last_good.
+#   Concurrent solver failures cannot overwrite another package's cooldown; unreadable primary+backup
+#   fails closed so automatic provider calls stay blocked until the hold file is explicitly cleared.
+# - exotic_key_state.json now has last-good recovery. Writer mode fails closed when both copies are
+#   unreadable, preventing an accidental replacement-key generation from corrupted local state.
+# - delta_key_runtime.json now has last-good recovery. Automatic Delta renewal/restart actions pause
+#   when both copies are unreadable instead of treating lost runtime state as a fresh/expired device.
+#
 # V4.81.18 — EXOTIC WRITER / LAST-GOOD CACHE GUARD
 # - Writer devices periodically verify the cloud key against their local authoritative key.
 #   A mismatch becomes a hard WRITER CONFLICT that blocks automatic generation/upload until
@@ -907,7 +916,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.18-exotic-writer-cache-guard"
+__version__ = "V4.81.19-critical-local-state-durability"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -2658,6 +2667,157 @@ def load_json(path, default):
         pass
 
     return default
+
+
+# V4.81.19: critical standalone JSON state is not part of unified nomo.json.
+# Protect files whose corruption can trigger provider/key/restart actions.
+_PROTECTED_JSON_LOCKS_GUARD = threading.Lock()
+_PROTECTED_JSON_LOCKS = {}
+_PROTECTED_JSON_HEALTH = {}
+
+
+def _protected_json_lock(path):
+    key = str(Path(path))
+    with _PROTECTED_JSON_LOCKS_GUARD:
+        lock = _PROTECTED_JSON_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _PROTECTED_JSON_LOCKS[key] = lock
+        return lock
+
+
+def _protected_json_backup_path(path):
+    path = Path(path)
+    return path.with_name(path.name + ".last_good")
+
+
+def _protected_json_parse_dict(path):
+    path = Path(path)
+    try:
+        if not path.exists():
+            return None, "missing"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return None, "root is not an object"
+        return dict(data), ""
+    except Exception as exc:
+        return None, str(exc)
+
+
+def _protected_json_atomic_write(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    encoded = json.dumps(dict(data or {}), indent=2, ensure_ascii=False)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        tmp.write_text(encoded, encoding="utf-8")
+        os.replace(str(tmp), str(path))
+    except Exception:
+        path.write_text(encoded, encoding="utf-8")
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+
+
+def _protected_json_read_dict(path, default=None):
+    """Read dict JSON with one last-good recovery copy.
+
+    Health values: ok, missing, recovered, corrupt. `corrupt` means both an
+    existing primary and its last-good copy were unreadable and callers that can
+    trigger destructive/remote actions should fail closed.
+    """
+    path = Path(path)
+    backup = _protected_json_backup_path(path)
+    lock = _protected_json_lock(path)
+    with lock:
+        primary_exists = path.exists()
+        backup_exists = backup.exists()
+        data, primary_err = _protected_json_parse_dict(path)
+        if data is not None:
+            _PROTECTED_JSON_HEALTH[str(path)] = {
+                "status": "ok", "error": "", "at": int(time.time())
+            }
+            # Seed or repair protection for state created by older NOMO or a
+            # damaged last-good copy while the primary is still healthy.
+            backup_data, _backup_seed_err = _protected_json_parse_dict(backup)
+            if backup_data is None:
+                try:
+                    _protected_json_atomic_write(backup, data)
+                except Exception:
+                    pass
+            return data
+
+        recovered, backup_err = _protected_json_parse_dict(backup)
+        if recovered is not None:
+            # Restore accidental deletion or a malformed primary from last-good.
+            try:
+                _protected_json_atomic_write(path, recovered)
+            except Exception:
+                pass
+            _PROTECTED_JSON_HEALTH[str(path)] = {
+                "status": "recovered",
+                "error": str(primary_err or "primary unavailable"),
+                "at": int(time.time()),
+            }
+            return recovered
+
+        if primary_exists or backup_exists:
+            _PROTECTED_JSON_HEALTH[str(path)] = {
+                "status": "corrupt",
+                "error": f"primary={primary_err}; last_good={backup_err}",
+                "at": int(time.time()),
+            }
+        else:
+            _PROTECTED_JSON_HEALTH[str(path)] = {
+                "status": "missing", "error": "", "at": int(time.time())
+            }
+        return dict(default or {})
+
+
+def _protected_json_write_dict(path, data, *, allow_corrupt_reset=False):
+    path = Path(path)
+    backup = _protected_json_backup_path(path)
+    lock = _protected_json_lock(path)
+    with lock:
+        if str(path) not in _PROTECTED_JSON_HEALTH:
+            _protected_json_read_dict(path, {})
+        health = _PROTECTED_JSON_HEALTH.get(str(path), {})
+        if health.get("status") == "corrupt" and not allow_corrupt_reset:
+            return False
+        payload = dict(data or {})
+        _protected_json_atomic_write(path, payload)
+        _protected_json_atomic_write(backup, payload)
+        _PROTECTED_JSON_HEALTH[str(path)] = {
+            "status": "ok", "error": "", "at": int(time.time())
+        }
+        return True
+
+
+def _protected_json_health(path):
+    path = Path(path)
+    # Ensure health is known at least once without mutating a healthy file.
+    if str(path) not in _PROTECTED_JSON_HEALTH:
+        _protected_json_read_dict(path, {})
+    return dict(_PROTECTED_JSON_HEALTH.get(str(path), {}))
+
+
+def _protected_json_clear(path):
+    """Explicit user reset: remove primary + last-good and clear fail-closed state."""
+    path = Path(path)
+    backup = _protected_json_backup_path(path)
+    lock = _protected_json_lock(path)
+    with lock:
+        for candidate in (path, backup, path.with_suffix(path.suffix + ".tmp")):
+            try:
+                if candidate.exists():
+                    candidate.unlink()
+            except Exception:
+                pass
+        _PROTECTED_JSON_HEALTH[str(path)] = {
+            "status": "missing", "error": "", "at": int(time.time())
+        }
 
 
 
@@ -16040,91 +16200,95 @@ def normalize_hatcher_profile(prof, idx=0):
     return base
 
 
+_CAPTCHA_HOLD_FILE = BASE_DIR / "captcha_hold.json"
+
+
+def _load_captcha_holds():
+    holds = _protected_json_read_dict(_CAPTCHA_HOLD_FILE, {})
+    health = _protected_json_health(_CAPTCHA_HOLD_FILE)
+    return holds, health
+
+
 def set_hold(package, reason, retry_seconds=None):
-    hold = {}
-    hold_file = BASE_DIR / "captcha_hold.json"
-    if hold_file.exists():
-        try:
-            with open(hold_file) as f:
-                hold = json.load(f)
-        except:
-            pass
-    retry_at = 0
-    if retry_seconds:
-        try:
-            retry_at = int(time.time()) + max(1, int(retry_seconds))
-        except Exception:
-            retry_at = 0
-    hold[package] = {
-        "reason": reason,
-        "timestamp": time.time(),
-        "retry_at": retry_at,
-        "retry_seconds": int(retry_seconds or 0),
-    }
-    with open(hold_file, "w") as f:
-        json.dump(hold, f, indent=2)
+    # One shared RLock covers read -> merge -> write, so two solver threads cannot
+    # erase each other's package hold.
+    lock = _protected_json_lock(_CAPTCHA_HOLD_FILE)
+    with lock:
+        hold, health = _load_captcha_holds()
+        if health.get("status") == "corrupt":
+            # Fail closed: never overwrite unknown holds automatically. Menu clear
+            # is the explicit recovery path if both primary and last-good are bad.
+            return False
+        retry_at = 0
+        if retry_seconds:
+            try:
+                retry_at = int(time.time()) + max(1, int(retry_seconds))
+            except Exception:
+                retry_at = 0
+        hold[str(package)] = {
+            "reason": reason,
+            "timestamp": time.time(),
+            "retry_at": retry_at,
+            "retry_seconds": int(retry_seconds or 0),
+        }
+        return _protected_json_write_dict(_CAPTCHA_HOLD_FILE, hold)
+
 
 def clear_hold(package):
-    hold_file = BASE_DIR / "captcha_hold.json"
-    if hold_file.exists():
-        try:
-            with open(hold_file) as f:
-                hold = json.load(f)
-            if package in hold:
-                del hold[package]
-                with open(hold_file, "w") as f:
-                    json.dump(hold, f, indent=2)
-        except:
-            pass
+    lock = _protected_json_lock(_CAPTCHA_HOLD_FILE)
+    with lock:
+        hold, health = _load_captcha_holds()
+        if health.get("status") == "corrupt":
+            return False
+        package = str(package)
+        if package in hold:
+            del hold[package]
+            return _protected_json_write_dict(_CAPTCHA_HOLD_FILE, hold)
+        return True
+
 
 def clear_all_holds():
-    hold_file = BASE_DIR / "captcha_hold.json"
-    if hold_file.exists():
-        try:
-            os.remove(hold_file)
-        except:
-            pass
+    # This is an explicit user action, so it is allowed to clear a fail-closed
+    # corrupt state as well as the last-good copy.
+    _protected_json_clear(_CAPTCHA_HOLD_FILE)
+
 
 def is_on_hold(package):
-    hold_file = BASE_DIR / "captcha_hold.json"
-    if not hold_file.exists():
-        return False
-    try:
-        with open(hold_file) as f:
-            hold = json.load(f)
+    lock = _protected_json_lock(_CAPTCHA_HOLD_FILE)
+    with lock:
+        hold, health = _load_captcha_holds()
+        if health.get("status") == "corrupt":
+            return True
+        package = str(package)
         item = hold.get(package)
         if not item:
             return False
         retry_at = int(item.get("retry_at", 0) or 0)
         if retry_at > 0 and retry_at <= int(time.time()):
             del hold[package]
-            with open(hold_file, "w") as f:
-                json.dump(hold, f, indent=2)
+            _protected_json_write_dict(_CAPTCHA_HOLD_FILE, hold)
             return False
         return True
-    except Exception:
-        return False
+
 
 def get_hold_reason(package):
-    hold_file = BASE_DIR / "captcha_hold.json"
-    if not hold_file.exists():
-        return None
-    try:
-        with open(hold_file) as f:
-            hold = json.load(f)
+    lock = _protected_json_lock(_CAPTCHA_HOLD_FILE)
+    with lock:
+        hold, health = _load_captcha_holds()
+        if health.get("status") == "corrupt":
+            return "captcha hold state unreadable; automatic solver blocked (clear holds to reset)"
+        package = str(package)
         item = hold.get(package, {})
         retry_at = int(item.get("retry_at", 0) or 0)
         if retry_at > 0:
             left = retry_at - int(time.time())
             if left <= 0:
-                del hold[package]
-                with open(hold_file, "w") as f:
-                    json.dump(hold, f, indent=2)
+                if package in hold:
+                    del hold[package]
+                    _protected_json_write_dict(_CAPTCHA_HOLD_FILE, hold)
                 return None
             return f"{item.get('reason')} | retry in {format_age(left)}"
         return item.get("reason")
-    except:
-        return None
 
 def is_placeholder_value(v):
     v = str(v or "").strip()
@@ -24457,7 +24621,7 @@ def _exotic_clean_key(value):
 
 def load_exotic_key_state():
     with _EXOTIC_STATE_LOCK:
-        state = load_json(EXOTIC_KEY_STATE_FILE, {})
+        state = _protected_json_read_dict(EXOTIC_KEY_STATE_FILE, {})
         return dict(state) if isinstance(state, dict) else {}
 
 
@@ -24465,13 +24629,13 @@ def save_exotic_key_state(state):
     with _EXOTIC_STATE_LOCK:
         state = dict(state or {})
         state["saved_at"] = now()
-        save_json(EXOTIC_KEY_STATE_FILE, state)
+        _protected_json_write_dict(EXOTIC_KEY_STATE_FILE, state)
 
 
 def _update_exotic_key_state(updates=None, *, expected_key=None):
     """Merge fields into the latest on-disk state under one re-entrant lock."""
     with _EXOTIC_STATE_LOCK:
-        state = load_json(EXOTIC_KEY_STATE_FILE, {})
+        state = _protected_json_read_dict(EXOTIC_KEY_STATE_FILE, {})
         if not isinstance(state, dict):
             state = {}
         state = dict(state)
@@ -24482,7 +24646,7 @@ def _update_exotic_key_state(updates=None, *, expected_key=None):
         elif isinstance(updates, dict):
             state.update(updates)
         state["saved_at"] = now()
-        save_json(EXOTIC_KEY_STATE_FILE, state)
+        _protected_json_write_dict(EXOTIC_KEY_STATE_FILE, state)
         return dict(state), True
 
 
@@ -24527,7 +24691,7 @@ def sync_exotic_key_to_local_workspaces(key, source="nomo"):
 
     with _EXOTIC_LOCAL_SYNC_LOCK:
         with _EXOTIC_STATE_LOCK:
-            latest = load_json(EXOTIC_KEY_STATE_FILE, {})
+            latest = _protected_json_read_dict(EXOTIC_KEY_STATE_FILE, {})
             latest_key = _exotic_clean_key(latest.get("key")) if isinstance(latest, dict) else ""
         if latest_key and latest_key != key:
             return False, "stale Exotic local sync skipped", 0, 0
@@ -24729,7 +24893,7 @@ def _exotic_reader_job(cfg_snapshot):
         return
 
     with _EXOTIC_STATE_LOCK:
-        latest = load_json(EXOTIC_KEY_STATE_FILE, {})
+        latest = _protected_json_read_dict(EXOTIC_KEY_STATE_FILE, {})
         latest = dict(latest) if isinstance(latest, dict) else {}
         changed = _exotic_clean_key(latest.get("key")) != key
         latest.update({
@@ -24745,7 +24909,7 @@ def _exotic_reader_job(cfg_snapshot):
             latest["key_changed_at"] = t
             latest["first_seen_at"] = t
         latest["saved_at"] = now()
-        save_json(EXOTIC_KEY_STATE_FILE, latest)
+        _protected_json_write_dict(EXOTIC_KEY_STATE_FILE, latest)
 
     ok, _note, shared_count, uid_count = sync_exotic_key_to_local_workspaces(key, source="cloud_reader")
     if changed:
@@ -25039,6 +25203,9 @@ def exotic_key_manager_tick(cfg, force_read=False, force_generate=False):
     reader = bool(cfg.get("exotic_key_reader_enabled", True))
 
     if writer:
+        exotic_state_health = _protected_json_health(EXOTIC_KEY_STATE_FILE)
+        if exotic_state_health.get("status") == "corrupt" and not force_generate:
+            return "writer_state_corrupt"
         if not str(cfg.get("exotic_key_write_secret", "") or "").strip():
             return "writer_secret_missing"
         # Manual Cloudflare READ on a Writer is a real non-mutating cloud-key verification.
@@ -25264,6 +25431,8 @@ def _exotic_writer_readiness(cfg, state):
     worker = _exotic_worker_base(cfg)
     if not writer:
         return "OFF", DIM
+    if _protected_json_health(EXOTIC_KEY_STATE_FILE).get("status") == "corrupt":
+        return "BLOCKED - LOCAL KEY STATE CORRUPT", RED
     if not manager:
         return "BLOCKED - KEY MANAGER OFF", RED
     if not worker.startswith("https://"):
@@ -36541,12 +36710,15 @@ _DELTA_KEY_RE = re.compile(r"^FREE_[A-Za-z0-9]+$")
 
 
 def load_delta_key_runtime():
-    data = load_json(DELTA_KEY_RUNTIME_FILE, {})
+    data = _protected_json_read_dict(DELTA_KEY_RUNTIME_FILE, {})
     return data if isinstance(data, dict) else {}
 
 
 def save_delta_key_runtime(data):
-    save_json(DELTA_KEY_RUNTIME_FILE, data if isinstance(data, dict) else {})
+    return _protected_json_write_dict(
+        DELTA_KEY_RUNTIME_FILE,
+        data if isinstance(data, dict) else {},
+    )
 
 
 def _delta_key_all_configs(primary=None):
@@ -38131,6 +38303,9 @@ def delta_key_validity_refresh_interval(runtime, cfg, current_time=None):
         return urgent, "near expiry"
     return healthy, "healthy"
 
+_DELTA_KEY_RUNTIME_CORRUPT_LOG_AT = 0
+
+
 def delta_key_auto_monitor_tick(cfg, safe_to_act=True):
     """One non-blocking expiry/key-renewal state-machine tick.
 
@@ -38139,7 +38314,7 @@ def delta_key_auto_monitor_tick(cfg, safe_to_act=True):
     only one alive clone with a saved Option 16 rectangle is sampled. Automatic
     clicks require two verified template matches and never bootstrap blindly.
     """
-    global _DELTA_KEY_AUTO_LAST_TICK
+    global _DELTA_KEY_AUTO_LAST_TICK, _DELTA_KEY_RUNTIME_CORRUPT_LOG_AT
 
     if not bool(cfg.get("delta_key_manager_enabled", True)):
         return "disabled"
@@ -38153,6 +38328,15 @@ def delta_key_auto_monitor_tick(cfg, safe_to_act=True):
     _DELTA_KEY_AUTO_LAST_TICK = current_time
 
     runtime = load_delta_key_runtime()
+    runtime_health = _protected_json_health(DELTA_KEY_RUNTIME_FILE)
+    if runtime_health.get("status") == "corrupt":
+        if current_time - int(_DELTA_KEY_RUNTIME_CORRUPT_LOG_AT or 0) >= 300:
+            _DELTA_KEY_RUNTIME_CORRUPT_LOG_AT = current_time
+            _delta_key_auto_log(
+                "Delta key runtime unreadable; automatic renewal/restart paused until runtime is repaired/reset",
+                color_code=RED,
+            )
+        return "runtime_corrupt"
     state = str(runtime.get("state") or "idle")
     auth_url = str(runtime.get("auth_url") or "").strip()
 
