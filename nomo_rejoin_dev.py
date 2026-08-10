@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.41 — MARKET SAFE REFRESH / MULTI-SOURCE LOADER GUARD
+# - Market Option 6 no longer hard-restarts a healthy Noka/App Cloner clone. It stages the
+#   latest validated Market source in Workspace and leaves the healthy Android task untouched.
+# - Dead/Home/stale Market targets still enter the normal Option 1 recovery queue.
+# - The Market AutoExec loader now tries raw GitHub, jsDelivr, a Termux-staged candidate,
+#   then the per-UID last-good cache. Only a source that compiles and runs is promoted.
+# - Runtime markers expose the selected Market source and remote failure detail.
+#
 # V4.81.40 — MARKET 773 TELEPORT OWNERSHIP GUARD
 # - Delta-key panel capture never launcher-foregrounds a Noka/App Cloner package. It only
 #   operates when that clone is already visibly present in its saved floating layout; hidden/
@@ -994,6 +1002,7 @@
 # - SAFE: Auto layout reserves a spare grid cell for Termux whenever possible.
 #
 import os
+import base64
 import copy
 import functools
 import re
@@ -1023,7 +1032,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.40-market-773-teleport-ownership-guard"
+__version__ = "V4.81.41-market-safe-refresh-multisource-loader-guard"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8051,7 +8060,187 @@ def verify_option6_open_results(cfg, tabs, label="tabs"):
     return all_ok
 
 
+MARKET_SOURCE_PRIMARY_URL = "https://raw.githubusercontent.com/atmincosplay-ship-it/nomo-market/main/nomo_obsidian.lua"
+MARKET_SOURCE_API_URL = "https://api.github.com/repos/atmincosplay-ship-it/nomo-market/contents/nomo_obsidian.lua?ref=main"
+MARKET_SOURCE_MIRROR_URL = "https://cdn.jsdelivr.net/gh/atmincosplay-ship-it/nomo-market@main/nomo_obsidian.lua"
+
+
+def _market_source_version_from_text(text):
+    match = re.search(r'local\s+VERSION\s*=\s*"V(\d+)\.(\d+)([^"]*)"', str(text or ""))
+    if not match:
+        return None, ""
+    major = int(match.group(1))
+    minor = int(match.group(2))
+    full = f"V{major}.{minor}{match.group(3) or ''}"
+    return (major, minor), full.strip()
+
+
+def _market_source_candidate_valid(text):
+    text = str(text or "")
+    if len(text) < 20000:
+        return False, "source too small"
+    required = (
+        "NOMO MARKET SELLER LITE",
+        "__NOMO_MARKET_V30_STATE",
+        "RemoteConfigRefreshSeconds",
+    )
+    missing = [marker for marker in required if marker not in text]
+    if missing:
+        return False, "missing marker: " + ",".join(missing)
+    parts, full = _market_source_version_from_text(text)
+    if not parts:
+        return False, "VERSION marker missing"
+    if parts < (17, 5):
+        return False, f"version {full} older than V17.5"
+    return True, full
+
+
+def _executor_workspace_root_for_tab(tab):
+    tab = tab or {}
+    state_path = str(tab.get("stat_file") or tab.get("state_file") or "").strip()
+    if state_path:
+        try:
+            path = Path(state_path)
+            if path.parent.name == STATE_FOLDER_NAME:
+                return path.parent.parent
+        except Exception:
+            pass
+
+    storage = str(tab.get("executor_storage", "") or "").lower()
+    if storage == "arceus_global":
+        return Path(ARCEUS_GLOBAL_WORKSPACE_DIR)
+    if storage == "delta_global":
+        return Path(DELTA_GLOBAL_WORKSPACE_DIR)
+    if storage == "custom_global":
+        custom = str(tab.get("workspace_path") or "").strip()
+        if custom:
+            return Path(custom)
+    return None
+
+
+def stage_latest_market_candidate(tabs, timeout=20):
+    """Stage latest public Market source without touching any Android package.
+
+    The staged file is *not* last-good. AutoExec must compile+run it successfully
+    before it is promoted to the per-UID last-good cache.
+    """
+    roots = []
+    seen = set()
+    for tab in list(tabs or []):
+        root = _executor_workspace_root_for_tab(tab)
+        if root is None:
+            continue
+        key = str(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        roots.append(root)
+
+    if not roots:
+        return False, "", "executor Workspace not resolved", 0
+
+    errors = []
+    source_text = ""
+    source_name = ""
+    version = ""
+    for label, url in (
+        ("github", MARKET_SOURCE_PRIMARY_URL),
+        ("github-api", MARKET_SOURCE_API_URL),
+        ("jsdelivr", MARKET_SOURCE_MIRROR_URL),
+    ):
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": "NOMO-Rejoin/MarketCandidate",
+                    "Cache-Control": "no-cache",
+                    "Accept": "application/vnd.github+json",
+                },
+                method="GET",
+            )
+            with urllib.request.urlopen(req, timeout=max(5, int(timeout))) as resp:
+                raw = resp.read()
+
+            if label == "github-api":
+                payload = json.loads(raw.decode("utf-8", errors="replace"))
+                encoded = str((payload or {}).get("content", "") or "").replace("\n", "")
+                if str((payload or {}).get("encoding", "") or "").lower() != "base64" or not encoded:
+                    raise ValueError("GitHub API content missing/base64 unavailable")
+                candidate = base64.b64decode(encoded).decode("utf-8", errors="replace")
+            else:
+                candidate = raw.decode("utf-8", errors="replace")
+
+            valid, detail = _market_source_candidate_valid(candidate)
+            if valid:
+                source_text = candidate
+                source_name = label
+                version = detail
+                break
+            errors.append(f"{label}: {detail}")
+        except Exception as exc:
+            errors.append(f"{label}: {cut(exc, 120)}")
+    else:
+        return False, "", " | ".join(errors) or "download failed", 0
+
+    wrote = 0
+    for root in roots:
+        try:
+            nomo = Path(root) / "Nomo"
+            nomo.mkdir(parents=True, exist_ok=True)
+            target = nomo / "market_candidate.lua"
+            tmp = nomo / f".market_candidate.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp"
+            tmp.write_text(source_text, encoding="utf-8")
+            os.replace(str(tmp), str(target))
+            wrote += 1
+        except Exception as exc:
+            errors.append(f"{root}: {cut(exc, 120)}")
+
+    if wrote <= 0:
+        return False, version, " | ".join(errors) or "candidate write failed", 0
+    note = f"{source_name} {version}; staged to {wrote} Workspace(s)"
+    if errors:
+        note += " | " + " | ".join(errors)
+    return True, version, note, wrote
+
+
+def _market_option6_healthy_noka(tab, cfg):
+    """True only when a Noka Market clone is healthy enough to leave untouched."""
+    pkg = str((tab or {}).get("package", "") or "")
+    if not _is_noka_clone_package(pkg):
+        return False, "not Noka"
+
+    proc_status, proc_note = package_alive_status(pkg, cfg, fresh=True)
+    if proc_status != "ALIVE":
+        return False, f"process {proc_status.lower()}: {proc_note}"
+
+    state, err = read_state(tab)
+    if not state_is_clean_fresh(state, cfg, seconds=30):
+        return False, f"state not clean/fresh: {err or state_age_seconds(state)}"
+
+    place = str((state or {}).get("place_id", "") or "")
+    if place and place != "129954712878723":
+        return False, f"state place {place}"
+
+    home = android_roblox_home_ui_detail(pkg, cfg, force=True)
+    if home:
+        return False, "Roblox Home visible"
+
+    activity_status, activity_note = package_activity_status(pkg, cfg)
+    if activity_status != "ACTIVITY":
+        return False, f"activity {activity_status.lower()}: {activity_note}"
+
+    return True, "fresh Market session"
+
+
+
 def open_all_tabs_once(cfg, selected_packages=None):
+    """Market Option 6: safe refresh + Option-1 recovery only for unhealthy targets.
+
+    Healthy Noka/App Cloner packages are deliberately not hard-restarted because
+    real-device tests showed that force-refreshing one live floating clone can
+    make sibling clone tasks disappear. We still stage the newest Market source
+    so the next normal/natural rejoin activates it.
+    """
     wanted = set(selected_packages or [])
     enabled_tabs = [
         dict(tab)
@@ -8064,20 +8253,75 @@ def open_all_tabs_once(cfg, selected_packages=None):
         pause()
         return
 
-    run_startup_cache_cleanup(
-        cfg,
-        selected_packages=[
-            str(tab.get("package") or "")
-            for tab in enabled_tabs
-        ],
-        reason="Option 6 Market force restart",
-        show_screen=True,
-        setting_key="clear_cache_before_option6_restart",
-        screen_title="OPTION 6: CACHE CLEANUP",
-    )
-
+    clear()
+    banner("OPTION 6: SAFE MARKET REFRESH", cfg)
     print(col(
-        "Option 6 uses the Option 1 recovery chain: one hard open, then normal route retries before any delayed hard fallback.",
+        "Market Option 6 stages the newest script first. Healthy Noka clones are NOT force-restarted.",
+        CYAN,
+    ))
+    print(col(
+        "Dead/Home/stale targets use the normal Option 1 recovery chain. Cache cleanup is skipped for App Cloner safety.",
+        DIM,
+    ))
+    print("")
+
+    staged_ok, staged_version, staged_note, _staged_roots = stage_latest_market_candidate(enabled_tabs)
+    if staged_ok:
+        print(col(f"Market candidate: READY {staged_version} ({staged_note})", GREEN))
+    else:
+        print(col(f"Market candidate: FAILED ({cut(staged_note, 120)})", YELLOW))
+
+    restart_tabs = []
+    skipped_healthy = []
+    rt = load_runtime()
+
+    for tab in enabled_tabs:
+        pkg = str(tab.get("package") or "")
+        if not pkg:
+            continue
+
+        if _is_noka_clone_package(pkg):
+            healthy, detail = _market_option6_healthy_noka(tab, cfg)
+            if healthy:
+                rt_tab = get_runtime_tab(rt, pkg)
+                rt_tab["last_option6_request_at"] = now()
+                rt_tab["last_option6_request_reason"] = "safe market refresh"
+                rt_tab["last_option6_request_result"] = "staged_healthy"
+                rt_tab["last_option6_request_detail"] = staged_version or "candidate staged"
+                rt_tab["note"] = (
+                    f"Market {staged_version or 'candidate'} staged; "
+                    "healthy Noka left running"
+                )
+                skipped_healthy.append(tab)
+                print(
+                    f"  {short_pkg(pkg):<10} "
+                    + col("SAFE REFRESH STAGED - healthy Noka left running", GREEN)
+                )
+                continue
+            print(
+                f"  {short_pkg(pkg):<10} "
+                + col("RECOVERY NEEDED - " + cut(detail, 70), YELLOW)
+            )
+
+        restart_tabs.append(tab)
+
+    save_runtime(rt)
+
+    if skipped_healthy:
+        print("")
+        print(col(
+            "Healthy Noka clone(s) were not Android-restarted. The staged Market version activates on their next normal rejoin.",
+            CYAN,
+        ))
+
+    if not restart_tabs:
+        print(col("No unsafe/failed Market target needs Android recovery.", GREEN))
+        pause()
+        return
+
+    print("")
+    print(col(
+        "Unhealthy target(s) now enter the same Option 1 recovery queue.",
         CYAN,
     ))
 
@@ -8087,12 +8331,13 @@ def open_all_tabs_once(cfg, selected_packages=None):
 
     manual_restart_tabs_via_queue(
         cfg,
-        enabled_tabs,
+        restart_tabs,
         target_for_tab,
-        "manual force restart",
+        "manual safe market recovery",
     )
-    verify_option6_open_results(cfg, enabled_tabs, "market tab(s)")
+    verify_option6_open_results(cfg, restart_tabs, "market recovery target(s)")
     pause()
+
 
 def show_config_value(key, value):
     kl = str(key).lower()
@@ -26668,7 +26913,7 @@ def cleanup_nomo_autoexec_backup_artifacts(cfg):
 def upgrade_known_nomo_market_loader_once(cfg):
     """Upgrade only known NOMO loader generations; preserve unrelated/custom AutoExec."""
     marker = "-- NOMO Market / GAG loader"
-    target_revision = 6
+    target_revision = 7
     target_marker = f"-- NOMO Market loader revision {target_revision}"
     old_worker = "https://nomo-key.atmincosplay.workers.dev/key"
     local_key_marker = 'local sharedKeyFile = sharedFolder .. "/exotic_key.json"'
@@ -26765,7 +27010,7 @@ def upgrade_known_nomo_aux_loaders_once(cfg):
 
 
 MARKET_LOADER_AUTOEXEC_TEMPLATE = r'''-- NOMO Market / GAG loader
--- NOMO Market loader revision 6
+-- NOMO Market loader revision 7
 if not game:IsLoaded() then
     game.Loaded:Wait()
 end
@@ -26841,8 +27086,8 @@ if game.PlaceId == 126884695634066 then
             exotic_source = scriptSource,
             exotic_cache_file = exoticCacheFile,
             exotic_cache_available = (type(isfile) == "function" and isfile(exoticCacheFile)) or false,
-            loader_build = "V4.81.18",
-            loader_revision = 6,
+            loader_build = "V4.81.41",
+            loader_revision = 7,
             error = tostring(err or ""),
         }
         pcall(function()
@@ -27057,11 +27302,14 @@ elseif game.PlaceId == 129954712878723 then
     local runtimeFolder = "Nomo"
     local runtimeFile = runtimeFolder .. "/market_runtime_" .. userId .. ".json"
     local marketUrl = "https://raw.githubusercontent.com/atmincosplay-ship-it/nomo-market/main/nomo_obsidian.lua"
+    local marketMirrorUrl = "https://cdn.jsdelivr.net/gh/atmincosplay-ship-it/nomo-market@main/nomo_obsidian.lua"
+    local marketCandidateFile = runtimeFolder .. "/market_candidate.lua"
     local marketCacheFile = runtimeFolder .. "/market_last_good_" .. userId .. ".lua"
     local legacyMarketCacheFile = runtimeFolder .. "/market_last_good.lua"
     local loaderStartedAt = 0
     local marketVersion = "UNKNOWN"
     local marketSourceName = "none"
+    local marketRemoteError = ""
 
     local function epochNow()
         local ok, value = pcall(function()
@@ -27127,11 +27375,14 @@ elseif game.PlaceId == 129954712878723 then
         local source = tostring(state and state.SharedConfigSource or "")
         return {
             marker_version = 5,
-            loader_version = "V4.81.18",
-            loader_build = "V4.81.18",
-            loader_revision = 6,
+            loader_version = "V4.81.41",
+            loader_build = "V4.81.41",
+            loader_revision = 7,
             market_version = tostring(marketVersion or "UNKNOWN"),
             market_source = tostring(marketSourceName or "none"),
+            market_remote_error = tostring(marketRemoteError or ""),
+            market_candidate_file = marketCandidateFile,
+            market_candidate_available = (type(isfile) == "function" and isfile(marketCandidateFile)) or false,
             market_cache_file = marketCacheFile,
             market_cache_available = (type(isfile) == "function" and isfile(marketCacheFile)) or false,
             uid = userId,
@@ -27240,6 +27491,21 @@ elseif game.PlaceId == 129954712878723 then
         return nil
     end
 
+    local function readMarketCandidate()
+        return readOneMarketCache(marketCandidateFile)
+    end
+
+    local function deleteMarketCandidate()
+        if type(delfile) ~= "function" then
+            return
+        end
+        pcall(function()
+            if type(isfile) ~= "function" or isfile(marketCandidateFile) then
+                delfile(marketCandidateFile)
+            end
+        end)
+    end
+
     local function saveMarketCache(text)
         if type(writefile) ~= "function" or not validMarketSource(text) then
             return false
@@ -27256,44 +27522,72 @@ elseif game.PlaceId == 129954712878723 then
     local marketChunk = nil
     local sourceErr = ""
 
-    -- Prefer GitHub latest, but never trust raw HTTP text until it passes
-    -- NOMO markers + a Lua compile check. This prevents 404/error pages from
-    -- replacing or bypassing the last-good copy.
-    local downloadOk, remoteText = pcall(function()
-        return game:HttpGet(marketUrl, true)
-    end)
-    if downloadOk and validMarketSource(remoteText) then
-        local remoteChunk, remoteCompileErr = loadstring(remoteText)
-        if type(remoteChunk) == "function" then
-            marketSource = remoteText
-            marketChunk = remoteChunk
-            marketSourceName = "github"
-        else
-            sourceErr = "github compile failed: " .. tostring(remoteCompileErr)
+    local function tryMarketText(text, sourceName, failurePrefix)
+        if not validMarketSource(text) then
+            return false, tostring(failurePrefix or sourceName) .. " source validation failed or version older than V17.5"
         end
-    elseif not downloadOk then
-        sourceErr = "github download failed: " .. tostring(remoteText)
-    else
-        sourceErr = "github source validation failed or version older than V17.5"
+        local chunk, compileErr = loadstring(text)
+        if type(chunk) ~= "function" then
+            return false, tostring(failurePrefix or sourceName) .. " compile failed: " .. tostring(compileErr)
+        end
+        marketSource = text
+        marketChunk = chunk
+        marketSourceName = sourceName
+        return true, ""
+    end
+
+    local function tryMarketUrl(url, sourceName)
+        local ok, body = pcall(function()
+            return game:HttpGet(url, true)
+        end)
+        if not ok then
+            return false, sourceName .. " download failed: " .. tostring(body)
+        end
+        return tryMarketText(body, sourceName, sourceName)
+    end
+
+    -- Prefer direct GitHub. If raw.githubusercontent.com is blocked for the
+    -- executor, prefer the Termux-staged candidate next: it was downloaded and
+    -- validated outside Roblox and may be newer than a CDN's branch cache.
+    local okGithub, errGithub = tryMarketUrl(marketUrl, "github")
+    if not okGithub then
+        sourceErr = errGithub
+    end
+
+    if not marketSource then
+        local candidateText = readMarketCandidate()
+        if candidateText then
+            local okCandidate, errCandidate = tryMarketText(candidateText, "candidate", "candidate")
+            if not okCandidate then
+                sourceErr = sourceErr .. " | " .. errCandidate
+            end
+        else
+            sourceErr = sourceErr .. " | no valid staged candidate"
+        end
+    end
+
+    if not marketSource then
+        local okMirror, errMirror = tryMarketUrl(marketMirrorUrl, "jsdelivr")
+        if not okMirror then
+            sourceErr = sourceErr .. " | " .. errMirror
+        end
     end
 
     if not marketSource then
         local cachedText = readMarketCache()
         if cachedText then
-            local cachedChunk, cachedCompileErr = loadstring(cachedText)
-            if type(cachedChunk) == "function" then
-                marketSource = cachedText
-                marketChunk = cachedChunk
-                marketSourceName = "cache"
-                warn("[NOMO MARKET] GitHub unavailable/bad; using last-good cache:", tostring(sourceErr))
+            local okCache, errCache = tryMarketText(cachedText, "cache", "cache")
+            if not okCache then
+                sourceErr = sourceErr .. " | " .. errCache
             else
-                sourceErr = sourceErr .. " | cache compile failed: " .. tostring(cachedCompileErr)
+                warn("[NOMO MARKET] live sources unavailable/bad; using last-good cache:", tostring(sourceErr))
             end
         else
             sourceErr = sourceErr .. " | no valid last-good cache"
         end
     end
 
+    marketRemoteError = sourceErr
     if not marketSource or type(marketChunk) ~= "function" then
         writeRuntime("SOURCE_UNAVAILABLE", sourceErr)
         warn("[NOMO MARKET] no usable Market source:", sourceErr)
@@ -27310,12 +27604,14 @@ elseif game.PlaceId == 129954712878723 then
         return
     end
 
-    -- Only a GitHub source that actually started successfully is allowed to
-    -- replace the cache. A bad download/compile/runtime can never poison it.
-    if marketSourceName == "github" then
+    -- Only a source that actually started successfully may replace last-good.
+    -- A bad HTTP response, candidate, compile, or runtime can never poison it.
+    if marketSourceName == "github" or marketSourceName == "jsdelivr" or marketSourceName == "candidate" then
         local cacheOk = saveMarketCache(marketSource)
         if not cacheOk then
-            warn("[NOMO MARKET] running GitHub source OK, but last-good cache write failed")
+            warn("[NOMO MARKET] running source OK, but last-good cache write failed:", tostring(marketSourceName))
+        elseif marketSourceName == "candidate" then
+            deleteMarketCandidate()
         end
     end
 
