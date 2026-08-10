@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
-# V4.81.24 — CAPTCHA STRICT VISUAL + BUBBLE ROUTE NUDGE GUARD
+# V4.81.25 — CAPTCHA STRICT VISUAL + BUBBLE ROUTE NUDGE GUARD
 # - Tightens automatic screenshot-only CAPTCHA detection: a generic white Roblox/Home panel plus a
 #   green avatar/game icon is no longer enough. Color-only CAPTCHA now requires a near-white challenge
 #   panel and a centered green-button signal before confirmations can start the provider.
@@ -943,7 +943,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.24-captcha-strict-bubble-route-nudge"
+__version__ = "V4.81.25-visible-home-heartbeat-guard"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -5101,6 +5101,8 @@ def core_rejoin_package(
         rt_tab["core_pending_open_at"] = opened_at
         rt_tab["core_pending_open_reason"] = reason
         rt_tab["core_pending_open_target"] = target
+        if str(target or "").lower() == "hatcher":
+            rt_tab["hatcher_home_watch_until"] = opened_at + max(300, int(cfg.get("hatcher_home_ui_watch_seconds", 900) or 900))
 
     ok, note = open_roblox(
         pkg,
@@ -11701,6 +11703,20 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
     if raw_alive:
         visible_window, visible_note = package_visible_window(pkg, cfg)
 
+    visible_home = None
+    if (
+        mode == "hatcher"
+        and raw_alive
+        and hatcher_visible_home_watch_active(rt_tab, cfg)
+    ):
+        visible_home = android_roblox_home_ui_detail(pkg, cfg, force=False)
+        if visible_home:
+            # V4.81.25: a package-scoped visible Roblox Home shell outranks a
+            # hidden/stale Lua heartbeat that App Cloner may keep updating.
+            clean_fresh = False
+            rt_tab["hatcher_visible_home_at"] = now()
+            rt_tab["hatcher_visible_home_hits"] = ",".join(visible_home.get("hits", [])[:8])
+
     if manual_login_blocked(rt_tab, cfg, pkg) and not state_login_challenge_detail(state):
         face_locked = str(rt_tab.get("manual_login_reason", "") or "") == "face_lock" or bool(rt_tab.get("face_lock_detected"))
         return {
@@ -11715,7 +11731,11 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
 
     if state:
         challenge_detail = state_login_challenge_detail(state)
-        if challenge_detail:
+        if visible_home:
+            status = "Home"
+            note = "Roblox Home visible; hidden heartbeat ignored"
+            bad_kind = "roblox_home"
+        elif challenge_detail:
             status = "Manual"
             note = "join captcha/manual"
             bad_kind = "challenge"
@@ -11979,6 +11999,34 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
             return solver_status, solver_note, True
         # Dead packages are owned by normal crash recovery, not solver retry logic.
         return "Offline", "challenge state present but package dead; crash recovery owns reopen", False
+
+    # --- visible Roblox Home: route in-place; never treat hidden heartbeat as Online ---
+    if bad == "roblox_home" and alive:
+        # Home is an observed visible Android condition. Cancel any stale hard
+        # recovery and deliver the Hatcher route to the existing clone task.
+        removed = core.cancel(pkg)
+        if removed:
+            log_activity("visible Roblox Home cancelled pending hard recovery", pkg, YELLOW)
+        interval = max(15, int(cfg.get("hatcher_visible_home_route_retry_seconds", 30) or 30))
+        last = int(rt_tab.get("hatcher_visible_home_route_last", 0) or 0)
+        if last > 0 and now() - last < interval:
+            left = max(1, interval - (now() - last))
+            rt_tab["note"] = f"Roblox Home visible; route retry in {left}s"
+            core.save()
+            return "Home", rt_tab["note"], True
+        meta = {
+            "bypass_recheck": True,
+            "skip_solver_probe": True,
+            "no_hard_fallback": True,
+            "visible_home_route_retry": True,
+        }
+        added, _ = core.queue_route_retry(
+            tab, target, "visible Roblox Home; Hatcher route retry", metadata=meta, bypass_manual=False
+        )
+        rt_tab["hatcher_visible_home_route_last"] = now()
+        rt_tab["note"] = "Roblox Home visible; route retry queued" if added else "Roblox Home visible; route retry already queued"
+        core.save()
+        return ("Queued" if added else "Home"), rt_tab["note"], True
 
     # --- disconnect / kick popup: always kill+open ---
     if bad == "disconnect" or (state and state_disconnect_ui(state)):
@@ -12395,6 +12443,79 @@ def android_ui_text_for_package(pkg, cfg, force=False):
         if node_pkg == pkg or node_pkg.startswith(str(pkg) + ":"):
             texts.extend(values if isinstance(values, list) else [str(values)])
     return texts, str(snapshot.get("error", "") or "")
+
+
+def android_roblox_home_ui_detail(pkg, cfg, force=False):
+    """Return a high-confidence package-scoped Roblox Home/navigation signal.
+
+    App Cloner can keep an old in-game Lua heartbeat alive behind the visible
+    Roblox Home activity.  A fresh state.json therefore cannot by itself prove
+    that the user-facing clone is actually in-game after a recovery.
+
+    This detector intentionally requires a cluster of Roblox Home navigation
+    labels from the *same package*; generic words such as Home/Search alone are
+    not enough.  It never uses unscoped text from sibling clones.
+    """
+    if not cfg.get("hatcher_home_ui_detection_enabled", True):
+        return None
+
+    texts, _ = android_ui_text_for_package(str(pkg or ""), cfg, force=force)
+    values = [str(v or "").strip() for v in (texts or []) if str(v or "").strip()]
+    if not values:
+        return None
+
+    lows = [v.lower() for v in values]
+    joined = "\n".join(lows)
+
+    def exact_or_prefix(label):
+        label = str(label).lower()
+        return any(v == label or v.startswith(label + " ") or v.startswith(label + "(") for v in lows)
+
+    search_hit = exact_or_prefix("search")
+    home_hit = exact_or_prefix("home")
+    nav_labels = ["charts", "avatar", "chat", "more", "friends"]
+    nav_hits = [label for label in nav_labels if exact_or_prefix(label)]
+
+    age_gate = "access to popular games has changed" in joined
+    recommended = "recommended for you" in joined
+
+    # Require Search + Home and a substantial navigation cluster, or one of the
+    # distinctive Home-only cards seen on the clone shell.  This avoids treating
+    # arbitrary in-game text or a single green/white icon as Roblox Home.
+    if not (search_hit and home_hit):
+        return None
+    if len(nav_hits) < 3 and not age_gate and not recommended:
+        return None
+
+    hits = ["search", "home"] + nav_hits[:5]
+    if age_gate:
+        hits.append("age-gate card")
+    if recommended:
+        hits.append("recommended card")
+    return {
+        "title": "Roblox Home",
+        "text": "\n".join(values),
+        "reason": "android_package_scoped_roblox_home",
+        "hits": hits[:8],
+    }
+
+
+def hatcher_visible_home_watch_active(rt_tab, cfg):
+    """Limit Home UI probing to the recovery window so normal Online clones stay cheap."""
+    if not isinstance(rt_tab, dict):
+        return False
+    explicit_until = int(rt_tab.get("hatcher_home_watch_until", 0) or 0)
+    if explicit_until > now():
+        return True
+    last_open = max(
+        int(rt_tab.get("last_open", 0) or 0),
+        int(rt_tab.get("core_last_rejoin_attempt_at", 0) or 0),
+        int(rt_tab.get("core_pending_open_at", 0) or 0),
+    )
+    if last_open <= 0:
+        return False
+    watch = max(300, int(cfg.get("hatcher_home_ui_watch_seconds", 900) or 900))
+    return now() - last_open <= watch
 
 
 def android_disconnect_ui_detail(pkg, cfg):
@@ -13473,6 +13594,13 @@ def wait_until_fresh_after_open(
         process_status, process_note = package_alive_status(tab["package"], cfg)
         alive = process_status == "ALIVE"
         fresh, state, err = state_fresh_after_open(tab, cfg, opened_at)
+        pending_target = str(rt_tab.get("core_pending_open_target") or rt_tab.get("core_last_rejoin_target") or "").lower()
+        visible_home = None
+        if alive and pending_target == "hatcher" and hatcher_visible_home_watch_active(rt_tab, cfg):
+            visible_home = android_roblox_home_ui_detail(pkg, cfg, force=False)
+            if visible_home:
+                rt_tab["hatcher_visible_home_at"] = now()
+                rt_tab["hatcher_visible_home_hits"] = ",".join(visible_home.get("hits", [])[:8])
 
         if process_status == "ALIVE":
             seen_alive_after_open = True
@@ -13574,7 +13702,9 @@ def wait_until_fresh_after_open(
             rt_tab["note"] = solver_note
             core.save()
             return False, "solver pending" if solver_status == "Solving" else "manual challenge"
-        if state_disconnect_ui(state):
+        if visible_home:
+            status_note = "Roblox Home visible; hidden heartbeat ignored"
+        elif state_disconnect_ui(state):
             status_note = state_disconnect_note(state)
         elif state_login_challenge_detail(state):
             if not allow_solver_probe and cfg.get(
@@ -13683,6 +13813,7 @@ def wait_until_fresh_after_open(
         clean_fresh = bool(
             fresh
             and route_ok
+            and not visible_home
             and not state_disconnect_ui(state)
             and not state_login_challenge_detail(state)
         )
@@ -14155,15 +14286,24 @@ def hatcher_bubble_second_private_intent(tab, rt_tab, cfg, rt, target, reason, f
             if stop_requested():
                 return last_sent_at, "stop"
             fresh, _state, _err = state_fresh_after_open(tab, cfg, first_opened_at)
-            if fresh:
+            home_visible = android_roblox_home_ui_detail(package, cfg, force=False) if fresh else None
+            if fresh and not home_visible:
                 return last_sent_at, ("first intent already fresh" if sent_count == 0 else f"fresh after route nudge {sent_count}")
+            if fresh and home_visible:
+                rt_tab["note"] = "Roblox Home visible; hidden heartbeat ignored during bubble rescue"
             if not wait_seconds(1, rt):
                 return last_sent_at, "stop"
         elapsed = target_elapsed
 
         fresh, _state, _err = state_fresh_after_open(tab, cfg, first_opened_at)
-        if fresh:
+        home_visible = android_roblox_home_ui_detail(package, cfg, force=True) if fresh else None
+        if fresh and not home_visible:
             return last_sent_at, ("first intent already fresh" if sent_count == 0 else f"fresh after route nudge {sent_count}")
+        if fresh and home_visible:
+            log_activity(
+                f"bubble rescue sees Roblox Home despite fresh hidden heartbeat; continuing route nudge {nudge_index}/2",
+                package, YELLOW,
+            )
 
         process_status, _process_note = package_alive_status(package, cfg, fresh=True)
         if process_status != "ALIVE":
