@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.4 — MARKET RUNTIME MARKER
+# - Market AutoExec now writes Nomo/market_runtime_<UID>.json per account.
+# - Marker records the exact downloaded Market version, load result, JobId,
+#   remote-config source, last/next fetch, refresh interval and active backoff.
+# - Marker updates only on state changes plus a 5-minute heartbeat; it creates no
+#   Cloudflare/Worker traffic and is safe for shared Delta Workspace.
+# - Normal NOMO startup upgrades the known V4.81.x Market/GAG loader automatically;
+#   Option 13 is not required. Unrelated/custom AutoExec files remain untouched.
+#
 # V4.81.3 — SOLVER HARD PROVIDER GATE
 # - Automatic solver submissions now obey the >=10-minute per-package provider
 #   interval even when pre-open uses force=True; force can no longer bypass it.
@@ -795,7 +804,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.3-solver-hard-provider-gate"
+__version__ = "V4.81.4-market-runtime-marker"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -24578,9 +24587,12 @@ def exotic_key_settings_menu(cfg):
 
 
 def upgrade_known_nomo_market_loader_once(cfg):
-    """Upgrade only our known old loader; preserve every unrelated AutoExec file."""
+    """Upgrade only known NOMO loader generations; preserve unrelated/custom AutoExec."""
     marker = "-- NOMO Market / GAG loader"
     old_worker = "https://nomo-key.atmincosplay.workers.dev/key"
+    local_key_marker = 'local sharedKeyFile = sharedFolder .. "/exotic_key.json"'
+    market_remote_marker = 'atmincosplay-ship-it/nomo-market/main/nomo_obsidian.lua'
+    runtime_marker = "-- NOMO Market runtime marker v1"
     changed = 0
     seen = set()
     for tab in autoexec_tabs(cfg):
@@ -24592,9 +24604,15 @@ def upgrade_known_nomo_market_loader_once(cfg):
                 if not path.exists():
                     continue
                 old = path.read_text(encoding="utf-8", errors="ignore")
-                if marker not in old or old_worker not in old:
+                if marker not in old:
                     continue
-                backup = path.with_suffix(path.suffix + ".v48039.bak")
+                if runtime_marker in old:
+                    continue
+                known_old = old_worker in old
+                known_v481 = local_key_marker in old and market_remote_marker in old
+                if not (known_old or known_v481):
+                    continue
+                backup = path.with_suffix(path.suffix + ".v4813.bak")
                 if not backup.exists():
                     shutil.copy2(path, backup)
                 tmp = path.with_suffix(path.suffix + ".tmp")
@@ -24793,8 +24811,190 @@ if game.PlaceId == 126884695634066 then
 
 elseif game.PlaceId == 129954712878723 then
     -- Trade World / Market
+    -- NOMO Market runtime marker v1
     print("trade world")
-    loadstring(game:HttpGet("https://raw.githubusercontent.com/atmincosplay-ship-it/nomo-market/main/nomo_obsidian.lua", true))()
+
+    local Players = game:GetService("Players")
+    local HttpService = game:GetService("HttpService")
+    local player = Players.LocalPlayer or Players.PlayerAdded:Wait()
+    local userId = tostring(player.UserId)
+    local runtimeFolder = "Nomo"
+    local runtimeFile = runtimeFolder .. "/market_runtime_" .. userId .. ".json"
+    local marketUrl = "https://raw.githubusercontent.com/atmincosplay-ship-it/nomo-market/main/nomo_obsidian.lua"
+    local loaderStartedAt = 0
+    local marketVersion = "UNKNOWN"
+
+    local function epochNow()
+        local ok, value = pcall(function()
+            return DateTime.now().UnixTimestamp
+        end)
+        if ok and type(value) == "number" then
+            return math.floor(value)
+        end
+        local ok2, value2 = pcall(os.time)
+        if ok2 and type(value2) == "number" then
+            return math.floor(value2)
+        end
+        return 0
+    end
+
+    loaderStartedAt = epochNow()
+
+    local function ensureRuntimeFolder()
+        pcall(function()
+            if type(isfolder) == "function" then
+                if not isfolder(runtimeFolder) and type(makefolder) == "function" then
+                    makefolder(runtimeFolder)
+                end
+            elseif type(makefolder) == "function" then
+                makefolder(runtimeFolder)
+            end
+        end)
+    end
+
+    local function marketState()
+        local ok, value = pcall(function()
+            return getgenv().__NOMO_MARKET_V30_STATE
+        end)
+        if ok and type(value) == "table" then
+            return value
+        end
+        return nil
+    end
+
+    local function marketCfg()
+        local ok, value = pcall(function()
+            return getgenv().NOMO_MARKET
+        end)
+        if ok and type(value) == "table" then
+            return value
+        end
+        return nil
+    end
+
+    local function snapshot(stage, err)
+        local state = marketState()
+        local cfg = marketCfg()
+        local seller = cfg and cfg.Seller or nil
+        local refreshSeconds = tonumber(seller and seller.RemoteConfigRefreshSeconds) or 21600
+        local lastFetch = tonumber(state and state.LastRemoteConfigUnix) or 0
+        local nextFetch = 0
+        if lastFetch > 0 then
+            nextFetch = lastFetch + refreshSeconds
+        elseif loaderStartedAt > 0 then
+            nextFetch = loaderStartedAt + refreshSeconds
+        end
+        local backoffUntil = tonumber(state and state.RemoteConfigBackoffUntil) or 0
+        local source = tostring(state and state.SharedConfigSource or "")
+        return {
+            marker_version = 1,
+            loader_version = "V4.81.4",
+            market_version = tostring(marketVersion or "UNKNOWN"),
+            uid = userId,
+            username = tostring(player.Name or ""),
+            display_name = tostring(player.DisplayName or ""),
+            place_id = tostring(game.PlaceId or ""),
+            job_id = tostring(game.JobId or ""),
+            loader_started_at = loaderStartedAt,
+            updated_at = epochNow(),
+            stage = tostring(stage or "UNKNOWN"),
+            ok = stage == "MARKET_RUNNING",
+            market_running = state ~= nil and state.Running ~= false,
+            remote_config_enabled = seller == nil or seller.RemoteConfigEnabled ~= false,
+            remote_config_refresh_seconds = refreshSeconds,
+            remote_config_last_fetch = lastFetch,
+            remote_config_next_fetch = nextFetch,
+            remote_config_backoff_until = backoffUntil,
+            remote_config_source = source,
+            remote_config_applied = state ~= nil and state.RemoteConfigApplied == true,
+            error = tostring(err or ""),
+        }
+    end
+
+    local function writeRuntime(stage, err)
+        if type(writefile) ~= "function" then
+            return false
+        end
+        ensureRuntimeFolder()
+        local payload = snapshot(stage, err)
+        local ok, encoded = pcall(function()
+            return HttpService:JSONEncode(payload)
+        end)
+        if not ok then
+            return false
+        end
+        return pcall(function()
+            writefile(runtimeFile, encoded)
+        end)
+    end
+
+    writeRuntime("LOADER_STARTED", "")
+
+    local downloadOk, marketSource = pcall(function()
+        return game:HttpGet(marketUrl, true)
+    end)
+    if not downloadOk or type(marketSource) ~= "string" or marketSource == "" then
+        writeRuntime("DOWNLOAD_FAILED", tostring(marketSource))
+        warn("[NOMO MARKET] download failed:", tostring(marketSource))
+        return
+    end
+
+    marketVersion = marketSource:match('local%s+VERSION%s*=%s*"([^"]+)"') or "UNKNOWN"
+    writeRuntime("SOURCE_READY", "")
+
+    local marketChunk, compileErr = loadstring(marketSource)
+    if type(marketChunk) ~= "function" then
+        writeRuntime("COMPILE_FAILED", tostring(compileErr))
+        warn("[NOMO MARKET] compile failed:", tostring(compileErr))
+        return
+    end
+
+    local runOk, runErr = pcall(marketChunk)
+    if not runOk then
+        writeRuntime("RUNTIME_FAILED", tostring(runErr))
+        warn("[NOMO MARKET] runtime failed:", tostring(runErr))
+        return
+    end
+
+    writeRuntime("MARKET_RUNNING", "")
+
+    -- Update only when interesting state changes, plus a 5-minute local heartbeat.
+    -- This watcher performs NO HTTP/Worker requests.
+    task.spawn(function()
+        local lastSignature = ""
+        local lastWriteAt = 0
+        while true do
+            local state = marketState()
+            local cfg = marketCfg()
+            local seller = cfg and cfg.Seller or nil
+            local refreshSeconds = tonumber(seller and seller.RemoteConfigRefreshSeconds) or 21600
+            local lastFetch = tonumber(state and state.LastRemoteConfigUnix) or 0
+            local backoffUntil = tonumber(state and state.RemoteConfigBackoffUntil) or 0
+            local source = tostring(state and state.SharedConfigSource or "")
+            local applied = state ~= nil and state.RemoteConfigApplied == true
+            local running = state ~= nil and state.Running ~= false
+            local signature = table.concat({
+                tostring(marketVersion),
+                tostring(refreshSeconds),
+                tostring(lastFetch),
+                tostring(backoffUntil),
+                source,
+                tostring(applied),
+                tostring(running),
+                tostring(game.JobId or ""),
+            }, "|")
+            local nowTs = epochNow()
+            if signature ~= lastSignature or lastWriteAt <= 0 or (nowTs - lastWriteAt) >= 300 then
+                writeRuntime(running and "MARKET_RUNNING" or "MARKET_STOPPED", "")
+                lastSignature = signature
+                lastWriteAt = nowTs
+            end
+            if state ~= nil and state.Running == false then
+                break
+            end
+            task.wait(30)
+        end
+    end)
 
 else
     print("unsupported place:", game.PlaceId)
@@ -37501,9 +37701,9 @@ def main():
     try:
         upgraded = upgrade_known_nomo_market_loader_once(cfg)
         if upgraded:
-            log_activity(f"AutoExec Exotic-local loader upgraded: {upgraded} file(s)", "", GREEN)
+            log_activity(f"AutoExec NOMO loader upgraded: {upgraded} file(s)", "", GREEN)
     except Exception as exc:
-        log_activity(f"AutoExec Exotic loader upgrade skipped: {cut(exc, 90)}", "", YELLOW)
+        log_activity(f"AutoExec NOMO loader upgrade skipped: {cut(exc, 90)}", "", YELLOW)
     try:
         exotic_key_manager_tick(cfg)
     except Exception as exc:
