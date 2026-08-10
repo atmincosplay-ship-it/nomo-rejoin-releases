@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.7 — BLOCKSOLVE FIRST-CLASS PROVIDER
+# - Adds an explicit BlockSolve provider profile instead of relying on the generic
+#   Winter-compatible adapter by accident. BlockSolve uses POST /join, X-API-Key,
+#   and JSON {cookie, placeId} exactly as documented.
+# - A bare https://blocksolve.site endpoint now resolves to /join automatically;
+#   Winter bare hosts retain /api/captcha/solve compatibility. Exact custom paths
+#   are preserved.
+# - Solver menu now shows detected provider + effective endpoint, making it obvious
+#   which request contract automatic jobs will use.
+# - BlockSolve automatic jobs remain challenge-only; manual package/sample tests
+#   remain explicit direct provider calls.
+# - Provider identity is attached to safe response/runtime diagnostics; API keys and
+#   Roblox cookies are never logged.
+#
 # V4.81.6 — BLOCKSOLVE CHALLENGE-ONLY AUTO MODE
 # - Automatic pre-open no longer submits the provider merely because a real rejoin
 #   is queued. A valid/no-challenge Roblox cookie skips the provider and opens normally.
@@ -828,7 +842,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.6-blocksolve-challenge-only"
+__version__ = "V4.81.7-blocksolve-provider"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1446,6 +1460,7 @@ DEFAULT_CONFIG = {
     # clone windows around or drop a sibling clone.
     "solver_preflight_open_on_failure": False,
     "solver_preflight_server_busy_retry_seconds": 600,
+    "solver_provider": "auto",
     "solver_endpoint": "https://solver.wintercode.dev",
     "solver_api_key": "",
     "solver_place_id": "126884695634066",
@@ -2584,6 +2599,8 @@ def apply_update_migrations(cfg):
     set_cfg("solver_probe_stale_state_enabled", False)
     if "solver_provider_probe_on_no_state" not in cfg:
         set_cfg("solver_provider_probe_on_no_state", True)
+    if str(cfg.get("solver_provider", "") or "").strip().lower() not in {"auto", "blocksolve", "winter", "generic"}:
+        set_cfg("solver_provider", "auto")
     # V4.81.6: default existing/fresh installs to challenge-only automatic provider
     # behavior. This avoids treating ordinary stale-state rejoins as CAPTCHA jobs.
     if "solver_provider_challenge_only" not in cfg:
@@ -28802,6 +28819,7 @@ def start_solver_job(tab, cfg, rt, rt_tab, reason, force=False, phase="solve", o
     target = str(target_override or rt_tab.get("target", "") or ("hatcher" if (tab or {}).get("server_link") else "market"))
     cfg_snapshot = {
         "solver_enabled": True,
+        "solver_provider": str(cfg.get("solver_provider", "auto") or "auto"),
         "solver_endpoint": str(cfg.get("solver_endpoint", "") or ""),
         "solver_api_key": str(cfg.get("solver_api_key", "") or ""),
         "solver_place_id": str(place_id),
@@ -29281,22 +29299,60 @@ def solver_response_is_success(data):
     return solver_response_kind(data) == "solved"
 
 
-def normalized_solver_endpoint(endpoint):
+def solver_provider_name(cfg=None, endpoint=None):
+    """Resolve the configured solver provider without exposing credentials."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    explicit = str(cfg.get("solver_provider", "auto") or "auto").strip().lower()
+    if explicit in {"blocksolve", "winter", "generic"}:
+        return explicit
+
+    raw = str(endpoint if endpoint is not None else cfg.get("solver_endpoint", "") or "").strip()
+    try:
+        host = (urllib.parse.urlparse(raw).hostname or "").lower()
+    except Exception:
+        host = raw.lower()
+    if host == "blocksolve.site" or host.endswith(".blocksolve.site"):
+        return "blocksolve"
+    if "wintercode" in host or "winterhub" in host:
+        return "winter"
+    return "generic"
+
+
+def normalized_solver_endpoint(endpoint, provider="auto"):
     endpoint = str(endpoint or "").strip().rstrip("/")
     if not endpoint:
         return ""
-    # Bare scheme+host keeps compatibility with Winter's historical endpoint.
-    after_scheme = endpoint.split("://", 1)[-1]
-    if "/" not in after_scheme:
-        return endpoint + "/api/captcha/solve"
-    return endpoint
+    provider = str(provider or "auto").strip().lower()
+    if provider == "auto":
+        provider = solver_provider_name({}, endpoint)
+
+    # Preserve an exact user-supplied path. Only a bare host gets a provider
+    # canonical path appended.
+    try:
+        parsed = urllib.parse.urlparse(endpoint)
+        has_path = bool(parsed.path and parsed.path not in {"", "/"})
+    except Exception:
+        after_scheme = endpoint.split("://", 1)[-1]
+        has_path = "/" in after_scheme
+    if has_path:
+        return endpoint
+    if provider == "blocksolve":
+        return endpoint + "/join"
+    # Historical Winter/generic compatibility.
+    return endpoint + "/api/captcha/solve"
+
+
+def effective_solver_endpoint(cfg):
+    provider = solver_provider_name(cfg)
+    return normalized_solver_endpoint(cfg.get("solver_endpoint", ""), provider)
 
 
 def solve_captcha(cookie, cfg, place_id=None):
-    """Submit one package cookie to the configured third-party solver."""
+    """Submit one package cookie using the selected provider contract."""
     if not cfg.get("solver_enabled", False):
         return False, {"success": False, "error": "solver disabled"}
-    endpoint = normalized_solver_endpoint(cfg.get("solver_endpoint", ""))
+    provider = solver_provider_name(cfg)
+    endpoint = normalized_solver_endpoint(cfg.get("solver_endpoint", ""), provider)
     api_key = str(cfg.get("solver_api_key", "") or "").strip()
     if not endpoint:
         return False, {"success": False, "error": "solver endpoint not set"}
@@ -29329,6 +29385,9 @@ def solve_captcha(cookie, cfg, place_id=None):
                 data = json.loads(raw) if raw else {}
             except Exception:
                 data = {"success": False, "error": f"non-JSON response: {cut(raw, 180)}"}
+            if not isinstance(data, dict):
+                data = {"success": False, "error": "provider returned non-object JSON"}
+            data.setdefault("provider", provider)
             return solver_response_is_success(data), data
     except urllib.error.HTTPError as e:
         try:
@@ -29342,6 +29401,7 @@ def solve_captcha(cookie, cfg, place_id=None):
         if not isinstance(data, dict):
             data = {}
         data.setdefault("success", False)
+        data.setdefault("provider", provider)
         data["http_status"] = e.code
         if not data.get("error"):
             data["error"] = f"HTTP {e.code}: {cut(body, 240)}"
@@ -29349,7 +29409,7 @@ def solve_captcha(cookie, cfg, place_id=None):
             data["error"] = f"HTTP {e.code}: {cut(str(data.get('error')), 220)}"
         return False, data
     except Exception as e:
-        return False, {"success": False, "error": str(e)}
+        return False, {"success": False, "error": str(e), "provider": provider}
 
 def get_roblox_user_info(cookie):
     """Fetch username, userID, created date from Roblox API using cookie."""
@@ -30570,14 +30630,19 @@ def solver_menu(cfg):
     while True:
         clear()
         banner("CAPTCHA SOLVER", cfg)
+        provider = solver_provider_name(cfg)
+        effective_endpoint = effective_solver_endpoint(cfg)
         print(f"1. Enable/disable: {cfg.get('solver_enabled', False)}")
-        print(f"2. Endpoint + API key (paste full URL): {cfg.get('solver_endpoint', 'https://solver.wintercode.dev')}")
+        print(f"   Provider: {provider.upper()} | Effective endpoint: {effective_endpoint or '-'}")
+        print(f"2. Provider endpoint + API key: {cfg.get('solver_endpoint', 'https://solver.wintercode.dev')}")
         print(f"   API key: {mask_secret(cfg.get('solver_api_key', ''))}")
+        if provider == "blocksolve":
+            print("   BlockSolve contract: POST /join | X-API-Key | {cookie, placeId} | auto=challenge-only")
         print(f"3. Default place ID: {cfg.get('solver_place_id', '126884695634066')}")
         print(f"4. Timeout / min provider interval / probe delay: {cfg.get('solver_timeout_seconds', 180)}s / {cfg.get('solver_min_resubmit_seconds', 600)}s / {cfg.get('solver_probe_after_seconds', 180)}s")
         print(f"   Once per actual rejoin: {cfg.get('solver_probe_once_per_open', True)}")
         print(f"   Cookie precheck required: {cfg.get('solver_require_cookie_precheck', True)}")
-        print("5. Test solver with a package (uses cached cookie)")
+        print("5. Test solver with a package (fresh package DB cookie)")
         print("6. Test solver with a sample cookie (paste manually)")
         print("0. Back")
         drain_stdin()
@@ -30593,12 +30658,15 @@ def solver_menu(cfg):
             print(col(f"Solver {'enabled' if cfg['solver_enabled'] else 'disabled'}", GREEN if cfg['solver_enabled'] else RED))
             pause()
         elif ch == "2":
-            url = input("Paste solver URL (e.g., https://solver.wintercode.dev/api/captcha/solve?apikey=YOUR_KEY): ").strip()
+            url = input("Paste provider URL (BlockSolve: https://blocksolve.site/join; bare host also works): ").strip()
             if url:
                 base, key = parse_solver_url(url)
                 if base:
                     cfg["solver_endpoint"] = base
-                    print(col(f"Base URL set to: {base}", GREEN))
+                    cfg["solver_provider"] = "auto"
+                    detected = solver_provider_name(cfg)
+                    print(col(f"Provider detected: {detected.upper()}", GREEN))
+                    print(col(f"Effective endpoint: {effective_solver_endpoint(cfg)}", GREEN))
                 if key:
                     cfg["solver_api_key"] = key
                     print(col(f"API key set: {mask_secret(key)}", GREEN))
