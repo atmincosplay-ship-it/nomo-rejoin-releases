@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.16 — SOLVER NO-REOPEN GUARD
+# - A visible/Lua-confirmed CAPTCHA is solved against the currently-open clone; NOMO
+#   cancels that package's pending reopen instead of restarting Roblox before solving.
+# - Solver 503/maintenance/SERVER_BUSY retries wait in place and retry the provider
+#   after cooldown; they never queue an exact-PID hard reopen just to retry the solver.
+# - This prevents repeated challenge retries from relaunching one Noka clone and
+#   disturbing sibling floating Roblox tasks on Redfinger/App Cloner.
+# - Crash/dead/stale recovery remains exact-package PID-only and otherwise unchanged.
+#
 # V4.81.15 — DURABILITY GUARD
 # - Healthy Delta key validity checks now run every 5 minutes instead of every 60s.
 # - Within 2 hours of expiry, or after a validity API error, monitoring tightens to 60s.
@@ -876,7 +885,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.15-durability-guard"
+__version__ = "V4.81.16-solver-no-reopen-guard"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -9936,40 +9945,28 @@ class RejoinCore:
         )
 
     def queue_join_challenge_rejoin(self, tab, target):
-        self.cancel(tab.get("package"))
-        return self.queue_exact_pid_recovery(
-            tab,
-            target,
-            "join challenge pre-solver rejoin",
-            skip_if_alive=False,
-            bypass_manual=True,
-            metadata={"bypass_recheck": True},
-        )
+        """Compatibility guard: CAPTCHA must be solved on the current task."""
+        pkg = str((tab or {}).get("package", "") or "")
+        removed = self.cancel(pkg)
+        if removed:
+            self.save()
+        return False, "challenge solver is in-place; package reopen blocked"
 
     def queue_visible_verification_rejoin(self, tab, target):
-        return self.queue_exact_pid_recovery(
-            tab,
-            target,
-            "visible verification preflight rejoin",
-            skip_if_alive=False,
-            bypass_manual=True,
-            metadata={"bypass_recheck": True},
-        )
+        """Compatibility guard: visible verification never queues a hard reopen."""
+        pkg = str((tab or {}).get("package", "") or "")
+        removed = self.cancel(pkg)
+        if removed:
+            self.save()
+        return False, "visible verification solver is in-place; package reopen blocked"
 
     def queue_solver_busy_retry(self, tab, target):
-        reason = str(((tab or {}).get("runtime") or {}).get("solver_retry_reason") or "SERVER_BUSY")
-        return self.queue_exact_pid_recovery(
-            tab,
-            target,
-            f"solver {reason} retry",
-            skip_if_alive=False,
-            bypass_manual=True,
-            metadata={
-                "solver_busy_retry": True,
-                "solver_retry_reason": reason,
-                "bypass_recheck": True,
-            },
-        )
+        """Compatibility guard: provider maintenance/busy retries are provider-only."""
+        pkg = str((tab or {}).get("package", "") or "")
+        removed = self.cancel(pkg)
+        if removed:
+            self.save()
+        return False, "solver retry is provider-only; package reopen blocked"
 
     def queue_solver_result_recovery(self, tab, target, result_label, metadata=None):
         return self.queue_exact_pid_recovery(
@@ -11289,10 +11286,11 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
 
 
 def maybe_queue_solver_busy_retry(open_queue, tab, target, rt_tab, cfg, health, core=None):
-    """Retry temporary solver-provider failures by opening the package again after cooldown.
+    """Retry temporary provider failures against the current challenge, never by reopening Roblox.
 
-    Never contact the provider from a healthy middle session. The provider call
-    remains inside wait-after-open and therefore happens once for that retry open.
+    V4.81.16 removes the legacy cooldown -> hard-reopen -> provider-retry loop.
+    On Noka/App Cloner, relaunching one Roblox task can disturb sibling floating tasks.
+    A provider retry therefore requires a still-live, package-scoped challenge signal.
     """
     if core is None:
         core = RejoinCore(open_queue, cfg, None)
@@ -11306,33 +11304,75 @@ def maybe_queue_solver_busy_retry(open_queue, tab, target, rt_tab, cfg, health, 
         rt_tab["note"] = "fresh state; solver retry cancelled"
         return None
 
+    pkg = str((tab or {}).get("package", "") or "")
     retry_reason = str(rt_tab.get("solver_retry_reason") or "SERVER_BUSY")
     retry_at = int(rt_tab.get("solver_busy_retry_at", 0) or 0)
     if retry_at <= 0 or now() < retry_at:
         left = max(1, retry_at - now()) if retry_at else 600
-        return "Waiting", f"solver {retry_reason}; retry rejoin in {format_age(left)}", True
+        # A pending solver retry must own this package's challenge incident. Do
+        # not let an old-state/dashboard branch leave a hard reopen queued behind it.
+        removed = core.cancel(pkg)
+        if removed:
+            core.save()
+        return "Waiting", f"solver {retry_reason}; retry provider in {format_age(left)} (no reopen)", True
 
-    pkg = str((tab or {}).get("package", "") or "")
     if solver_job_running(pkg):
         return "Solving", solver_job_note(pkg), True
-    if core.has(pkg):
-        return "Queued", f"solver {retry_reason} retry already queued", True
 
-    added, _ = core.queue_solver_busy_retry(tab, target)
-    if added:
+    alive = bool((health or {}).get("alive"))
+    state = (health or {}).get("state") or {}
+    challenge_detail = state_login_challenge_detail(state)
+    visible = android_login_challenge_ui_detail(pkg, cfg, force=True) if alive else None
+
+    if not alive:
+        # Solver retry does not own crash recovery. Let the normal dead-package
+        # path reopen it if required, but never create a reopen solely for solver.
         rt_tab["solver_busy_retry_pending"] = False
         rt_tab["solver_busy_retry_at"] = 0
-        rt_tab["note"] = f"solver {retry_reason} retry rejoin queued"
-        log_activity(f"solver {retry_reason} cooldown done; retry rejoin queued", pkg, YELLOW)
-        return "Queued", f"solver {retry_reason} retry rejoin queued", True
-    return health.get("status", "Loading"), f"solver {retry_reason} retry queue failed", True
+        rt_tab["solver_retry_reason"] = ""
+        rt_tab["note"] = "solver retry cancelled; package is not alive"
+        core.save()
+        return None
 
+    if not visible and not challenge_detail:
+        # Challenge-only invariant: do not blindly call the provider and do not
+        # bounce Roblox merely to rediscover a challenge. Recheck shortly.
+        wait_again = 60
+        rt_tab["solver_busy_retry_at"] = now() + wait_again
+        rt_tab["note"] = "solver retry due; waiting for current challenge (no reopen)"
+        removed = core.cancel(pkg)
+        core.save()
+        if removed:
+            log_activity("solver retry cancelled queued reopen; waiting for challenge in-place", pkg, YELLOW)
+        return "Waiting", rt_tab["note"], True
+
+    removed = core.cancel(pkg)
+    rt_tab["solver_busy_retry_pending"] = False
+    rt_tab["solver_busy_retry_at"] = 0
+    rt_tab["solver_retry_reason"] = ""
+    if removed:
+        log_activity("verification owns package; cancelled pending reopen before solver retry", pkg, YELLOW)
+
+    detail = (
+        str((visible or {}).get("text") or (visible or {}).get("reason") or "").strip()
+        if visible else str(challenge_detail or "").strip()
+    )
+    status, note = core.handle_detected_solver_challenge(
+        tab, rt_tab, detail or f"{retry_reason} retry on current verification UI"
+    )
+    log_activity(
+        f"solver {retry_reason} cooldown done; provider retry in-place (no reopen)",
+        pkg,
+        CYAN if status == "Solving" else YELLOW,
+    )
+    return status, note, True
 
 def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, health, core=None):
-    """Turn one package-scoped visible challenge into one queued rejoin.
+    """Solve one package-scoped visible challenge in-place without reopening Roblox.
 
-    V4.14 never submits the solver directly from a dashboard scan. The queued
-    generation owns one pre-open solver request, then one Roblox launch.
+    V4.81.16: verification UI outranks stale/dead routing. Any pending reopen for
+    this package is cancelled before the provider is contacted. Maintenance/busy
+    responses leave the current Roblox task open and retry the provider after cooldown.
     """
     if core is None:
         core = RejoinCore(open_queue, cfg, rt)
@@ -11343,38 +11383,58 @@ def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, he
     rt_tab["captcha_ui_visible"] = True
     rt_tab["captcha_ui_last_seen_at"] = now()
 
+    # Never allow an old-state/periodic/provider-retry hard reopen to survive once
+    # the current package's verification UI is confirmed.
+    removed = core.cancel(pkg)
+    if removed:
+        log_activity("verification UI cancelled pending package reopen", pkg, YELLOW)
+
     if solver_job_running(pkg):
         note = solver_job_note(pkg)
         rt_tab["note"] = note
+        core.save()
         return "Solving", note, True
+
+    busy_pending = bool(rt_tab.get("solver_busy_retry_pending"))
+    busy_at = int(rt_tab.get("solver_busy_retry_at", 0) or 0)
+    if busy_pending and busy_at > now():
+        left = max(1, busy_at - now())
+        reason = str(rt_tab.get("solver_retry_reason") or "PROVIDER")
+        note = f"verification UI; {reason} retry provider in {format_age(left)} (no reopen)"
+        rt_tab["note"] = note
+        core.save()
+        return "Captcha", note, True
 
     retry_at = int(rt_tab.get("captcha_ui_retry_at", 0) or 0)
     if retry_at > now():
         left = max(1, retry_at - now())
-        note = f"verification UI; next rejoin check in {format_age(left)}"
+        note = f"verification UI; retry provider in {format_age(left)} (no reopen)"
         rt_tab["note"] = note
+        core.save()
         return "Captcha", note, True
 
-    if core.has(pkg):
-        note = "verification UI; rejoin already queued"
-        rt_tab["note"] = note
-        return "Queued", note, True
+    if busy_pending:
+        rt_tab["solver_busy_retry_pending"] = False
+        rt_tab["solver_busy_retry_at"] = 0
+        rt_tab["solver_retry_reason"] = ""
 
-    added, _ = core.queue_visible_verification_rejoin(tab, target)
-    if added:
-        clear_hold(pkg)
-        rt_tab["manual_login_needed"] = False
-        rt_tab["manual_login_reason"] = ""
-        rt_tab["manual_login_detail"] = ""
-        rt_tab["note"] = "verification UI; solver-before-open queued"
-        core.save()
-        log_activity("verification UI; queued one solver-before-open rejoin", pkg, YELLOW)
-        return "Queued", rt_tab["note"], True
-
-    rt_tab["note"] = "verification UI; queue failed"
+    detail_obj = android_login_challenge_ui_detail(pkg, cfg, force=True)
+    detail = str(
+        (detail_obj or {}).get("text")
+        or (detail_obj or {}).get("reason")
+        or "visible package-scoped verification UI"
+    )
+    status, note = core.handle_detected_solver_challenge(tab, rt_tab, detail)
+    rt_tab["note"] = note
     core.save()
-    return "Captcha", rt_tab["note"], True
-
+    log_activity(
+        "verification UI; solver provider started in-place (no package reopen)"
+        if status == "Solving"
+        else "verification UI held in-place; no package reopen",
+        pkg,
+        CYAN if status == "Solving" else YELLOW,
+    )
+    return status, note, True
 
 def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=None, mode="market", core=None):
     """SHARED rejoin engine for both Market and Hatcher."""
@@ -11404,10 +11464,18 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
     stale_limit = int(cfg.get("state_stale_seconds", 180) or 180)
     grace = int(cfg.get("post_open_grace_seconds", 360) or 360)
 
-    # --- join/login challenge: provider calls are event-bound to a rejoin ---
+    # --- join/login challenge: solve current live challenge in-place ---
     if bad == "challenge" or (state and state_login_challenge_detail(state)):
-        added, _ = core.queue_join_challenge_rejoin(tab, target)
-        return ("Queued" if added else "Manual"),                ("challenge rejoin queued; solver runs before open" if added else "challenge already queued"), True
+        if alive:
+            removed = core.cancel(pkg)
+            if removed:
+                log_activity("Lua challenge cancelled pending package reopen", pkg, YELLOW)
+            solver_status, solver_note = core.handle_detected_solver_challenge(
+                tab, rt_tab, state_login_challenge_detail(state) or "Lua-confirmed login challenge"
+            )
+            return solver_status, solver_note, True
+        # Dead packages are owned by normal crash recovery, not solver retry logic.
+        return "Offline", "challenge state present but package dead; crash recovery owns reopen", False
 
     # --- disconnect / kick popup: always kill+open ---
     if bad == "disconnect" or (state and state_disconnect_ui(state)):
@@ -18580,10 +18648,11 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                 pets = int(state.get("pet_count", 0) or 0)
                 eggs = int(state.get("egg_total", 0) or 0)
                 age = int(state.get("age", 999999) or 999999)
-                # A current kick/disconnect owns this cycle. Do not also queue
-                # an old-state recovery for the same package before the popup
-                # handler gets its turn below.
-                recovery_age = 0 if (alive and state_disconnect_ui(state)) else age
+                # A current kick/disconnect OR verification challenge owns this cycle.
+                # Never stamp/queue old-state recovery while the solver is supposed
+                # to operate on the currently-open package in-place.
+                challenge_active = str(health.get("bad") or "") in {"ui_challenge", "challenge"}
+                recovery_age = 0 if (alive and (state_disconnect_ui(state) or challenge_active)) else age
 
                 ready_at = int((prof or {}).get("ready_pet_count", 200))
                 ready_pet = pets >= ready_at
@@ -18744,7 +18813,11 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                         if last_no_state_hard > 0 else 0
                     )
 
-                    if rt_tab.get("last_open") and in_post_open_grace(rt_tab, cfg):
+                    challenge_active = str(health.get("bad") or "") in {"ui_challenge", "challenge"}
+                    if challenge_active:
+                        status = "Captcha"
+                        note = "verification UI detected; solver owns package (no reopen)"
+                    elif rt_tab.get("last_open") and in_post_open_grace(rt_tab, cfg):
                         status = "Loading"
                         note = f"waiting for {expected_state_name(tab)}"
                     elif (
@@ -18818,13 +18891,21 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                     note = "crash open" if ok else msg
                     status = "Loading" if ok else "Offline"
 
-            # A Lua-reported CAPTCHA outranks stale/dead routing, but the
-            # provider is never called from the middle-session dashboard. Queue
-            # one package rejoin; the queued generation owns one pre-open provider call.
+            # A Lua-reported CAPTCHA outranks stale/dead routing. Solve the
+            # current live challenge in-place; never relaunch Roblox just to retry
+            # the provider. Cancel only this package's pending open generation.
             if health.get("bad") == "challenge" or (state and state_login_challenge_detail(state)):
-                added, _ = core.queue_join_challenge_rejoin(tab, "hatcher")
-                status = "Queued" if added else "Manual"
-                note = "challenge rejoin queued; solver runs before open" if added else "challenge already queued"
+                if alive:
+                    removed = core.cancel(pkg)
+                    if removed:
+                        log_activity("Lua challenge cancelled pending package reopen", pkg, YELLOW)
+                    solver_status, solver_note = core.handle_detected_solver_challenge(
+                        tab, rt_tab, state_login_challenge_detail(state) or "Lua-confirmed login challenge"
+                    )
+                    status = solver_status
+                    note = solver_note
+                else:
+                    note = "challenge state present but package dead; crash recovery owns reopen"
 
             # V4.12: visible package-scoped verification UI outranks every
             # stale/dead/routing decision above. Remove only this package's queued
