@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.30 — BACKEND TRUTH / TRI-STATE / APP-CLONER RELAUNCH GUARD
+# - Cloudflare Hatcher reporter refuses stale/invalid/challenge/Home-hidden-heartbeat state as an online update; last-good backend records are preserved instead.
+# - Rejoin Only uses ALIVE/DEAD/UNKNOWN process state, including the last-second action recheck, so Android ps failures never become crash opens.
+# - Noka/App Cloner packages skip rapid second soft intents and Delta cold-start launcher/second-deeplink tricks; normal later retry paths remain.
+#
 # V4.81.29 — SESSION RUNTIME TRUTH GUARD
 # - Bubble-only classification no longer trusts dumpsys window visibility. Only a confirmed
 #   NO_ACTIVITY result can fast-track the special bubble recovery; window dumps remain status-only.
@@ -961,7 +966,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.29-session-runtime-truth-guard"
+__version__ = "V4.81.30-backend-truth-tristate-appcloner-guard"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -14323,6 +14328,14 @@ def market_booster_second_soft_intent(
     if core is None:
         core = RejoinCore([], cfg, rt)
 
+    package = str((tab or {}).get("package") or "")
+    if _is_noka_clone_package(package):
+        # V4.81.30: App Cloner safety. We proved on Redfinger that a rapid
+        # second am-start can reshuffle/close sibling floating clone tasks even
+        # when no sibling PID is signalled. Let the ordinary delayed retry cycle
+        # handle Home/no-state instead of issuing a second intent seconds later.
+        return True, first_opened_at, "second intent disabled for Noka/App Cloner safety"
+
     if not cfg.get(
         "market_booster_second_intent_enabled",
         True,
@@ -18044,7 +18057,30 @@ def hatcher_report_once(hcfg, force=True, state_cache=None, main_runtime=None):
             health=None,
         )
 
-        entry = hatcher_entry(eff, state, state_err)
+        # V4.81.30: Cloudflare backend truth guard. The dashboard already refuses
+        # to recover from impossible phantom ages (for example 277h from a missing
+        # ts), but the reporter previously still uploaded that raw state as ONLINE
+        # with stale pet/egg counts. For Cloudflare, only a clean fresh heartbeat
+        # may replace the last-good Hatcher record. A recently observed visible
+        # Roblox Home shell also invalidates the hidden heartbeat App Cloner can
+        # keep writing behind Home. Treat these as no_state so the existing
+        # Cloudflare no_state-preserve path keeps the last-good route untouched.
+        report_state = state
+        report_state_err = state_err
+        if provider == "cloudflare" and state is not None:
+            report_state_ok = state_is_clean_fresh(state, main_cfg)
+            home_seen_at = int(rt_tab.get("hatcher_visible_home_at", 0) or 0)
+            home_recent = home_seen_at > 0 and (now() - home_seen_at) <= max(60, int(main_cfg.get("hatcher_visible_home_route_retry_seconds", 30) or 30) * 3)
+            if not report_state_ok or home_recent:
+                reasons = []
+                if not report_state_ok:
+                    reasons.append(f"state not clean/fresh age={state_age_seconds(state)}")
+                if home_recent:
+                    reasons.append("visible Roblox Home")
+                report_state = None
+                report_state_err = "; ".join(reasons) or "state not reportable"
+
+        entry = hatcher_entry(eff, report_state, report_state_err)
         status = str(entry.get("status", "")).lower()
 
         # During an event transition, publish one unavailable status and then
@@ -36966,16 +37002,23 @@ def start_rejoin_only(cfg):
         for tab in tabs:
             pkg = str(tab.get("package") or "")
             item = runtime.setdefault(pkg, {})
-            alive = bool(package_alive(pkg, cfg))
+            process_status, process_note = package_alive_status(pkg, cfg)
+            alive = process_status == "ALIVE"
+            process_unknown = process_status == "UNKNOWN"
             state = _rejoin_only_state(tab) if use_state else None
             state_age = state.get("age") if state else None
             state_fresh = state is not None and state_age <= stale_seconds
 
-            # A fresh heartbeat overrides a false-negative PID check.
+            # A fresh heartbeat overrides a false-negative/inconclusive PID check.
             if state_fresh:
                 alive = True
+                process_unknown = False
 
             if alive:
+                item["dead_since"] = 0
+            elif process_unknown:
+                # UNKNOWN is not DEAD. Never start/advance dead confirmation from
+                # a failed Android ps snapshot.
                 item["dead_since"] = 0
             elif int(item.get("dead_since", 0) or 0) <= 0:
                 item["dead_since"] = current_time
@@ -36999,6 +37042,8 @@ def start_rejoin_only(cfg):
 
             if hold_reason and alive:
                 status = hold_reason
+            elif process_unknown and not alive:
+                status = "unknown: process check"
             elif not alive:
                 dead_for = current_time - int(item.get("dead_since", current_time) or current_time)
                 immediate = first_cycle and bool(cfg.get("rejoin_only_open_closed_on_start", True))
@@ -37030,6 +37075,8 @@ def start_rejoin_only(cfg):
                 "alive": alive,
                 "state": f"{state_age}s" if state_age is not None else "off" if not use_state else "none",
                 "status": status,
+                "process_status": process_status,
+                "process_note": process_note,
                 "link": _rejoin_only_link(tab, cfg),
             })
 
@@ -37063,11 +37110,17 @@ def start_rejoin_only(cfg):
             tab, item, reason, hard = actions[0]
             pkg = str(tab.get("package") or "")
             state_now = _rejoin_only_state(tab) if use_state else None
-            alive_now = bool(package_alive(pkg, cfg))
+            process_now, process_now_note = package_alive_status(pkg, cfg, fresh=True)
+            alive_now = process_now == "ALIVE"
             if state_now and state_now.get("age", 999999) <= stale_seconds:
                 alive_now = True
 
-            should_open = reason != "package closed" or not alive_now
+            if process_now == "UNKNOWN" and not alive_now:
+                should_open = False
+                item["status"] = "deferred: process check unavailable"
+                item["last_process_note"] = str(process_now_note or "")
+            else:
+                should_open = reason != "package closed" or not alive_now
             if reason.startswith("state stale") and state_now and state_now.get("age", 0) <= stale_seconds:
                 should_open = False
 
@@ -37490,13 +37543,19 @@ def delta_key_open_selected_clone(package, cfg):
         if not link:
             return False, "no Delta bootstrap PlaceId configured"
 
-    was_alive = package_alive(package, cfg, fresh=True)
+    process_status, process_note = package_alive_status(package, cfg, fresh=True)
+    if process_status == "UNKNOWN":
+        return False, "process check unavailable; Delta bootstrap deferred: " + cut(process_note, 60)
+    was_alive = process_status == "ALIVE"
+    is_noka = _is_noka_clone_package(package)
     prewarm_note = ""
 
-    # A never-opened App Cloner package can consume the first VIEW intent while
-    # initializing and remain on Roblox Home. Open the launcher once first.
+    # Never launcher-prewarm Noka/App Cloner packages. That exact pattern was
+    # proven capable of disturbing sibling floating tasks during Hatcher bubble
+    # recovery. Non-Noka packages retain the historical cold-start helper.
     if (
         not was_alive
+        and not is_noka
         and bool(cfg.get("delta_key_cold_start_prewarm_enabled", True))
     ):
         activity = delta_key_resolve_activity(package, cfg)
@@ -37554,7 +37613,7 @@ def delta_key_open_selected_clone(package, cfg):
     # On a cold package, deliver the same deep link again after Roblox has
     # initialized its task. No PID kill occurs here.
     second_note = ""
-    if not was_alive:
+    if not was_alive and not is_noka:
         second_delay = max(
             0,
             int(
