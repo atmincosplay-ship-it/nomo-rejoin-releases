@@ -18,6 +18,7 @@
 #
 # V4.81.19 — CRITICAL LOCAL STATE DURABILITY
 # - captcha_hold.json is lock-protected, atomic, and backed by captcha_hold.json.last_good.
+# V4.81.22: confirmed bubble-only shells bypass stale startup/cooldown gates and queue target-only recovery.
 # - exotic_key_state.json and delta_key_runtime.json use last-good recovery and fail closed when
 #   both copies are unreadable.
 #
@@ -928,7 +929,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.21-bubble-only-home-rescue"
+__version__ = "V4.81.22-bubble-rescue-queue-guard"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -4892,6 +4893,72 @@ def prewarm_closed_clone_for_hard_open(pkg, cfg, reason=""):
         return True, "prewarmed"
     log_activity("prewarm launcher opened but no exact PID", pkg, YELLOW)
     return False, "prewarm no pid"
+
+
+def hatcher_bubble_only_recovery_candidate(pkg, cfg, *, process_status=None):
+    """Return (confirmed, note) for an App Cloner shell with no Roblox activity.
+
+    This is intentionally narrow: a surviving Noka process/floating bubble is not
+    itself proof that Roblox is open. A confirmed NO_ACTIVITY result lets the
+    Hatcher watchdog bypass stale-state timing gates once the state is already old
+    enough for recovery. UNKNOWN never triggers recovery.
+    """
+    if not cfg.get("prewarm_shell_only_clone_before_hard_open", True):
+        return False, "bubble-only rescue disabled"
+    if not _is_noka_clone_package(pkg):
+        return False, "not a noka clone"
+
+    ps = process_status
+    if ps is None:
+        ps, _ = package_alive_status(pkg, cfg, fresh=True)
+    if ps != "ALIVE":
+        return False, "package process not confirmed alive"
+
+    activity_status, activity_note = package_activity_status(pkg, cfg)
+    if activity_status == "NO_ACTIVITY":
+        return True, activity_note or "no live ActivityRecord"
+    if activity_status == "UNKNOWN":
+        return False, "activity query unavailable"
+    return False, activity_note or "live activity"
+
+
+def queue_hatcher_bubble_only_recovery(core, tab, rt_tab, cfg, reason):
+    """Queue one package-local recovery for a confirmed bubble-only shell.
+
+    Do not bypass manual/solver holds. This path exists only to bypass the stale
+    startup-observe / old-state cooldown gates after Android directly confirms
+    that the package has a process but no Roblox ActivityRecord.
+    """
+    pkg = str((tab or {}).get("package", "") or "")
+    if not pkg:
+        return False, "no package"
+    if solver_job_running(pkg):
+        return False, "solver running"
+    manual_hold, manual_note = recovery_manual_hold_active(rt_tab, cfg, pkg)
+    if manual_hold:
+        return False, manual_note
+
+    added, note = core.queue_exact_pid_recovery(
+        tab,
+        "hatcher",
+        str(reason or "bubble-only shell recovery"),
+        skip_if_alive=False,
+        front=True,
+        bypass_manual=False,
+        metadata={
+            "bypass_recheck": True,
+            "bubble_only_recovery": True,
+        },
+    )
+    if added:
+        rt_tab["hatcher_startup_observe_until"] = 0
+        rt_tab["note"] = "bubble-only rescue queued"
+        log_activity("bubble-only shell confirmed; target-only recovery queued", pkg, YELLOW)
+        core.save()
+        return True, "bubble-only rescue queued"
+    if core.has(pkg):
+        return False, "bubble-only rescue already queued"
+    return False, note or "bubble-only rescue blocked"
 
 
 def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop=True, skip_force_stop=False, allow_launcher_fallback=False):
@@ -18952,6 +19019,18 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                 continue
 
             if raw_alive and state is not None and old_enabled and old_sec <= state_age <= old_max:
+                bubble_only, bubble_note = hatcher_bubble_only_recovery_candidate(
+                    pkg, cfg, process_status=process_status
+                )
+                if bubble_only:
+                    added, qnote = queue_hatcher_bubble_only_recovery(
+                        core, tab, rt_tab, cfg,
+                        f"startup bubble-only shell; old state {state_age}s",
+                    )
+                    rt_tab["note"] = qnote
+                    if added or core.has(pkg):
+                        continue
+
                 # NOMO may have been started while this clone was already in the
                 # Roblox loading screen. Its previous state file remains old until
                 # AutoExec reaches the game, so observe first instead of killing it.
@@ -19129,7 +19208,30 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                     alive and startup_observe_until > now()
                 )
 
+                bubble_rescue_handled = False
+                if (
+                    not problem_code
+                    and alive
+                    and old_enabled
+                    and old_sec <= recovery_age <= old_max
+                    and not challenge_active
+                ):
+                    bubble_only, bubble_note = hatcher_bubble_only_recovery_candidate(
+                        pkg, cfg, process_status=process_status
+                    )
+                    if bubble_only:
+                        added, qnote = queue_hatcher_bubble_only_recovery(
+                            core, tab, rt_tab, cfg,
+                            f"bubble-only shell; old state {recovery_age}s",
+                        )
+                        if added or core.has(pkg):
+                            status = "Queued"
+                            note = qnote
+                            bubble_rescue_handled = True
+
                 if problem_code:
+                    pass
+                elif bubble_rescue_handled:
                     pass
                 elif in_startup_observe and recovery_age >= old_sec:
                     status = "Loading"
