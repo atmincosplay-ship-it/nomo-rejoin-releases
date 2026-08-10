@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.35 — OPTION 6 SINGLE-ATTEMPT SAFETY GUARD
+# - Option 6 never sends the legacy 8-second route nudge after a manual hard restart.
+# - Option 6 manual items are single-attempt only: Home/no-state does not queue an immediate
+#   route/hard fallback inside the same menu action; the normal Option 1 watchdog retries later.
+# - A successful Option 6 restart arms a 5-minute per-package repeat guard so pressing Option 6
+#   again cannot rapidly relaunch the same App Cloner task and disturb sibling floating clones.
+#
+# V4.81.34 — STATE READ / COOKIE TEMP / QUEUE TRI-STATE GUARD
+# - State JSON reads tolerate a concurrent Lua rewrite: parse failures are retried briefly before
+#   being surfaced as missing/broken telemetry, preventing one partial write from becoming a recovery signal.
+# - Legacy cookie webhook export uses package/thread-specific temporary SQLite copies instead of the
+#   shared /sdcard/Download/tmp_cookie.db path.
+# - skip_if_alive queue decisions preserve ALIVE/DEAD/UNKNOWN; UNKNOWN is deferred before a hard
+#   recovery item enters the normal open cycle instead of churning as effectively dead.
+#
 # V4.81.33 — LAST-SECOND / SHELL / REJOIN-ONLY DURABILITY GUARD
 # - The final pre-stop healed check is tri-state too: a second Android `ps` failure defers the
 #   queued hard recovery instead of falling through to an exact-PID stop.
@@ -977,7 +992,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.33-lastsecond-shell-rejoinonly-durability-guard"
+__version__ = "V4.81.35-option6-single-attempt-safety-guard"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -5829,6 +5844,31 @@ def format_session(rt_tab):
     return format_uptime(now() - start)
 
 
+def _read_state_json_stable(path, attempts=3, delay_seconds=0.04):
+    """Read a Lua-written JSON file without treating one in-progress rewrite as corruption.
+
+    Executor writefile() is not guaranteed to be atomic on shared Android storage. A reader can
+    catch the destination between truncate/write operations. Retry only the read/JSON parse; all
+    semantic validation remains in read_state().
+    """
+    path = Path(path)
+    attempts = max(1, int(attempts or 1))
+    last_exc = None
+    for index in range(attempts):
+        try:
+            text = path.read_text()
+            if not str(text or "").strip():
+                raise ValueError("state file temporarily empty")
+            return json.loads(text)
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError, ValueError) as exc:
+            last_exc = exc
+            if index + 1 < attempts:
+                time.sleep(max(0.0, float(delay_seconds or 0.0)))
+    if last_exc is not None:
+        raise last_exc
+    raise ValueError("state read failed")
+
+
 def read_state(tab):
     if delta_mapping_conflict_for_tab(tab):
         return None, "Delta mapping conflict"
@@ -5839,7 +5879,7 @@ def read_state(tab):
         return None, "missing"
 
     try:
-        data = json.loads(path.read_text())
+        data = _read_state_json_stable(path)
 
         if is_delta_global_tab(tab) or is_shared_global_executor_tab(tab):
             expected = _usable_detected_username(
@@ -7814,9 +7854,22 @@ def manual_restart_tabs_via_queue(
     open_queue, core = make_rejoin_core(cfg, rt)
     tabs = list(tabs or [])
 
+    repeat_guard = max(60, int(cfg.get("option6_repeat_guard_seconds", 300) or 300))
+
     for tab in tabs:
         pkg = str((tab or {}).get("package", "") or "")
         if not pkg:
+            continue
+        rt_tab = get_runtime_tab(rt, pkg)
+        last_option6 = int(rt_tab.get("last_option6_restart_at", 0) or 0)
+        if last_option6 > 0 and now() - last_option6 < repeat_guard:
+            remain = max(1, repeat_guard - (now() - last_option6))
+            rt_tab["note"] = f"Option 6 repeat blocked {format_age(remain)}"
+            log_activity(
+                f"Option 6 repeat blocked for App Cloner safety; retry in {format_age(remain)}",
+                pkg,
+                YELLOW,
+            )
             continue
         target = (
             target_for_tab(tab, rt)
@@ -7829,6 +7882,9 @@ def manual_restart_tabs_via_queue(
             reason,
             metadata={
                 "manual_option6": True,
+                # V4.81.35: Option 6 is exactly one Android launch attempt.
+                # If Roblox lands Home/no-state, the normal watchdog may retry later.
+                "no_hard_fallback": True,
             },
         )
         if not added:
@@ -7847,60 +7903,13 @@ def manual_restart_tabs_via_queue(
 
 
 def nudge_option6_routes(cfg, tabs, target_for_tab, label="tabs"):
-    """Send the selected deep link again after Option 6 opens the clone.
+    """V4.81.35 compatibility stub: Option 6 never emits a second App Cloner intent.
 
-    Some Noka/App Cloner builds keep a warm Roblox task alive but drop the
-    first deep link, leaving the clone on the Roblox home page. A soft resend
-    of the exact saved route is enough to steer that already-open task without
-    stopping other clones.
+    Rapid/repeated ``am start`` calls were proven capable of disturbing sibling
+    Noka floating tasks even without any sibling PID signal.  The normal Option 1
+    watchdog owns any later Home/no-state retry.
     """
-    tabs = list(tabs or [])
-    if not tabs:
-        return 0
-
-    wait_seconds(8, {})
-
-    rt = load_runtime()
-    nudged = 0
-    print("")
-    print(col(f"Route nudge for {len(tabs)} {label}:", CYAN))
-    for tab in tabs:
-        pkg = str((tab or {}).get("package", "") or "")
-        if not pkg:
-            continue
-
-        rt_tab = rt.get(pkg) if isinstance(rt, dict) else None
-        target = (
-            target_for_tab(tab, rt)
-            if callable(target_for_tab)
-            else str(target_for_tab or "market")
-        )
-        link = target_link(tab, cfg, target, rt_tab, rt)
-        if not link:
-            print(f"  {short_pkg(pkg):<10} {col('NO ROUTE', RED)}")
-            continue
-
-        ok, note = open_roblox(
-            pkg,
-            link,
-            cfg,
-            soft=True,
-            rt_tab=rt_tab,
-            reason="option6 route nudge",
-            require_stop=False,
-            skip_force_stop=True,
-        )
-        if ok:
-            nudged += 1
-            print(f"  {short_pkg(pkg):<10} {col('ROUTE SENT', GREEN)} {cut(note, 50)}")
-        else:
-            print(f"  {short_pkg(pkg):<10} {col('ROUTE FAILED', RED)} {cut(note, 50)}")
-        wait_seconds(1, {})
-
-    save_runtime(rt)
-    return nudged
-
-
+    return 0
 
 
 def verify_option6_open_results(cfg, tabs, label="tabs"):
@@ -11618,14 +11627,33 @@ def state_recent_enough_for_alive(tab, cfg, seconds=None):
     return age <= int(seconds)
 
 
-def effective_package_alive(tab, cfg, raw_alive=None):
-    alive = package_alive(tab["package"], cfg, fresh=True) if raw_alive is None else bool(raw_alive)
+def effective_package_status(tab, cfg, raw_status=None):
+    """Tri-state version of the old effective-package-alive startup heuristic."""
+    if raw_status is None:
+        status, _note = package_alive_status(tab["package"], cfg, fresh=True)
+    else:
+        status = str(raw_status or "UNKNOWN").upper()
+        if status not in {"ALIVE", "DEAD", "UNKNOWN"}:
+            status = "ALIVE" if bool(raw_status) else "DEAD"
+
     stale_limit = int(cfg.get("state_stale_seconds", 180) or 180)
-    if alive:
+    fresh_state = state_recent_enough_for_alive(tab, cfg, seconds=stale_limit)
+
+    if status == "ALIVE":
         if cfg.get("start_reopen_alive_without_fresh_state", True):
-            return state_recent_enough_for_alive(tab, cfg, seconds=stale_limit)
-        return True
-    return state_recent_enough_for_alive(tab, cfg, seconds=stale_limit)
+            return "ALIVE" if fresh_state else "DEAD"
+        return "ALIVE"
+    if status == "UNKNOWN":
+        # A fresh healthy Lua heartbeat is enough to skip a start action even when ps failed.
+        # Without that proof, preserve UNKNOWN so the caller can defer instead of queueing hard work.
+        return "ALIVE" if fresh_state else "UNKNOWN"
+    return "ALIVE" if fresh_state else "DEAD"
+
+
+def effective_package_alive(tab, cfg, raw_alive=None):
+    if raw_alive is None:
+        return effective_package_status(tab, cfg) == "ALIVE"
+    return effective_package_status(tab, cfg, "ALIVE" if bool(raw_alive) else "DEAD") == "ALIVE"
 
 
 def package_has_fresh_healthy_state(pkg, cfg, seconds=None):
@@ -14219,10 +14247,21 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
             core.save()
             return True
 
-    if item.get("skip_if_alive") and effective_package_alive(tab, cfg):
-        rt_tab["note"] = "queue skip alive"
-        core.save()
-        return True
+    if item.get("skip_if_alive"):
+        effective_status = effective_package_status(tab, cfg)
+        if effective_status == "ALIVE":
+            rt_tab["note"] = "queue skip alive"
+            core.save()
+            return True
+        if effective_status == "UNKNOWN":
+            core.requeue_front(item)
+            rt_tab["note"] = "queue deferred: process check unavailable"
+            log_activity(
+                "queued recovery deferred; effective process state UNKNOWN (no open)",
+                pkg, YELLOW,
+            )
+            core.save()
+            return True
 
     # If cooldown blocks this package, do not block other packages behind it.
     if not item.get("force") and not can_open(rt_tab, cfg):
@@ -14527,6 +14566,11 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
         mode=mode,
     )
     opened_at = int(rt_tab.get("last_open", now()))
+
+    if ok and item.get("manual_option6"):
+        rt_tab["last_option6_restart_at"] = int(opened_at or now())
+        rt_tab["last_option6_restart_target"] = str(target or "")
+        rt_tab["last_option6_restart_reason"] = str(reason or "")
 
     if ok and item.get("hatcher_old_state_recovery"):
         rt_tab["hatcher_alive_old_state_hard_last"] = now()
@@ -20180,13 +20224,6 @@ def open_all_hatcher_tabs_once(
         tabs,
         "hatcher",
         "manual hatcher/booster force restart",
-    )
-
-    nudge_option6_routes(
-        cfg,
-        tabs,
-        "hatcher",
-        "Hatcher/Booster tab(s)",
     )
 
     verify_option6_open_results(cfg, tabs, "Hatcher/Booster tab(s)")
@@ -31657,10 +31694,14 @@ def export_cookies_webhook(cfg, selected_packages=None):
         print(f"  -> Extracting from {pkg}...")
         cookie = None
         db_src = f"/data/data/{pkg}/app_webview/Default/Cookies"
-        db_dst = "/sdcard/Download/tmp_cookie.db"
+        safe_pkg = re.sub(r"[^A-Za-z0-9_.-]", "_", str(pkg or "package"))
+        db_dst = (
+            f"/sdcard/Download/tmp_cookie_export_{safe_pkg}_{os.getpid()}_"
+            f"{threading.get_ident()}.db"
+        )
         try:
             p = subprocess.run(
-                ["su", "-c", f"cp {db_src} {db_dst}"],
+                ["su", "-c", f"cp {shlex.quote(db_src)} {shlex.quote(db_dst)}"],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -37252,9 +37293,17 @@ def rejoin_only_force_restart_all(cfg):
             or 20
         ),
     )
+    repeat_guard = max(60, int(cfg.get("option6_repeat_guard_seconds", 300) or 300))
+    runtime = _rejoin_only_load_runtime()
 
     for index, tab in enumerate(tabs):
         pkg = str(tab.get("package") or "")
+        item = runtime.setdefault(pkg, {})
+        last_option6 = int(item.get("last_option6_restart_at", 0) or 0)
+        if last_option6 > 0 and now() - last_option6 < repeat_guard:
+            remain = max(1, repeat_guard - (now() - last_option6))
+            print(col(f"[{pkg}] Option 6 repeat blocked for {format_age(remain)}", YELLOW))
+            continue
         print(
             col(
                 f"[{pkg}] force restart -> saved Rejoin Only link",
@@ -37267,6 +37316,9 @@ def rejoin_only_force_restart_all(cfg):
             "manual force restart",
             hard=True,
         )
+        if ok:
+            item["last_option6_restart_at"] = now()
+            _rejoin_only_save_runtime(runtime)
         print(
             col(
                 f"  {'OK' if ok else 'FAILED'}: {note}",
