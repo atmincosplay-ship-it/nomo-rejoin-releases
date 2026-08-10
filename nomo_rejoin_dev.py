@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.17 — TRI-STATE / ALLOWLIST / MARKET CACHE GUARD
+# - Android process liveness is tri-state (ALIVE/DEAD/UNKNOWN) in startup and
+#   watchdog decisions. A failed `ps` query is UNKNOWN and defers recovery instead
+#   of being treated as a dead Roblox clone. Exact-PID stop remains fail-closed.
+# - Private-server allowlist verification distinguishes confirmed missing users from
+#   unavailable verification APIs. A successful PATCH followed by failed verification
+#   is deferred; NOMO never fans out duplicate individual PATCH retries blindly.
+# - Global Arceus Market last-good cache is isolated per Roblox UID and the loader
+#   rejects remote NOMO Market versions older than V17.5 before execution/cache write.
+# - Legacy shared market_last_good.lua is read only as a one-time migration fallback;
+#   validated content is copied into market_last_good_<UID>.lua.
+#
 # V4.81.16 — SOLVER NO-REOPEN GUARD
 # - A visible/Lua-confirmed CAPTCHA is solved against the currently-open clone; NOMO
 #   cancels that package's pending reopen instead of restarting Roblox before solving.
@@ -885,7 +897,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.16-solver-no-reopen-guard"
+__version__ = "V4.81.17-tristate-allowlist-market-cache-guard"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -3608,18 +3620,35 @@ def package_pids(pkg, cfg):
     return pids if ok else []
 
 
-def package_alive(pkg, cfg, fresh=False):
-    """Return True only when an exact package PID is running."""
+def package_alive_status(pkg, cfg, fresh=False):
+    """Return (ALIVE|DEAD|UNKNOWN, note) for one exact Android package.
+
+    UNKNOWN is intentionally distinct from DEAD. A transient/root/`ps` query failure
+    must never be used as evidence that a Roblox clone is stopped.
+    """
     pkg = str(pkg or "").strip()
     if not pkg:
-        return False
+        return "UNKNOWN", "no package"
 
     if not fresh:
         refresh_process_list(cfg)
         if _PROC_CACHE.get("ok"):
-            return any(_process_name_matches_package(name, pkg) for name in _PROC_CACHE["names"])
+            alive = any(
+                _process_name_matches_package(name, pkg)
+                for name in _PROC_CACHE.get("names", set())
+            )
+            return ("ALIVE" if alive else "DEAD"), "cached process list"
 
-    return bool(package_pids(pkg, cfg))
+    ok, pids, note = package_pids_checked(pkg, cfg)
+    if not ok:
+        return "UNKNOWN", str(note or "process query unavailable")
+    return ("ALIVE" if pids else "DEAD"), "exact PID query"
+
+
+def package_alive(pkg, cfg, fresh=False):
+    """Compatibility bool wrapper. Recovery decisions should prefer package_alive_status()."""
+    status, _note = package_alive_status(pkg, cfg, fresh=fresh)
+    return status == "ALIVE"
 
 
 _WINDOW_DUMP_CACHE = {"ts": 0, "text": "", "ok": False}
@@ -11051,11 +11080,23 @@ def state_is_clean_fresh(state, cfg, seconds=None):
     return state_is_fresh(state, cfg, seconds=seconds) and state_is_clean(state)
 
 
-def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=None, raw_alive=None, state=None, err=None):
-    """One shared answer for Market/Hatcher package health."""
+def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=None, raw_alive=None, state=None, err=None, process_status=None, process_note=""):
+    """One shared answer for Market/Hatcher package health.
+
+    V4.81.17: process_status may be ALIVE/DEAD/UNKNOWN. UNKNOWN is a hold, not a
+    crash signal; fresh clean Lua state can still prove the clone is healthy.
+    """
     pkg = tab.get("package")
-    if raw_alive is None:
-        raw_alive = package_alive(pkg, cfg)
+    if process_status is None:
+        if raw_alive is None:
+            process_status, process_note = package_alive_status(pkg, cfg)
+            raw_alive = process_status == "ALIVE"
+        else:
+            process_status = "ALIVE" if bool(raw_alive) else "DEAD"
+    else:
+        process_status = str(process_status or "UNKNOWN").upper()
+        if raw_alive is None:
+            raw_alive = process_status == "ALIVE"
     if state is None and err is None:
         state, err = read_state(tab)
 
@@ -11192,6 +11233,23 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
     bad_kind = ""
     clean_fresh = state_is_clean_fresh(state, cfg) if state else False
     fresh = state_is_fresh(state, cfg) if state else False
+
+    # V4.81.17: a failed Android process query is not evidence of a dead clone.
+    # A fresh clean Lua heartbeat remains authoritative; otherwise hold one cycle
+    # and let the next successful `ps` snapshot decide ALIVE vs DEAD.
+    if process_status == "UNKNOWN" and not clean_fresh:
+        note_unknown = "process check unavailable; recovery deferred"
+        if process_note:
+            note_unknown += ": " + cut(process_note, 80)
+        return {
+            "pkg": pkg, "user": tab.get("user_name", pkg), "alive": False,
+            "process_status": "UNKNOWN", "process_note": str(process_note or ""),
+            "state": state, "state_err": err, "fresh": fresh, "clean_fresh": False,
+            "pets": pets, "eggs": eggs, "age": age,
+            "status": "Unknown", "note": note_unknown,
+            "bad": "process_unknown", "visible_window": None,
+        }
+
     if clean_fresh:
         # A genuinely healthy heartbeat starts a new disconnect-recovery cycle.
         # Do not let an old popup cooldown delay a later, unrelated Error 288.
@@ -11444,6 +11502,13 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
     state = health.get("state")
     alive = bool(health.get("alive"))
     bad = str(health.get("bad") or "")
+
+    # V4.81.17: UNKNOWN process liveness is a fail-closed observation state.
+    # Never turn an unavailable `ps` query into a queued crash/stale recovery.
+    if bad == "process_unknown" or str(health.get("process_status") or "").upper() == "UNKNOWN":
+        rt_tab["note"] = str(health.get("note") or "process check unavailable; recovery deferred")
+        core.save()
+        return "Unknown", rt_tab["note"], True
 
     captcha_action = apply_visible_captcha_ui_action(
         open_queue, tab, target, rt_tab, cfg, rt, health, core
@@ -12958,14 +13023,19 @@ def wait_until_fresh_after_open(
             core.save()
             return False, "stop"
 
-        alive = package_alive(tab["package"], cfg)
+        process_status, process_note = package_alive_status(tab["package"], cfg)
+        alive = process_status == "ALIVE"
         fresh, state, err = state_fresh_after_open(tab, cfg, opened_at)
 
-        if alive:
+        if process_status == "ALIVE":
             seen_alive_after_open = True
             process_missing_since = 0
-        elif process_missing_since <= 0:
-            process_missing_since = now()
+        elif process_status == "DEAD":
+            if process_missing_since <= 0:
+                process_missing_since = now()
+        else:
+            # UNKNOWN must not advance the continuous-dead timer.
+            process_missing_since = 0
 
         # V3.84: one provider check per actual open/rejoin. An old state file may
         # still exist, so use `not fresh` rather than only `not state`.
@@ -13129,6 +13199,8 @@ def wait_until_fresh_after_open(
                 if not route_ok
                 else "waiting fresh state"
             )
+        elif process_status == "UNKNOWN":
+            status_note = "process check unavailable; waiting"
         elif not alive:
             missing_for = max(0, now() - int(process_missing_since or now()))
             if seen_alive_after_open:
@@ -13179,7 +13251,7 @@ def wait_until_fresh_after_open(
             log_activity("fresh clean state - rejoin complete", pkg, GREEN)
             return True, "fresh"
     
-        if not alive:
+        if process_status == "DEAD":
             missing_for = max(0, now() - int(process_missing_since or now()))
 
             # The clone may need a long time before ps exposes its new process.
@@ -13408,6 +13480,20 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
 
     item_mode = str(item.get("mode", "hard") or "hard").lower()
     is_hard = item_mode not in ("soft", "route", "switch", "reuse_task")
+
+    # V4.81.17: fail closed at execution time too. A recovery queued from a
+    # previously confirmed condition must not execute while Android `ps` is UNKNOWN.
+    if is_hard:
+        process_status, process_note = package_alive_status(pkg, cfg, fresh=True)
+        if process_status == "UNKNOWN":
+            core.requeue_front(item)
+            rt_tab["note"] = "queued open deferred: process check unavailable"
+            log_activity(
+                "hard open deferred; process check unavailable (no PID stop/open)",
+                pkg, YELLOW,
+            )
+            core.save()
+            return True
 
     # V3.79: SINGLE-FLIGHT GATE
     # Never start a kill/open while another package is still inside its own
@@ -14115,12 +14201,17 @@ def _nomo_start_market_rejoin_original(cfg):
             tabs_to_open = []
             for tab in enabled_tabs:
                 rt_tab = get_runtime_tab(rt, tab["package"])
-                raw_alive = package_alive(tab["package"], cfg)
+                process_status, process_note = package_alive_status(tab["package"], cfg)
+                raw_alive = process_status == "ALIVE"
                 fresh_state = state_recent_enough_for_alive(tab, cfg, seconds=stale_limit)
 
                 if raw_alive or fresh_state:
                     rt_tab["note"] = "start alive - skipped"
                     core.save()
+                elif process_status == "UNKNOWN":
+                    rt_tab["note"] = "start deferred: process check unavailable"
+                    core.save()
+                    log_activity("startup process check unavailable; no reopen queued", tab["package"], YELLOW)
                 else:
                     tabs_to_open.append((tab, "hard", True))
         else:
@@ -14186,11 +14277,13 @@ def _nomo_start_market_rejoin_original(cfg):
                 if removed >= 0:
                     rt_tab["orphan_cleanup_done"] = True
 
-            raw_alive = package_alive(pkg, cfg)
+            process_status, process_note = package_alive_status(pkg, cfg)
+            raw_alive = process_status == "ALIVE"
             state, err = read_state(tab)
             alive = raw_alive or (state is not None and not state_disconnect_ui(state) and int(state.get("age", 999999) or 999999) <= int(cfg.get("state_stale_seconds", 180) or 180))
             health = evaluate_package_health(
-                tab, cfg, rt_tab, mode="market", raw_alive=raw_alive, state=state, err=err
+                tab, cfg, rt_tab, mode="market", raw_alive=raw_alive, state=state, err=err,
+                process_status=process_status, process_note=process_note
             )
 
             pets = "-"
@@ -17784,12 +17877,16 @@ def start_hatcher_reporter(main_cfg=None):
     # Smart startup
     if cfg.get("open_all_on_start", True):
         for tab in tabs:
-            raw_alive = package_alive(tab["package"], cfg)
+            process_status, process_note = package_alive_status(tab["package"], cfg)
+            raw_alive = process_status == "ALIVE"
             fresh_state = state_recent_enough_for_alive(tab, cfg, seconds=int(cfg.get("state_stale_seconds", 180) or 180))
             rt_tab = get_runtime_tab(rt, tab["package"])
             rt_tab["target"] = "hatcher"
             if fresh_state:
                 rt_tab["note"] = "start fresh state"
+                core.save()
+            elif process_status == "UNKNOWN":
+                rt_tab["note"] = "start deferred: process check unavailable"
                 core.save()
             elif raw_alive and cfg.get("start_reopen_alive_without_fresh_state", True):
                 rt_tab["note"] = "start alive no-fresh -> soft"
@@ -17835,7 +17932,8 @@ def start_hatcher_reporter(main_cfg=None):
             pkg = tab["package"]
             rt_tab = get_runtime_tab(rt, pkg)
             rt_tab["target"] = "hatcher"
-            raw_alive = package_alive(pkg, cfg)
+            process_status, process_note = package_alive_status(pkg, cfg)
+            raw_alive = process_status == "ALIVE"
             state, err = read_state(tab)
             report_state_cache[pkg] = (state, err)
             alive = raw_alive or (state is not None and not state_disconnect_ui(state) and int(state.get("age", 999999) or 999999) <= int(cfg.get("state_stale_seconds", 180) or 180))
@@ -17949,6 +18047,10 @@ def start_hatcher_reporter(main_cfg=None):
             elif manual_login_blocked(rt_tab, cfg, pkg):
                 status = "Manual"
                 note = rt_tab.get("note") or "needs manual login"
+            elif process_status == "UNKNOWN" and not alive:
+                rt_tab["dead_since"] = 0
+                status = "Unknown"
+                note = "process check unavailable; recovery deferred"
             elif not alive and cfg.get("rejoin_if_crash", True):
                 dead_since = int(rt_tab.get("dead_since", 0) or 0)
                 if dead_since <= 0:
@@ -18517,7 +18619,8 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
         old_enabled, old_sec, old_max, _old_cd = hatcher_alive_old_state_hard_settings(hcfg, cfg)
         for tab in tabs:
             pkg = tab["package"]
-            raw_alive = package_alive(pkg, cfg, fresh=True)
+            process_status, process_note = package_alive_status(pkg, cfg, fresh=True)
+            raw_alive = process_status == "ALIVE"
             state, _state_err = read_state(tab)
             state_age = int((state or {}).get("age", 999999) or 999999) if state else None
             fresh_state = bool(
@@ -18530,6 +18633,11 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
 
             if fresh_state:
                 rt_tab["note"] = "start fresh state"
+                continue
+
+            if process_status == "UNKNOWN":
+                rt_tab["note"] = "start deferred: process check unavailable"
+                log_activity("startup process check unavailable; no reopen queued", pkg, YELLOW)
                 continue
 
             if raw_alive and state is not None and old_enabled and old_sec <= state_age <= old_max:
@@ -18601,7 +18709,8 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
             rt_tab = get_runtime_tab(rt, pkg)
             rt_tab["target"] = "hatcher"
 
-            raw_alive = package_alive(pkg, cfg)
+            process_status, process_note = package_alive_status(pkg, cfg)
+            raw_alive = process_status == "ALIVE"
             state, err = read_state(tab)
             report_state_cache[pkg] = (state, err)
             alive = raw_alive or (state is not None and not state_disconnect_ui(state) and int(state.get("age", 999999) or 999999) <= int(cfg.get("state_stale_seconds", 180) or 180))
@@ -18612,7 +18721,8 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                     break
             health = evaluate_package_health(
                 tab, cfg, rt_tab, mode="hatcher", hcfg=hcfg, prof=prof,
-                raw_alive=alive, state=state, err=err
+                raw_alive=alive, state=state, err=err,
+                process_status=process_status, process_note=process_note
             )
             transition = hatcher_transition_guard_update(
                 rt_tab,
@@ -25383,7 +25493,7 @@ def cleanup_nomo_autoexec_backup_artifacts(cfg):
 def upgrade_known_nomo_market_loader_once(cfg):
     """Upgrade only known NOMO loader generations; preserve unrelated/custom AutoExec."""
     marker = "-- NOMO Market / GAG loader"
-    target_revision = 4
+    target_revision = 5
     target_marker = f"-- NOMO Market loader revision {target_revision}"
     old_worker = "https://nomo-key.atmincosplay.workers.dev/key"
     local_key_marker = 'local sharedKeyFile = sharedFolder .. "/exotic_key.json"'
@@ -25425,7 +25535,7 @@ def upgrade_known_nomo_market_loader_once(cfg):
 
 
 MARKET_LOADER_AUTOEXEC_TEMPLATE = r'''-- NOMO Market / GAG loader
--- NOMO Market loader revision 4
+-- NOMO Market loader revision 5
 if not game:IsLoaded() then
     game.Loaded:Wait()
 end
@@ -25621,7 +25731,7 @@ if game.PlaceId == 126884695634066 then
 
 elseif game.PlaceId == 129954712878723 then
     -- Trade World / Market
-    -- NOMO Market runtime marker v3
+    -- NOMO Market runtime marker v4
     print("trade world")
 
     local Players = game:GetService("Players")
@@ -25631,7 +25741,8 @@ elseif game.PlaceId == 129954712878723 then
     local runtimeFolder = "Nomo"
     local runtimeFile = runtimeFolder .. "/market_runtime_" .. userId .. ".json"
     local marketUrl = "https://raw.githubusercontent.com/atmincosplay-ship-it/nomo-market/main/nomo_obsidian.lua"
-    local marketCacheFile = runtimeFolder .. "/market_last_good.lua"
+    local marketCacheFile = runtimeFolder .. "/market_last_good_" .. userId .. ".lua"
+    local legacyMarketCacheFile = runtimeFolder .. "/market_last_good.lua"
     local loaderStartedAt = 0
     local marketVersion = "UNKNOWN"
     local marketSourceName = "none"
@@ -25699,8 +25810,9 @@ elseif game.PlaceId == 129954712878723 then
         local backoffUntil = tonumber(state and state.RemoteConfigBackoffUntil) or 0
         local source = tostring(state and state.SharedConfigSource or "")
         return {
-            marker_version = 3,
-            loader_version = "V4.81.10",
+            marker_version = 4,
+            loader_version = "V4.81.17",
+            loader_revision = 5,
             market_version = tostring(marketVersion or "UNKNOWN"),
             market_source = tostring(marketSourceName or "none"),
             market_cache_file = marketCacheFile,
@@ -25743,6 +25855,29 @@ elseif game.PlaceId == 129954712878723 then
         end)
     end
 
+    local function marketVersionParts(text)
+        if type(text) ~= "string" then
+            return nil, nil, nil
+        end
+        local full = text:match('local%s+VERSION%s*=%s*"(V[^"]+)"')
+        if not full then
+            return nil, nil, nil
+        end
+        local major, minor = full:match('^V(%d+)%.(%d+)')
+        return tonumber(major), tonumber(minor), full
+    end
+
+    local function marketVersionAtLeast(text, minMajor, minMinor)
+        local major, minor = marketVersionParts(text)
+        if not major or not minor then
+            return false
+        end
+        if major ~= minMajor then
+            return major > minMajor
+        end
+        return minor >= minMinor
+    end
+
     local function validMarketSource(text)
         if type(text) ~= "string" or #text < 20000 then
             return false
@@ -25750,21 +25885,40 @@ elseif game.PlaceId == 129954712878723 then
         return string.find(text, "NOMO MARKET SELLER LITE", 1, true) ~= nil
             and string.find(text, "__NOMO_MARKET_V30_STATE", 1, true) ~= nil
             and string.find(text, "RemoteConfigRefreshSeconds", 1, true) ~= nil
-            and text:match('local%s+VERSION%s*=%s*"[^"]+"') ~= nil
+            and marketVersionAtLeast(text, 17, 5)
     end
 
-    local function readMarketCache()
+    local function readOneMarketCache(path)
         if type(readfile) ~= "function" then
             return nil
         end
         local ok, text = pcall(function()
-            if type(isfile) == "function" and not isfile(marketCacheFile) then
+            if type(isfile) == "function" and not isfile(path) then
                 return nil
             end
-            return readfile(marketCacheFile)
+            return readfile(path)
         end)
         if ok and validMarketSource(text) then
             return text
+        end
+        return nil
+    end
+
+    local function readMarketCache()
+        local text = readOneMarketCache(marketCacheFile)
+        if text then
+            return text
+        end
+        -- One-time compatibility migration from V4.81.10's device-shared cache.
+        local legacy = readOneMarketCache(legacyMarketCacheFile)
+        if legacy then
+            ensureRuntimeFolder()
+            if type(writefile) == "function" then
+                pcall(function()
+                    writefile(marketCacheFile, legacy)
+                end)
+            end
+            return legacy
         end
         return nil
     end
@@ -25803,7 +25957,7 @@ elseif game.PlaceId == 129954712878723 then
     elseif not downloadOk then
         sourceErr = "github download failed: " .. tostring(remoteText)
     else
-        sourceErr = "github source validation failed"
+        sourceErr = "github source validation failed or version older than V17.5"
     end
 
     if not marketSource then
@@ -27826,9 +27980,9 @@ def json_contains_exact_user_id(obj, user_id):
 def private_server_users_membership(cookie, server_id, user_ids):
     """Verify many private-server members with at most one permissions GET + one metadata GET.
 
-    Returns (present_ids, missing_details). This deliberately shares the same Roblox
-    responses across all requested UIDs so a 20-user allowlist sync does not turn into
-    20-40 verification requests.
+    Returns (present_ids, missing_details, verification_available). V4.81.17 keeps
+    "confirmed absent" separate from "both verification endpoints unavailable" so a
+    successful PATCH is never followed by blind duplicate PATCH fan-out.
     """
     ids = []
     seen = set()
@@ -27838,7 +27992,7 @@ def private_server_users_membership(cookie, server_id, user_ids):
             seen.add(value)
             ids.append(value)
     if not ids:
-        return set(), {}
+        return set(), {}, True
 
     present = set()
     details = {}
@@ -27859,18 +28013,26 @@ def private_server_users_membership(cookie, server_id, user_ids):
                 if json_contains_exact_user_id(data, uid):
                     present.add(uid)
 
-    detail = perm_err or meta_err or "user not visible in private server permissions"
+    verification_available = (not bool(perm_err)) or (missing and not bool(meta_err)) or (not missing)
+    if verification_available:
+        detail = "user not visible in private server permissions"
+    else:
+        detail = "verification unavailable: " + " | ".join(
+            part for part in (str(perm_err or ""), str(meta_err or "")) if part
+        )
     for uid in ids:
         if uid not in present:
             details[uid] = detail
-    return present, details
+    return present, details, bool(verification_available)
 
 
 def private_server_user_is_member(cookie, server_id, user_id):
-    present, details = private_server_users_membership(cookie, server_id, [user_id])
+    present, details, verification_available = private_server_users_membership(cookie, server_id, [user_id])
     uid = str(user_id or "").strip()
     if uid in present:
         return True, "permissions/metadata"
+    if not verification_available:
+        return False, details.get(uid, "verification unavailable")
     return False, details.get(uid, "user not visible in private server permissions")
 
 
@@ -27961,9 +28123,19 @@ def add_private_server_allowed_users(cookie, server_id, user_ids, friends_allowe
             for uid in remaining:
                 last_errors[uid] = err or last_errors[uid]
         else:
-            present, verify_details = private_server_users_membership(cookie, server_id, remaining)
+            present, verify_details, verification_available = private_server_users_membership(cookie, server_id, remaining)
             mark_added(uid for uid in remaining if uid in present)
             remaining = [uid for uid in remaining if uid not in present]
+            if not verification_available:
+                # PATCH may already have succeeded. Do not blindly PATCH the same
+                # users again just because Roblox verification endpoints are down.
+                for uid in remaining:
+                    failed.append({
+                        "user_id": uid,
+                        "error": verify_details.get(uid, "verification unavailable; deferred"),
+                    })
+                remaining = []
+                continue
             for uid in remaining:
                 last_errors[uid] = verify_details.get(uid, "PATCH ok but user not visible in permissions")
             if not remaining:
@@ -27977,13 +28149,31 @@ def add_private_server_allowed_users(cookie, server_id, user_ids, friends_allowe
             if not remaining:
                 break
             attempted = list(remaining)
+            shape_success = False
             for uid in attempted:
                 ok1, err1, _ = patch([uid], shape=shape)
-                if not ok1:
+                if ok1:
+                    shape_success = True
+                else:
                     last_errors[uid] = err1 or last_errors.get(uid) or "permission update failed"
 
-            present, verify_details = private_server_users_membership(cookie, server_id, remaining)
+            # If every PATCH in this shape failed, there is nothing new to verify;
+            # try the next compatibility payload shape without spending a GET.
+            if not shape_success:
+                continue
+
+            present, verify_details, verification_available = private_server_users_membership(cookie, server_id, remaining)
             mark_added(uid for uid in remaining if uid in present)
+            if not verification_available:
+                for uid in remaining:
+                    if uid not in present:
+                        failed.append({
+                            "user_id": uid,
+                            "error": verify_details.get(uid, "verification unavailable; deferred"),
+                        })
+                remaining = []
+                break
+
             next_remaining = []
             for uid in remaining:
                 if uid in present:
