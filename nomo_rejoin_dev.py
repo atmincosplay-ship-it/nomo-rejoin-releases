@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
-# V4.81.39 — NOKA DELTA FOREGROUND / COOKIE RACE GUARD
+# V4.81.40 — MARKET 773 TELEPORT OWNERSHIP GUARD
 # - Delta-key panel capture never launcher-foregrounds a Noka/App Cloner package. It only
 #   operates when that clone is already visibly present in its saved floating layout; hidden/
 #   ambiguous Noka windows are deferred instead of using `am start -n` on the launcher.
@@ -1023,7 +1023,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.39-noka-delta-foreground-cookie-guard"
+__version__ = "V4.81.40-market-773-teleport-ownership-guard"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -6373,7 +6373,7 @@ def status_color(status):
         return GREEN
     if low in ("manual", "captcha", "kicked", "offline", "no state", "no server", "wrong server"):
         return RED
-    if low in ("queued", "loading", "opening", "stale", "cooldown"):
+    if low in ("queued", "loading", "opening", "stale", "cooldown", "teleport"):
         return YELLOW
     if low == "restock":
         return BLUE
@@ -12292,7 +12292,49 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
         core.save()
         return ("Queued" if added else "Home"), rt_tab["note"], True
 
-    # --- disconnect / kick popup: always kill+open ---
+    # V4.81.40: Error 773 is commonly emitted while Market's own
+    # TeleportToListing / low-player hop is in progress or has just failed. If
+    # the Market Lua heartbeat is still fresh, NOMO must not race that owner by
+    # starting a second Android recovery.  Let the Market script retry its own
+    # teleport.  If the heartbeat later goes stale (or the process dies), this
+    # exception stops applying and the normal disconnect/crash path below owns
+    # recovery again.
+    disconnect_code = str((state or {}).get("disconnect_code") or "").strip()
+    if mode == "market" and alive and disconnect_code == "773":
+        try:
+            market_773_age = int(state_age_seconds(state)) if state else 999999
+        except Exception:
+            market_773_age = 999999
+        market_773_fresh_limit = max(15, int(cfg.get("state_stale_seconds", 180) or 180))
+        if market_773_age <= market_773_fresh_limit:
+            removed = core.cancel(pkg)
+            # A previous dashboard tick may already have queued the generic
+            # disconnect generation.  Clear only that incident bookkeeping so
+            # it cannot survive after the queue item is removed.
+            rt_tab["disconnect_ui_recovery_active"] = False
+            rt_tab["disconnect_ui_recovery_stage"] = ""
+            rt_tab["last_disconnect_ui_open"] = 0
+            rt_tab["disconnect_ui_hold_until"] = 0
+            rt_tab["market_773_last_seen_at"] = now()
+            rt_tab["market_773_state_age"] = market_773_age
+            rt_tab["note"] = "market teleport 773; Market script owns retry"
+            last_log = int(rt_tab.get("market_773_last_log_at", 0) or 0)
+            if now() - last_log >= 60:
+                log_activity(
+                    "Market Error 773 with fresh heartbeat; rejoin suppressed (Market owns teleport)",
+                    pkg, YELLOW,
+                )
+                rt_tab["market_773_last_log_at"] = now()
+            core.save()
+            return "Teleport", rt_tab["note"], True
+
+    # Clear the temporary 773 ownership marker once the current state is no
+    # longer reporting that teleport error.
+    if disconnect_code != "773" and int(rt_tab.get("market_773_last_seen_at", 0) or 0) > 0:
+        rt_tab["market_773_last_seen_at"] = 0
+        rt_tab["market_773_state_age"] = 0
+
+    # --- disconnect / kick popup: recover normally ---
     if bad == "disconnect" or (state and state_disconnect_ui(state)):
         if str((state or {}).get("disconnect_code") or "") == "524":
             removed = core.cancel(pkg)
