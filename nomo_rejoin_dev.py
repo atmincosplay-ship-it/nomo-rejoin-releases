@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.23 — BUBBLE HOME SECOND-INTENT RESCUE
+# - Bubble/minimized shell detection now accepts a stale package with no visible package window even
+#   when App Cloner leaves a ghost ActivityRecord after the floating window is X-closed.
+# - After the target-only exact-PID recovery, NOMO waits briefly and, if no fresh state exists, sends
+#   the same Hatcher private deep link once more in-place. The second intent never PID-stops anything.
+#
 # V4.81.21 — BUBBLE-ONLY HOME RESCUE
 # - Detects the App Cloner/Noka edge case where the clone process/floating bubble is still alive
 #   but Android has no live ActivityRecord for that package after its floating window was closed.
@@ -929,7 +935,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.22-bubble-rescue-queue-guard"
+__version__ = "V4.81.23-bubble-home-second-intent-rescue"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1840,6 +1846,11 @@ DEFAULT_CONFIG = {
     # the target launcher once before the normal exact-PID hard stop.
     "prewarm_shell_only_clone_before_hard_open": True,
     "prewarm_closed_clone_wait_seconds": 2,
+    # V4.81.23: after a bubble-only hard bootstrap, Roblox can materialize at Home
+    # before consuming the original VIEW deep link. Send the same Hatcher link once
+    # more in-place after a short delay if no fresh state has appeared.
+    "bubble_rescue_second_intent_enabled": True,
+    "bubble_rescue_second_intent_delay_seconds": 6,
 
     # Pool-wide stagger: minimum seconds between any two hard opens across ALL
     # clones. Spaces out restarts so reloads don't overlap (memory spikes) and
@@ -3120,6 +3131,10 @@ def apply_update_migrations(cfg):
         set_cfg("prewarm_shell_only_clone_before_hard_open", True)
     if _int_cfg(cfg.get("prewarm_closed_clone_wait_seconds"), 0) <= 0:
         set_cfg("prewarm_closed_clone_wait_seconds", 2)
+    if "bubble_rescue_second_intent_enabled" not in cfg:
+        set_cfg("bubble_rescue_second_intent_enabled", True)
+    if _int_cfg(cfg.get("bubble_rescue_second_intent_delay_seconds"), 0) <= 0:
+        set_cfg("bubble_rescue_second_intent_delay_seconds", 6)
     if "login_challenge_detection_enabled" not in cfg:
         set_cfg("login_challenge_detection_enabled", True)
     if "login_challenge_api_detection_enabled" not in cfg:
@@ -4917,9 +4932,21 @@ def hatcher_bubble_only_recovery_candidate(pkg, cfg, *, process_status=None):
     activity_status, activity_note = package_activity_status(pkg, cfg)
     if activity_status == "NO_ACTIVITY":
         return True, activity_note or "no live ActivityRecord"
+
+    # V4.81.23: App Cloner can retain a stopped/ghost ActivityRecord after the
+    # floating window is X-closed. At this call site the Hatcher state is already
+    # older than the recovery threshold, so a confirmed absence from the current
+    # window dump is enough to classify the surviving package as a bubble/minimized
+    # shell. A healthy clone never reaches this stale-state branch.
+    visible, visible_note = package_visible_window(pkg, cfg)
+    if visible is False:
+        return True, visible_note or "no visible package window"
+
+    if activity_status == "UNKNOWN" and visible is None:
+        return False, "activity/window query unavailable"
     if activity_status == "UNKNOWN":
-        return False, "activity query unavailable"
-    return False, activity_note or "live activity"
+        return False, visible_note or "activity query unavailable"
+    return False, activity_note or visible_note or "live activity"
 
 
 def queue_hatcher_bubble_only_recovery(core, tab, rt_tab, cfg, reason):
@@ -14060,6 +14087,74 @@ def market_booster_second_soft_intent(
     return True, second_opened_at, "second soft intent sent"
 
 
+
+def hatcher_bubble_second_private_intent(tab, rt_tab, cfg, rt, target, reason, first_opened_at, core=None):
+    """Send one in-place Hatcher deep link after a bubble-only hard bootstrap.
+
+    App Cloner sometimes starts the selected Roblox package at Home after its
+    shell-only floating task is materialized and exact-PID stopped. The package
+    is alive at that point, so a second VIEW intent with CLEAR_TOP|SINGLE_TOP can
+    deliver the saved private/game route without another stop or another hard
+    recovery generation.
+    """
+    if core is None:
+        core = RejoinCore([], cfg, rt)
+    if not cfg.get("bubble_rescue_second_intent_enabled", True):
+        return int(first_opened_at), "second intent disabled"
+
+    delay = max(1, int(cfg.get("bubble_rescue_second_intent_delay_seconds", 6) or 6))
+    for _ in range(delay):
+        if stop_requested():
+            return int(first_opened_at), "stop"
+        fresh, _state, _err = state_fresh_after_open(tab, cfg, first_opened_at)
+        if fresh:
+            return int(first_opened_at), "first intent already fresh"
+        if not wait_seconds(1, rt):
+            return int(first_opened_at), "stop"
+
+    package = str((tab or {}).get("package", "") or "")
+    process_status, process_note = package_alive_status(package, cfg, fresh=True)
+    if process_status != "ALIVE":
+        return int(first_opened_at), f"second intent skipped: {process_status.lower()}"
+
+    link = target_link(tab, cfg, target, rt_tab, rt)
+    if not link:
+        return int(first_opened_at), "second intent skipped: no Hatcher link"
+
+    log_activity(
+        "bubble rescue first launch has no fresh state; sending second Hatcher deep link in-place",
+        package,
+        YELLOW,
+    )
+    rt_tab["bubble_rescue_second_intent_at"] = now()
+    rt_tab["note"] = "bubble rescue second private intent"
+    core.save()
+
+    # Critical safety property: soft=True + require_stop=False means this call can
+    # never exact-PID stop the target, and therefore cannot disturb siblings.
+    ok, note = open_roblox(
+        package,
+        link,
+        cfg,
+        soft=True,
+        rt_tab=rt_tab,
+        reason="bubble rescue second private intent",
+        require_stop=False,
+        skip_force_stop=True,
+    )
+    sent_at = now()
+    rt_tab["bubble_rescue_second_intent_ok"] = bool(ok)
+    rt_tab["bubble_rescue_second_intent_note"] = str(note or "")
+    if ok:
+        rt_tab["last_open"] = sent_at
+        log_activity("bubble rescue second Hatcher deep link sent in-place", package, GREEN)
+        core.save()
+        return sent_at, "second Hatcher intent sent"
+
+    log_activity(f"bubble rescue second Hatcher deep link failed: {cut(note, 70)}", package, RED)
+    core.save()
+    return int(first_opened_at), f"second intent failed: {note}"
+
 def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_hard, cfg, rt, core=None):
     """The actual target-only open -> wait-for-fresh cycle for one package."""
     if core is None:
@@ -14105,6 +14200,13 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
     core.save()
 
     if ok:
+        if item.get("bubble_only_recovery") and target == "hatcher":
+            opened_at, bubble_second_note = hatcher_bubble_second_private_intent(
+                tab, rt_tab, cfg, rt, target, reason, opened_at, core
+            )
+            item["bubble_rescue_second_intent_done"] = True
+            item["bubble_rescue_second_intent_note"] = bubble_second_note
+
         actual_open_mode = str(
             rt_tab.get("last_open_mode", mode)
             or mode
