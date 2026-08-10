@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.9 — AUTOEXEC BACKUP GUARD
+# - NOMO-owned AutoExec backups/disabled copies are removed from executor folders;
+#   backups now live under NOMO's own backup directory outside AutoExec.
+# - Startup cleans legacy nomo_market_loader / pet-counter / booster .bak/.tmp/disabled
+#   artifacts that Delta may otherwise execute as real AutoExec code.
+# - Market loader revision 3 reports V4.81.9 so old backup loaders cannot overwrite
+#   the runtime marker after a clean restart.
+# - Successful Exotic-reader schedules are migrated/clamped to the 10-minute cadence;
+#   real network/rate-limit backoffs remain untouched.
+#
 # V4.81.8 — STABILITY GUARD
 # - Exotic readers sync every 10 minutes; state updates are serialized/merged.
 # - Exact-PID recovery fails closed when Android PID queries fail.
@@ -850,7 +860,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.8-stability-guard"
+__version__ = "V4.81.9-autoexec-backup-guard"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -24481,7 +24491,24 @@ def exotic_key_manager_tick(cfg, force_read=False, force_generate=False):
 
     if not reader:
         return "reader_disabled"
+
+    interval = max(300, int(cfg.get("exotic_key_sync_interval_seconds", 600) or 600))
     next_check = int(state.get("next_cloud_check_at", 0) or 0)
+
+    # V4.81.9: V4.81.8 migrated the config from 1h -> 10m but an already
+    # persisted successful next_cloud_check_at could still be ~1h away. Clamp
+    # only successful schedules. Real network/429 backoffs keep their longer
+    # retry time and are never shortened here.
+    if not str(state.get("last_cloud_error") or "").strip():
+        last_ok = int(state.get("last_cloud_ok_at", 0) or 0)
+        desired_next = (last_ok + interval) if last_ok > 0 else t
+        if next_check <= 0 or next_check > desired_next + 5:
+            latest, _updated = _update_exotic_key_state({
+                "next_cloud_check_at": desired_next,
+            })
+            state = latest
+            next_check = int(state.get("next_cloud_check_at", desired_next) or desired_next)
+
     if force_read or next_check <= 0 or t >= next_check:
         return "reader_started" if _start_exotic_key_job(cfg, "read") else "reader_busy"
     return "reader_ok"
@@ -24848,10 +24875,114 @@ def exotic_key_settings_menu(cfg):
             pause()
 
 
+
+NOMO_AUTOEXEC_BACKUP_DIR = BASE_DIR / "autoexec_backups"
+_NOMO_AUTOEXEC_LIVE_FILES = {
+    "nomo_market_loader.lua",
+    "nomo_pet_counter.lua",
+    "nomo_booster_probe.lua",
+}
+
+
+def _nomo_autoexec_external_backup_path(path, tag="backup"):
+    """Return a unique NOMO backup path that is never inside an AutoExec folder."""
+    path = Path(path)
+    NOMO_AUTOEXEC_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    safe_tag = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(tag or "backup"))[:48] or "backup"
+    stamp = f"{int(time.time())}.{os.getpid()}.{time.time_ns() % 1000000000}"
+    return NOMO_AUTOEXEC_BACKUP_DIR / f"{path.name}.{safe_tag}.{stamp}.bak"
+
+
+def _backup_nomo_autoexec_outside(path, tag="backup"):
+    """Copy one live NOMO AutoExec file to NOMO storage, never beside executable files."""
+    path = Path(path)
+    if not path.exists() or not path.is_file():
+        return None
+    target = _nomo_autoexec_external_backup_path(path, tag)
+    shutil.copy2(path, target)
+    return target
+
+
+def _write_nomo_autoexec_text(path, content, *, backup_tag=None):
+    """Write AutoExec content without ever creating a temp/backup beside executable files."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if backup_tag and path.exists():
+        _backup_nomo_autoexec_outside(path, backup_tag)
+    staging = _nomo_autoexec_external_backup_path(path, "staging")
+    staging.write_text(str(content), encoding="utf-8")
+    try:
+        os.replace(str(staging), str(path))
+    except Exception:
+        shutil.copy2(staging, path)
+        try:
+            staging.unlink()
+        except Exception:
+            pass
+    return path
+
+
+def _is_nomo_autoexec_backup_artifact(path):
+    """Match only NOMO-owned stale backup/temp artifacts, never arbitrary user files."""
+    name = Path(path).name.lower()
+    for live in _NOMO_AUTOEXEC_LIVE_FILES:
+        live = live.lower()
+        if not name.startswith(live + "."):
+            continue
+        tail = name[len(live) + 1:]
+        if (
+            ".bak" in tail
+            or tail.endswith("bak")
+            or ".tmp" in tail
+            or tail.endswith("tmp")
+            or "disabled_" in tail
+        ):
+            return True
+    return False
+
+
+def cleanup_nomo_autoexec_backup_artifacts(cfg):
+    """Move old NOMO backup/temp files out of AutoExec so Delta cannot execute them."""
+    moved = 0
+    errors = []
+    seen_folders = set()
+    for tab in autoexec_tabs(cfg):
+        # Resolve the same live Market loader location used by automatic migration.
+        for live_name in sorted(_NOMO_AUTOEXEC_LIVE_FILES):
+            try:
+                paths = autoexec_paths_for_tab(tab, "1", filename=live_name)
+            except Exception:
+                paths = []
+            for live_path in paths:
+                folder = Path(live_path).parent
+                key = str(folder)
+                if key in seen_folders:
+                    continue
+                seen_folders.add(key)
+                try:
+                    entries = list(folder.iterdir()) if folder.exists() else []
+                except Exception as exc:
+                    errors.append(f"{folder}: {exc}")
+                    continue
+                for item in entries:
+                    try:
+                        if not item.is_file() or not _is_nomo_autoexec_backup_artifact(item):
+                            continue
+                        target = _nomo_autoexec_external_backup_path(item, "autoexec-cleanup")
+                        try:
+                            shutil.move(str(item), str(target))
+                        except Exception:
+                            shutil.copy2(item, target)
+                            item.unlink()
+                        moved += 1
+                    except Exception as exc:
+                        errors.append(f"{item}: {exc}")
+    return moved, errors
+
 def upgrade_known_nomo_market_loader_once(cfg):
     """Upgrade only known NOMO loader generations; preserve unrelated/custom AutoExec."""
     marker = "-- NOMO Market / GAG loader"
-    target_revision = 2
+    target_revision = 3
     target_marker = f"-- NOMO Market loader revision {target_revision}"
     old_worker = "https://nomo-key.atmincosplay.workers.dev/key"
     local_key_marker = 'local sharedKeyFile = sharedFolder .. "/exotic_key.json"'
@@ -24879,12 +25010,13 @@ def upgrade_known_nomo_market_loader_once(cfg):
                 known_runtime = runtime_marker_v1 in old
                 if not (known_old or known_v481 or known_runtime or old_revision > 0):
                     continue
-                backup = path.with_suffix(path.suffix + ".v4818.bak")
-                if not backup.exists():
-                    shutil.copy2(path, backup)
-                tmp = path.with_suffix(path.suffix + ".tmp")
-                tmp.write_text(MARKET_LOADER_AUTOEXEC_TEMPLATE, encoding="utf-8")
-                os.replace(str(tmp), str(path))
+                # Never leave backup/temp scripts in AutoExec: Delta may execute
+                # every file in this folder regardless of extension.
+                _write_nomo_autoexec_text(
+                    path,
+                    MARKET_LOADER_AUTOEXEC_TEMPLATE,
+                    backup_tag=f"pre-loader-rev{target_revision}",
+                )
                 changed += 1
             except Exception:
                 continue
@@ -24892,7 +25024,7 @@ def upgrade_known_nomo_market_loader_once(cfg):
 
 
 MARKET_LOADER_AUTOEXEC_TEMPLATE = r'''-- NOMO Market / GAG loader
--- NOMO Market loader revision 2
+-- NOMO Market loader revision 3
 if not game:IsLoaded() then
     game.Loaded:Wait()
 end
@@ -25165,7 +25297,7 @@ elseif game.PlaceId == 129954712878723 then
         local source = tostring(state and state.SharedConfigSource or "")
         return {
             marker_version = 2,
-            loader_version = "V4.81.8",
+            loader_version = "V4.81.9",
             market_version = tostring(marketVersion or "UNKNOWN"),
             uid = userId,
             username = tostring(player.Name or ""),
@@ -25862,9 +25994,7 @@ def _write_autoexec_script(selected, path_mode, filename, script, cfg, replace_p
                 print(col(f"Unchanged: {path}", DIM))
                 unchanged += 1
                 continue
-            tmp = path.with_suffix(path.suffix + ".tmp")
-            tmp.write_text(script, encoding="utf-8")
-            os.replace(str(tmp), str(path))
+            _write_nomo_autoexec_text(path, script)
             print(col(f"Saved: {path}", GREEN))
             wrote += 1
         except Exception as exc:
@@ -31169,19 +31299,9 @@ def _setup_configure_cloudflare(cfg, automatic=False):
 
 
 def _legacy_setup_disabled_path(path):
-    path = Path(path)
-    candidate = path.with_name(
-        path.name + LEGACY_SETUP_DISABLED_SUFFIX
-    )
-    suffix = 1
-    while candidate.exists():
-        candidate = path.with_name(
-            path.name
-            + LEGACY_SETUP_DISABLED_SUFFIX
-            + f".{suffix}"
-        )
-        suffix += 1
-    return candidate
+    # V4.81.9: a renamed file inside AutoExec is still executable on Delta.
+    # Quarantine NOMO-owned obsolete scripts outside the executor directory.
+    return _nomo_autoexec_external_backup_path(path, "disabled_v4582")
 
 
 def _setup_legacy_autoexec_names_for_role(role):
@@ -31264,7 +31384,7 @@ def _setup_cleanup_legacy_autoexec_for_packages(
 
             try:
                 target = _legacy_setup_disabled_path(path)
-                path.rename(target)
+                shutil.move(str(path), str(target))
                 disabled.append(
                     {
                         "old": str(path),
@@ -31370,9 +31490,7 @@ def _setup_install_counter_for_packages(cfg, packages, path_mode):
 
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
-                tmp = path.with_suffix(path.suffix + ".tmp")
-                tmp.write_text(pet_counter_autoexec_source(), encoding="utf-8")
-                os.replace(str(tmp), str(path))
+                _write_nomo_autoexec_text(path, pet_counter_autoexec_source())
                 written[key] = (True, f"saved: {path}")
                 ok_count += 1
                 notes.append(f"saved: {path}")
@@ -31430,9 +31548,7 @@ def _setup_install_booster_probe_for_packages(cfg, packages, path_mode):
                     ok_count += 1
                     notes.append(f"unchanged: {path}")
                     continue
-                tmp = path.with_suffix(path.suffix + ".tmp")
-                tmp.write_text(script, encoding="utf-8")
-                os.replace(str(tmp), str(path))
+                _write_nomo_autoexec_text(path, script)
                 written[key] = (True, f"saved: {path}")
                 ok_count += 1
                 notes.append(f"saved: {path}")
@@ -31481,9 +31597,7 @@ def _setup_install_market_loader_for_packages(cfg, packages, path_mode):
                     notes.append(f"unchanged: {path}")
                     continue
 
-                tmp = path.with_suffix(path.suffix + ".tmp")
-                tmp.write_text(MARKET_LOADER_AUTOEXEC_TEMPLATE, encoding="utf-8")
-                os.replace(str(tmp), str(path))
+                _write_nomo_autoexec_text(path, MARKET_LOADER_AUTOEXEC_TEMPLATE)
                 written[key] = (True, f"saved: {path}")
                 ok_count += 1
                 notes.append(f"saved: {path}")
@@ -38065,9 +38179,23 @@ def main():
     cfg = load_config()
     nomo_auto_repair_launchers_once(cfg)
     try:
+        moved, cleanup_errors = cleanup_nomo_autoexec_backup_artifacts(cfg)
+        if moved:
+            log_activity(f"AutoExec NOMO backup cleanup: moved {moved} file(s) outside AutoExec", "", GREEN)
+        if cleanup_errors:
+            log_activity(f"AutoExec NOMO backup cleanup warnings: {len(cleanup_errors)}", "", YELLOW)
+    except Exception as exc:
+        log_activity(f"AutoExec NOMO backup cleanup skipped: {cut(exc, 90)}", "", YELLOW)
+    try:
         upgraded = upgrade_known_nomo_market_loader_once(cfg)
         if upgraded:
             log_activity(f"AutoExec NOMO loader upgraded: {upgraded} file(s)", "", GREEN)
+        # The upgrade itself must never leave a staging/backup artifact behind.
+        moved_after, cleanup_errors_after = cleanup_nomo_autoexec_backup_artifacts(cfg)
+        if moved_after:
+            log_activity(f"AutoExec post-upgrade cleanup: moved {moved_after} file(s)", "", GREEN)
+        if cleanup_errors_after:
+            log_activity(f"AutoExec post-upgrade cleanup warnings: {len(cleanup_errors_after)}", "", YELLOW)
     except Exception as exc:
         log_activity(f"AutoExec NOMO loader upgrade skipped: {cut(exc, 90)}", "", YELLOW)
     try:
