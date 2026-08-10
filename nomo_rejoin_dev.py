@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.28 — RECOVERY RECHECK / UI SNAPSHOT GUARD
+# - Bubble-only classification no longer trusts dumpsys window visibility. Only a confirmed
+#   NO_ACTIVITY result can fast-track the special bubble recovery; window dumps remain status-only.
+# - Speculative alive-old-state / alive-no-state / bubble hard recoveries are rechecked immediately
+#   before execution. If the clone healed or the bubble condition disappeared while queued, NOMO
+#   cancels that special hard stop and lets the normal watchdog decide again.
+# - Android uiautomator snapshots use a serialized per-thread temp file that is deleted after read,
+#   and Android UI/window/visual caches are invalidated around app launches so Home/CAPTCHA logic
+#   cannot reuse a pre-launch snapshot against the new Roblox screen.
+#
 # V4.81.27 — BUBBLE PREWARM SAFETY ROLLBACK
 # - Removes the App Cloner launcher/materialize prewarm from every recovery hard-open. Runtime
 #   recovery is restored to the proven safety invariant: exact target PID stop -> sibling verify ->
@@ -951,7 +961,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.27-bubble-prewarm-safety-rollback"
+__version__ = "V4.81.28-recovery-recheck-ui-snapshot-guard"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -4974,20 +4984,14 @@ def hatcher_bubble_only_recovery_candidate(pkg, cfg, *, process_status=None):
     if activity_status == "NO_ACTIVITY":
         return True, activity_note or "no live ActivityRecord"
 
-    # V4.81.23: App Cloner can retain a stopped/ghost ActivityRecord after the
-    # floating window is X-closed. At this call site the Hatcher state is already
-    # older than the recovery threshold, so a confirmed absence from the current
-    # window dump is enough to classify the surviving package as a bubble/minimized
-    # shell. A healthy clone never reaches this stale-state branch.
-    visible, visible_note = package_visible_window(pkg, cfg)
-    if visible is False:
-        return True, visible_note or "no visible package window"
-
-    if activity_status == "UNKNOWN" and visible is None:
-        return False, "activity/window query unavailable"
+    # V4.81.28: never promote a dumpsys-window miss into a hard-recovery reason.
+    # Floating/minimized App Cloner windows are not reported reliably enough by
+    # dumpsys window, and using that negative signal can hard-stop a healthy clone.
+    # The ordinary old-state watchdog remains responsible when a ghost ActivityRecord
+    # survives an X-close; that slower path was proven safe on the real device.
     if activity_status == "UNKNOWN":
-        return False, visible_note or "activity query unavailable"
-    return False, activity_note or visible_note or "live activity"
+        return False, activity_note or "activity query unavailable"
+    return False, activity_note or "live ActivityRecord"
 
 
 def queue_hatcher_bubble_only_recovery(core, tab, rt_tab, cfg, reason):
@@ -5014,7 +5018,8 @@ def queue_hatcher_bubble_only_recovery(core, tab, rt_tab, cfg, reason):
         front=True,
         bypass_manual=False,
         metadata={
-            "bypass_recheck": True,
+            "bypass_recheck": False,
+            "always_recheck_health": True,
             "bubble_only_recovery": True,
         },
     )
@@ -5027,6 +5032,27 @@ def queue_hatcher_bubble_only_recovery(core, tab, rt_tab, cfg, reason):
     if core.has(pkg):
         return False, "bubble-only rescue already queued"
     return False, note or "bubble-only rescue blocked"
+
+
+def invalidate_android_observation_caches():
+    """Forget Android UI/window/visual snapshots after a package launch transition."""
+    for name in (
+        "_ANDROID_UI_SNAPSHOT_CACHE",
+        "_WINDOW_DUMP_CACHE",
+        "_LOADING_VISUAL_FRAME_CACHE",
+        "_VISUAL_CAPTCHA_CACHE",
+        "_FACE_LOCK_VISUAL_CACHE",
+    ):
+        cache = globals().get(name)
+        if isinstance(cache, dict):
+            cache["ts"] = 0
+            if name == "_ANDROID_UI_SNAPSHOT_CACHE":
+                cache["by_pkg"] = {}
+                cache["all_text"] = []
+                cache["error"] = "invalidated after launch"
+            elif name == "_WINDOW_DUMP_CACHE":
+                cache["text"] = ""
+                cache["ok"] = False
 
 
 def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop=True, skip_force_stop=False, allow_launcher_fallback=False):
@@ -5081,9 +5107,11 @@ def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop
         + f"-p {shlex.quote(pkg)}"
     )
 
+    invalidate_android_observation_caches()
     cmd = "am start " + base_args
     code, out = shell_timeout(cmd, cfg, capture=True, timeout=15)
     if code == 0:
+        invalidate_android_observation_caches()
         if bubble_launch_diag and sibling_before_launch:
             # Give Android/App Cloner a moment to settle, then prove whether the
             # plain target launch itself affected a peer process. This does not
@@ -10525,7 +10553,7 @@ class RejoinCore:
         )
 
     def queue_alive_no_state_recovery(self, tab, target, reason, metadata=None):
-        merged = {"bypass_recheck": True}
+        merged = {"bypass_recheck": False, "always_recheck_health": True}
         if isinstance(metadata, dict):
             merged.update(metadata)
         return self.queue_exact_pid_recovery(
@@ -10551,7 +10579,7 @@ class RejoinCore:
         )
 
     def queue_alive_old_state_recovery(self, tab, target, reason, metadata=None):
-        merged = {"bypass_recheck": True}
+        merged = {"bypass_recheck": False, "always_recheck_health": True}
         if isinstance(metadata, dict):
             merged.update(metadata)
         return self.queue_exact_pid_recovery(
@@ -11120,6 +11148,8 @@ def _queue_hatcher_alive_old_state_hard(open_queue, tab, rt_tab, hcfg, cfg, age_
         str(reason or "hatcher alive old state hard"),
         front=False,
         metadata={
+            "bypass_recheck": False,
+            "always_recheck_health": True,
             "hatcher_old_state_recovery": True,
             "hatcher_old_state_age": age_i,
             "hatcher_old_state_reason": str(reason or "alive old state"),
@@ -12417,6 +12447,7 @@ _ANDROID_UI_SNAPSHOT_CACHE = {
     "all_text": [],
     "error": "not captured",
 }
+_ANDROID_UI_DUMP_LOCK = threading.Lock()
 
 
 def _parse_android_ui_xml(xml_text):
@@ -12462,13 +12493,20 @@ def capture_android_ui_snapshot(cfg, force=False):
         if t - int(_ANDROID_UI_SNAPSHOT_CACHE.get("ts", 0) or 0) < max(1, cache_seconds):
             return _ANDROID_UI_SNAPSHOT_CACHE
 
-    dump_path = f"/sdcard/Download/nomo_ui_snapshot_{os.getpid()}.xml"
+    dump_path = (
+        f"/sdcard/Download/nomo_ui_snapshot_{os.getpid()}_"
+        f"{threading.get_ident()}.xml"
+    )
+    qdump = shlex.quote(dump_path)
     cmd = (
-        f"uiautomator dump {shlex.quote(dump_path)} >/dev/null 2>&1 && "
-        f"cat {shlex.quote(dump_path)}"
+        f"uiautomator dump {qdump} >/dev/null 2>&1 && cat {qdump}; "
+        f"rc=$?; rm -f {qdump} >/dev/null 2>&1; exit $rc"
     )
     timeout = int(cfg.get("android_ui_snapshot_timeout_seconds", 15) or 15)
-    code, out = shell_timeout(cmd, cfg, capture=True, timeout=max(3, timeout))
+    # uiautomator itself is global Android state. Serialize forced/manual and
+    # watchdog captures so one dump cannot overwrite or partially read another.
+    with _ANDROID_UI_DUMP_LOCK:
+        code, out = shell_timeout(cmd, cfg, capture=True, timeout=max(3, timeout))
 
     if code != 0 or not out:
         _ANDROID_UI_SNAPSHOT_CACHE = {
@@ -14127,6 +14165,23 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
             core.save()
             return True
 
+    # V4.81.28: a bubble-only item is a speculative fast-track. Revalidate the
+    # Android activity immediately before execution; if the shell materialized,
+    # died, or the query became inconclusive while queued, cancel this special
+    # hard stop and let the ordinary old-state/crash watchdog classify it again.
+    if is_hard and item.get("bubble_only_recovery"):
+        bubble_ok, bubble_note = hatcher_bubble_only_recovery_candidate(
+            pkg, cfg, process_status=process_status
+        )
+        if not bubble_ok:
+            rt_tab["note"] = "bubble condition cleared; special recovery cancelled"
+            log_activity(
+                "bubble recovery cancelled at execution recheck: " + cut(bubble_note, 80),
+                pkg, GREEN if process_status == "ALIVE" else YELLOW,
+            )
+            core.save()
+            return True
+
     # V3.79: SINGLE-FLIGHT GATE
     # Never start a kill/open while another package is still inside its own
     # kill -> open -> wait-for-fresh cycle. One clone at a time, always.
@@ -14151,7 +14206,11 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
     # package that is alive AND writing fresh state right now.
     if is_hard and cfg.get("recheck_before_hard_open", True) and not item.get("bypass_recheck"):
         queued_at = int(item.get("queued_at", 0) or 0)
-        min_age = int(cfg.get("recheck_min_queue_age_seconds", 20) or 0)
+        min_age = (
+            0
+            if item.get("always_recheck_health")
+            else int(cfg.get("recheck_min_queue_age_seconds", 20) or 0)
+        )
         if queued_at > 0 and (now() - queued_at) >= min_age:
             stale_s = int(cfg.get("state_stale_seconds", 180) or 180)
             if package_alive(pkg, cfg, fresh=True) and state_recent_enough_for_alive(tab, cfg, seconds=stale_s):
