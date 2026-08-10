@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.6 — BLOCKSOLVE CHALLENGE-ONLY AUTO MODE
+# - Automatic pre-open no longer submits the provider merely because a real rejoin
+#   is queued. A valid/no-challenge Roblox cookie skips the provider and opens normally.
+# - Inconclusive Roblox precheck also skips blind pre-open submission; the normal
+#   post-open Loading/UI detector remains armed for that generation.
+# - Confirmed package-scoped CAPTCHA/login UI can still submit the provider once,
+#   even when the authenticated-cookie API itself still reports the cookie as valid.
+# - Post-open no-state by itself no longer probes BlockSolve when challenge-only mode
+#   is enabled; a real API/UI challenge signal is required.
+# - Manual Solver Test remains a direct explicit provider call and is unchanged.
+#
 # V4.81.5 — SOLVER FRESH COOKIE PATH
 # - Automatic pre-open solver submissions now refresh .ROBLOSECURITY directly
 #   from the target package WebView DB immediately before a real provider send.
@@ -817,7 +828,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.5-solver-fresh-cookie"
+__version__ = "V4.81.6-blocksolve-challenge-only"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1457,6 +1468,10 @@ DEFAULT_CONFIG = {
     # package has produced no state for solver_probe_after_seconds, allow the
     # configured provider to make the authoritative check once for that open.
     "solver_provider_probe_on_no_state": True,
+    # V4.81.6: BlockSolve-style providers can reject a valid cookie when there is
+    # simply no CAPTCHA task to solve. Automatic mode therefore sends only after
+    # a real API/UI challenge signal. Manual Solver Test is always explicit/direct.
+    "solver_provider_challenge_only": True,
     "solver_rejoin_on_success": False,
     # Solver retries are package-local now. Do not reopen Roblox just because the
     # provider returned NO_CAPTCHA/CAPTCHA_SUCCESS after the package is already up.
@@ -2569,6 +2584,10 @@ def apply_update_migrations(cfg):
     set_cfg("solver_probe_stale_state_enabled", False)
     if "solver_provider_probe_on_no_state" not in cfg:
         set_cfg("solver_provider_probe_on_no_state", True)
+    # V4.81.6: default existing/fresh installs to challenge-only automatic provider
+    # behavior. This avoids treating ordinary stale-state rejoins as CAPTCHA jobs.
+    if "solver_provider_challenge_only" not in cfg:
+        set_cfg("solver_provider_challenge_only", True)
     # V4.80.20: solver results should not reopen the Roblox package after it is
     # already running. Reopening one clone can disturb sibling Noka windows.
     set_cfg("solver_rejoin_on_success", False)
@@ -12928,6 +12947,24 @@ def solver_preflight_before_open(open_queue, item, tab, rt_tab, pkg, target, cfg
         return "waiting", item
 
     note_l = str(note or "").lower()
+    if "challenge-only clear" in note_l or "challenge-only inconclusive" in note_l:
+        # Provider was intentionally not called. Open normally and KEEP the
+        # post-open challenge detector armed for this generation.
+        item["solver_preflight_done"] = True
+        item["solver_result"] = (
+            "LOCAL_CLEAR" if "challenge-only clear" in note_l else "LOCAL_INCONCLUSIVE"
+        )
+        item["skip_solver_once"] = False
+        item["skip_solver_probe"] = False
+        rt_tab["note"] = (
+            "solver local clear; opening normally"
+            if "challenge-only clear" in note_l
+            else "solver precheck inconclusive; opening and watching challenge"
+        )
+        log_activity(rt_tab["note"], pkg, DIM if "challenge-only clear" in note_l else YELLOW)
+        core.save()
+        return "ready", item
+
     if "invalid/expired" in note_l or "no package cookie" in note_l:
         # For an already-running client that visibly reports Kicked/Disconnected,
         # the restart must not disappear merely because cookie extraction failed.
@@ -28493,6 +28530,8 @@ def _solver_probe_worker(package, tab, cookie, cfg_snapshot, place_id):
             locally_detected = locally_detected or (ui_hit is True)
 
         provider_probe = bool(cfg_snapshot.get("solver_provider_probe_on_no_state", True))
+        if cfg_snapshot.get("solver_provider_challenge_only", True):
+            provider_probe = False
         should_call_provider = locally_detected or provider_probe
 
         if not should_call_provider:
@@ -28601,7 +28640,11 @@ def start_challenge_probe_job(tab, cfg, rt, rt_tab, probe_token=0, reason="wait-
             rt_tab["solver_probe_token"] = token
         return False, f"provider cooldown {format_age(left)}"
 
-    cookie = cached_cookie_for_package(pkg) or ensure_cookie_for_package(pkg, cfg)
+    cookie, cookie_source, cookie_note = solver_cookie_for_package(pkg, cfg)
+    if not cookie:
+        return False, "captcha probe: no package cookie"
+    rt_tab["solver_cookie_source"] = cookie_source
+    rt_tab["solver_cookie_refresh_note"] = cut(cookie_note, 120)
     place_id = solver_place_id_for_tab(tab, cfg)
     timeout = max(20, int(cfg.get("solver_timeout_seconds", 180) or 180))
     job = {
@@ -28670,7 +28713,7 @@ def _solver_worker(package, cookie, cfg_snapshot, place_id):
             job["finished_at"] = now()
 
 
-def start_solver_job(tab, cfg, rt, rt_tab, reason, force=False, phase="solve", open_generation="", target_override="", core=None):
+def start_solver_job(tab, cfg, rt, rt_tab, reason, force=False, phase="solve", open_generation="", target_override="", core=None, challenge_confirmed=False):
     pkg = str((tab or {}).get("package", "") or "")
     if not pkg:
         return False, "solver: missing package"
@@ -28735,10 +28778,24 @@ def start_solver_job(tab, cfg, rt, rt_tab, reason, force=False, phase="solve", o
         # An API timeout/unavailable response is not proof that the cookie is bad.
         # Continue with the freshly extracted package cookie when available.
         log_activity(
-            f"solver cookie precheck unavailable; provider send continues: {cut(api_detail, 60)}",
+            f"solver cookie precheck unavailable: {cut(api_detail, 60)}",
             pkg,
             YELLOW,
         )
+
+    # V4.81.6: providers such as BlockSolve may return HTTP 400 when a perfectly
+    # valid cookie simply has no CAPTCHA to solve. Automatic pre-open therefore
+    # treats the Roblox/API result as a gate instead of using the provider as a
+    # generic NO_CAPTCHA probe. A package-scoped UI/state challenge can explicitly
+    # override api_hit=False because the join challenge may not invalidate auth.
+    if cfg.get("solver_provider_challenge_only", True) and not challenge_confirmed:
+        if api_hit is False:
+            rt_tab["solver_state"] = "local_clear"
+            rt_tab["solver_last_error"] = ""
+            return False, "challenge-only clear: API valid; provider not sent"
+        if api_hit is None:
+            rt_tab["solver_state"] = "precheck_inconclusive"
+            return False, "challenge-only inconclusive: provider not sent"
 
     place_id = solver_place_id_for_tab(tab, cfg)
     timeout = max(15, int(cfg.get("solver_timeout_seconds", 180) or 180))
@@ -28750,6 +28807,7 @@ def start_solver_job(tab, cfg, rt, rt_tab, reason, force=False, phase="solve", o
         "solver_place_id": str(place_id),
         "solver_timeout_seconds": timeout,
         "solver_provider_probe_on_no_state": bool(cfg.get("solver_provider_probe_on_no_state", True)),
+        "solver_provider_challenge_only": bool(cfg.get("solver_provider_challenge_only", True)),
     }
     job = {
         "package": pkg,
@@ -28816,7 +28874,7 @@ def _solver_error_text(response):
 def handle_detected_solver_challenge(tab, cfg, rt, rt_tab, reason, core=None):
     """Start/describe a solver job, or isolate the package if unavailable."""
     pkg = str((tab or {}).get("package", "") or "")
-    started, note = start_solver_job(tab, cfg, rt, rt_tab, reason, core=core)
+    started, note = start_solver_job(tab, cfg, rt, rt_tab, reason, core=core, challenge_confirmed=True)
     if started:
         rt_tab["note"] = note
         if core is not None:
