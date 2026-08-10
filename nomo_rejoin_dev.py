@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.44 — OPTION 6 ALIVE-NOKA ROUTE-ONLY SAFETY
+# - Option 6 still enters the shared Option 1 recovery core, but an already-ALIVE Noka/App-Cloner target
+#   is never auto-escalated from route retries into a delayed hard PID-stop. Route retries remain in-place.
+# - The Option 6 origin/safety marker is preserved across every queued route retry so later generations cannot
+#   silently become generic hard-fallback items. DEAD targets still use normal exact-PID/start recovery.
+# - This prevents the proven App-Cloner failure where C eventually joined after a hard fallback but A collapsed.
+#
 # V4.81.43 — OPTION 6 OPTION-1 ROUTE-FIRST RECOVERY
 # - Option 6 is again an explicit operator force-reopen: selected packages hard-reopen once regardless
 #   of healthy/Home/CAPTCHA/face-lock/manual-hold status, while still using exact-PID sibling safety.
@@ -1041,7 +1048,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.43-option6-option1-route-first-recovery"
+__version__ = "V4.81.44-option6-alive-noka-route-only-safety"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -7979,6 +7986,12 @@ def manual_restart_tabs_via_queue(
             "manual_option6": True,
             "option6_normal_recovery_chain": True,
             "option6_route_first": True,
+            # V4.81.44: a healthy Noka/App-Cloner target may reuse/route its
+            # existing task, but must never silently escalate into a PID-stop
+            # later in the same manual recovery generation.
+            "option6_alive_noka_route_only": bool(
+                process_status == "ALIVE" and _is_noka_clone_package(pkg)
+            ),
         }
 
         if process_status == "UNKNOWN":
@@ -15260,6 +15273,67 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                 int(cfg.get("join_failures_before_hard_rejoin", 3) or 3),
             )
 
+            # V4.81.44: App Cloner proved that the delayed hard fallback itself
+            # can collapse a sibling floating task even though exact-PID stop
+            # verified siblings immediately beforehand.  For an Option 6
+            # generation that started while this Noka target was ALIVE, keep
+            # the entire generation route-only while the target remains ALIVE.
+            # A genuinely DEAD target is still allowed to use the normal
+            # Option 1 crash/start recovery on a later watchdog pass.
+            option6_alive_noka_route_only = bool(
+                item.get("option6_alive_noka_route_only")
+                and _is_noka_clone_package(pkg)
+                and alive_for_retry
+            )
+            if option6_alive_noka_route_only:
+                option6_route_limit = max(
+                    failures_before_hard,
+                    int(cfg.get("option6_alive_noka_route_retry_limit", 4) or 4),
+                )
+                if join_fail_count < option6_route_limit:
+                    retry_meta = {
+                        "solver_preflight_done": True,
+                        "skip_solver_once": True,
+                        "skip_solver_probe": True,
+                        "solver_result": str(item.get("solver_result", "") or ""),
+                        "manual_option6": True,
+                        "option6_normal_recovery_chain": True,
+                        "option6_route_first": True,
+                        "option6_alive_noka_route_only": True,
+                    }
+                    retry_reason = (
+                        f"Option 6 alive Noka route retry {join_fail_count}/{option6_route_limit - 1} "
+                        f"after {fresh_msg}"
+                    )
+                    added, _ = core.queue_route_retry(
+                        tab,
+                        target,
+                        retry_reason,
+                        metadata=retry_meta,
+                    )
+                    rt_tab["note"] = (
+                        f"{fresh_msg}; Option 6 alive Noka route-only "
+                        + ("retry queued" if added else "retry already queued")
+                    )
+                    log_activity(
+                        f"Option 6 alive Noka route retry {join_fail_count}/{option6_route_limit - 1}; "
+                        "hard fallback blocked for sibling safety",
+                        pkg,
+                        YELLOW,
+                    )
+                else:
+                    rt_tab["note"] = (
+                        f"{fresh_msg}; Option 6 route-only retries exhausted; "
+                        "no hard fallback while package remains alive"
+                    )
+                    log_activity(
+                        "Option 6 alive Noka route retries exhausted; no PID-stop fallback",
+                        pkg,
+                        YELLOW,
+                    )
+                core.save()
+                return True
+
             if allow_hard_fallback and alive_for_retry and join_fail_count < failures_before_hard:
                 retry_meta = {
                     "solver_preflight_done": True,
@@ -15269,6 +15343,14 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                     "manual_booster_route": bool(item.get("manual_booster_route")),
                     "manual_booster_second_intent_done": bool(
                         item.get("manual_booster_second_intent_done")
+                    ),
+                    "manual_option6": bool(item.get("manual_option6")),
+                    "option6_normal_recovery_chain": bool(
+                        item.get("option6_normal_recovery_chain")
+                    ),
+                    "option6_route_first": bool(item.get("option6_route_first")),
+                    "option6_alive_noka_route_only": bool(
+                        item.get("option6_alive_noka_route_only")
                     ),
                 }
                 retry_reason = f"join fail {join_fail_count}/{failures_before_hard}; route retry after {fresh_msg}"
@@ -15343,8 +15425,26 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
         core.save()
 
         if mode in ("soft", "route") and cfg.get("soft_hop_fallback_hard", True):
-            fallback_reason = "route failed hard" if mode == "route" else "soft failed hard"
-            core.queue_hard_retry(tab, target, fallback_reason, front=True)
+            fallback_status, _fallback_note = package_alive_status(pkg, cfg, fresh=True)
+            block_option6_noka_hard = bool(
+                item.get("option6_alive_noka_route_only")
+                and _is_noka_clone_package(pkg)
+                and fallback_status == "ALIVE"
+            )
+            if block_option6_noka_hard:
+                rt_tab["note"] = "Option 6 route open failed; hard fallback blocked while Noka remains alive"
+                log_activity(
+                    "Option 6 route open failed; no PID-stop fallback while Noka remains alive",
+                    pkg,
+                    YELLOW,
+                )
+                core.save()
+            elif fallback_status == "UNKNOWN":
+                rt_tab["note"] = "route open failed; process UNKNOWN; hard fallback deferred"
+                core.save()
+            else:
+                fallback_reason = "route failed hard" if mode == "route" else "soft failed hard"
+                core.queue_hard_retry(tab, target, fallback_reason, front=True)
 
     return True
 
