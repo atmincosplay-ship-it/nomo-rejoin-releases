@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.8 — STABILITY GUARD
+# - Exotic readers sync every 10 minutes; state updates are serialized/merged.
+# - Exact-PID recovery fails closed when Android PID queries fail.
+# - Sibling PID verification failures abort the target reopen instead of being ignored.
+# - Internal updater/rollback now targets the actual running nomo_rejoin_dev.py.
+# - Exotic writer verifies its published cloud key and warns on possible second-writer mismatch.
+# - Market AutoExec has an explicit loader revision and shared Exotic key repairs stale UID login files.
+#
 # V4.81.7 — BLOCKSOLVE FIRST-CLASS PROVIDER
 # - Adds an explicit BlockSolve provider profile instead of relying on the generic
 #   Winter-compatible adapter by accident. BlockSolve uses POST /join, X-API-Key,
@@ -842,11 +850,14 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.7-blocksolve-provider"
+__version__ = "V4.81.8-stability-guard"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
-NOMO_APP_FILE = BASE_DIR / "nomo_rejoin_dev.py"
+# V4.81.8: data stays in BASE_DIR, but self-update/rollback must replace the
+# exact script that is currently running (nomo-dev installs it in a different folder).
+NOMO_APP_FILE = Path(__file__).resolve()
+NOMO_APP_DIR = NOMO_APP_FILE.parent
 
 DELTA_GLOBAL_ROOT = Path("/storage/emulated/0/Delta")
 DELTA_GLOBAL_AUTOEXEC_DIR = DELTA_GLOBAL_ROOT / "Autoexecute"
@@ -1279,7 +1290,7 @@ DEFAULT_CONFIG = {
     "exotic_key_worker_url": DEFAULT_EXOTIC_KEY_WORKER_URL,
     "exotic_key_write_secret": "",
     "exotic_key_read_token": "",
-    "exotic_key_sync_interval_seconds": 3600,
+    "exotic_key_sync_interval_seconds": 600,
     "exotic_key_reader_retry_seconds": 1800,
     "exotic_key_rate_limit_backoff_seconds": 21600,
     "exotic_key_expiry_seconds": 86400,
@@ -2579,6 +2590,13 @@ def apply_update_migrations(cfg):
     if _int_cfg(cfg.get("username_resolve_interval_seconds"), 0) <= 0:
         set_cfg("username_resolve_interval_seconds", 600)
 
+    # V4.81.8: the original Exotic reader default was one hour. The writer
+    # refreshes only 15 minutes before the 24h key expiry, so migrate only the
+    # known old 3600s default to 10 minutes. Preserve deliberate custom values.
+    exotic_sync = _int_cfg(cfg.get("exotic_key_sync_interval_seconds"), 0)
+    if exotic_sync <= 0 or exotic_sync == 3600:
+        set_cfg("exotic_key_sync_interval_seconds", 600)
+
     # V3.81: non-blocking solver defaults for existing nomo.json files.
     if _int_cfg(cfg.get("solver_timeout_seconds"), 0) <= 0:
         set_cfg("solver_timeout_seconds", 180)
@@ -3353,19 +3371,21 @@ def _process_name_matches_package(name, pkg):
     return bool(pkg) and (name == pkg or name.startswith(pkg + ":"))
 
 
-def package_pids(pkg, cfg):
-    """Return only PIDs whose Android process NAME exactly belongs to pkg.
+def package_pids_checked(pkg, cfg):
+    """Return (query_ok, exact_pids, note).
 
-    We intentionally do not trust a broad `pidof` result for cloned APKs. The
-    exact package name (or package:subprocess) is read from `ps` first, then only
-    those numeric PIDs are eligible for kill.
+    An empty PID list is valid only after `ps` itself completed successfully.
+    Safety-critical recovery must never confuse an Android/root query failure
+    with "the package is already stopped".
     """
     pkg = str(pkg or "").strip()
     if not pkg:
-        return []
+        return False, [], "no package"
     code, out = shell_timeout("ps -A -o PID,NAME 2>/dev/null", cfg, capture=True, timeout=6)
-    if code != 0 or not out:
-        return []
+    if code != 0:
+        return False, [], f"ps query failed (exit {code})"
+    if not str(out or "").strip():
+        return False, [], "ps query returned no output"
     pids = []
     for line in out.splitlines():
         parts = line.strip().split(None, 1)
@@ -3374,7 +3394,13 @@ def package_pids(pkg, cfg):
         pid, name = int(parts[0]), parts[1].strip()
         if _process_name_matches_package(name, pkg):
             pids.append(pid)
-    return sorted(set(pids))
+    return True, sorted(set(pids)), "ok"
+
+
+def package_pids(pkg, cfg):
+    """Compatibility wrapper for non-safety callers; exact-PID stop uses checked form."""
+    ok, pids, _note = package_pids_checked(pkg, cfg)
+    return pids if ok else []
 
 
 def package_alive(pkg, cfg, fresh=False):
@@ -3457,25 +3483,39 @@ def _configured_clone_packages(cfg):
 
 def _sibling_pid_snapshot(target_pkg, cfg):
     if not cfg.get("verify_sibling_pids_on_stop", True):
-        return {}
+        return {}, []
     snap = {}
+    errors = []
     for p in _configured_clone_packages(cfg):
-        if p != target_pkg:
-            ids = package_pids(p, cfg)
-            if ids:
-                snap[p] = ids
-    return snap
+        if p == target_pkg:
+            continue
+        ok, ids, note = package_pids_checked(p, cfg)
+        if not ok:
+            errors.append(f"{p}: {note}")
+            continue
+        if ids:
+            snap[p] = ids
+    return snap, errors
 
 
 def _verify_sibling_pid_snapshot(before, cfg, target_pkg):
     if not before:
-        return True, ""
+        return True, "peer snapshot empty"
     lost = []
+    query_errors = []
     for p, old_ids in before.items():
-        current = set(package_pids(p, cfg))
+        ok, ids, note = package_pids_checked(p, cfg)
+        if not ok:
+            query_errors.append(f"{p}: {note}")
+            continue
+        current = set(ids)
         missing = [pid for pid in old_ids if pid not in current]
         if missing and not current:
             lost.append(f"{p}:{','.join(map(str, missing))}")
+    if query_errors:
+        msg = "peer PID verification query failed -> " + " | ".join(query_errors)
+        log_activity(msg, target_pkg, RED)
+        return False, msg
     if lost:
         msg = "peer PID loss observed after target stop -> " + " | ".join(lost)
         log_activity(msg, target_pkg, RED)
@@ -3486,53 +3526,79 @@ def _verify_sibling_pid_snapshot(before, cfg, target_pkg):
 def force_stop_package(pkg, cfg, tries=3, wait_after=0.8, settle=1.0):
     """Stop exactly ONE clone using verified package PIDs only.
 
+    V4.81.8 fails closed on every PID-query or sibling-verification failure.
     There is deliberately no `am force-stop`, `killall`, or `pkill` fallback.
-    If exact PIDs cannot be found or survive SIGKILL, the function returns False
-    instead of claiming success and risking another package.
     """
     pkg = str(pkg or "").strip()
     if not pkg:
         return False, "no package"
 
-    sibling_before = _sibling_pid_snapshot(pkg, cfg)
-    initial = package_pids(pkg, cfg)
+    sibling_before, sibling_query_errors = _sibling_pid_snapshot(pkg, cfg)
+    if sibling_query_errors:
+        msg = "PID safety precheck failed; sibling query unavailable -> " + " | ".join(sibling_query_errors)
+        log_activity(msg, pkg, RED)
+        return False, msg
+
+    ok_query, initial, note = package_pids_checked(pkg, cfg)
+    if not ok_query:
+        msg = "PID query failed before stop: " + str(note)
+        log_activity(msg, pkg, RED)
+        return False, msg
     if not initial:
-        return True, "already stopped (no exact PID)"
+        return True, "already stopped (verified no exact PID)"
 
     log_activity("PID-only stop -> " + ",".join(map(str, initial)), pkg, YELLOW)
 
+    def checked_ids(stage):
+        ok, ids, qnote = package_pids_checked(pkg, cfg)
+        if not ok:
+            msg = f"PID query failed {stage}: {qnote}"
+            log_activity(msg, pkg, RED)
+            return None, msg
+        return ids, ""
+
+    def finish_success():
+        time.sleep(float(settle or 1.0))
+        _PROC_CACHE["ts"] = 0
+        peer_ok, peer_note = _verify_sibling_pid_snapshot(sibling_before, cfg, pkg)
+        if not peer_ok:
+            msg = "SIBLING SAFETY FAILURE; target reopen aborted: " + peer_note
+            log_activity(msg, pkg, RED)
+            return False, msg
+        log_activity("PID-only stopped", pkg, YELLOW)
+        return True, "stopped (exact PID; siblings verified)"
+
     for _ in range(max(1, int(tries or 1))):
-        pids = package_pids(pkg, cfg)
+        pids, err = checked_ids("before signal")
+        if pids is None:
+            return False, err
         if not pids:
-            time.sleep(float(settle or 1.0))
-            _PROC_CACHE["ts"] = 0
-            log_activity("PID-only stopped", pkg, YELLOW)
-            _verify_sibling_pid_snapshot(sibling_before, cfg, pkg)
-            return True, "stopped (exact PID)"
+            return finish_success()
 
         _kill_exact_package_pids(pkg, pids, "TERM", cfg)
         time.sleep(float(wait_after or 0.8))
 
-        survivors = package_pids(pkg, cfg)
+        survivors, err = checked_ids("after TERM")
+        if survivors is None:
+            return False, err
         if survivors:
             _kill_exact_package_pids(pkg, survivors, "KILL", cfg)
             time.sleep(0.6)
 
         for _wait in range(6):
-            survivors = package_pids(pkg, cfg)
+            survivors, err = checked_ids("while confirming stop")
+            if survivors is None:
+                return False, err
             if not survivors:
-                time.sleep(float(settle or 1.0))
-                _PROC_CACHE["ts"] = 0
-                log_activity("PID-only stopped", pkg, YELLOW)
-                _verify_sibling_pid_snapshot(sibling_before, cfg, pkg)
-                return True, "stopped (exact PID)"
+                return finish_success()
             time.sleep(0.4)
 
-    survivors = package_pids(pkg, cfg)
+    survivors, err = checked_ids("after stop retries")
+    if survivors is None:
+        return False, err
     msg = "PID stop failed; survivors=" + ",".join(map(str, survivors))
     log_activity(msg, pkg, RED)
     return False, msg
-
 
 
 
@@ -23867,6 +23933,8 @@ end)
 # ============================================================
 
 _EXOTIC_KEY_JOB_LOCK = threading.Lock()
+_EXOTIC_STATE_LOCK = threading.RLock()
+_EXOTIC_LOCAL_SYNC_LOCK = threading.Lock()
 _EXOTIC_KEY_JOB = {"running": False, "mode": "", "started_at": 0}
 _EXOTIC_KEY_LAST_TICK = 0
 _EXOTIC_STATUS_CACHE = {"ts": 0, "items": []}
@@ -23884,14 +23952,34 @@ def _exotic_clean_key(value):
 
 
 def load_exotic_key_state():
-    state = load_json(EXOTIC_KEY_STATE_FILE, {})
-    return state if isinstance(state, dict) else {}
+    with _EXOTIC_STATE_LOCK:
+        state = load_json(EXOTIC_KEY_STATE_FILE, {})
+        return dict(state) if isinstance(state, dict) else {}
 
 
 def save_exotic_key_state(state):
-    state = dict(state or {})
-    state["saved_at"] = now()
-    save_json(EXOTIC_KEY_STATE_FILE, state)
+    with _EXOTIC_STATE_LOCK:
+        state = dict(state or {})
+        state["saved_at"] = now()
+        save_json(EXOTIC_KEY_STATE_FILE, state)
+
+
+def _update_exotic_key_state(updates=None, *, expected_key=None):
+    """Merge fields into the latest on-disk state under one re-entrant lock."""
+    with _EXOTIC_STATE_LOCK:
+        state = load_json(EXOTIC_KEY_STATE_FILE, {})
+        if not isinstance(state, dict):
+            state = {}
+        state = dict(state)
+        if expected_key is not None and _exotic_clean_key(state.get("key")) != _exotic_clean_key(expected_key):
+            return state, False
+        if callable(updates):
+            updates(state)
+        elif isinstance(updates, dict):
+            state.update(updates)
+        state["saved_at"] = now()
+        save_json(EXOTIC_KEY_STATE_FILE, state)
+        return dict(state), True
 
 
 def _exotic_workspace_roots():
@@ -23924,62 +24012,73 @@ def _atomic_json_file(path, payload):
 
 
 def sync_exotic_key_to_local_workspaces(key, source="nomo"):
-    """Persist one shared key and update every existing UID_exologin.json."""
+    """Persist one authoritative shared key and update existing UID_exologin.json files.
+
+    V4.81.8 serializes local fan-out and refuses to write a key that is already
+    stale versus the latest device state, preventing reader/main-loop races.
+    """
     key = _exotic_clean_key(key)
     if not key:
         return False, "invalid Exotic key", 0, 0
 
-    shared_written = 0
-    uid_updated = 0
-    payload = {
-        "token": key,
-        "type": "lootlabs",
-        "synced_at": now(),
-        "source": str(source or "nomo"),
-    }
+    with _EXOTIC_LOCAL_SYNC_LOCK:
+        with _EXOTIC_STATE_LOCK:
+            latest = load_json(EXOTIC_KEY_STATE_FILE, {})
+            latest_key = _exotic_clean_key(latest.get("key")) if isinstance(latest, dict) else ""
+        if latest_key and latest_key != key:
+            return False, "stale Exotic local sync skipped", 0, 0
 
-    for root in _exotic_workspace_roots():
-        try:
-            if not root.exists():
-                continue
-            shared_path = root / EXOTIC_KEY_SHARED_RELATIVE
-            existing_shared = load_json(shared_path, {})
-            existing_key = _exotic_clean_key(
-                (existing_shared or {}).get("token") if isinstance(existing_shared, dict) else ""
-            )
-            if existing_key != key or not shared_path.exists():
-                _atomic_json_file(shared_path, payload)
-                shared_written += 1
+        shared_written = 0
+        uid_updated = 0
+        payload = {
+            "token": key,
+            "type": "lootlabs",
+            "synced_at": now(),
+            "source": str(source or "nomo"),
+        }
 
+        for root in _exotic_workspace_roots():
             try:
-                login_files = list(root.glob("*_exologin.json"))
-            except Exception:
-                login_files = []
-            for login_file in login_files:
+                if not root.exists():
+                    continue
+                shared_path = root / EXOTIC_KEY_SHARED_RELATIVE
+                existing_shared = load_json(shared_path, {})
+                existing_key = _exotic_clean_key(
+                    (existing_shared or {}).get("token") if isinstance(existing_shared, dict) else ""
+                )
+                if existing_key != key or not shared_path.exists():
+                    _atomic_json_file(shared_path, payload)
+                    shared_written += 1
+
                 try:
-                    # Preserve Exotic's existing per-UID schema exactly. Only a
-                    # valid JSON object is edited; malformed/unknown files are
-                    # deliberately left untouched instead of being rewritten.
+                    login_files = list(root.glob("*_exologin.json"))
+                except Exception:
+                    login_files = []
+                for login_file in login_files:
                     try:
-                        raw_login = login_file.read_text(encoding="utf-8")
-                        current = json.loads(raw_login)
+                        # Preserve Exotic's existing per-UID schema exactly. Only a
+                        # valid JSON object is edited; malformed/unknown files are
+                        # deliberately left untouched instead of being rewritten.
+                        try:
+                            raw_login = login_file.read_text(encoding="utf-8")
+                            current = json.loads(raw_login)
+                        except Exception:
+                            continue
+                        if not isinstance(current, dict):
+                            continue
+                        if _exotic_clean_key(current.get("token")) == key:
+                            continue
+                        current["token"] = key
+                        if not str(current.get("type") or "").strip():
+                            current["type"] = "lootlabs"
+                        _atomic_json_file(login_file, current)
+                        uid_updated += 1
                     except Exception:
                         continue
-                    if not isinstance(current, dict):
-                        continue
-                    if _exotic_clean_key(current.get("token")) == key:
-                        continue
-                    current["token"] = key
-                    if not str(current.get("type") or "").strip():
-                        current["type"] = "lootlabs"
-                    _atomic_json_file(login_file, current)
-                    uid_updated += 1
-                except Exception:
-                    continue
-        except Exception:
-            continue
+            except Exception:
+                continue
 
-    return True, "local Exotic key synced", shared_written, uid_updated
+        return True, "local Exotic key synced", shared_written, uid_updated
 
 
 def _exotic_worker_base(cfg):
@@ -24109,74 +24208,117 @@ def _exotic_generate_key_from_site(cfg):
 
 
 def _exotic_reader_job(cfg_snapshot):
-    state = load_exotic_key_state()
     key, err = _exotic_cloud_read(cfg_snapshot)
     t = now()
     if not key:
-        state["last_cloud_error"] = str(err)
-        state["last_cloud_check_at"] = t
         backoff = (
             max(3600, int(cfg_snapshot.get("exotic_key_rate_limit_backoff_seconds", 21600) or 21600))
             if _exotic_rate_limited_text(err)
             else max(300, int(cfg_snapshot.get("exotic_key_reader_retry_seconds", 1800) or 1800))
         )
-        state["next_cloud_check_at"] = t + backoff
-        save_exotic_key_state(state)
+        _update_exotic_key_state({
+            "last_cloud_error": str(err),
+            "last_cloud_check_at": t,
+            "next_cloud_check_at": t + backoff,
+        })
         log_activity(f"Exotic key reader failed; retry {format_age(backoff)}: {cut(err, 90)}", "", YELLOW)
         return
 
-    changed = _exotic_clean_key(state.get("key")) != key
-    state["key"] = key
-    state["key_source"] = "cloud_reader"
-    state["last_cloud_check_at"] = t
-    state["last_cloud_ok_at"] = t
-    state["worker_read_verified_at"] = t
-    state["last_cloud_error"] = ""
-    state["next_cloud_check_at"] = t + max(300, int(cfg_snapshot.get("exotic_key_sync_interval_seconds", 3600) or 3600))
-    if changed:
-        state["key_changed_at"] = t
-        state["first_seen_at"] = t
-    save_exotic_key_state(state)
+    with _EXOTIC_STATE_LOCK:
+        latest = load_json(EXOTIC_KEY_STATE_FILE, {})
+        latest = dict(latest) if isinstance(latest, dict) else {}
+        changed = _exotic_clean_key(latest.get("key")) != key
+        latest.update({
+            "key": key,
+            "key_source": "cloud_reader",
+            "last_cloud_check_at": t,
+            "last_cloud_ok_at": t,
+            "worker_read_verified_at": t,
+            "last_cloud_error": "",
+            "next_cloud_check_at": t + max(300, int(cfg_snapshot.get("exotic_key_sync_interval_seconds", 600) or 600)),
+        })
+        if changed:
+            latest["key_changed_at"] = t
+            latest["first_seen_at"] = t
+        latest["saved_at"] = now()
+        save_json(EXOTIC_KEY_STATE_FILE, latest)
+
     ok, _note, shared_count, uid_count = sync_exotic_key_to_local_workspaces(key, source="cloud_reader")
     if changed:
         log_activity(f"Exotic key changed; local sync shared={shared_count} uid={uid_count}", "", GREEN if ok else YELLOW)
 
 
+def _exotic_verify_published_key(cfg_snapshot, expected_key):
+    """Best-effort second-writer detector. A mismatch warns but never rewrites cloud automatically."""
+    expected_key = _exotic_clean_key(expected_key)
+    if not expected_key:
+        return False, "invalid expected key"
+    # KV propagation can be briefly stale, so retry a few times before warning.
+    last_note = ""
+    for attempt in range(3):
+        if attempt:
+            time.sleep(2)
+        cloud_key, note = _exotic_cloud_read(cfg_snapshot)
+        if cloud_key == expected_key:
+            return True, "cloud key verified"
+        if cloud_key:
+            last_note = "cloud key differs from writer key"
+        else:
+            last_note = str(note or "cloud verify failed")
+    return False, last_note
+
+
 def _exotic_writer_job(cfg_snapshot, mode):
-    state = load_exotic_key_state()
     t = now()
     retry = max(300, int(cfg_snapshot.get("exotic_key_writer_retry_seconds", 600) or 600))
 
     if mode == "upload":
+        state = load_exotic_key_state()
         key = _exotic_clean_key(state.get("key"))
         if not key:
             mode = "generate"
         else:
             ok, note = _exotic_cloud_write(cfg_snapshot, key)
-            state["last_writer_attempt_at"] = t
+            t = now()
             if ok:
-                state["cloud_pending"] = False
-                state["last_cloud_upload_at"] = t
-                state["last_cloud_error"] = ""
-                state["next_writer_retry_at"] = 0
-                state["writer_secret_status"] = "verified"
-                state["writer_secret_verified_at"] = t
-                save_exotic_key_state(state)
-                log_activity("Exotic writer: pending key uploaded to Cloudflare", "", GREEN)
+                verified, verify_note = _exotic_verify_published_key(cfg_snapshot, key)
+                updates = {
+                    "cloud_pending": False,
+                    "last_writer_attempt_at": t,
+                    "last_cloud_upload_at": t,
+                    "next_writer_retry_at": 0,
+                    "writer_secret_status": "verified",
+                    "writer_secret_verified_at": t,
+                    "writer_cloud_verify_status": "verified" if verified else "warning",
+                    "writer_cloud_verified_at": t if verified else 0,
+                    "writer_cloud_verify_note": "" if verified else str(verify_note),
+                    "writer_conflict_suspected": not verified and "differs" in str(verify_note).lower(),
+                }
+                if verified:
+                    updates["last_cloud_error"] = ""
+                _update_exotic_key_state(updates, expected_key=key)
+                if verified:
+                    log_activity("Exotic writer: pending key uploaded + cloud key verified", "", GREEN)
+                else:
+                    log_activity(f"Exotic writer upload succeeded but verification warned: {cut(verify_note, 100)}", "", YELLOW)
                 return
-            state["cloud_pending"] = True
-            state["last_cloud_error"] = str(note)
+
             write_backoff = (
                 max(3600, int(cfg_snapshot.get("exotic_key_rate_limit_backoff_seconds", 21600) or 21600))
                 if _exotic_rate_limited_text(note)
                 else retry
             )
-            state["next_writer_retry_at"] = t + write_backoff
+            updates = {
+                "cloud_pending": True,
+                "last_writer_attempt_at": t,
+                "last_cloud_error": str(note),
+                "next_writer_retry_at": t + write_backoff,
+            }
             note_low = str(note or "").lower()
             if "http 401" in note_low or "http 403" in note_low or "unauthorized" in note_low or "forbidden" in note_low:
-                state["writer_secret_status"] = "rejected"
-                state["writer_secret_verified_at"] = 0
-            save_exotic_key_state(state)
+                updates["writer_secret_status"] = "rejected"
+                updates["writer_secret_verified_at"] = 0
+            _update_exotic_key_state(updates, expected_key=key)
             log_activity(f"Exotic writer upload failed; retry {format_age(write_backoff)}: {cut(note, 100)}", "", YELLOW)
             return
 
@@ -24185,19 +24327,19 @@ def _exotic_writer_job(cfg_snapshot, mode):
             key, err = _exotic_generate_key_from_site(cfg_snapshot)
         except Exception as exc:
             key, err = "", str(exc)
-        state = load_exotic_key_state()
         t = now()
-        state["last_writer_attempt_at"] = t
         if not key:
-            state["last_writer_error"] = str(err)
-            state["next_writer_retry_at"] = t + retry
-            save_exotic_key_state(state)
+            _update_exotic_key_state({
+                "last_writer_attempt_at": t,
+                "last_writer_error": str(err),
+                "next_writer_retry_at": t + retry,
+            })
             log_activity(f"Exotic writer generation failed; retry {format_age(retry)}: {cut(err, 100)}", "", RED)
             return
 
         expiry = max(3600, int(cfg_snapshot.get("exotic_key_expiry_seconds", 86400) or 86400))
         buffer_seconds = max(60, min(expiry - 60, int(cfg_snapshot.get("exotic_key_refresh_buffer_seconds", 900) or 900)))
-        state.update({
+        _update_exotic_key_state({
             "key": key,
             "key_source": "local_writer",
             "generated_at": t,
@@ -24205,45 +24347,61 @@ def _exotic_writer_job(cfg_snapshot, mode):
             "refresh_at": t + expiry - buffer_seconds,
             "key_changed_at": t,
             "first_seen_at": t,
+            "last_writer_attempt_at": t,
             "last_writer_error": "",
             "next_writer_retry_at": 0,
             "cloud_pending": True,
+            "writer_conflict_suspected": False,
+            "writer_cloud_verify_status": "pending",
+            "writer_cloud_verify_note": "",
         })
-        save_exotic_key_state(state)
         ok_local, _note, shared_count, uid_count = sync_exotic_key_to_local_workspaces(key, source="local_writer")
         log_activity(f"Exotic writer generated new key; local sync shared={shared_count} uid={uid_count}", "", GREEN if ok_local else YELLOW)
 
         ok, note = _exotic_cloud_write(cfg_snapshot, key)
-        state = load_exotic_key_state()
-        state["last_writer_attempt_at"] = now()
+        t2 = now()
         if ok:
-            uploaded_at = now()
-            state["cloud_pending"] = False
-            state["last_cloud_upload_at"] = uploaded_at
-            state["last_cloud_error"] = ""
-            state["next_writer_retry_at"] = 0
-            state["writer_secret_status"] = "verified"
-            state["writer_secret_verified_at"] = uploaded_at
-            log_activity("Exotic writer uploaded new key to Cloudflare", "", GREEN)
+            verified, verify_note = _exotic_verify_published_key(cfg_snapshot, key)
+            updates = {
+                "last_writer_attempt_at": t2,
+                "cloud_pending": False,
+                "last_cloud_upload_at": t2,
+                "next_writer_retry_at": 0,
+                "writer_secret_status": "verified",
+                "writer_secret_verified_at": t2,
+                "writer_cloud_verify_status": "verified" if verified else "warning",
+                "writer_cloud_verified_at": t2 if verified else 0,
+                "writer_cloud_verify_note": "" if verified else str(verify_note),
+                "writer_conflict_suspected": not verified and "differs" in str(verify_note).lower(),
+            }
+            if verified:
+                updates["last_cloud_error"] = ""
+            _update_exotic_key_state(updates, expected_key=key)
+            if verified:
+                log_activity("Exotic writer uploaded new key + cloud key verified", "", GREEN)
+            else:
+                log_activity(f"Exotic writer upload succeeded but verification warned: {cut(verify_note, 100)}", "", YELLOW)
         else:
-            failed_at = now()
-            state["cloud_pending"] = True
-            state["last_cloud_error"] = str(note)
             write_backoff = (
                 max(3600, int(cfg_snapshot.get("exotic_key_rate_limit_backoff_seconds", 21600) or 21600))
                 if _exotic_rate_limited_text(note)
                 else retry
             )
-            state["next_writer_retry_at"] = failed_at + write_backoff
+            updates = {
+                "last_writer_attempt_at": t2,
+                "cloud_pending": True,
+                "last_cloud_error": str(note),
+                "next_writer_retry_at": t2 + write_backoff,
+            }
             note_low = str(note or "").lower()
             if "http 401" in note_low or "http 403" in note_low or "unauthorized" in note_low or "forbidden" in note_low:
-                state["writer_secret_status"] = "rejected"
-                state["writer_secret_verified_at"] = 0
+                updates["writer_secret_status"] = "rejected"
+                updates["writer_secret_verified_at"] = 0
+            _update_exotic_key_state(updates, expected_key=key)
             log_activity(
                 f"Exotic writer generated locally but Cloudflare upload failed; retry {format_age(write_backoff)}: {cut(note, 100)}",
                 "", YELLOW
             )
-        save_exotic_key_state(state)
 
 
 def _exotic_key_job_wrapper(cfg_snapshot, mode):
@@ -24289,15 +24447,19 @@ def exotic_key_manager_tick(cfg, force_read=False, force_generate=False):
 
     state = load_exotic_key_state()
     local_key = _exotic_clean_key(state.get("key"))
+    key_source = str(state.get("key_source") or "persisted")
     last_local_sync = int(state.get("last_local_sync_at", 0) or 0)
     if local_key and (t - last_local_sync >= 3600 or force_read or force_generate):
         _ok, _note, shared_count, uid_count = sync_exotic_key_to_local_workspaces(
-            local_key, source=str(state.get("key_source") or "persisted")
+            local_key, source=key_source
         )
-        state["last_local_sync_at"] = t
-        state["last_local_shared_writes"] = shared_count
-        state["last_local_uid_updates"] = uid_count
-        save_exotic_key_state(state)
+        latest, updated = _update_exotic_key_state({
+            "last_local_sync_at": t,
+            "last_local_shared_writes": shared_count,
+            "last_local_uid_updates": uid_count,
+        }, expected_key=local_key)
+        if updated:
+            state = latest
 
     writer = bool(cfg.get("exotic_key_writer_enabled", False))
     reader = bool(cfg.get("exotic_key_reader_enabled", True))
@@ -24475,6 +24637,8 @@ def _exotic_writer_readiness(cfg, state):
         mode = str(_EXOTIC_KEY_JOB.get("mode") or "").upper()
     if running:
         return f"BUSY - {mode or 'BACKGROUND JOB'}", CYAN
+    if bool(state.get("writer_conflict_suspected", False)):
+        return "WARNING - CLOUD KEY MISMATCH / POSSIBLE SECOND WRITER", YELLOW
     retry_at = int(state.get("next_writer_retry_at", 0) or 0)
     if retry_at > now():
         err = str(state.get("last_cloud_error") or state.get("last_writer_error") or "")
@@ -24552,6 +24716,9 @@ def exotic_key_settings_menu(cfg):
         else:
             print(f"Next cloud read: {_exotic_menu_wait(state.get('next_cloud_check_at'))}")
         print(f"Last cloud OK:   {_exotic_menu_time(state.get('last_cloud_ok_at') or state.get('last_cloud_upload_at'))}")
+        print(f"Cloud verify:    {state.get('writer_cloud_verify_status', '-') or '-'}")
+        if state.get("writer_cloud_verify_note"):
+            print(f"Verify note:     {cut(state.get('writer_cloud_verify_note', ''), 90)}")
         print(f"Last cloud err:  {cut(state.get('last_cloud_error', ''), 90) or '-'}")
         print(f"Last writer err: {cut(state.get('last_writer_error', ''), 90) or '-'}")
         print("")
@@ -24617,7 +24784,7 @@ def exotic_key_settings_menu(cfg):
                 print(col("Writer secret saved. It becomes VERIFIED after the first successful Cloudflare PUT.", GREEN))
                 time.sleep(1.5)
         elif ch == "6":
-            raw = input(f"Reader interval seconds [{cfg.get('exotic_key_sync_interval_seconds', 3600)}]: ").strip()
+            raw = input(f"Reader interval seconds [{cfg.get('exotic_key_sync_interval_seconds', 600)}]: ").strip()
             if raw.isdigit():
                 cfg["exotic_key_sync_interval_seconds"] = max(300, int(raw))
                 save_config(cfg)
@@ -24684,10 +24851,12 @@ def exotic_key_settings_menu(cfg):
 def upgrade_known_nomo_market_loader_once(cfg):
     """Upgrade only known NOMO loader generations; preserve unrelated/custom AutoExec."""
     marker = "-- NOMO Market / GAG loader"
+    target_revision = 2
+    target_marker = f"-- NOMO Market loader revision {target_revision}"
     old_worker = "https://nomo-key.atmincosplay.workers.dev/key"
     local_key_marker = 'local sharedKeyFile = sharedFolder .. "/exotic_key.json"'
     market_remote_marker = 'atmincosplay-ship-it/nomo-market/main/nomo_obsidian.lua'
-    runtime_marker = "-- NOMO Market runtime marker v1"
+    runtime_marker_v1 = "-- NOMO Market runtime marker v1"
     changed = 0
     seen = set()
     for tab in autoexec_tabs(cfg):
@@ -24701,13 +24870,16 @@ def upgrade_known_nomo_market_loader_once(cfg):
                 old = path.read_text(encoding="utf-8", errors="ignore")
                 if marker not in old:
                     continue
-                if runtime_marker in old:
+                rev_match = re.search(r"-- NOMO Market loader revision (\d+)", old)
+                old_revision = int(rev_match.group(1)) if rev_match else 0
+                if old_revision >= target_revision and target_marker in old:
                     continue
                 known_old = old_worker in old
                 known_v481 = local_key_marker in old and market_remote_marker in old
-                if not (known_old or known_v481):
+                known_runtime = runtime_marker_v1 in old
+                if not (known_old or known_v481 or known_runtime or old_revision > 0):
                     continue
-                backup = path.with_suffix(path.suffix + ".v4813.bak")
+                backup = path.with_suffix(path.suffix + ".v4818.bak")
                 if not backup.exists():
                     shutil.copy2(path, backup)
                 tmp = path.with_suffix(path.suffix + ".tmp")
@@ -24720,6 +24892,7 @@ def upgrade_known_nomo_market_loader_once(cfg):
 
 
 MARKET_LOADER_AUTOEXEC_TEMPLATE = r'''-- NOMO Market / GAG loader
+-- NOMO Market loader revision 2
 if not game:IsLoaded() then
     game.Loaded:Wait()
 end
@@ -24833,17 +25006,26 @@ if game.PlaceId == 126884695634066 then
 
     writeStatus("LOADER_STARTED", "")
 
-    local key = readJsonToken(loginFile)
-    if key then
-        keySource = "uid_exologin"
-    end
+    -- Device-shared key is authoritative because NOMO Termux updates it first.
+    -- If a per-UID file missed a sync/write, repair it before Exotic starts.
+    local uidKey = readJsonToken(loginFile)
+    local sharedKey = readJsonToken(sharedKeyFile)
+    local key = nil
 
-    if not key then
-        key = readJsonToken(sharedKeyFile)
-        if key then
+    if sharedKey then
+        key = sharedKey
+        if uidKey and uidKey ~= sharedKey then
+            keySource = "device_shared_repair"
+            saveLoginFile(sharedKey)
+        elseif uidKey then
+            keySource = "uid_matches_device_shared"
+        else
             keySource = "device_shared_local"
-            saveLoginFile(key)
+            saveLoginFile(sharedKey)
         end
+    elseif uidKey then
+        key = uidKey
+        keySource = "uid_exologin_fallback"
     end
 
     if not key then
@@ -24906,7 +25088,7 @@ if game.PlaceId == 126884695634066 then
 
 elseif game.PlaceId == 129954712878723 then
     -- Trade World / Market
-    -- NOMO Market runtime marker v1
+    -- NOMO Market runtime marker v2
     print("trade world")
 
     local Players = game:GetService("Players")
@@ -24982,8 +25164,8 @@ elseif game.PlaceId == 129954712878723 then
         local backoffUntil = tonumber(state and state.RemoteConfigBackoffUntil) or 0
         local source = tostring(state and state.SharedConfigSource or "")
         return {
-            marker_version = 1,
-            loader_version = "V4.81.4",
+            marker_version = 2,
+            loader_version = "V4.81.8",
             market_version = tostring(marketVersion or "UNKNOWN"),
             uid = userId,
             username = tostring(player.Name or ""),
@@ -33247,7 +33429,7 @@ def _nomo_unique_backup_path(version, reason="backup"):
 
 
 def _nomo_backup_current(reason="pre_update"):
-    source = NOMO_APP_FILE if NOMO_APP_FILE.exists() else Path(__file__).resolve()
+    source = Path(__file__).resolve() if Path(__file__).resolve().exists() else NOMO_APP_FILE
     if not source.exists():
         return None
     try:
@@ -33261,14 +33443,15 @@ def _nomo_backup_current(reason="pre_update"):
 
 
 def _nomo_write_update_atomically(source_text):
-    BASE_DIR.mkdir(parents=True, exist_ok=True)
-    temp_path = BASE_DIR / ".nomo_rejoin.update.tmp.py"
+    target = Path(NOMO_APP_FILE).resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = target.parent / ".nomo_rejoin.update.tmp.py"
     try:
         temp_path.write_text(source_text, encoding="utf-8")
         os.chmod(temp_path, 0o755)
         _nomo_compile_source_file(temp_path)
-        os.replace(str(temp_path), str(NOMO_APP_FILE))
-        os.chmod(NOMO_APP_FILE, 0o755)
+        os.replace(str(temp_path), str(target))
+        os.chmod(target, 0o755)
     finally:
         try:
             if temp_path.exists():
@@ -33393,7 +33576,7 @@ def nomo_restore_backup(backup, cfg, *, restart=False, interactive=True):
         raise RuntimeError("selected file is not a valid NOMO Rejoin backup")
 
     current_backup = _nomo_backup_current("pre_rollback")
-    temp_path = BASE_DIR / ".nomo_rejoin.rollback.tmp.py"
+    temp_path = Path(NOMO_APP_FILE).resolve().parent / ".nomo_rejoin.rollback.tmp.py"
     try:
         shutil.copy2(backup, temp_path)
         _nomo_compile_source_file(temp_path)
