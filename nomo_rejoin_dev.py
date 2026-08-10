@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
-# V4.81.42 — OPTION 6 FORCE-REOPEN SEMANTICS RESTORE
+# V4.81.43 — OPTION 6 OPTION-1 ROUTE-FIRST RECOVERY
 # - Option 6 is again an explicit operator force-reopen: selected packages hard-reopen once regardless
 #   of healthy/Home/CAPTCHA/face-lock/manual-hold status, while still using exact-PID sibling safety.
 # - Market Option 6 stages the newest validated Market source first, then reopens the selected clone so
@@ -1041,7 +1041,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.42-option6-force-reopen-semantics-restore"
+__version__ = "V4.81.43-option6-option1-route-first-recovery"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -7915,19 +7915,27 @@ def manual_restart_tabs_via_queue(
     target_for_tab,
     reason,
 ):
-    """Explicit Option 6 force-reopen using the shared Option 1 recovery core.
+    """Option 6 manual recovery using the same safe route-first core as Option 1.
 
-    Operator intent wins over health/CAPTCHA/face-lock/manual-hold state.  We
-    still preserve single-flight, exact-PID sibling verification, and the
-    normal post-open Option 1 recovery chain.
+    App Cloner on this Redfinger build can collapse sibling floating tasks when
+    a *healthy* clone is PID-stopped and immediately relaunched.  Option 1 has
+    been stable because an alive target is allowed to reuse its current Roblox
+    task first, and only the shared recovery chain may escalate later if that
+    route cannot produce fresh state.
+
+    Option 6 therefore only chooses *which* package to recover.  From this point
+    onward it follows ordinary Option 1 liveness semantics:
+      ALIVE   -> one route/deep-link attempt, no PID stop
+      DEAD    -> normal exact-PID/start recovery
+      UNKNOWN -> defer, no Android action
+
+    No Option-6-only hard flags, solver bypass, API bypass, or health-recheck
+    bypass are injected here.
     """
     rt = load_runtime()
     open_queue, core = make_rejoin_core(cfg, rt)
     tabs = list(tabs or [])
 
-    # Only prevent an accidental double ENTER/click.  This is not a health or
-    # recovery cooldown: a deliberate Option 6 request after a few seconds is
-    # allowed even if the package is healthy, challenged, or manually held.
     debounce = max(0, int(cfg.get("option6_double_submit_guard_seconds", 8) or 8))
     queued_count = 0
 
@@ -7953,79 +7961,79 @@ def manual_restart_tabs_via_queue(
             continue
 
         rt_tab["last_option6_force_request_at"] = request_at
-
         target = (
             target_for_tab(tab, rt)
             if callable(target_for_tab)
             else str(target_for_tab or "market")
         )
 
-        # Option 6 is an explicit operator override.  Remove only this package's
-        # older recovery generation and ignore any solver result for the screen
-        # we are about to destroy.  Never touch sibling packages.
+        # Replace any older queued generation for this package, but do not
+        # bypass Option 1's current solver/manual/API safety state.
         core.cancel(pkg)
-        _option6_supersede_solver_job(pkg)
-        try:
-            clear_hold(pkg)
-        except Exception:
-            pass
-        try:
-            clear_manual_login_block(rt_tab)
-        except Exception:
-            pass
-        try:
-            clear_captcha_ui_runtime(rt_tab)
-        except Exception:
-            pass
-
-        # A manual force request must not be cancelled because the package is
-        # healthy or because API/solver preflight sees the old challenge.  After
-        # this one hard open, normal Option 1 post-open detection/recovery resumes.
         rt_tab["homepage_join_fail_count"] = 0
         rt_tab["homepage_hard_retries"] = 0
-        rt_tab["last_option6_recovery_chain"] = "option1_after_forced_open"
-        added, note = core.queue_hard_retry(
-            tab,
-            target,
-            reason,
-            metadata={
-                "manual_option6": True,
-                "manual_option6_force_override": True,
-                "option6_normal_recovery_chain": True,
-                "bypass_api_precheck": True,
-                "skip_solver_once": True,
-                "skip_solver_probe": True,
-                "solver_preflight_done": True,
-                "bypass_recheck": True,
-            },
-        )
+        rt_tab["last_option6_recovery_chain"] = "option1_route_first"
+
+        process_status, process_note = package_alive_status(pkg, cfg, fresh=True)
+        metadata = {
+            "manual_option6": True,
+            "option6_normal_recovery_chain": True,
+            "option6_route_first": True,
+        }
+
+        if process_status == "UNKNOWN":
+            note = "process check unavailable; Option 6 deferred"
+            if process_note:
+                note += ": " + cut(process_note, 70)
+            rt_tab["last_option6_request_result"] = "deferred_unknown"
+            rt_tab["last_option6_request_detail"] = note
+            rt_tab["note"] = note
+            print(col(f"  {short_pkg(pkg):<10} DEFERRED - process UNKNOWN", YELLOW))
+            continue
+
+        if process_status == "ALIVE":
+            # Important: use mode=route, not mode=soft.  `disable_soft_rejoin`
+            # intentionally promotes ordinary soft opens to hard, while a route
+            # is the Option-1 task-reuse path that never PID-stops first.
+            added, note = core.queue_route_retry(
+                tab,
+                target,
+                "Option 6 Option-1 route recovery",
+                metadata=metadata,
+                bypass_manual=False,
+            )
+            action = "ROUTE-FIRST QUEUED"
+        else:
+            added, note = core.queue_crash_recovery(
+                tab,
+                target,
+                "Option 6 Option-1 dead/start recovery",
+                metadata=metadata,
+            )
+            action = "DEAD/START RECOVERY QUEUED"
+
         if added:
             queued_count += 1
-            rt_tab["last_option6_request_result"] = "queued_force"
+            rt_tab["last_option6_request_result"] = "queued_option1"
             rt_tab["last_option6_request_detail"] = str(target or "")
-            print(col(
-                f"  {short_pkg(pkg):<10} FORCE REOPEN QUEUED -> {target}",
-                CYAN,
-            ))
+            print(col(f"  {short_pkg(pkg):<10} {action} -> {target}", CYAN))
         else:
             rt_tab["last_option6_request_result"] = "queue_skipped"
             rt_tab["last_option6_request_detail"] = str(note or "")
-            print(col(
-                f"  {short_pkg(pkg):<10} NO ATTEMPT - {cut(note, 60)}",
-                YELLOW,
-            ))
+            print(col(f"  {short_pkg(pkg):<10} NO ATTEMPT - {cut(note, 60)}", YELLOW))
 
     if queued_count <= 0:
         save_runtime(rt)
-        print(col("No Option 6 Android restart was queued.", YELLOW))
+        print(col("No Option 6 recovery action was queued.", YELLOW))
         return True
 
-    if not core.drain(delay_seconds=1):
+    # Use the same spacing as the normal Option 1 queue rather than the old
+    # Option-6 1-second drain loop.
+    if not core.drain(delay_seconds=cfg.get("delay_between_open", 45)):
         return False
 
     save_runtime(rt)
     return True
-
 
 def nudge_option6_routes(cfg, tabs, target_for_tab, label="tabs"):
     """V4.81.35 compatibility stub: Option 6 never emits a second App Cloner intent.
@@ -8283,11 +8291,11 @@ def _market_option6_healthy_noka(tab, cfg):
 
 
 def open_all_tabs_once(cfg, selected_packages=None):
-    """Market Option 6: stage newest source, then force-reopen selected package(s).
+    """Market Option 6: stage newest source, then use the Option 1 recovery path.
 
-    Unlike V4.81.41, a healthy Market clone is not left running.  Option 6 is
-    explicit operator intent to restart the selected Roblox package now so
-    AutoExec re-executes the current/staged Market script.
+    ALIVE targets use one non-killing route attempt first.  DEAD targets use
+    normal exact-PID/start recovery.  This intentionally avoids immediate hard
+    restarts of healthy App Cloner tasks, which can collapse sibling windows.
     """
     wanted = set(selected_packages or [])
     enabled_tabs = [
@@ -8302,13 +8310,13 @@ def open_all_tabs_once(cfg, selected_packages=None):
         return
 
     clear()
-    banner("OPTION 6: FORCE REOPEN + MARKET REFRESH", cfg)
+    banner("OPTION 6: OPTION-1 RECOVERY + MARKET REFRESH", cfg)
     print(col(
-        "Selected package(s) WILL be hard-reopened once regardless of current status.",
+        "Selected package(s) enter the same safe recovery chain used by Option 1.",
         CYAN,
     ))
     print(col(
-        "Latest Market source is staged first; then the normal Option 1 recovery chain handles Home/no-state.",
+        "ALIVE = route-first/no PID stop; DEAD = normal exact-PID start; UNKNOWN = defer.",
         DIM,
     ))
     print("")
@@ -8322,7 +8330,7 @@ def open_all_tabs_once(cfg, selected_packages=None):
     run_startup_cache_cleanup(
         cfg,
         selected_packages=[str(tab.get("package") or "") for tab in enabled_tabs],
-        reason="Option 6 Market force restart",
+        reason="Option 6 Market recovery",
         show_screen=False,
         setting_key="clear_cache_before_option6_restart",
         screen_title="OPTION 6: CACHE CLEANUP",
@@ -8334,7 +8342,7 @@ def open_all_tabs_once(cfg, selected_packages=None):
 
     print("")
     print(col(
-        "Force-reopening selected Market target(s) through the shared Option 1 recovery core.",
+        "Handing selected Market target(s) to the shared Option 1 recovery core.",
         CYAN,
     ))
 
@@ -8342,7 +8350,7 @@ def open_all_tabs_once(cfg, selected_packages=None):
         cfg,
         enabled_tabs,
         target_for_tab,
-        "manual market force restart",
+        "manual market Option 1 recovery",
     )
     verify_option6_open_results(cfg, enabled_tabs, "market tab(s)")
     pause()
