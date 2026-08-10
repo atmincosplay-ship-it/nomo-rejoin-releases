@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.18 — EXOTIC WRITER / LAST-GOOD CACHE GUARD
+# - Writer devices periodically verify the cloud key against their local authoritative key.
+#   A mismatch becomes a hard WRITER CONFLICT that blocks automatic generation/upload until
+#   a later verification matches again; explicit manual generation remains available.
+# - Writer Cloudflare READ/test now really performs a verification read even while Writer mode
+#   is active, so a resolved conflict can be cleared without generating a replacement key.
+# - Hatcher AutoExec keeps a per-UID Nomo/exotic_last_good_<UID>.lua and falls back to it when
+#   Exotic's remote auto.lua cannot be downloaded or compiled. Cache replacement happens only
+#   after the downloaded remote chunk executes successfully, so failures cannot poison it.
+#
 # V4.81.17 — TRI-STATE / ALLOWLIST / MARKET CACHE GUARD
 # - Android process liveness is tri-state (ALIVE/DEAD/UNKNOWN) in startup and
 #   watchdog decisions. A failed `ps` query is UNKNOWN and defers recovery instead
@@ -897,7 +907,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.17-tristate-allowlist-market-cache-guard"
+__version__ = "V4.81.18-exotic-writer-cache-guard"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1490,6 +1500,8 @@ DEFAULT_CONFIG = {
     "exotic_key_expiry_seconds": 86400,
     "exotic_key_refresh_buffer_seconds": 900,
     "exotic_key_writer_retry_seconds": 600,
+    "exotic_key_writer_verify_interval_seconds": 600,
+    "exotic_key_writer_verify_retry_seconds": 300,
     "exotic_key_status_warn_after_seconds": 180,
     "exotic_key_status_show_ok": False,
 
@@ -24760,6 +24772,71 @@ def _exotic_verify_published_key(cfg_snapshot, expected_key):
     return False, last_note
 
 
+def _exotic_writer_verify_job(cfg_snapshot):
+    """Periodic second-writer detector for the configured Writer device."""
+    state = load_exotic_key_state()
+    expected_key = _exotic_clean_key(state.get("key"))
+    t = now()
+    interval = max(300, int(cfg_snapshot.get("exotic_key_writer_verify_interval_seconds", 600) or 600))
+    retry = max(300, int(cfg_snapshot.get("exotic_key_writer_verify_retry_seconds", 300) or 300))
+    if not expected_key:
+        _update_exotic_key_state({
+            "writer_cloud_verify_status": "no_local_key",
+            "writer_cloud_verify_note": "no local writer key to verify",
+            "writer_cloud_verified_at": 0,
+            "next_writer_verify_at": t + retry,
+        })
+        return
+
+    cloud_key, note = _exotic_cloud_read(cfg_snapshot)
+    t = now()
+    if cloud_key == expected_key:
+        _update_exotic_key_state({
+            "last_cloud_check_at": t,
+            "last_cloud_ok_at": t,
+            "writer_cloud_verify_status": "verified",
+            "writer_cloud_verified_at": t,
+            "writer_cloud_verify_note": "",
+            "writer_conflict_suspected": False,
+            "next_writer_verify_at": t + interval,
+        }, expected_key=expected_key)
+        return
+
+    if cloud_key:
+        _update_exotic_key_state({
+            "last_cloud_check_at": t,
+            "last_cloud_ok_at": t,
+            "writer_cloud_verify_status": "conflict",
+            "writer_cloud_verified_at": 0,
+            "writer_cloud_verify_note": "cloud key differs from this writer key",
+            "writer_conflict_suspected": True,
+            "writer_conflict_detected_at": t,
+            "next_writer_verify_at": t + interval,
+        }, expected_key=expected_key)
+        log_activity(
+            "EXOTIC WRITER CONFLICT: cloud key differs; automatic writer actions blocked",
+            "", RED
+        )
+        return
+
+    backoff = (
+        max(3600, int(cfg_snapshot.get("exotic_key_rate_limit_backoff_seconds", 21600) or 21600))
+        if _exotic_rate_limited_text(note)
+        else retry
+    )
+    _update_exotic_key_state({
+        "last_cloud_check_at": t,
+        "writer_cloud_verify_status": "unavailable",
+        "writer_cloud_verified_at": 0,
+        "writer_cloud_verify_note": str(note or "cloud verification unavailable"),
+        "next_writer_verify_at": t + backoff,
+    }, expected_key=expected_key)
+    log_activity(
+        f"Exotic writer cloud verification unavailable; retry {format_age(backoff)}: {cut(note, 90)}",
+        "", YELLOW
+    )
+
+
 def _exotic_writer_job(cfg_snapshot, mode):
     t = now()
     retry = max(300, int(cfg_snapshot.get("exotic_key_writer_retry_seconds", 600) or 600))
@@ -24785,6 +24862,7 @@ def _exotic_writer_job(cfg_snapshot, mode):
                     "writer_cloud_verified_at": t if verified else 0,
                     "writer_cloud_verify_note": "" if verified else str(verify_note),
                     "writer_conflict_suspected": not verified and "differs" in str(verify_note).lower(),
+                    "next_writer_verify_at": t + max(300, int(cfg_snapshot.get("exotic_key_writer_verify_interval_seconds", 600) or 600)),
                 }
                 if verified:
                     updates["last_cloud_error"] = ""
@@ -24846,6 +24924,7 @@ def _exotic_writer_job(cfg_snapshot, mode):
             "writer_conflict_suspected": False,
             "writer_cloud_verify_status": "pending",
             "writer_cloud_verify_note": "",
+            "next_writer_verify_at": 0,
         })
         ok_local, _note, shared_count, uid_count = sync_exotic_key_to_local_workspaces(key, source="local_writer")
         log_activity(f"Exotic writer generated new key; local sync shared={shared_count} uid={uid_count}", "", GREEN if ok_local else YELLOW)
@@ -24865,6 +24944,7 @@ def _exotic_writer_job(cfg_snapshot, mode):
                 "writer_cloud_verified_at": t2 if verified else 0,
                 "writer_cloud_verify_note": "" if verified else str(verify_note),
                 "writer_conflict_suspected": not verified and "differs" in str(verify_note).lower(),
+                "next_writer_verify_at": t2 + max(300, int(cfg_snapshot.get("exotic_key_writer_verify_interval_seconds", 600) or 600)),
             }
             if verified:
                 updates["last_cloud_error"] = ""
@@ -24900,6 +24980,8 @@ def _exotic_key_job_wrapper(cfg_snapshot, mode):
     try:
         if mode == "read":
             _exotic_reader_job(cfg_snapshot)
+        elif mode == "verify":
+            _exotic_writer_verify_job(cfg_snapshot)
         else:
             _exotic_writer_job(cfg_snapshot, mode)
     except Exception as exc:
@@ -24959,13 +25041,30 @@ def exotic_key_manager_tick(cfg, force_read=False, force_generate=False):
     if writer:
         if not str(cfg.get("exotic_key_write_secret", "") or "").strip():
             return "writer_secret_missing"
+        # Manual Cloudflare READ on a Writer is a real non-mutating cloud-key verification.
+        if force_read:
+            return "writer_verify_started" if _start_exotic_key_job(cfg, "verify") else "writer_busy"
+        # Explicit manual generation is allowed to recover/take ownership deliberately.
         if force_generate:
             return "writer_started" if _start_exotic_key_job(cfg, "generate") else "writer_busy"
         retry_at = int(state.get("next_writer_retry_at", 0) or 0)
         if retry_at > t:
             return "writer_retry_wait"
+
+        verify_interval = max(300, int(cfg.get("exotic_key_writer_verify_interval_seconds", 600) or 600))
+        next_verify = int(state.get("next_writer_verify_at", 0) or 0)
+        last_verified = int(state.get("writer_cloud_verified_at", 0) or 0)
+        if local_key and next_verify <= 0:
+            next_verify = (last_verified + verify_interval) if last_verified > 0 else t
+            latest, _updated = _update_exotic_key_state({"next_writer_verify_at": next_verify}, expected_key=local_key)
+            state = latest
+        if local_key and t >= next_verify:
+            return "writer_verify_started" if _start_exotic_key_job(cfg, "verify") else "writer_busy"
+        if bool(state.get("writer_conflict_suspected", False)):
+            return "writer_conflict"
         if state.get("cloud_pending") and local_key:
             return "upload_started" if _start_exotic_key_job(cfg, "upload") else "writer_busy"
+
         refresh_at = int(state.get("refresh_at", 0) or 0)
         if not local_key or refresh_at <= 0 or t >= refresh_at:
             return "writer_started" if _start_exotic_key_job(cfg, "generate") else "writer_busy"
@@ -25088,6 +25187,7 @@ def exotic_status_note_for_username(
         "KEY_MISSING",
         "EXOTIC_DOWNLOAD_FAILED",
         "EXOTIC_COMPILE_FAILED",
+        "EXOTIC_SOURCE_UNAVAILABLE",
         "EXOTIC_RUNTIME_FAILED",
     }
     if stage in failures:
@@ -25176,7 +25276,7 @@ def _exotic_writer_readiness(cfg, state):
     if running:
         return f"BUSY - {mode or 'BACKGROUND JOB'}", CYAN
     if bool(state.get("writer_conflict_suspected", False)):
-        return "WARNING - CLOUD KEY MISMATCH / POSSIBLE SECOND WRITER", YELLOW
+        return "BLOCKED - WRITER CONFLICT / CLOUD KEY DIFFERS", RED
     retry_at = int(state.get("next_writer_retry_at", 0) or 0)
     if retry_at > now():
         err = str(state.get("last_cloud_error") or state.get("last_writer_error") or "")
@@ -25251,6 +25351,7 @@ def exotic_key_settings_menu(cfg):
         print(f"Cloud pending:   {'YES' if bool(state.get('cloud_pending', False)) else 'NO'}")
         if writer:
             print(f"Writer retry:    {_exotic_menu_wait(state.get('next_writer_retry_at'))}")
+            print(f"Next verify:     {_exotic_menu_wait(state.get('next_writer_verify_at'))}")
         else:
             print(f"Next cloud read: {_exotic_menu_wait(state.get('next_cloud_check_at'))}")
         print(f"Last cloud OK:   {_exotic_menu_time(state.get('last_cloud_ok_at') or state.get('last_cloud_upload_at'))}")
@@ -25336,6 +25437,8 @@ def exotic_key_settings_menu(cfg):
                 "reader_started": "Cloudflare READ started in background",
                 "reader_busy": "A key-manager background job is already running",
                 "writer_started": "Writer generation started (writer role takes priority over reader)",
+                "writer_verify_started": "Writer cloud-key verification READ started in background",
+                "writer_conflict": "WRITER CONFLICT: cloud key differs; automatic writer actions are blocked",
                 "writer_busy": "Writer background job already running",
                 "writer_secret_missing": "BLOCKED: writer secret missing",
             }
@@ -25493,7 +25596,7 @@ def cleanup_nomo_autoexec_backup_artifacts(cfg):
 def upgrade_known_nomo_market_loader_once(cfg):
     """Upgrade only known NOMO loader generations; preserve unrelated/custom AutoExec."""
     marker = "-- NOMO Market / GAG loader"
-    target_revision = 5
+    target_revision = 6
     target_marker = f"-- NOMO Market loader revision {target_revision}"
     old_worker = "https://nomo-key.atmincosplay.workers.dev/key"
     local_key_marker = 'local sharedKeyFile = sharedFolder .. "/exotic_key.json"'
@@ -25521,7 +25624,7 @@ def upgrade_known_nomo_market_loader_once(cfg):
                 known_runtime = runtime_marker_v1 in old
                 if not (known_old or known_v481 or known_runtime or old_revision > 0):
                     continue
-                # Never leave backup/temp scripts in AutoExec: Delta may execute
+                # Never leave backup/temp scripts in AutoExec: some executors may execute
                 # every file in this folder regardless of extension.
                 _write_nomo_autoexec_text(
                     path,
@@ -25535,7 +25638,7 @@ def upgrade_known_nomo_market_loader_once(cfg):
 
 
 MARKET_LOADER_AUTOEXEC_TEMPLATE = r'''-- NOMO Market / GAG loader
--- NOMO Market loader revision 5
+-- NOMO Market loader revision 6
 if not game:IsLoaded() then
     game.Loaded:Wait()
 end
@@ -25552,7 +25655,9 @@ if game.PlaceId == 126884695634066 then
     local sharedFolder = "Nomo"
     local sharedKeyFile = sharedFolder .. "/exotic_key.json"
     local statusFile = sharedFolder .. "/exotic_status_" .. userId .. ".json"
+    local exoticCacheFile = sharedFolder .. "/exotic_last_good_" .. userId .. ".lua"
     local keySource = ""
+    local scriptSource = "none"
 
     local function clean(value)
         if type(value) ~= "string" then
@@ -25606,6 +25711,11 @@ if game.PlaceId == 126884695634066 then
             stage = tostring(stage or "UNKNOWN"),
             ok = stage == "EXOTIC_STARTED",
             key_source = keySource,
+            exotic_source = scriptSource,
+            exotic_cache_file = exoticCacheFile,
+            exotic_cache_available = (type(isfile) == "function" and isfile(exoticCacheFile)) or false,
+            loader_build = "V4.81.18",
+            loader_revision = 6,
             error = tostring(err or ""),
         }
         pcall(function()
@@ -25681,29 +25791,108 @@ if game.PlaceId == 126884695634066 then
     writeStatus("KEY_READY", "")
     task.wait(5)
 
-    local downloadOk, sourceOrErr = pcall(function()
+    local function compileExoticSource(text)
+        if type(text) ~= "string" or #text < 20 then
+            return nil, "source missing/too small"
+        end
+        local chunk, compileErr = loadstring(text)
+        if type(chunk) ~= "function" then
+            return nil, tostring(compileErr)
+        end
+        return chunk, ""
+    end
+
+    local function readExoticCache()
+        if type(readfile) ~= "function" then
+            return nil
+        end
+        local ok, text = pcall(function()
+            if type(isfile) == "function" and not isfile(exoticCacheFile) then
+                return nil
+            end
+            return readfile(exoticCacheFile)
+        end)
+        if not ok then
+            return nil
+        end
+        local chunk = compileExoticSource(text)
+        if type(chunk) == "function" then
+            return text
+        end
+        return nil
+    end
+
+    local function saveExoticCache(text)
+        if type(writefile) ~= "function" then
+            return false
+        end
+        local chunk = compileExoticSource(text)
+        if type(chunk) ~= "function" then
+            return false
+        end
+        ensureFolder(sharedFolder)
+        return pcall(function()
+            writefile(exoticCacheFile, text)
+        end)
+    end
+
+    local selectedSource = nil
+    local selectedChunk = nil
+    local sourceErr = ""
+    local downloadOk, remoteText = pcall(function()
         return game:HttpGet("https://exotichub.app/auto.lua", true)
     end)
-    if not downloadOk or type(sourceOrErr) ~= "string" or sourceOrErr == "" then
-        writeStatus("EXOTIC_DOWNLOAD_FAILED", tostring(sourceOrErr))
-        warn("[NOMO EXOTIC] download failed:", tostring(sourceOrErr))
-        return
+    if downloadOk then
+        local remoteChunk, remoteCompileErr = compileExoticSource(remoteText)
+        if type(remoteChunk) == "function" then
+            selectedSource = remoteText
+            selectedChunk = remoteChunk
+            scriptSource = "remote"
+            writeStatus("EXOTIC_DOWNLOADED", "")
+        else
+            sourceErr = "remote compile/validation failed: " .. tostring(remoteCompileErr)
+        end
+    else
+        sourceErr = "remote download failed: " .. tostring(remoteText)
     end
-    writeStatus("EXOTIC_DOWNLOADED", "")
 
-    local chunk, compileErr = loadstring(sourceOrErr)
-    if type(chunk) ~= "function" then
-        writeStatus("EXOTIC_COMPILE_FAILED", tostring(compileErr))
-        warn("[NOMO EXOTIC] compile failed:", tostring(compileErr))
+    if not selectedChunk then
+        local cachedText = readExoticCache()
+        if cachedText then
+            local cachedChunk, cachedCompileErr = compileExoticSource(cachedText)
+            if type(cachedChunk) == "function" then
+                selectedSource = cachedText
+                selectedChunk = cachedChunk
+                scriptSource = "cache"
+                writeStatus("EXOTIC_CACHE_READY", sourceErr)
+                warn("[NOMO EXOTIC] remote unavailable/bad; using last-good cache:", sourceErr)
+            else
+                sourceErr = sourceErr .. " | cache compile failed: " .. tostring(cachedCompileErr)
+            end
+        else
+            sourceErr = sourceErr .. " | no valid last-good cache"
+        end
+    end
+
+    if type(selectedChunk) ~= "function" then
+        writeStatus("EXOTIC_SOURCE_UNAVAILABLE", sourceErr)
+        warn("[NOMO EXOTIC] no usable source:", sourceErr)
         return
     end
 
     writeStatus("EXOTIC_EXECUTING", "")
-    local runOk, runErr = pcall(chunk)
+    local runOk, runErr = pcall(selectedChunk)
     if not runOk then
         writeStatus("EXOTIC_RUNTIME_FAILED", tostring(runErr))
-        warn("[NOMO EXOTIC] runtime failed:", tostring(runErr))
+        warn("[NOMO EXOTIC] " .. tostring(scriptSource) .. " runtime failed:", tostring(runErr))
         return
+    end
+
+    -- A remote source can replace last-good only after successful execution.
+    if scriptSource == "remote" then
+        if not saveExoticCache(selectedSource) then
+            warn("[NOMO EXOTIC] remote started OK, but last-good cache write failed")
+        end
     end
     writeStatus("EXOTIC_STARTED", "")
 
@@ -25731,7 +25920,7 @@ if game.PlaceId == 126884695634066 then
 
 elseif game.PlaceId == 129954712878723 then
     -- Trade World / Market
-    -- NOMO Market runtime marker v4
+    -- NOMO Market runtime marker v5
     print("trade world")
 
     local Players = game:GetService("Players")
@@ -25810,9 +25999,10 @@ elseif game.PlaceId == 129954712878723 then
         local backoffUntil = tonumber(state and state.RemoteConfigBackoffUntil) or 0
         local source = tostring(state and state.SharedConfigSource or "")
         return {
-            marker_version = 4,
-            loader_version = "V4.81.17",
-            loader_revision = 5,
+            marker_version = 5,
+            loader_version = "V4.81.18",
+            loader_build = "V4.81.18",
+            loader_revision = 6,
             market_version = tostring(marketVersion or "UNKNOWN"),
             market_source = tostring(marketSourceName or "none"),
             market_cache_file = marketCacheFile,
