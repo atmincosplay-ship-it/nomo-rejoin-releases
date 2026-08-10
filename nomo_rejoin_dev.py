@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.5 — SOLVER FRESH COOKIE PATH
+# - Automatic pre-open solver submissions now refresh .ROBLOSECURITY directly
+#   from the target package WebView DB immediately before a real provider send.
+# - The >=10-minute provider gate is checked before cookie extraction, avoiding
+#   pointless DB copies while a package is still cooling down.
+# - A fresh package cookie is saved back to cookie_cache.json; cached cookie is
+#   used only as a fallback when live extraction is unavailable.
+# - Manual package Solver Test uses the same fresh-cookie helper, eliminating the
+#   old mismatch where manual BlockSolve tests worked but automatic pre-open sent
+#   an older cached cookie.
+# - Solver runtime records cookie source/refresh note only; cookie contents remain
+#   secret and are never logged.
+#
 # V4.81.4 — MARKET RUNTIME MARKER
 # - Market AutoExec now writes Nomo/market_runtime_<UID>.json per account.
 # - Marker records the exact downloaded Market version, load result, JobId,
@@ -804,7 +817,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.4-market-runtime-marker"
+__version__ = "V4.81.5-solver-fresh-cookie"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -11356,6 +11369,34 @@ def refresh_cached_cookie_for_package(pkg):
     except Exception as exc:
         return cookie, f"cookie refreshed but cache save failed: {exc}"
     return cookie, "cookie refreshed"
+
+
+def solver_cookie_for_package(pkg, cfg=None):
+    """Return the freshest available package cookie for a provider submission.
+
+    Live WebView extraction is authoritative because Roblox may rotate the package
+    session while NOMO's cookie_cache.json still contains an older token. The cache
+    is only a fallback when live extraction is temporarily unavailable.
+    """
+    pkg = str(pkg or "").strip()
+    if not pkg:
+        return "", "none", "no package"
+
+    fresh, note = refresh_cached_cookie_for_package(pkg)
+    fresh = str(fresh or "").strip()
+    if fresh:
+        return fresh, "fresh_db", str(note or "cookie refreshed")
+
+    cached = str(cached_cookie_for_package(pkg) or "").strip()
+    if cached:
+        return cached, "cache_fallback", str(note or "live extraction unavailable")
+
+    # Last compatibility fallback for packages that have never populated NOMO's
+    # cache. ensure_cookie_for_package may extract and cache a cookie itself.
+    ensured = str(ensure_cookie_for_package(pkg, cfg) or "").strip()
+    if ensured:
+        return ensured, "ensure_fallback", str(note or "cookie ensured")
+    return "", "none", str(note or "package cookie unavailable")
 
 
 def roblox_cookie_detection(cookie):
@@ -28664,28 +28705,40 @@ def start_solver_job(tab, cfg, rt, rt_tab, reason, force=False, phase="solve", o
         left = max(1, cooldown - (now() - last_attempt))
         return False, f"solver retry in {format_age(left)}"
 
-    cookie = cached_cookie_for_package(pkg) or ensure_cookie_for_package(pkg, cfg)
+    # V4.81.3/5: check the hard provider gate before touching the package cookie
+    # DB. A cooldown-only rejoin can continue without doing a root DB copy.
+    provider_left = solver_provider_cooldown_left(rt_tab, cfg)
+    if provider_left > 0:
+        return False, f"provider cooldown {format_age(provider_left)}"
+
+    # V4.81.5: a live package cookie is authoritative. The previous automatic
+    # path preferred cookie_cache.json, while Manual Solver Test read the package
+    # DB directly. Providers such as BlockSolve can reject that older cached token
+    # even while the package itself has already rotated to a newer valid cookie.
+    cookie, cookie_source, cookie_note = solver_cookie_for_package(pkg, cfg)
+    rt_tab["solver_cookie_source"] = cookie_source
+    rt_tab["solver_cookie_refresh_note"] = cut(cookie_note, 120)
+    rt_tab["solver_cookie_refreshed_at"] = now() if cookie_source == "fresh_db" else 0
     if not cookie:
         return False, "solver: no package cookie"
+    if cookie_source != "fresh_db":
+        log_activity(
+            f"solver cookie live refresh unavailable; using {cookie_source}: {cut(cookie_note, 65)}",
+            pkg,
+            YELLOW,
+        )
+
     api_hit, api_detail = roblox_cookie_detection(cookie)
     if cfg.get("solver_require_cookie_precheck", True) and api_hit is None:
         if "invalid/expired" in str(api_detail).lower():
             return False, "solver: package cookie invalid/expired"
-        # V4.58: an API timeout/unavailable response is not proof that the
-        # package cookie is bad. The user's rule is one provider request per
-        # actual rejoin, so continue with the locally extracted cookie.
+        # An API timeout/unavailable response is not proof that the cookie is bad.
+        # Continue with the freshly extracted package cookie when available.
         log_activity(
             f"solver cookie precheck unavailable; provider send continues: {cut(api_detail, 60)}",
             pkg,
             YELLOW,
         )
-
-    # V4.81.3: force=True means "run the pre-open solver path now"; it must never
-    # mean "ignore the provider's minimum interval". This is package-local, so a
-    # recent NokaA request never blocks NokaB.
-    provider_left = solver_provider_cooldown_left(rt_tab, cfg)
-    if provider_left > 0:
-        return False, f"provider cooldown {format_age(provider_left)}"
 
     place_id = solver_place_id_for_tab(tab, cfg)
     timeout = max(15, int(cfg.get("solver_timeout_seconds", 180) or 180))
@@ -28710,6 +28763,7 @@ def start_solver_job(tab, cfg, rt, rt_tab, reason, force=False, phase="solve", o
         "done": False,
         "ok": False,
         "provider_probed": True,
+        "cookie_source": cookie_source,
         "response": None,
     }
     with _SOLVER_LOCK:
@@ -28734,7 +28788,7 @@ def start_solver_job(tab, cfg, rt, rt_tab, reason, force=False, phase="solve", o
         else ""
     )
     log_activity(
-        f"{prefix}{generation_note}: {cut(job['reason'], 60)}",
+        f"{prefix}{generation_note}: {cut(job['reason'], 60)} | cookie={cookie_source}",
         pkg,
         CYAN,
     )
@@ -30528,11 +30582,14 @@ def solver_menu(cfg):
             if not selected:
                 continue
             pkg = selected[0]
-            cookie = get_cookie_from_package(pkg)
+            cookie, cookie_source, cookie_note = solver_cookie_for_package(pkg, cfg)
             if not cookie:
                 print(col(f"No cookie found for {pkg}. Run Option 7 -> 1 first.", RED))
+                if cookie_note:
+                    print(col(f"Cookie refresh: {cut(cookie_note, 100)}", DIM))
                 pause()
                 continue
+            print(col(f"Cookie source: {cookie_source} ({cut(cookie_note, 80)})", DIM))
 
             place_id = cfg.get("solver_place_id", "126884695634066")
             for tab in cfg.get("tabs", []):
