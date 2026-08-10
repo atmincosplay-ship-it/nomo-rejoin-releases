@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
-# V4.81.28 — RECOVERY RECHECK / UI SNAPSHOT GUARD
+# V4.81.29 — SESSION RUNTIME TRUTH GUARD
 # - Bubble-only classification no longer trusts dumpsys window visibility. Only a confirmed
 #   NO_ACTIVITY result can fast-track the special bubble recovery; window dumps remain status-only.
 # - Speculative alive-old-state / alive-no-state / bubble hard recoveries are rechecked immediately
@@ -961,7 +961,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.28-recovery-recheck-ui-snapshot-guard"
+__version__ = "V4.81.29-session-runtime-truth-guard"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -5765,18 +5765,51 @@ def cleanup_orphan_state_files(tab, cfg):
     return deleted
 
 
-def update_clone_session(rt_tab, status, cfg):
-    """Track per-clone session uptime."""
-    s = str(status or "").lower()
-    active = s in ("ingame", "online")
-    resetting = s in ("queued", "loading", "offline", "stale", "kicked", "no state")
+def update_clone_session(rt_tab, status, cfg, state=None):
+    """Track the *current Roblox session* runtime, not the NOMO process lifetime.
 
-    cur = int(rt_tab.get("session_start", 0) or 0)
-    if active:
-        if cur <= 0:
-            rt_tab["session_start"] = now()
-    elif resetting:
+    Prefer the state writer's own timestamp/script_uptime pair because it survives
+    Termux/NOMO restarts and naturally resets when AutoExec starts in a new Roblox
+    session.  job_id is retained as the session identity/fallback.  Any non-active
+    dashboard state hides/resets the displayed runtime so Home/Captcha/Queued cannot
+    carry an old server's timer forward.
+    """
+    s = str(status or "").strip().lower()
+    active = s in ("ingame", "online", "ready", "booster")
+
+    if not active:
         rt_tab["session_start"] = 0
+        rt_tab["session_job_id"] = ""
+        return 0
+
+    state = state if isinstance(state, dict) else {}
+    state_job = str(state.get("job_id") or "").strip()
+    state_ts = int(state.get("ts", 0) or 0)
+    script_uptime = int(state.get("script_uptime", 0) or 0)
+    current_job = str(rt_tab.get("session_job_id") or "").strip()
+    cur = int(rt_tab.get("session_start", 0) or 0)
+
+    # Best source: the Lua writer tells us how long *this* execution has run.
+    # Reconstruct an absolute start so NOMO restarts do not reset RunTime.
+    estimated_start = 0
+    if state_ts > 0 and script_uptime >= 0:
+        estimated_start = max(1, state_ts - max(0, script_uptime))
+
+    if state_job and state_job != current_job:
+        rt_tab["session_job_id"] = state_job
+        rt_tab["session_start"] = estimated_start or now()
+    elif estimated_start > 0:
+        # Keep the display anchored to the state writer.  A meaningful jump means
+        # AutoExec restarted even if Roblox happened to keep the same JobId.
+        if cur <= 0 or abs(cur - estimated_start) > 30:
+            rt_tab["session_start"] = estimated_start
+        if state_job:
+            rt_tab["session_job_id"] = state_job
+    elif cur <= 0:
+        rt_tab["session_start"] = now()
+        if state_job:
+            rt_tab["session_job_id"] = state_job
+
     return int(rt_tab.get("session_start", 0) or 0)
 
 
@@ -15130,7 +15163,7 @@ def _nomo_start_market_rejoin_original(cfg):
                 status = "Manual"
                 note = rt_tab.get("manual_login_reason") or rt_tab.get("note") or "needs manual login"
 
-            update_clone_session(rt_tab, status, cfg)
+            update_clone_session(rt_tab, status, cfg, state)
 
             rows.append({
                 "user": user,
@@ -18818,7 +18851,7 @@ def start_hatcher_reporter(main_cfg=None):
                 if ("FAILED" in exotic_note or "KEY_MISSING" in exotic_note or "KEY MISSING" in exotic_note):
                     status = "Exotic fail"
 
-            update_clone_session(rt_tab, status, cfg)
+            update_clone_session(rt_tab, status, cfg, state)
             rows.append({
                 "user": display_user,
                 "pkg": pkg,
@@ -19794,7 +19827,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                 status = "Manual"
                 note = rt_tab.get("manual_login_reason") or rt_tab.get("note") or "needs manual login"
 
-            update_clone_session(rt_tab, status, cfg)
+            update_clone_session(rt_tab, status, cfg, state)
             rows.append({
                 "user": display_user,
                 "pkg": pkg,
