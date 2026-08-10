@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.33 — LAST-SECOND / SHELL / REJOIN-ONLY DURABILITY GUARD
+# - The final pre-stop healed check is tri-state too: a second Android `ps` failure defers the
+#   queued hard recovery instead of falling through to an exact-PID stop.
+# - The legacy `shell()` helper now has a hard timeout, so cache cleanup / package-list commands
+#   cannot freeze the entire NOMO loop forever if `su`, PackageManager, or `find` wedges.
+# - Rejoin Only runtime uses the same protected JSON + last-good recovery used by critical local
+#   state. Corruption no longer silently resets its cooldown/open history.
+#
 # V4.81.32 — FINAL ROUTING TRI-STATE GUARD
 # - Final open_target routing preserves ALIVE/DEAD/UNKNOWN; UNKNOWN emits no stop/open.
 # - Home/no-state retry escalation defers on UNKNOWN instead of jumping toward hard recovery.
@@ -969,7 +977,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.32-final-routing-tristate-guard"
+__version__ = "V4.81.33-lastsecond-shell-rejoinonly-durability-guard"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -3723,23 +3731,15 @@ def workspace_sync_screen(cfg, reason, msg=""):
 
 
 def shell(cmd, cfg, capture=True):
-    if cfg.get("use_su", True):
-        cmd = "su -c " + shlex.quote(cmd)
+    """Compatibility shell helper with a bounded wait.
 
-    p = subprocess.run(
-        cmd,
-        shell=True,
-        text=True,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
-        stderr=subprocess.STDOUT if capture else subprocess.DEVNULL
-    )
-
-    out = ""
-    if capture and p.stdout:
-        out = p.stdout.strip()
-
-    return p.returncode, out
+    V4.81.33: the old helper had no timeout.  It is used by package discovery
+    and cache cleanup, so one wedged root/PackageManager command could freeze
+    the whole watchdog.  Keep the existing call sites but route them through
+    shell_timeout() with a conservative default.
+    """
+    timeout = max(5, int((cfg or {}).get("shell_default_timeout_seconds", 30) or 30))
+    return shell_timeout(cmd, cfg, capture=capture, timeout=timeout)
 
 
 def shell_timeout(cmd, cfg, capture=True, timeout=None):
@@ -14295,7 +14295,22 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
         )
         if queued_at > 0 and (now() - queued_at) >= min_age:
             stale_s = int(cfg.get("state_stale_seconds", 180) or 180)
-            if package_alive(pkg, cfg, fresh=True) and state_recent_enough_for_alive(tab, cfg, seconds=stale_s):
+            # V4.81.33: do not collapse a *second* process-query failure to False
+            # here.  The clone may have healed while queued; UNKNOWN means we do
+            # not have permission to make a destructive decision this cycle.
+            healed_status, healed_note = package_alive_status(pkg, cfg, fresh=True)
+            if healed_status == "UNKNOWN":
+                core.requeue_front(item)
+                rt_tab["note"] = "open recheck deferred: process check unavailable"
+                log_activity(
+                    "open recheck UNKNOWN; hard recovery deferred (no PID stop/open): "
+                    + cut(healed_note, 70),
+                    pkg,
+                    YELLOW,
+                )
+                core.save()
+                return True
+            if healed_status == "ALIVE" and state_recent_enough_for_alive(tab, cfg, seconds=stale_s):
                 rt_tab["note"] = "healed - open cancelled"
                 log_activity("open cancelled: healed while queued", pkg, GREEN)
                 core.save()
@@ -36809,24 +36824,19 @@ REJOIN_ONLY_RUNTIME_FILE = BASE_DIR / "rejoin_only_runtime.json"
 
 
 def _rejoin_only_load_runtime():
-    try:
-        if REJOIN_ONLY_RUNTIME_FILE.exists():
-            data = json.loads(REJOIN_ONLY_RUNTIME_FILE.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                return data
-    except Exception:
-        pass
-    return {}
+    """Load Rejoin Only bookkeeping with last-good recovery.
+
+    This file controls dead-confirm/open cooldown history.  Treating malformed
+    JSON as a brand-new empty runtime can cause an unnecessary reopen burst after
+    a restart, so use the same protected standalone-JSON mechanism as solver/key
+    state.
+    """
+    data = _protected_json_read_dict(REJOIN_ONLY_RUNTIME_FILE, {})
+    return dict(data) if isinstance(data, dict) else {}
 
 
 def _rejoin_only_save_runtime(runtime):
-    try:
-        BASE_DIR.mkdir(parents=True, exist_ok=True)
-        temp = REJOIN_ONLY_RUNTIME_FILE.with_suffix(".json.tmp")
-        temp.write_text(json.dumps(runtime, indent=2), encoding="utf-8")
-        os.replace(str(temp), str(REJOIN_ONLY_RUNTIME_FILE))
-    except Exception:
-        pass
+    return _protected_json_write_dict(REJOIN_ONLY_RUNTIME_FILE, dict(runtime or {}))
 
 
 def _rejoin_only_link(tab, cfg):
