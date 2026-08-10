@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
-# V4.81.30 — BACKEND TRUTH / TRI-STATE / APP-CLONER RELAUNCH GUARD
+# V4.81.31 — APP-CLONER LAUNCHER SAFETY / TRI-STATE COMPLETION
 # - Cloudflare Hatcher reporter refuses stale/invalid/challenge/Home-hidden-heartbeat state as an online update; last-good backend records are preserved instead.
 # - Rejoin Only uses ALIVE/DEAD/UNKNOWN process state, including the last-second action recheck, so Android ps failures never become crash opens.
 # - Noka/App Cloner packages skip rapid second soft intents and Delta cold-start launcher/second-deeplink tricks; normal later retry paths remain.
@@ -966,7 +966,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.30-backend-truth-tristate-appcloner-guard"
+__version__ = "V4.81.31-appcloner-launcher-safety-tristate-completion"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -5143,6 +5143,7 @@ def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop
     if (
         not soft
         and allow_launcher_fallback
+        and not _is_noka_clone_package(pkg)
         and cfg.get("fallback_launcher_after_hard_open_fail", False)
     ):
         log_activity(f"deep-link open failed, trying launcher: {cut(out, 60)}", pkg, YELLOW)
@@ -7915,16 +7916,19 @@ def verify_option6_open_results(cfg, tabs, label="tabs"):
         if not pkg:
             continue
 
-        alive = package_alive(pkg, cfg, fresh=True)
+        proc_status, proc_note = package_alive_status(pkg, cfg, fresh=True)
+        alive = proc_status == "ALIVE"
         visible, visible_note = package_visible_window(pkg, cfg)
 
-        if alive and visible is False:
-            print(f"  {short_pkg(pkg):<10} {col('PID alive, window hidden; nudging launcher', YELLOW)}")
-            open_package_launcher(pkg, cfg)
-            wait_seconds(2, {})
-            _WINDOW_DUMP_CACHE["ts"] = 0
-            alive = package_alive(pkg, cfg, fresh=True)
-            visible, visible_note = package_visible_window(pkg, cfg)
+        # V4.81.31: verification is read-only. Never launcher/monkey-nudge a
+        # hidden Noka/App Cloner task here; that action was proven capable of
+        # disturbing sibling floating clones. UNKNOWN also stays UNKNOWN.
+        if proc_status == "UNKNOWN":
+            note = "PID UNKNOWN"
+            color = YELLOW
+            extra = f" ({cut(proc_note, 48)})"
+            print(f"  {short_pkg(pkg):<10} {col(note + extra, color)}")
+            continue
 
         if alive and visible is False:
             note = "NOT VISIBLE"
@@ -12342,9 +12346,21 @@ def maybe_open_manual_auth_package(tab, cfg, rt_tab, reason="manual auth"):
     if last > 0 and now() - last < cooldown:
         return False, f"manual auth open cooldown {format_age(cooldown - (now() - last))}"
 
-    if package_alive(pkg, cfg, fresh=True):
+    proc_status, proc_note = package_alive_status(pkg, cfg, fresh=True)
+    if proc_status == "ALIVE":
         rt_tab["manual_auth_last_open_at"] = now()
-        return False, "package already visible/alive"
+        return False, "package already alive"
+    if proc_status == "UNKNOWN":
+        rt_tab["manual_auth_last_open_note"] = "process unknown: " + str(proc_note or "")
+        return False, "process check unavailable; manual-auth launcher deferred"
+    if _is_noka_clone_package(pkg):
+        # Human auth is already required. Do not automatically materialize a
+        # Noka launcher and risk sibling floating tasks; let the user open the
+        # affected clone explicitly.
+        rt_tab["manual_auth_last_open_at"] = now()
+        rt_tab["manual_auth_last_open_note"] = "Noka launcher auto-open suppressed"
+        log_activity(f"manual auth hold; Noka launcher auto-open suppressed: {cut(reason, 70)}", pkg, YELLOW)
+        return False, "manual login needed; open affected Noka clone manually"
 
     ok, note = open_package_launcher(pkg, cfg)
     rt_tab["manual_auth_last_open_at"] = now()
@@ -36827,7 +36843,10 @@ def _rejoin_only_open(tab, cfg, reason, hard=True):
     if not link:
         return False, "no rejoin link"
 
-    alive_now = bool(package_alive(pkg, cfg, fresh=True))
+    proc_status, proc_note = package_alive_status(pkg, cfg, fresh=True)
+    if proc_status == "UNKNOWN":
+        return False, "process check unavailable; Rejoin Only open deferred: " + cut(proc_note, 70)
+    alive_now = proc_status == "ALIVE"
     low_reason = str(reason or "").lower()
     manual_force = any(token in low_reason for token in (
         "manual force", "force restart", "manual restart",
