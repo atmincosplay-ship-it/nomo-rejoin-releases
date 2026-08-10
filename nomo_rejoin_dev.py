@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.39 — NOKA DELTA FOREGROUND / COOKIE RACE GUARD
+# - Delta-key panel capture never launcher-foregrounds a Noka/App Cloner package. It only
+#   operates when that clone is already visibly present in its saved floating layout; hidden/
+#   ambiguous Noka windows are deferred instead of using `am start -n` on the launcher.
+# - Delta-key capture preserves ALIVE/DEAD/UNKNOWN. UNKNOWN never becomes an auto-open, and an
+#   already-ALIVE clone is never hard-restarted merely because the key panel was not captured.
+# - Core WebView cookie extraction uses a package/process/thread/nonce-specific temporary SQLite
+#   copy, so concurrent reads of the same clone cannot overwrite/delete each other's temp DB.
+#
 # V4.81.38 — FINAL PID TRUTH CLEANUP
 # - Booster Hatcher startup preserves ALIVE/DEAD/UNKNOWN; an unavailable Android ps check
 #   defers startup instead of queueing a recovery as though the clone were dead.
@@ -1014,7 +1023,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.38-final-pid-truth-cleanup"
+__version__ = "V4.81.39-noka-delta-foreground-cookie-guard"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -20426,10 +20435,16 @@ def get_cookie_from_package(package):
     """Extract .ROBLOSECURITY from package's WebView cookie DB."""
     db_src = f"/data/data/{package}/app_webview/Default/Cookies"
     safe_pkg = re.sub(r"[^A-Za-z0-9_.-]", "_", package)
-    db_dst = f"/sdcard/Download/tmp_cookie_{safe_pkg}_{os.getpid()}.db"
+    # V4.81.39: this helper is used by normal health/solver/cookie paths. Package+PID
+    # alone is not unique when two threads read the same clone concurrently. Give every
+    # extraction its own copy so one caller cannot delete another caller's SQLite DB.
+    db_dst = (
+        f"/sdcard/Download/tmp_cookie_{safe_pkg}_{os.getpid()}_"
+        f"{threading.get_ident()}_{time.time_ns()}.db"
+    )
     try:
         ret = subprocess.run(
-            ["su", "-c", f"cp {db_src} {db_dst}"],
+            ["su", "-c", f"cp {shlex.quote(db_src)} {shlex.quote(db_dst)}"],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -37691,6 +37706,27 @@ def delta_key_resolve_activity(package, cfg):
 
 
 def delta_key_bring_package_front(package, cfg):
+    package = str(package or "").strip()
+    if not package:
+        return False, "no package"
+
+    # V4.81.39: never launcher-foreground a Noka/App Cloner package. We already
+    # proved that `am start -n <launcher>`/materialization can disturb sibling
+    # floating clone tasks. The key-panel flow uses a saved on-screen rectangle,
+    # so it is safe to continue only when that Noka window is already visible.
+    if _is_noka_clone_package(package):
+        process_status, process_note = package_alive_status(package, cfg, fresh=True)
+        if process_status == "UNKNOWN":
+            return False, "process check unavailable; Noka foreground deferred: " + cut(process_note, 60)
+        if process_status != "ALIVE":
+            return False, "Noka clone is not running"
+        visible, visible_note = package_visible_window(package, cfg)
+        if visible is True:
+            return True, "Noka window already visible; launcher foreground suppressed"
+        if visible is None:
+            return False, "Noka window check unavailable; launcher foreground suppressed"
+        return False, "Noka window not visible; launcher foreground suppressed"
+
     activity = delta_key_resolve_activity(package, cfg)
     if not activity:
         return False, "launcher activity unavailable"
@@ -38557,17 +38593,22 @@ def delta_key_capture_new_ticket(
                 say("Visual template bootstrap warning: " + template_note, YELLOW)
         return True, "captured", auth_url
 
-    # Preserve the fast path: when the clone is already running with the panel
-    # visible, capture immediately without restarting it.
-    if package_alive(package, cfg, fresh=True):
+    # Preserve the fast path only when process liveness is authoritative. UNKNOWN
+    # must never turn into an automatic open, and an already-ALIVE clone is not
+    # hard-restarted merely because its key panel is not currently capturable.
+    process_status, process_note = package_alive_status(package, cfg, fresh=True)
+    if process_status == "ALIVE":
         say("Checking the currently open clone for the expired panel...", CYAN)
         captured, note, auth_url = try_copy_link()
-    else:
+    elif process_status == "DEAD":
         captured, note, auth_url = False, "clone is not running", ""
+    else:
+        captured, note, auth_url = False, "process check unavailable: " + cut(process_note, 70), ""
 
-    # Manual runs may open the selected clone and wait. Automatic expiry runs
-    # pass auto_open=False and only inspect clones the normal rejoin loop opened.
-    if not captured and auto_open:
+    # Manual runs may cold-open only a clone that is authoritatively DEAD. An
+    # ALIVE clone with an unavailable/hidden panel is left untouched; automatic
+    # expiry runs already pass auto_open=False.
+    if not captured and auto_open and process_status == "DEAD":
         say("Opening the selected Delta clone and waiting for its key panel...", CYAN)
         opened, open_note = delta_key_open_selected_clone(package, cfg)
         if not opened:
@@ -38604,11 +38645,20 @@ def delta_key_capture_new_ticket(
 
     if not captured:
         delta_key_close_browser(browser_package, cfg)
-        delta_key_bring_package_front(package, cfg)
-        return False, (
-            f"expired Delta panel did not become active after {attempt_count} "
-            f"attempt(s); last={note}"
-        ), {
+        # Do not use a launcher action as cleanup for Noka. Non-Noka keeps the
+        # historical best-effort foreground behavior.
+        if not _is_noka_clone_package(package):
+            delta_key_bring_package_front(package, cfg)
+        if process_status == "UNKNOWN":
+            failure_note = "Delta capture deferred; process check unavailable"
+        elif process_status == "ALIVE" and auto_open:
+            failure_note = "Delta panel unavailable on live clone; automatic restart suppressed"
+        else:
+            failure_note = (
+                f"expired Delta panel did not become active after {attempt_count} "
+                f"attempt(s); last={note}"
+            )
+        return False, failure_note, {
             "package": package,
             "uid": uid,
             "rect": rect,
