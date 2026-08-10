@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
-# V4.81.25 — CAPTCHA STRICT VISUAL + BUBBLE ROUTE NUDGE GUARD
+# V4.81.26 — NO ROUTE NUDGE SAFETY HOTFIX
 # - Tightens automatic screenshot-only CAPTCHA detection: a generic white Roblox/Home panel plus a
 #   green avatar/game icon is no longer enough. Color-only CAPTCHA now requires a near-white challenge
 #   panel and a centered green-button signal before confirmations can start the provider.
@@ -943,7 +943,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.25-visible-home-heartbeat-guard"
+__version__ = "V4.81.26-no-route-nudge-safety"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1859,7 +1859,7 @@ DEFAULT_CONFIG = {
     # V4.81.23: after a bubble-only hard bootstrap, Roblox can materialize at Home
     # before consuming the original VIEW deep link. Send the same Hatcher link once
     # more in-place after a short delay if no fresh state has appeared.
-    "bubble_rescue_second_intent_enabled": True,
+    "bubble_rescue_second_intent_enabled": False,
     "bubble_rescue_second_intent_delay_seconds": 6,
     "bubble_rescue_route_nudge_first_seconds": 15,
     "bubble_rescue_route_nudge_second_seconds": 45,
@@ -3144,7 +3144,7 @@ def apply_update_migrations(cfg):
     if _int_cfg(cfg.get("prewarm_closed_clone_wait_seconds"), 0) <= 0:
         set_cfg("prewarm_closed_clone_wait_seconds", 2)
     if "bubble_rescue_second_intent_enabled" not in cfg:
-        set_cfg("bubble_rescue_second_intent_enabled", True)
+        set_cfg("bubble_rescue_second_intent_enabled", False)
     if _int_cfg(cfg.get("bubble_rescue_second_intent_delay_seconds"), 0) <= 0:
         set_cfg("bubble_rescue_second_intent_delay_seconds", 6)
     if _int_cfg(cfg.get("bubble_rescue_route_nudge_first_seconds"), 0) < 10:
@@ -14266,97 +14266,18 @@ def market_booster_second_soft_intent(
 
 
 def hatcher_bubble_second_private_intent(tab, rt_tab, cfg, rt, target, reason, first_opened_at, core=None):
-    """Send two delayed in-place Hatcher route nudges after a bubble-only bootstrap."""
-    if core is None:
-        core = RejoinCore([], cfg, rt)
-    if not cfg.get("bubble_rescue_second_intent_enabled", True):
-        return int(first_opened_at), "route nudges disabled"
+    """V4.81.26 safety: never relaunch an App Cloner package as a bubble-route nudge.
 
-    package = str((tab or {}).get("package", "") or "")
-    first_at = max(10, int(cfg.get("bubble_rescue_route_nudge_first_seconds", 15) or 15))
-    second_at = max(first_at + 10, int(cfg.get("bubble_rescue_route_nudge_second_seconds", 45) or 45))
-    schedule = [first_at, second_at]
-    elapsed = 0
-    last_sent_at = int(first_opened_at)
-    sent_count = 0
-
-    for nudge_index, target_elapsed in enumerate(schedule, 1):
-        wait_for = max(0, target_elapsed - elapsed)
-        for _ in range(wait_for):
-            if stop_requested():
-                return last_sent_at, "stop"
-            fresh, _state, _err = state_fresh_after_open(tab, cfg, first_opened_at)
-            home_visible = android_roblox_home_ui_detail(package, cfg, force=False) if fresh else None
-            if fresh and not home_visible:
-                return last_sent_at, ("first intent already fresh" if sent_count == 0 else f"fresh after route nudge {sent_count}")
-            if fresh and home_visible:
-                rt_tab["note"] = "Roblox Home visible; hidden heartbeat ignored during bubble rescue"
-            if not wait_seconds(1, rt):
-                return last_sent_at, "stop"
-        elapsed = target_elapsed
-
-        fresh, _state, _err = state_fresh_after_open(tab, cfg, first_opened_at)
-        home_visible = android_roblox_home_ui_detail(package, cfg, force=True) if fresh else None
-        if fresh and not home_visible:
-            return last_sent_at, ("first intent already fresh" if sent_count == 0 else f"fresh after route nudge {sent_count}")
-        if fresh and home_visible:
-            log_activity(
-                f"bubble rescue sees Roblox Home despite fresh hidden heartbeat; continuing route nudge {nudge_index}/2",
-                package, YELLOW,
-            )
-
-        process_status, _process_note = package_alive_status(package, cfg, fresh=True)
-        if process_status != "ALIVE":
-            return last_sent_at, f"route nudge skipped: {process_status.lower()}"
-
-        link = target_link(tab, cfg, target, rt_tab, rt)
-        if not link:
-            return last_sent_at, "route nudge skipped: no Hatcher link"
-
-        log_activity(
-            f"bubble rescue still has no fresh state; sending Hatcher route nudge {nudge_index}/2 in-place",
-            package,
-            YELLOW,
-        )
-        rt_tab["bubble_rescue_route_nudge_count"] = nudge_index
-        rt_tab["note"] = f"bubble rescue route nudge {nudge_index}/2"
-        core.save()
-
-        ok, note = open_roblox(
-            package,
-            link,
-            cfg,
-            soft=True,
-            rt_tab=rt_tab,
-            reason=f"bubble rescue Hatcher route nudge {nudge_index}",
-            require_stop=False,
-            skip_force_stop=True,
-        )
-        sent_at = now()
-        rt_tab[f"bubble_rescue_route_nudge_{nudge_index}_ok"] = bool(ok)
-        rt_tab[f"bubble_rescue_route_nudge_{nudge_index}_at"] = sent_at
-        rt_tab[f"bubble_rescue_route_nudge_{nudge_index}_note"] = str(note or "")
-        if not ok:
-            log_activity(
-                f"bubble rescue Hatcher route nudge {nudge_index}/2 failed: {cut(note, 70)}",
-                package,
-                RED,
-            )
-            core.save()
-            continue
-
-        sent_count += 1
-        last_sent_at = sent_at
-        rt_tab["last_open"] = sent_at
-        log_activity(
-            f"bubble rescue Hatcher route nudge {nudge_index}/2 sent in-place",
-            package,
-            GREEN,
-        )
-        core.save()
-
-    return last_sent_at, f"sent {sent_count} bubble route nudge(s)"
-
+    Repeated in-place ``am start`` intents can disturb sibling floating clone tasks on
+    some App Cloner/Redfinger builds even though no sibling PID is signalled.  Bubble
+    recovery therefore performs only the one normal target-only recovery/open.  Any
+    later Home-page routing is left to the ordinary recovery cycle, which preserves
+    the existing per-package cooldown/sibling safety gates.
+    """
+    if rt_tab is not None:
+        rt_tab["bubble_rescue_route_nudges_disabled"] = True
+        rt_tab["bubble_rescue_route_nudge_count"] = 0
+    return int(first_opened_at), "automatic bubble route nudges disabled for App Cloner safety"
 
 def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_hard, cfg, rt, core=None):
     """The actual target-only open -> wait-for-fresh cycle for one package."""
