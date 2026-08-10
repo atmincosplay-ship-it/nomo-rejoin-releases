@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.21 — BUBBLE-ONLY HOME RESCUE
+# - Detects the App Cloner/Noka edge case where the clone process/floating bubble is still alive
+#   but Android has no live ActivityRecord for that package after its floating window was closed.
+# - Before an exact-PID hard open of that shell-only target, NOMO materializes that clone's launcher
+#   once, then performs the existing exact-package PID stop and sends the intended game/private link.
+# - Normal visible/in-game clone activities skip this prewarm path; UNKNOWN activity queries fail safe.
+# - No sibling kill, no floating-button cleanup, no am force-stop/killall/pkill, and solver behavior unchanged.
+#
 # V4.81.20 — COOKIE + LUA CACHE DURABILITY
 # - cookie_cache.json now uses lock-protected read/merge/write + last-good recovery, so concurrent
 #   solver/private-server/cookie-tool updates cannot erase another package's cached cookie.
@@ -920,7 +928,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.20-cookie-lua-cache-durability"
+__version__ = "V4.81.21-bubble-only-home-rescue"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1826,6 +1834,10 @@ DEFAULT_CONFIG = {
     # For selected-package hard opens, materialize that task once, exact-PID stop
     # it, then send the intended deep link.
     "prewarm_closed_clone_before_hard_open": True,
+    # V4.81.21: a manually-X-closed Noka window may leave only the floating
+    # clone shell/service alive. If there is no live ActivityRecord, materialize
+    # the target launcher once before the normal exact-PID hard stop.
+    "prewarm_shell_only_clone_before_hard_open": True,
     "prewarm_closed_clone_wait_seconds": 2,
 
     # Pool-wide stagger: minimum seconds between any two hard opens across ALL
@@ -3103,6 +3115,8 @@ def apply_update_migrations(cfg):
         set_cfg("alive_recovery_soft_timeout_seconds", 90)
     if "prewarm_closed_clone_before_hard_open" not in cfg:
         set_cfg("prewarm_closed_clone_before_hard_open", True)
+    if "prewarm_shell_only_clone_before_hard_open" not in cfg:
+        set_cfg("prewarm_shell_only_clone_before_hard_open", True)
     if _int_cfg(cfg.get("prewarm_closed_clone_wait_seconds"), 0) <= 0:
         set_cfg("prewarm_closed_clone_wait_seconds", 2)
     if "login_challenge_detection_enabled" not in cfg:
@@ -3865,6 +3879,50 @@ def package_alive(pkg, cfg, fresh=False):
     """Compatibility bool wrapper. Recovery decisions should prefer package_alive_status()."""
     status, _note = package_alive_status(pkg, cfg, fresh=fresh)
     return status == "ALIVE"
+
+
+def package_activity_status(pkg, cfg):
+    """Return (ACTIVITY|NO_ACTIVITY|UNKNOWN, note) for a live Android activity.
+
+    App Cloner can leave the clone process/floating bubble alive after the user
+    closes the floating Roblox window. That shell-only state has a package PID
+    but normally no live ActivityRecord. We intentionally inspect ActivityRecord
+    lines only (not recents/task metadata) so a dead historical task does not
+    count as a currently materialized Roblox activity.
+    """
+    pkg = str(pkg or "").strip()
+    if not pkg:
+        return "UNKNOWN", "no package"
+
+    code, out = shell_timeout(
+        "dumpsys activity activities",
+        cfg,
+        capture=True,
+        timeout=6,
+    )
+    text = str(out or "")
+    if code != 0:
+        return "UNKNOWN", f"activity query failed (exit {code})"
+    if not text.strip():
+        return "UNKNOWN", "activity query returned no output"
+
+    pkg_low = pkg.lower()
+    needle = pkg_low + "/"
+    for line in text.splitlines():
+        low = line.lower()
+        # ActivityRecord covers resumed, paused and stopped-but-live activities
+        # in Android's activity stack. Resumed aliases are accepted as well for
+        # vendor-modified dumpsys output.
+        if not (
+            "activityrecord{" in low
+            or "mresumedactivity" in low
+            or "topresumedactivity" in low
+        ):
+            continue
+        if needle in low:
+            return "ACTIVITY", "live ActivityRecord"
+
+    return "NO_ACTIVITY", "no live ActivityRecord"
 
 
 _WINDOW_DUMP_CACHE = {"ts": 0, "text": "", "ok": False}
@@ -4766,15 +4824,50 @@ def open_package_launcher(pkg, cfg):
 
 
 def prewarm_closed_clone_for_hard_open(pkg, cfg, reason=""):
-    """Materialize a stale App Cloner mini-task so exact-PID stop can clear it."""
+    """Materialize a stale/bubble-only App Cloner task before exact-PID stop.
+
+    V4.81.21 handles the manual-X-close case where the package process and Noka
+    floating bubble survive but Roblox has no live ActivityRecord. That state
+    used to skip prewarm because PID==alive, then the next deep link could land
+    on Roblox Home. Materializing the target launcher once lets the existing
+    exact-PID stop clear that stale App Cloner task before the real game link.
+    """
     if not cfg.get("prewarm_closed_clone_before_hard_open", True):
         log_activity("prewarm skipped: disabled", pkg, DIM)
         return False, "prewarm disabled"
     if not _is_noka_clone_package(pkg):
         return False, "not a noka clone"
-    if package_alive(pkg, cfg, fresh=True):
-        log_activity("prewarm skipped: exact PID already alive", pkg, DIM)
-        return False, "package already alive"
+
+    process_status, process_note = package_alive_status(pkg, cfg, fresh=True)
+    shell_only = False
+
+    if process_status == "UNKNOWN":
+        # Do not guess. The following exact-PID stop has its own fail-closed
+        # process/sibling verification and will abort safely if queries remain bad.
+        log_activity(f"prewarm process unknown: {cut(process_note, 60)}", pkg, DIM)
+        return False, "process unknown"
+
+    if process_status == "ALIVE":
+        if not cfg.get("prewarm_shell_only_clone_before_hard_open", True):
+            log_activity("prewarm skipped: exact PID already alive", pkg, DIM)
+            return False, "package already alive"
+
+        activity_status, activity_note = package_activity_status(pkg, cfg)
+        if activity_status == "ACTIVITY":
+            log_activity("prewarm skipped: live package activity", pkg, DIM)
+            return False, "live activity"
+        if activity_status == "UNKNOWN":
+            # A dumpsys failure is not proof of a bubble-only state. Avoid a
+            # speculative launcher action and keep the ordinary hard-open path.
+            log_activity(f"prewarm activity unknown: {cut(activity_note, 60)}", pkg, DIM)
+            return False, "activity unknown"
+
+        shell_only = True
+        log_activity(
+            f"bubble-only clone shell detected; materializing target launcher: {cut(reason, 48)}",
+            pkg,
+            YELLOW,
+        )
 
     ok, note = open_package_launcher(pkg, cfg)
     if not ok:
@@ -4784,6 +4877,13 @@ def prewarm_closed_clone_for_hard_open(pkg, cfg, reason=""):
     wait_s = max(1, int(cfg.get("prewarm_closed_clone_wait_seconds", 2) or 2))
     wait_seconds(wait_s)
     if package_alive(pkg, cfg, fresh=True):
+        if shell_only:
+            log_activity(
+                f"prewarm bubble-only task before hard open: {cut(reason, 60)}",
+                pkg,
+                YELLOW,
+            )
+            return True, "bubble-only prewarmed"
         log_activity(
             f"prewarm stale task before hard open: {cut(reason, 60)}",
             pkg,
