@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.38 — FINAL PID TRUTH CLEANUP
+# - Booster Hatcher startup preserves ALIVE/DEAD/UNKNOWN; an unavailable Android ps check
+#   defers startup instead of queueing a recovery as though the clone were dead.
+# - Non-Noka Booster second-intent routing also fails closed on UNKNOWN process state instead of
+#   launching during an ambiguous liveness check.
+# - Hatcher backend reporting no longer performs redundant per-profile process queries for the
+#   removed transition system, reducing root/ps churn without changing report semantics.
+#
 # V4.81.37 — OPTION 6 OPTION-1 RECOVERY PATH
 # - Option 6 keeps one initial manual hard restart, but after that it uses the exact normal
 #   Option 1 post-open recovery chain: wait for fresh state, then in-place route retries before
@@ -1006,7 +1014,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.37-option6-option1-recovery-path"
+__version__ = "V4.81.38-final-pid-truth-cleanup"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -14541,11 +14549,23 @@ def market_booster_second_soft_intent(
             return False, first_opened_at, "stop"
 
     package = str(tab.get("package") or "")
-    if not package_alive(package, cfg, fresh=True):
+    process_status, process_note = package_alive_status(package, cfg, fresh=True)
+    if process_status == "DEAD":
         return (
             True,
             first_opened_at,
             "package not alive for second soft intent",
+        )
+    if process_status == "UNKNOWN":
+        log_activity(
+            f"second Booster soft intent deferred; process state UNKNOWN: {cut(process_note, 60)}",
+            package,
+            YELLOW,
+        )
+        return (
+            True,
+            first_opened_at,
+            "process state unknown; second soft intent deferred",
         )
 
     log_activity(
@@ -15723,8 +15743,14 @@ def booster_hatcher_startup_queue(
         rt_tab["target"] = "hatcher"
         rt_tab["booster_routing_core"] = "hatcher"
 
-        if package_alive(package, cfg, fresh=True):
+        process_status, process_note = package_alive_status(package, cfg, fresh=True)
+        if process_status == "ALIVE":
             skipped.append((package, "already alive"))
+            continue
+        if process_status == "UNKNOWN":
+            note = f"process unknown; startup deferred: {cut(process_note, 60)}"
+            skipped.append((package, note))
+            log_activity(note, package, YELLOW)
             continue
 
         added, note = core.queue_exact_pid_recovery(
@@ -18224,11 +18250,14 @@ def hatcher_report_once(hcfg, force=True, state_cache=None, main_runtime=None):
             state, state_err = hatcher_read_state(eff)
 
         rt_tab = get_runtime_tab(runtime, pkg)
-        raw_alive = package_alive(pkg, main_cfg, fresh=True) if pkg else False
+        # V4.81.38: the event/transition system is a compatibility no-op, so do not
+        # spend one exact Android process query per Hatcher profile just to feed it.
+        # This removes reporter-side ps churn and avoids creating another boolean
+        # UNKNOWN->dead interpretation outside the actual recovery watchdog.
         transition = hatcher_transition_guard_update(
             rt_tab,
             state,
-            raw_alive,
+            None,
             hcfg,
             main_cfg,
             open_queue=None,
