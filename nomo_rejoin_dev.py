@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
-# V4.81.31 — APP-CLONER LAUNCHER SAFETY / TRI-STATE COMPLETION
+# V4.81.32 — FINAL ROUTING TRI-STATE GUARD
+# - Final open_target routing preserves ALIVE/DEAD/UNKNOWN; UNKNOWN emits no stop/open.
+# - Home/no-state retry escalation defers on UNKNOWN instead of jumping toward hard recovery.
+# - Invalid-cookie API precheck defers manual-auth holds when process liveness is UNKNOWN.
 # - Cloudflare Hatcher reporter refuses stale/invalid/challenge/Home-hidden-heartbeat state as an online update; last-good backend records are preserved instead.
 # - Rejoin Only uses ALIVE/DEAD/UNKNOWN process state, including the last-second action recheck, so Android ps failures never become crash opens.
 # - Noka/App Cloner packages skip rapid second soft intents and Delta cold-start launcher/second-deeplink tricks; normal later retry paths remain.
@@ -966,7 +969,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.31-appcloner-launcher-safety-tristate-completion"
+__version__ = "V4.81.32-final-routing-tristate-guard"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -10033,7 +10036,18 @@ def open_target(tab, rt_tab, cfg, target, reason, force=False, rt=None, mode="ha
         rt_tab["note"] = "no restock link" if target == "restock" else "no link"
         return False, rt_tab["note"]
 
-    pkg_alive = package_alive(tab["package"], cfg, fresh=True)
+    # V4.81.32: the final routing decision must preserve tri-state process
+    # liveness too.  A failed Android `ps` query is not DEAD and is not a safe
+    # reason to choose a hard open (or even to emit another App Cloner intent).
+    process_status, process_note = package_alive_status(tab["package"], cfg, fresh=True)
+    if process_status == "UNKNOWN":
+        note = "process check unavailable; target open deferred"
+        if process_note:
+            note += ": " + cut(process_note, 70)
+        rt_tab["note"] = note
+        log_activity("target open deferred; process liveness UNKNOWN (no stop/open)", tab["package"], YELLOW)
+        return False, note
+    pkg_alive = process_status == "ALIVE"
     open_policy = resolve_open_policy(cfg, reason, pkg_alive, mode)
 
     # V4.15: `disable_soft_rejoin` still disables ordinary/scheduled soft hops,
@@ -11321,14 +11335,28 @@ def disconnect_ui_api_precheck(tab, rt_tab, cfg, reason="kick popup", require_di
                     return False, rt_tab["note"]
                 detail = refreshed_detail or refresh_note or detail
                 detail_l = detail.lower()
-        if api_status == "invalid" and package_alive(pkg, cfg, fresh=True):
-            rt_tab["disconnect_ui_api_last_status"] = "invalid_alive"
-            rt_tab["disconnect_ui_api_last_detail"] = detail
-            clear_hold(pkg)
-            clear_manual_login_block(rt_tab)
-            rt_tab["note"] = "api invalid/expired, but app is alive"
-            log_activity(f"{reason}; API invalid/expired but app alive - not held", pkg, YELLOW)
-            return False, rt_tab["note"]
+        if api_status == "invalid":
+            invalid_process_status, invalid_process_note = package_alive_status(pkg, cfg, fresh=True)
+            if invalid_process_status == "ALIVE":
+                rt_tab["disconnect_ui_api_last_status"] = "invalid_alive"
+                rt_tab["disconnect_ui_api_last_detail"] = detail
+                clear_hold(pkg)
+                clear_manual_login_block(rt_tab)
+                rt_tab["note"] = "api invalid/expired, but app is alive"
+                log_activity(f"{reason}; API invalid/expired but app alive - not held", pkg, YELLOW)
+                return False, rt_tab["note"]
+            if invalid_process_status == "UNKNOWN":
+                # A transient/root `ps` failure is not proof that the current
+                # in-game session is dead.  Do not manufacture a 1h manual-auth
+                # hold from that ambiguity; the final open gate is tri-state too.
+                rt_tab["disconnect_ui_api_last_status"] = "invalid_process_unknown"
+                rt_tab["disconnect_ui_api_last_detail"] = detail
+                rt_tab["note"] = "api invalid/expired; process check unavailable - auth hold deferred"
+                log_activity(
+                    f"{reason}; API invalid/expired but process liveness UNKNOWN - auth hold deferred",
+                    pkg, YELLOW,
+                )
+                return False, rt_tab["note"]
         rt_tab["disconnect_ui_api_last_status"] = api_status
         retry_seconds = max(600, int(cfg.get("manual_auth_retry_seconds", 3600) or 3600))
         manual_reason = "api user moderated" if api_status == "moderated" else "api invalid/expired"
@@ -14754,7 +14782,16 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                 if item.get("no_hard_fallback"):
                     allow_hard_fallback = False
 
-            alive_for_retry = package_alive(pkg, cfg, fresh=True)
+            retry_process_status, retry_process_note = package_alive_status(pkg, cfg, fresh=True)
+            if retry_process_status == "UNKNOWN":
+                rt_tab["note"] = "join timeout; process check unavailable; retry escalation deferred"
+                log_activity(
+                    "join timeout escalation deferred; process liveness UNKNOWN (no route/hard open)",
+                    pkg, YELLOW,
+                )
+                core.save()
+                return True
+            alive_for_retry = retry_process_status == "ALIVE"
             join_fail_count = int(rt_tab.get("homepage_join_fail_count", 0) or 0) + 1
             rt_tab["homepage_join_fail_count"] = join_fail_count
             failures_before_hard = max(
