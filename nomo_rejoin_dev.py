@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
-# V4.81.10 — MARKET LAST-GOOD LOADER
+# V4.81.14 — UNIFIED JSON WRITE GUARD
+# - Healthy Delta key validity checks now run every 5 minutes instead of every 60s.
+# - Within 2 hours of expiry, or after a validity API error, monitoring tightens to 60s.
+# - Pending renewal tickets keep the existing 15s poll cadence for fast completion/rejection.
+# - Existing 60s healthy defaults migrate to the adaptive 300s policy; custom intervals remain configurable.
+# - Delta settings show both the healthy interval and the fixed adaptive near-expiry/error interval.
+#
+# V4.81.12 — BOOSTER CLOUDFLARE PRESERVE GUARD
 # - Market AutoExec now validates GitHub source before execution and keeps a last-good
 #   local cache under the executor Workspace (Nomo/market_last_good.lua).
 # - GitHub/network/validation/compile failures fall back to the last-good Market source
@@ -869,7 +876,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.10-market-last-good-loader"
+__version__ = "V4.81.14-unified-json-write-guard"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -978,31 +985,78 @@ _MERGED_SECTIONS = {
     str(BOOSTER_RUNTIME_FILE): "runtime_booster",
 }
 
-_NOMO_CACHE = {"data": None}
+# V4.81.14: unified nomo.json write guard.
+#
+# Runtime/config sections share one physical JSON file, and many call sites save
+# defensively even when nothing changed.  Keep real state durable (changed data
+# is still written immediately), but avoid rewriting the same unified snapshot.
+# A single RLock also prevents two threads from interleaving read/modify/write.
+_NOMO_CACHE = {
+    "data": None,
+    "persisted_signature": None,
+    "writes": 0,
+    "skips": 0,
+}
+_NOMO_FILE_LOCK = threading.RLock()
+
+
+def _nomo_signature(data):
+    """Stable semantic signature used only to suppress identical disk writes."""
+    try:
+        return json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    except Exception:
+        # Keep the save path robust for any odd legacy value.  Falling back to
+        # repr may miss an optimization, but must never block a real save.
+        return repr(data)
 
 
 def _nomo_read_all():
     """Read the whole unified file (cached in-process)."""
-    if _NOMO_CACHE["data"] is None:
-        try:
-            if NOMO_FILE.exists():
-                _NOMO_CACHE["data"] = json.loads(NOMO_FILE.read_text())
-            else:
+    with _NOMO_FILE_LOCK:
+        if _NOMO_CACHE["data"] is None:
+            try:
+                if NOMO_FILE.exists():
+                    _NOMO_CACHE["data"] = json.loads(NOMO_FILE.read_text())
+                else:
+                    _NOMO_CACHE["data"] = {}
+            except Exception:
                 _NOMO_CACHE["data"] = {}
+            _NOMO_CACHE["persisted_signature"] = _nomo_signature(_NOMO_CACHE["data"])
+        return _NOMO_CACHE["data"]
+
+
+def _nomo_write_all(data, force=False):
+    """Atomically persist nomo.json, skipping only byte-equivalent state.
+
+    Changed state is never delayed/debounced: solver reservations, backend holds,
+    key timers, and rejoin bookkeeping remain crash-durable immediately.
+    """
+    with _NOMO_FILE_LOCK:
+        signature = _nomo_signature(data)
+        if not force and _NOMO_CACHE.get("persisted_signature") == signature:
+            _NOMO_CACHE["data"] = data
+            _NOMO_CACHE["skips"] = int(_NOMO_CACHE.get("skips", 0) or 0) + 1
+            return False
+
+        pretty = json.dumps(data, indent=2, ensure_ascii=False)
+        BASE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = NOMO_FILE.with_suffix(".json.tmp")
+        try:
+            tmp.write_text(pretty)
+            os.replace(str(tmp), str(NOMO_FILE))
         except Exception:
-            _NOMO_CACHE["data"] = {}
-    return _NOMO_CACHE["data"]
+            NOMO_FILE.write_text(pretty)
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
 
-
-def _nomo_write_all(data):
-    _NOMO_CACHE["data"] = data
-    BASE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = NOMO_FILE.with_suffix(".json.tmp")
-    try:
-        tmp.write_text(json.dumps(data, indent=2))
-        os.replace(str(tmp), str(NOMO_FILE))
-    except Exception:
-        NOMO_FILE.write_text(json.dumps(data, indent=2))
+        # Only mark the signature after a successful persistence path.
+        _NOMO_CACHE["data"] = data
+        _NOMO_CACHE["persisted_signature"] = signature
+        _NOMO_CACHE["writes"] = int(_NOMO_CACHE.get("writes", 0) or 0) + 1
+        return True
 
 
 def _migrate_legacy_files():
@@ -1387,7 +1441,11 @@ DEFAULT_CONFIG = {
     "delta_key_visual_confirmations": 2,
     "delta_key_visual_scan_seconds": 5,
     "delta_key_auto_tick_seconds": 5,
-    "delta_key_validity_refresh_seconds": 60,
+    # Adaptive valid-key status polling: quiet while healthy, fast near expiry/error.
+    "delta_key_validity_refresh_seconds": 300,
+    "delta_key_validity_near_expiry_seconds": 60,
+    "delta_key_validity_near_expiry_window_seconds": 7200,
+    "delta_key_validity_policy_version": 2,
     "delta_key_pause_rejoin_during_renewal": True,
     "delta_key_expired_retry_seconds": 600,
     "delta_key_bootstrap_template_from_manual_success": True,
@@ -2427,9 +2485,11 @@ def save_json(path, data):
     # Redirect the 4 merged files to sections of the unified nomo.json.
     key = str(path)
     if key in _MERGED_SECTIONS:
-        alld = _nomo_read_all()
-        alld[_MERGED_SECTIONS[key]] = data
-        _nomo_write_all(alld)
+        # Keep read -> section update -> write atomic across background workers.
+        with _NOMO_FILE_LOCK:
+            alld = _nomo_read_all()
+            alld[_MERGED_SECTIONS[key]] = data
+            _nomo_write_all(alld)
         return
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -3028,17 +3088,27 @@ def load_config():
         cfg["delta_key_restart_scope"] = "source_only"
         changed = True
 
-    # V4.58.50: the previous default waited ten minutes before discovering
-    # that PlatoRelay had rejected the old ticket. Migrate only that old
-    # default; preserve unrelated custom intervals.
+    # V4.81.13: adaptive validity polling. The old 60s default was intentionally
+    # fast enough to catch rejected tickets, but it also queried forever while
+    # healthy. Migrate known historical defaults to a 5m healthy cadence; the
+    # monitor automatically tightens to 60s near expiry or after an API error.
     try:
         delta_validity_refresh = int(
-            cfg.get("delta_key_validity_refresh_seconds", 60) or 60
+            cfg.get("delta_key_validity_refresh_seconds", 300) or 300
         )
     except Exception:
-        delta_validity_refresh = 60
-    if delta_validity_refresh == 600:
-        cfg["delta_key_validity_refresh_seconds"] = 60
+        delta_validity_refresh = 300
+    policy_version = int(cfg.get("delta_key_validity_policy_version", 0) or 0)
+    if policy_version < 2:
+        if delta_validity_refresh in (60, 600):
+            cfg["delta_key_validity_refresh_seconds"] = 300
+        cfg["delta_key_validity_near_expiry_seconds"] = max(
+            60, int(cfg.get("delta_key_validity_near_expiry_seconds", 60) or 60)
+        )
+        cfg["delta_key_validity_near_expiry_window_seconds"] = max(
+            600, int(cfg.get("delta_key_validity_near_expiry_window_seconds", 7200) or 7200)
+        )
+        cfg["delta_key_validity_policy_version"] = 2
         changed = True
     if "delta_key_pause_rejoin_during_renewal" not in cfg:
         cfg["delta_key_pause_rejoin_during_renewal"] = True
@@ -15077,6 +15147,42 @@ def booster_should_update(bcfg, name, entry, force=False):
 
 
 
+def _cloudflare_booster_tombstone_entry(entry, status, name=""):
+    tombstone = dict(entry or {})
+    name = str(name or tombstone.get("booster_name") or tombstone.get("name") or "booster").strip() or "booster"
+    tombstone["enabled"] = False
+    tombstone["status"] = str(status or "disabled")
+    tombstone["server_link"] = ""
+    tombstone["boosting_matches"] = []
+    tombstone["boosting_match_count"] = 0
+    tombstone["mode"] = "booster"
+    tombstone["role"] = "booster"
+    tombstone["booster_name"] = name
+    tombstone["name"] = name
+    tombstone["updated_at"] = now()
+    tombstone["updated_text"] = date_time_text()
+    tombstone.setdefault("source", "nomo_rejoin_booster_tombstone")
+    return tombstone
+
+
+def _cloudflare_booster_tombstone_due(bcfg, profile_name, tombstone, force=False):
+    # Booster tombstones are state changes, not heartbeats. Once a given
+    # disabled/no_server signature was sent successfully, do not resend it on
+    # every reporter loop. Explicit force/report tests may intentionally resend.
+    if force:
+        return True
+    rt = load_booster_runtime()
+    sig = booster_signature(tombstone)
+    last_sig = str(rt.get("last_signature", {}).get(profile_name, ""))
+    return sig != last_sig
+
+
+def _update_booster_runtime_entry(rt, name, entry):
+    rt["last_update_ts"][name] = now()
+    rt["last_signature"][name] = booster_signature(entry)
+    rt["last_status"][name] = entry.get("status")
+
+
 def booster_report_once(bcfg=None, force=False, state_cache=None):
     bcfg = load_booster_config() if bcfg is None else bcfg
     if not bcfg.get("enabled", True):
@@ -15084,9 +15190,12 @@ def booster_report_once(bcfg=None, force=False, state_cache=None):
     if hatcher_backend_missing(bcfg):
         return False, "backend missing"
 
+    provider = backend_provider(bcfg)
     updates = []
-    removes = []
+    removes = []  # legacy/JSONBin removal path only
+    cloudflare_tombstones = []
     probe_waiting = []
+    skips = []
     brt = load_booster_runtime()
     profiles = booster_profiles_with_hatcher_routing(
         bcfg,
@@ -15102,7 +15211,20 @@ def booster_report_once(bcfg=None, force=False, state_cache=None):
         for name in _unique_identity_names(brt.get("pending_remove_names", []))
         if name not in current_profile_names
     ]
-    removes.extend((name, "renamed") for name in pending_identity_removes)
+
+    # A renamed Booster identity must be retired once. On Cloudflare publish a
+    # Booster-shaped tombstone so role/mode remain correct; JSONBin keeps its
+    # original delete semantics.
+    if provider == "cloudflare":
+        for name in pending_identity_removes:
+            cloudflare_tombstones.append((
+                name,
+                _cloudflare_booster_tombstone_entry({}, "renamed", name=name),
+                "renamed",
+            ))
+    else:
+        removes.extend((name, "renamed") for name in pending_identity_removes)
+
     if brt.get("mapping_force_report"):
         force = True
 
@@ -15134,9 +15256,32 @@ def booster_report_once(bcfg=None, force=False, state_cache=None):
             probe_err=probe_err,
             bcfg=bcfg,
         )
-        if entry["status"] in ("disabled", "no_server", "no_state"):
-            removes.append((name, entry["status"]))
+        status = str(entry.get("status") or "").lower()
+
+        # Match Hatcher's proven Cloudflare semantics: a temporary missing
+        # state must never erase a previously-good Booster route. Let backend
+        # staleness age it naturally while NOMO recovery handles the package.
+        if provider == "cloudflare" and status == "no_state":
+            skips.append(f"{name}:no_state-preserve")
             continue
+
+        # disabled/no_server become Booster-shaped tombstones and are sent only
+        # when their signature changes. This prevents a 60s removal heartbeat.
+        if provider == "cloudflare" and status in ("disabled", "no_server"):
+            tombstone = _cloudflare_booster_tombstone_entry(entry, status, name=name)
+            if _cloudflare_booster_tombstone_due(
+                bcfg, name, tombstone, force=bool(force)
+            ):
+                cloudflare_tombstones.append((name, tombstone, status))
+            else:
+                skips.append(f"{name}:{status}-unchanged")
+            continue
+
+        # Preserve the original JSONBin behavior outside Cloudflare.
+        if status in ("disabled", "no_server", "no_state"):
+            removes.append((name, status))
+            continue
+
         if bcfg.get("probe_required_for_report", True) and not entry.get("booster_probe_reportable", False):
             probe_waiting.append((name, entry.get("booster_probe_status", "missing")))
             continue
@@ -15144,51 +15289,67 @@ def booster_report_once(bcfg=None, force=False, state_cache=None):
         should, _reason = booster_should_update(bcfg, name, entry, force=force)
         if should:
             updates.append((name, entry))
+        else:
+            skips.append(f"{name}:unchanged")
 
-    if not updates and not removes:
+    if not updates and not removes and not cloudflare_tombstones:
         if probe_waiting:
             detail = ", ".join(f"{name}:{status}" for name, status in probe_waiting[:4])
             return True, f"waiting for Booster probe ({detail})"
+        if skips:
+            return True, "no update; " + ", ".join(skips[:4])
         return True, "no update; unchanged"
 
-    if backend_provider(bcfg) == "cloudflare":
-        for name, entry in updates:
-            ok, msg = cloudflare_update_one_hatcher(bcfg, name, entry)
-            if not ok:
-                return False, f"{name}: {msg}"
-        for name, status in removes:
-            removed_entry = {
-                "mode": "booster",
-                "role": "booster",
-                "enabled": False,
-                "status": status,
-                "server_link": "",
-                "boosting_matches": [],
-                "boosting_match_count": 0,
-                "updated_at": now(),
-            }
-            ok, msg = cloudflare_update_one_hatcher(bcfg, name, removed_entry)
-            if not ok:
-                return False, f"remove {name}: {msg}"
-    else:
-        record, err = jsonbin_read_bin(bcfg)
-        if err:
-            return False, err
-        record = record if isinstance(record, dict) else {}
-        pool = record.setdefault("hatchers", {})
-        for name, _status in removes:
-            pool.pop(name, None)
-        for name, entry in updates:
-            pool[name] = entry
-        ok, msg = jsonbin_update_bin(bcfg, record)
+    if provider == "cloudflare":
+        # Use the same global/persistent Cloudflare upload hold as Hatcher.
+        # Tombstones are sent through the normal update endpoint so they keep
+        # mode=booster instead of being rewritten as Hatcher removals.
+        upload_pairs = list(updates) + [
+            (name, tombstone)
+            for name, tombstone, status in cloudflare_tombstones
+        ]
+        ok, msg = cloudflare_update_hatchers(bcfg, upload_pairs, [])
         if not ok:
-            return False, msg
+            return False, f"cloudflare update: {msg}"
+
+        # The shared upload helper intentionally returns OK while a persistent
+        # 429/1027 cooldown is active. Do NOT stamp signatures or clear renamed
+        # identities until the data really reached Cloudflare.
+        msg_lower = str(msg or "").lower()
+        if "cooldown" in msg_lower or "rate limited" in msg_lower:
+            return True, msg
+
+        rt = load_booster_runtime()
+        for name, entry in updates:
+            _update_booster_runtime_entry(rt, name, entry)
+        for name, tombstone, status in cloudflare_tombstones:
+            _update_booster_runtime_entry(rt, name, tombstone)
+        save_booster_runtime(rt)
+        _clear_booster_pending_identity_removes(pending_identity_removes)
+
+        waiting_note = f"; probe waiting {len(probe_waiting)}" if probe_waiting else ""
+        return True, (
+            f"cloudflare updated {len(updates)} "
+            f"tombstoned {len(cloudflare_tombstones)}{waiting_note}"
+        )
+
+    # JSONBin path intentionally preserves the pre-V4.81.12 behavior.
+    record, err = jsonbin_read_bin(bcfg)
+    if err:
+        return False, err
+    record = record if isinstance(record, dict) else {}
+    pool = record.setdefault("hatchers", {})
+    for name, _status in removes:
+        pool.pop(name, None)
+    for name, entry in updates:
+        pool[name] = entry
+    ok, msg = jsonbin_update_bin(bcfg, record)
+    if not ok:
+        return False, msg
 
     rt = load_booster_runtime()
     for name, entry in updates:
-        rt["last_update_ts"][name] = now()
-        rt["last_signature"][name] = booster_signature(entry)
-        rt["last_status"][name] = entry.get("status")
+        _update_booster_runtime_entry(rt, name, entry)
     save_booster_runtime(rt)
     _clear_booster_pending_identity_removes(pending_identity_removes)
     waiting_note = f"; probe waiting {len(probe_waiting)}" if probe_waiting else ""
@@ -27431,27 +27592,63 @@ def json_contains_exact_user_id(obj, user_id):
     return False
 
 
+def private_server_users_membership(cookie, server_id, user_ids):
+    """Verify many private-server members with at most one permissions GET + one metadata GET.
+
+    Returns (present_ids, missing_details). This deliberately shares the same Roblox
+    responses across all requested UIDs so a 20-user allowlist sync does not turn into
+    20-40 verification requests.
+    """
+    ids = []
+    seen = set()
+    for raw in user_ids or []:
+        value = str(raw or "").strip()
+        if value.isdigit() and value not in seen:
+            seen.add(value)
+            ids.append(value)
+    if not ids:
+        return set(), {}
+
+    present = set()
+    details = {}
+    permissions, perm_err = fetch_private_server_permissions_raw(cookie, server_id)
+    if not perm_err:
+        for uid in ids:
+            if json_contains_exact_user_id(permissions, uid):
+                present.add(uid)
+
+    missing = [uid for uid in ids if uid not in present]
+    meta_err = ""
+    if missing:
+        # Some Roblox responses expose members only on the server metadata endpoint.
+        url = f"https://games.roblox.com/v1/vip-servers/{urllib.parse.quote(str(server_id), safe='')}"
+        data, meta_err, _ = _roblox_json_request(url, cookie=cookie, method="GET", timeout=20)
+        if not meta_err:
+            for uid in missing:
+                if json_contains_exact_user_id(data, uid):
+                    present.add(uid)
+
+    detail = perm_err or meta_err or "user not visible in private server permissions"
+    for uid in ids:
+        if uid not in present:
+            details[uid] = detail
+    return present, details
+
+
 def private_server_user_is_member(cookie, server_id, user_id):
-    permissions, err = fetch_private_server_permissions_raw(cookie, server_id)
-    if not err and json_contains_exact_user_id(permissions, user_id):
-        return True, "permissions"
-
-    # Some Roblox responses expose members only on the server metadata endpoint.
-    url = f"https://games.roblox.com/v1/vip-servers/{urllib.parse.quote(str(server_id), safe='')}"
-    data, meta_err, _ = _roblox_json_request(url, cookie=cookie, method="GET", timeout=20)
-    if not meta_err and json_contains_exact_user_id(data, user_id):
-        return True, "metadata"
-
-    detail = err or meta_err or "user not visible in private server permissions"
-    return False, detail
+    present, details = private_server_users_membership(cookie, server_id, [user_id])
+    uid = str(user_id or "").strip()
+    if uid in present:
+        return True, "permissions/metadata"
+    return False, details.get(uid, "user not visible in private server permissions")
 
 
 def add_private_server_allowed_users(cookie, server_id, user_ids, friends_allowed=True, chunk_size=25):
     """Add specific Roblox user IDs without removing existing members.
 
-    Returns (added_ids, failed_items). A PATCH success is not enough: Roblox can
-    return OK while the configure page still shows no server members. Count a
-    user only after a follow-up permissions read confirms the ID is present.
+    Returns (added_ids, failed_items). Verification is batched: after a chunk PATCH,
+    all requested UIDs are checked against one permissions response (plus at most one
+    metadata response). Only still-missing users fall back to individual PATCH shapes.
     """
     server_id = str(server_id or "").strip()
     ids = []
@@ -27513,43 +27710,65 @@ def add_private_server_allowed_users(cookie, server_id, user_ids, friends_allowe
         return not bool(err), str(err or ""), data if isinstance(data, dict) else {}
 
     added = []
+    added_set = set()
     failed = []
     size = max(1, min(50, int(chunk_size or 25)))
-    for start in range(0, len(ids), size):
-        chunk = ids[start:start + size]
-        ok, err, _ = patch(chunk)
-        if ok:
-            unverified = []
-            for uid in chunk:
-                present, verify_err = private_server_user_is_member(cookie, server_id, uid)
-                if present:
-                    added.append(uid)
-                else:
-                    unverified.append((uid, verify_err))
-            if not unverified:
-                continue
-            chunk = [uid for uid, _ in unverified]
-            err = "; ".join(f"{uid}: {cut(verr, 80)}" for uid, verr in unverified[:3])
 
-        # A single ineligible user can reject a whole chunk, and some Roblox
-        # builds accept only object-shaped usersToAdd entries. Retry each user
-        # with all known safe additive shapes, verifying after every success.
-        for uid in chunk:
-            last_err = err or "permission update failed"
-            confirmed = False
-            for shape in ("ids", "id_objects", "user_id_objects"):
+    def mark_added(values):
+        for uid in values:
+            if uid not in added_set:
+                added_set.add(uid)
+                added.append(uid)
+
+    for start in range(0, len(ids), size):
+        original_chunk = ids[start:start + size]
+        remaining = list(original_chunk)
+        last_errors = {uid: "permission update failed" for uid in remaining}
+
+        ok, err, _ = patch(remaining)
+        if not ok:
+            for uid in remaining:
+                last_errors[uid] = err or last_errors[uid]
+        else:
+            present, verify_details = private_server_users_membership(cookie, server_id, remaining)
+            mark_added(uid for uid in remaining if uid in present)
+            remaining = [uid for uid in remaining if uid not in present]
+            for uid in remaining:
+                last_errors[uid] = verify_details.get(uid, "PATCH ok but user not visible in permissions")
+            if not remaining:
+                continue
+
+        # A single ineligible user can reject a whole chunk, and some Roblox builds
+        # accept only object-shaped usersToAdd entries. Retry only still-missing UIDs.
+        # Verification is done once per shape for the whole remaining set, rather than
+        # one GET (or two) after every UID PATCH.
+        for shape in ("ids", "id_objects", "user_id_objects"):
+            if not remaining:
+                break
+            attempted = list(remaining)
+            for uid in attempted:
                 ok1, err1, _ = patch([uid], shape=shape)
                 if not ok1:
-                    last_err = err1 or last_err
+                    last_errors[uid] = err1 or last_errors.get(uid) or "permission update failed"
+
+            present, verify_details = private_server_users_membership(cookie, server_id, remaining)
+            mark_added(uid for uid in remaining if uid in present)
+            next_remaining = []
+            for uid in remaining:
+                if uid in present:
                     continue
-                present, verify_err = private_server_user_is_member(cookie, server_id, uid)
-                if present:
-                    added.append(uid)
-                    confirmed = True
-                    break
-                last_err = verify_err or "PATCH ok but user not visible in permissions"
-            if not confirmed:
-                failed.append({"user_id": uid, "error": last_err})
+                if uid in verify_details and verify_details[uid]:
+                    # Preserve a more concrete PATCH error when available; otherwise
+                    # surface the shared verification result.
+                    prior = str(last_errors.get(uid) or "")
+                    if not prior or prior == "permission update failed":
+                        last_errors[uid] = verify_details[uid]
+                next_remaining.append(uid)
+            remaining = next_remaining
+
+        for uid in remaining:
+            failed.append({"user_id": uid, "error": last_errors.get(uid) or "user not visible after permission update"})
+
     return added, failed
 
 
@@ -37274,6 +37493,33 @@ def _delta_key_preserve_applied_runtime(runtime, previous):
     return runtime
 
 
+
+def delta_key_validity_refresh_interval(runtime, cfg, current_time=None):
+    """Return adaptive API refresh cadence for an already-valid Delta key.
+
+    Healthy/far-from-expiry keys use the configured quiet interval (default 5m).
+    Near expiry or after a validity API error, checks tighten to 60s by default.
+    Pending renewal tickets are handled earlier by delta_key_auto_monitor_tick and
+    retain delta_key_poll_seconds (normally 15s), so this helper never slows them.
+    """
+    current_time = now() if current_time is None else int(current_time)
+    healthy = max(60, int(cfg.get("delta_key_validity_refresh_seconds", 300) or 300))
+    urgent = max(60, int(cfg.get("delta_key_validity_near_expiry_seconds", 60) or 60))
+    near_window = max(600, int(cfg.get("delta_key_validity_near_expiry_window_seconds", 7200) or 7200))
+
+    expires_at = int(runtime.get("expires_at", 0) or 0)
+    remaining = max(0, expires_at - current_time) if expires_at > 0 else 0
+    last_error = str(runtime.get("validity_refresh_error") or "").strip()
+    state = str(runtime.get("state") or "")
+
+    if last_error:
+        return urgent, "last validity error"
+    if state in {"status_error", "ticket_expired", "expired_ticket_retry", "apply_error"}:
+        return urgent, "suspicious state"
+    if expires_at > 0 and remaining <= near_window:
+        return urgent, "near expiry"
+    return healthy, "healthy"
+
 def delta_key_auto_monitor_tick(cfg, safe_to_act=True):
     """One non-blocking expiry/key-renewal state-machine tick.
 
@@ -37398,13 +37644,15 @@ def delta_key_auto_monitor_tick(cfg, safe_to_act=True):
 
     expires_at = int(runtime.get("expires_at", 0) or 0)
 
-    # While valid: no screenshots. A low-frequency API status refresh only
-    # corrects the local expiry estimate and never creates a new ticket.
+    # While valid: no screenshots. Adaptive API status refresh is quiet while
+    # healthy/far from expiry, then tightens near expiry or after an API error.
+    # Pending renewal tickets were handled above and keep their fast 15s cadence.
     if expires_at > current_time:
-        refresh_seconds = max(
-            60,
-            int(cfg.get("delta_key_validity_refresh_seconds", 600) or 600),
+        refresh_seconds, refresh_reason = delta_key_validity_refresh_interval(
+            runtime, cfg, current_time=current_time
         )
+        runtime["validity_refresh_interval_seconds"] = int(refresh_seconds)
+        runtime["validity_refresh_interval_reason"] = str(refresh_reason)
         last_refresh = int(runtime.get("last_validity_refresh_at", 0) or 0)
         if auth_url and current_time - last_refresh >= refresh_seconds:
             previous = dict(runtime)
@@ -37439,11 +37687,16 @@ def delta_key_auto_monitor_tick(cfg, safe_to_act=True):
             if status.get("ready"):
                 refreshed = delta_key_update_runtime_from_status(status)
                 refreshed["last_validity_refresh_at"] = current_time
+                refreshed["validity_refresh_error"] = ""
+                refreshed["validity_refresh_interval_seconds"] = int(refresh_seconds)
+                refreshed["validity_refresh_interval_reason"] = str(refresh_reason)
                 _delta_key_preserve_applied_runtime(refreshed, previous)
             else:
                 runtime = load_delta_key_runtime()
                 runtime["last_validity_refresh_at"] = current_time
                 runtime["validity_refresh_error"] = str(status.get("error") or "")
+                runtime["validity_refresh_interval_seconds"] = int(refresh_seconds)
+                runtime["validity_refresh_interval_reason"] = str(refresh_reason)
                 save_delta_key_runtime(runtime)
         return "valid"
 
@@ -37712,7 +37965,11 @@ def delta_key_settings_menu(cfg):
         print(f"16. Retry after panel not found: {cfg.get('delta_key_expired_retry_seconds', 600)}s")
         bootstrap_ids = delta_key_bootstrap_place_ids(cfg)
         bootstrap_display = ", ".join(str(x) for x in bootstrap_ids) or "NOT SET"
-        print(f"17. Valid-key API refresh: {cfg.get('delta_key_validity_refresh_seconds', 600)}s")
+        print(
+            f"17. Healthy valid-key API refresh: "
+            f"{cfg.get('delta_key_validity_refresh_seconds', 300)}s "
+            f"(adaptive: 60s near expiry/error)"
+        )
         print(f"18. Delta bootstrap PlaceId: {bootstrap_display}")
         webhook_target = delta_key_ticket_webhook_url(cfg)
         print(
@@ -37826,7 +38083,7 @@ def delta_key_settings_menu(cfg):
                 pass
         elif choice == "17":
             try:
-                cfg["delta_key_validity_refresh_seconds"] = max(60, int(input("Seconds: ").strip()))
+                cfg["delta_key_validity_refresh_seconds"] = max(60, int(input("Healthy seconds: ").strip()))
             except ValueError:
                 pass
         elif choice == "18":
@@ -37992,6 +38249,9 @@ def delta_key_manager_menu(cfg):
         print(f"Minutes left: {minutes if minutes is not None else '-'}")
         print(f"Expiry      : {expiry}")
         print(f"Auto monitor: {'ON' if cfg.get('delta_key_auto_monitor_enabled', True) else 'OFF'}")
+        if int(runtime.get("expires_at", 0) or 0) > now():
+            adaptive_sec, adaptive_reason = delta_key_validity_refresh_interval(runtime, cfg)
+            print(f"Validity API: every {adaptive_sec}s ({adaptive_reason})")
         print(
             "Panel template: "
             + (col("READY", GREEN) if template else col("MISSING", YELLOW))
