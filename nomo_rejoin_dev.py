@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.36 — OPTION 6 ROBLOX-ACTIVITY TRUTH GUARD
+# - Option 6 post-check no longer treats a surviving Noka bubble/process as OPEN OK.
+# - Repeat-guarded/manual queue-skipped requests are surfaced explicitly instead of being masked by the bubble PID.
+# - Verification distinguishes Roblox Home, bubble-only/no ActivityRecord, activity-open/loading, and fresh in-game state.
+#
 # V4.81.35 — OPTION 6 SINGLE-ATTEMPT SAFETY GUARD
 # - Option 6 never sends the legacy 8-second route nudge after a manual hard restart.
 # - Option 6 manual items are single-attempt only: Home/no-state does not queue an immediate
@@ -992,7 +997,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.35-option6-single-attempt-safety-guard"
+__version__ = "V4.81.36-option6-roblox-activity-truth-guard"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -7855,16 +7860,26 @@ def manual_restart_tabs_via_queue(
     tabs = list(tabs or [])
 
     repeat_guard = max(60, int(cfg.get("option6_repeat_guard_seconds", 300) or 300))
+    queued_count = 0
 
     for tab in tabs:
         pkg = str((tab or {}).get("package", "") or "")
         if not pkg:
             continue
         rt_tab = get_runtime_tab(rt, pkg)
+        request_at = now()
+        rt_tab["last_option6_request_at"] = request_at
+        rt_tab["last_option6_request_reason"] = str(reason or "")
         last_option6 = int(rt_tab.get("last_option6_restart_at", 0) or 0)
-        if last_option6 > 0 and now() - last_option6 < repeat_guard:
-            remain = max(1, repeat_guard - (now() - last_option6))
+        if last_option6 > 0 and request_at - last_option6 < repeat_guard:
+            remain = max(1, repeat_guard - (request_at - last_option6))
+            rt_tab["last_option6_request_result"] = "blocked_repeat"
+            rt_tab["last_option6_request_detail"] = f"repeat guard {format_age(remain)}"
             rt_tab["note"] = f"Option 6 repeat blocked {format_age(remain)}"
+            print(col(
+                f"  {short_pkg(pkg):<10} BLOCKED - repeat guard {format_age(remain)}",
+                YELLOW,
+            ))
             log_activity(
                 f"Option 6 repeat blocked for App Cloner safety; retry in {format_age(remain)}",
                 pkg,
@@ -7882,17 +7897,32 @@ def manual_restart_tabs_via_queue(
             reason,
             metadata={
                 "manual_option6": True,
-                # V4.81.35: Option 6 is exactly one Android launch attempt.
+                # V4.81.35+: Option 6 is exactly one Android launch attempt.
                 # If Roblox lands Home/no-state, the normal watchdog may retry later.
                 "no_hard_fallback": True,
             },
         )
-        if not added:
+        if added:
+            queued_count += 1
+            rt_tab["last_option6_request_result"] = "queued"
+            rt_tab["last_option6_request_detail"] = str(target or "")
+        else:
+            rt_tab["last_option6_request_result"] = "queue_skipped"
+            rt_tab["last_option6_request_detail"] = str(note or "")
+            print(col(
+                f"  {short_pkg(pkg):<10} NO ATTEMPT - {cut(note, 60)}",
+                YELLOW,
+            ))
             log_activity(
                 f"manual restart queue skipped: {note}",
                 pkg,
                 YELLOW,
             )
+
+    if queued_count <= 0:
+        save_runtime(rt)
+        print(col("No Option 6 Android restart was queued.", YELLOW))
+        return True
 
     if not core.drain(delay_seconds=1):
         return False
@@ -7913,12 +7943,13 @@ def nudge_option6_routes(cfg, tabs, target_for_tab, label="tabs"):
 
 
 def verify_option6_open_results(cfg, tabs, label="tabs"):
-    """Best-effort confirmation after option 6 queues/open attempts."""
+    """Read-only truth check after Option 6; a Noka bubble is never OPEN OK."""
     tabs = list(tabs or [])
     if not tabs:
         return False
 
     wait_seconds(5, {})
+    rt = load_runtime()
 
     ok_count = 0
     print("")
@@ -7927,45 +7958,59 @@ def verify_option6_open_results(cfg, tabs, label="tabs"):
         pkg = str((tab or {}).get("package", "") or "")
         if not pkg:
             continue
+        rt_tab = get_runtime_tab(rt, pkg)
+        request_at = int(rt_tab.get("last_option6_request_at", 0) or 0)
+        request_result = str(rt_tab.get("last_option6_request_result", "") or "")
+        request_detail = str(rt_tab.get("last_option6_request_detail", "") or "")
+        recent_request = request_at > 0 and now() - request_at <= 180
 
-        proc_status, proc_note = package_alive_status(pkg, cfg, fresh=True)
-        alive = proc_status == "ALIVE"
-        visible, visible_note = package_visible_window(pkg, cfg)
-
-        # V4.81.31: verification is read-only. Never launcher/monkey-nudge a
-        # hidden Noka/App Cloner task here; that action was proven capable of
-        # disturbing sibling floating clones. UNKNOWN also stays UNKNOWN.
-        if proc_status == "UNKNOWN":
-            note = "PID UNKNOWN"
-            color = YELLOW
-            extra = f" ({cut(proc_note, 48)})"
-            print(f"  {short_pkg(pkg):<10} {col(note + extra, color)}")
+        if recent_request and request_result == "blocked_repeat":
+            print(f"  {short_pkg(pkg):<10} {col('BLOCKED - ' + cut(request_detail, 58), YELLOW)}")
+            continue
+        if recent_request and request_result == "queue_skipped":
+            print(f"  {short_pkg(pkg):<10} {col('NO ATTEMPT - ' + cut(request_detail, 55), YELLOW)}")
             continue
 
-        if alive and visible is False:
-            note = "NOT VISIBLE"
-            color = RED
-        elif alive and visible is True:
-            note = "OPEN OK"
-            color = GREEN
-        elif alive:
-            note = "PID alive, visibility unknown"
-            color = YELLOW
-        else:
-            note = "OPEN NOT CONFIRMED"
-            color = RED
+        proc_status, proc_note = package_alive_status(pkg, cfg, fresh=True)
+        if proc_status == "UNKNOWN":
+            print(f"  {short_pkg(pkg):<10} {col('PID UNKNOWN (' + cut(proc_note, 48) + ')', YELLOW)}")
+            continue
+        if proc_status != "ALIVE":
+            print(f"  {short_pkg(pkg):<10} {col('ROBLOX CLOSED', RED)}")
+            continue
 
-        if alive and visible is not False:
+        # Force a fresh UI snapshot: a visible Roblox Home shell must never be
+        # reported as a successful Option 6 restart merely because an old Lua
+        # heartbeat or the App Cloner process remains alive behind it.
+        home = android_roblox_home_ui_detail(pkg, cfg, force=True)
+        if home:
+            print(f"  {short_pkg(pkg):<10} {col('ROBLOX HOME - NOT INGAME', YELLOW)}")
+            continue
+
+        activity_status, activity_note = package_activity_status(pkg, cfg)
+        if activity_status == "UNKNOWN":
+            print(f"  {short_pkg(pkg):<10} {col('ACTIVITY UNKNOWN (' + cut(activity_note, 42) + ')', YELLOW)}")
+            continue
+        if activity_status == "NO_ACTIVITY":
+            print(f"  {short_pkg(pkg):<10} {col('BUBBLE ONLY - ROBLOX CLOSED', RED)}")
+            continue
+
+        state, _state_err = read_state(tab)
+        restart_at = int(rt_tab.get("last_option6_restart_at", 0) or 0)
+        state_ts = int((state or {}).get("ts", 0) or 0)
+        state_age = int((state or {}).get("age", 999999) or 999999)
+        # A state written after this Option 6 open is the strongest cheap proof
+        # that the executor/game session actually came back.  Otherwise report
+        # the Android activity honestly as loading/open, not OPEN OK.
+        if restart_at > 0 and state_ts >= restart_at and state_age <= 30:
+            print(f"  {short_pkg(pkg):<10} {col('INGAME CONFIRMED', GREEN)}")
             ok_count += 1
-
-        extra = ""
-        if visible is None:
-            extra = f" ({visible_note})"
-        print(f"  {short_pkg(pkg):<10} {col(note + extra, color)}")
+        else:
+            print(f"  {short_pkg(pkg):<10} {col('ROBLOX ACTIVITY OPEN / LOADING', CYAN)}")
 
     all_ok = ok_count == len(tabs)
     color = GREEN if all_ok else YELLOW
-    print(col(f"Open check: {ok_count}/{len(tabs)} package(s) visible/alive.", color))
+    print(col(f"Open check: {ok_count}/{len(tabs)} package(s) ingame confirmed.", color))
     return all_ok
 
 
@@ -14571,6 +14616,8 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
         rt_tab["last_option6_restart_at"] = int(opened_at or now())
         rt_tab["last_option6_restart_target"] = str(target or "")
         rt_tab["last_option6_restart_reason"] = str(reason or "")
+        rt_tab["last_option6_request_result"] = "opened"
+        rt_tab["last_option6_request_detail"] = str(target or "")
 
     if ok and item.get("hatcher_old_state_recovery"):
         rt_tab["hatcher_alive_old_state_hard_last"] = now()
