@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.27 — BUBBLE PREWARM SAFETY ROLLBACK
+# - Removes the App Cloner launcher/materialize prewarm from every recovery hard-open. Runtime
+#   recovery is restored to the proven safety invariant: exact target PID stop -> sibling verify ->
+#   one plain target deep-link am start. No launcher/monkey action occurs before the stop.
+# - Bubble-only detection/cooldown bypass remains, but it uses the same normal exact-PID hard-open
+#   path as every other recovery. If Roblox lands on Home, NOMO waits for a later ordinary retry
+#   instead of trying extra launcher/route actions that can disturb sibling floating tasks.
+# - Adds a bubble-recovery post-launch sibling PID diagnostic so, if a plain target am start itself
+#   ever makes another clone disappear, the log can prove the loss happened after launch.
+#
 # V4.81.26 — NO ROUTE NUDGE SAFETY HOTFIX
 # - Tightens automatic screenshot-only CAPTCHA detection: a generic white Roblox/Home panel plus a
 #   green avatar/game icon is no longer enough. Color-only CAPTCHA now requires a near-white challenge
 #   panel and a centered green-button signal before confirmations can start the provider.
-# - Bubble-only Hatcher recovery keeps the one exact-PID bootstrap, then uses two delayed in-place
-#   private-route nudges (no additional PID stop) so Roblox Home has time to finish booting before
-#   the saved Hatcher deep link is resent.
+# - Automatic 15s/45s bubble route nudges are disabled for App Cloner safety.
 #
 # V4.81.23 — BUBBLE HOME SECOND-INTENT RESCUE
 # - Bubble/minimized shell detection now accepts a stale package with no visible package window even
@@ -943,7 +951,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.26-no-route-nudge-safety"
+__version__ = "V4.81.27-bubble-prewarm-safety-rollback"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -4868,7 +4876,12 @@ def open_package_launcher(pkg, cfg):
 
 
 def prewarm_closed_clone_for_hard_open(pkg, cfg, reason=""):
-    """Materialize a stale/bubble-only App Cloner task before exact-PID stop.
+    """Legacy diagnostic helper; runtime recovery no longer calls this.
+
+    V4.81.27 removed launcher/materialize prewarm from the hard-open path because
+    opening a clone launcher can disturb sibling App Cloner floating tasks.
+
+    Historical behavior:
 
     V4.81.21 handles the manual-X-close case where the package process and Noka
     floating bubble survive but Roblox has no live ActivityRecord. That state
@@ -5022,10 +5035,15 @@ def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop
 
     link = android_launch_roblox_link(link, cfg)
 
+    bubble_launch_diag = False
+    sibling_before_launch = {}
+
     if not soft and require_stop and not skip_force_stop:
-        prewarm_ok, prewarm_note = prewarm_closed_clone_for_hard_open(pkg, cfg, reason)
-        if prewarm_ok:
-            log_activity(f"prewarm ok before hard open: {cut(prewarm_note, 40)}", pkg, DIM)
+        # V4.81.27 SAFETY ROLLBACK:
+        # Never materialize/open the App Cloner launcher before a recovery stop.
+        # The proven-safe runtime invariant is exact target PID stop followed by
+        # one plain target VIEW intent. The old launcher prewarm could reshuffle
+        # sibling floating tasks even though no sibling PID was signalled.
         stopped, stop_note = force_stop_package(pkg, cfg, tries=3, wait_after=0.8, settle=1.0)
         log_activity(f"hard open stop check: {cut(stop_note, 70)}", pkg, DIM)
         if not stopped:
@@ -5033,6 +5051,21 @@ def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop
             # still alive. On App Cloner this creates a second/cascaded window.
             log_activity(f"hard open aborted: {cut(stop_note, 80)}", pkg, RED)
             return False, f"stop failed: {cut(stop_note, 60)}"
+
+        # Bubble recovery is the only path that recently showed sibling loss.
+        # Snapshot peers *after* the exact-PID stop and immediately before the
+        # one target launch. This is diagnostic only; it never kills/repairs peers.
+        if "bubble-only" in str(reason or "").lower():
+            bubble_launch_diag = True
+            sibling_before_launch, sibling_errors = _sibling_pid_snapshot(pkg, cfg)
+            if sibling_errors:
+                log_activity(
+                    "bubble launch peer snapshot unavailable: "
+                    + " | ".join(sibling_errors),
+                    pkg,
+                    YELLOW,
+                )
+                sibling_before_launch = {}
 
     if should_clear_cache_for_open(cfg, soft):
         clear_package_cache(pkg, cfg, rt_tab=rt_tab, reason=reason)
@@ -5051,6 +5084,27 @@ def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop
     cmd = "am start " + base_args
     code, out = shell_timeout(cmd, cfg, capture=True, timeout=15)
     if code == 0:
+        if bubble_launch_diag and sibling_before_launch:
+            # Give Android/App Cloner a moment to settle, then prove whether the
+            # plain target launch itself affected a peer process. This does not
+            # attempt any sibling repair or additional launch.
+            time.sleep(1.0)
+            peer_ok, peer_note = _verify_sibling_pid_snapshot(
+                sibling_before_launch, cfg, pkg
+            )
+            if not peer_ok:
+                log_activity(
+                    "BUBBLE LAUNCH SIBLING LOSS; no further auto action: "
+                    + cut(peer_note, 100),
+                    pkg,
+                    RED,
+                )
+                if rt_tab is not None:
+                    rt_tab["bubble_launch_sibling_loss"] = True
+                    rt_tab["bubble_launch_sibling_loss_note"] = str(peer_note or "")
+                    rt_tab["bubble_launch_sibling_loss_at"] = now()
+            elif rt_tab is not None:
+                rt_tab["bubble_launch_sibling_loss"] = False
         return True, "soft hop" if soft else "opened"
 
     if (
