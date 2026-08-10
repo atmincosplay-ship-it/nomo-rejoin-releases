@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.37 — OPTION 6 OPTION-1 RECOVERY PATH
+# - Option 6 keeps one initial manual hard restart, but after that it uses the exact normal
+#   Option 1 post-open recovery chain: wait for fresh state, then in-place route retries before
+#   the standard delayed hard fallback. It no longer stops after the first Home/no-state result.
+# - Option 6 resets only the current recovery generation's Home/join-fail counters before queueing
+#   so an old failed generation cannot jump directly to another hard restart.
+# - The 5-minute per-package repeat guard remains as a safety belt, but a normal Option 6 call now
+#   drains the same recovery queue until the selected package reaches the same terminal outcome as Option 1.
+#
 # V4.81.36 — OPTION 6 ROBLOX-ACTIVITY TRUTH GUARD
 # - Option 6 post-check no longer treats a surviving Noka bubble/process as OPEN OK.
 # - Repeat-guarded/manual queue-skipped requests are surfaced explicitly instead of being masked by the bubble PID.
@@ -997,7 +1006,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.36-option6-roblox-activity-truth-guard"
+__version__ = "V4.81.37-option6-option1-recovery-path"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -7891,15 +7900,26 @@ def manual_restart_tabs_via_queue(
             if callable(target_for_tab)
             else str(target_for_tab or "market")
         )
+        # V4.81.37: Option 6 may still make the one explicit manual hard
+        # restart requested by the user, but after that it must behave exactly
+        # like the normal Option 1 recovery chain.  In particular, DO NOT set
+        # no_hard_fallback here: that flag also suppresses the safe route-retry
+        # stages and forces the user to press Option 6 again, creating another
+        # App-Cloner hard launch.
+        #
+        # Reset only the current Home/join-failure generation so a previous
+        # failed cycle cannot make this new manual request jump straight to a
+        # second hard fallback.  The core owns all later route/hard escalation.
+        rt_tab["homepage_join_fail_count"] = 0
+        rt_tab["homepage_hard_retries"] = 0
+        rt_tab["last_option6_recovery_chain"] = "option1"
         added, note = core.queue_hard_retry(
             tab,
             target,
             reason,
             metadata={
                 "manual_option6": True,
-                # V4.81.35+: Option 6 is exactly one Android launch attempt.
-                # If Roblox lands Home/no-state, the normal watchdog may retry later.
-                "no_hard_fallback": True,
+                "option6_normal_recovery_chain": True,
             },
         )
         if added:
@@ -8040,7 +8060,7 @@ def open_all_tabs_once(cfg, selected_packages=None):
     )
 
     print(col(
-        "Option 6 uses the normal queue; solver submits once before every actual open.",
+        "Option 6 uses the Option 1 recovery chain: one hard open, then normal route retries before any delayed hard fallback.",
         CYAN,
     ))
 
@@ -20255,7 +20275,7 @@ def open_all_hatcher_tabs_once(
 
     print(
         col(
-            "Option 6: exact proven Hatcher restart path.",
+            "Option 6: same post-open recovery chain as Option 1.",
             CYAN,
         )
     )
