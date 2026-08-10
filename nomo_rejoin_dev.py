@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
-# V4.81.14 — UNIFIED JSON WRITE GUARD
+# V4.81.15 — DURABILITY GUARD
 # - Healthy Delta key validity checks now run every 5 minutes instead of every 60s.
 # - Within 2 hours of expiry, or after a validity API error, monitoring tightens to 60s.
 # - Pending renewal tickets keep the existing 15s poll cadence for fast completion/rejection.
@@ -876,7 +876,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.14-unified-json-write-guard"
+__version__ = "V4.81.15-durability-guard"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -974,6 +974,7 @@ CLOUDFLARE_UPLOAD_REASON_KEY = "cloudflare_upload_hold_reason"
 # old separate files are auto-imported and backed up.
 # --------------------------------------------------------------------------
 NOMO_FILE = BASE_DIR / "nomo.json"
+NOMO_LAST_GOOD_FILE = BASE_DIR / "nomo.json.last_good"
 
 # Map each logical file constant -> its section key inside nomo.json.
 _MERGED_SECTIONS = {
@@ -996,6 +997,9 @@ _NOMO_CACHE = {
     "persisted_signature": None,
     "writes": 0,
     "skips": 0,
+    "recovered_from_last_good": False,
+    "recovery_blocked": False,
+    "last_read_error": "",
 }
 _NOMO_FILE_LOCK = threading.RLock()
 
@@ -1010,28 +1014,133 @@ def _nomo_signature(data):
         return repr(data)
 
 
+def _nomo_parse_dict_file(path):
+    path = Path(path)
+    try:
+        if not path.exists():
+            return None, "missing"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return None, "root is not an object"
+        return data, ""
+    except Exception as exc:
+        return None, str(exc)
+
+
+def _nomo_atomic_text(path, text):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(str(tmp), str(path))
+    except Exception:
+        path.write_text(text, encoding="utf-8")
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+
+
+def _nomo_quarantine_corrupt_file(path):
+    path = Path(path)
+    if not path.exists():
+        return ""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    target = path.with_name(path.name + f".corrupt-{stamp}")
+    suffix = 1
+    while target.exists():
+        target = path.with_name(path.name + f".corrupt-{stamp}-{suffix}")
+        suffix += 1
+    try:
+        os.replace(str(path), str(target))
+        return str(target)
+    except Exception:
+        return ""
+
+
+def _nomo_seed_last_good(data):
+    """Best-effort seed/update of the recoverable unified snapshot."""
+    try:
+        pretty = json.dumps(data, indent=2, ensure_ascii=False)
+        _nomo_atomic_text(NOMO_LAST_GOOD_FILE, pretty)
+        return True
+    except Exception:
+        return False
+
+
 def _nomo_read_all():
-    """Read the whole unified file (cached in-process)."""
+    """Read the whole unified file with last-good corruption recovery."""
     with _NOMO_FILE_LOCK:
         if _NOMO_CACHE["data"] is None:
-            try:
-                if NOMO_FILE.exists():
-                    _NOMO_CACHE["data"] = json.loads(NOMO_FILE.read_text())
+            data, primary_err = _nomo_parse_dict_file(NOMO_FILE)
+            primary_exists = NOMO_FILE.exists()
+
+            if data is not None:
+                _NOMO_CACHE["data"] = data
+                _NOMO_CACHE["recovery_blocked"] = False
+                _NOMO_CACHE["last_read_error"] = ""
+                # Seed protection immediately after updating from an older build.
+                if not NOMO_LAST_GOOD_FILE.exists():
+                    _nomo_seed_last_good(data)
+            elif primary_exists:
+                recovered, backup_err = _nomo_parse_dict_file(NOMO_LAST_GOOD_FILE)
+                if recovered is not None:
+                    quarantined = _nomo_quarantine_corrupt_file(NOMO_FILE)
+                    _NOMO_CACHE["data"] = recovered
+                    _NOMO_CACHE["recovered_from_last_good"] = True
+                    _NOMO_CACHE["recovery_blocked"] = False
+                    _NOMO_CACHE["last_read_error"] = str(primary_err or "invalid nomo.json")
+                    # Restore the primary file before any section save can occur.
+                    _nomo_atomic_text(
+                        NOMO_FILE,
+                        json.dumps(recovered, indent=2, ensure_ascii=False),
+                    )
+                    print(
+                        "[NOMO] recovered corrupt nomo.json from last-good"
+                        + (f"; quarantined={quarantined}" if quarantined else "")
+                    )
+                else:
+                    # Never turn a malformed unified config into an empty one and
+                    # overwrite it on the next innocent runtime save. Fail closed.
+                    _NOMO_CACHE["data"] = {}
+                    _NOMO_CACHE["recovery_blocked"] = True
+                    _NOMO_CACHE["last_read_error"] = (
+                        f"nomo.json invalid: {primary_err}; last-good invalid: {backup_err}"
+                    )
+                    print("[NOMO] ERROR: unified config recovery blocked; refusing nomo.json writes")
+            else:
+                # Brand-new install: no primary file is not corruption.
+                recovered, _backup_err = _nomo_parse_dict_file(NOMO_LAST_GOOD_FILE)
+                if recovered is not None:
+                    _NOMO_CACHE["data"] = recovered
+                    _NOMO_CACHE["recovered_from_last_good"] = True
+                    _NOMO_CACHE["recovery_blocked"] = False
+                    _nomo_atomic_text(
+                        NOMO_FILE,
+                        json.dumps(recovered, indent=2, ensure_ascii=False),
+                    )
                 else:
                     _NOMO_CACHE["data"] = {}
-            except Exception:
-                _NOMO_CACHE["data"] = {}
+                    _NOMO_CACHE["recovery_blocked"] = False
+                    _NOMO_CACHE["last_read_error"] = ""
+
             _NOMO_CACHE["persisted_signature"] = _nomo_signature(_NOMO_CACHE["data"])
         return _NOMO_CACHE["data"]
 
 
 def _nomo_write_all(data, force=False):
-    """Atomically persist nomo.json, skipping only byte-equivalent state.
+    """Atomically persist nomo.json and its recoverable last-good snapshot.
 
-    Changed state is never delayed/debounced: solver reservations, backend holds,
-    key timers, and rejoin bookkeeping remain crash-durable immediately.
+    Changed state is never delayed/debounced. If both the primary and backup were
+    unreadable on startup, writes fail closed so an innocent runtime save cannot
+    destroy the user's other unified sections.
     """
     with _NOMO_FILE_LOCK:
+        if _NOMO_CACHE.get("recovery_blocked"):
+            return False
+
         signature = _nomo_signature(data)
         if not force and _NOMO_CACHE.get("persisted_signature") == signature:
             _NOMO_CACHE["data"] = data
@@ -1040,19 +1149,10 @@ def _nomo_write_all(data, force=False):
 
         pretty = json.dumps(data, indent=2, ensure_ascii=False)
         BASE_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = NOMO_FILE.with_suffix(".json.tmp")
-        try:
-            tmp.write_text(pretty)
-            os.replace(str(tmp), str(NOMO_FILE))
-        except Exception:
-            NOMO_FILE.write_text(pretty)
-            try:
-                if tmp.exists():
-                    tmp.unlink()
-            except Exception:
-                pass
+        _nomo_atomic_text(NOMO_FILE, pretty)
+        # The exact successfully serialized unified state is the last-good copy.
+        _nomo_atomic_text(NOMO_LAST_GOOD_FILE, pretty)
 
-        # Only mark the signature after a successful persistence path.
         _NOMO_CACHE["data"] = data
         _NOMO_CACHE["persisted_signature"] = signature
         _NOMO_CACHE["writes"] = int(_NOMO_CACHE.get("writes", 0) or 0) + 1
@@ -1364,7 +1464,7 @@ DEFAULT_CONFIG = {
     "exotic_key_write_secret": "",
     "exotic_key_read_token": "",
     "exotic_key_sync_interval_seconds": 600,
-    "exotic_key_reader_retry_seconds": 1800,
+    "exotic_key_reader_retry_seconds": 300,
     "exotic_key_rate_limit_backoff_seconds": 21600,
     "exotic_key_expiry_seconds": 86400,
     "exotic_key_refresh_buffer_seconds": 900,
@@ -2675,6 +2775,13 @@ def apply_update_migrations(cfg):
     exotic_sync = _int_cfg(cfg.get("exotic_key_sync_interval_seconds"), 0)
     if exotic_sync <= 0 or exotic_sync == 3600:
         set_cfg("exotic_key_sync_interval_seconds", 600)
+
+    # V4.81.15: a normal reader/network failure must retry before the old
+    # 24-hour key can expire. Preserve custom short values; migrate the old
+    # 30-minute default (and invalid/missing values) to 5 minutes.
+    exotic_reader_retry = _int_cfg(cfg.get("exotic_key_reader_retry_seconds"), 0)
+    if exotic_reader_retry <= 0 or exotic_reader_retry == 1800:
+        set_cfg("exotic_key_reader_retry_seconds", 300)
 
     # V3.81: non-blocking solver defaults for existing nomo.json files.
     if _int_cfg(cfg.get("solver_timeout_seconds"), 0) <= 0:
@@ -17804,7 +17911,21 @@ def start_hatcher_reporter(main_cfg=None):
                 status = "Manual"
                 note = rt_tab.get("manual_login_reason") or rt_tab.get("note") or "needs manual login"
 
-            exotic_note = exotic_status_note_for_username(display_user, cfg)
+            current_exotic_job = str((state or {}).get("job_id") or "").strip()
+            exotic_job_seen_age = None
+            if current_exotic_job:
+                if str(rt_tab.get("exotic_expected_job_id") or "") != current_exotic_job:
+                    rt_tab["exotic_expected_job_id"] = current_exotic_job
+                    rt_tab["exotic_expected_job_seen_at"] = now()
+                seen_at = int(rt_tab.get("exotic_expected_job_seen_at", 0) or 0)
+                if seen_at <= 0:
+                    rt_tab["exotic_expected_job_seen_at"] = now()
+                    seen_at = int(rt_tab["exotic_expected_job_seen_at"])
+                exotic_job_seen_age = max(0, now() - seen_at)
+
+            exotic_note = exotic_status_note_for_username(
+                display_user, cfg, current_exotic_job, exotic_job_seen_age
+            )
             if exotic_note:
                 note = (exotic_note + "; " + str(note or "")).strip("; ")
                 if ("FAILED" in exotic_note or "KEY_MISSING" in exotic_note or "KEY MISSING" in exotic_note):
@@ -24394,7 +24515,7 @@ def _exotic_reader_job(cfg_snapshot):
         backoff = (
             max(3600, int(cfg_snapshot.get("exotic_key_rate_limit_backoff_seconds", 21600) or 21600))
             if _exotic_rate_limited_text(err)
-            else max(300, int(cfg_snapshot.get("exotic_key_reader_retry_seconds", 1800) or 1800))
+            else max(300, int(cfg_snapshot.get("exotic_key_reader_retry_seconds", 300) or 300))
         )
         _update_exotic_key_state({
             "last_cloud_error": str(err),
@@ -24735,13 +24856,43 @@ def exotic_status_for_username(username):
     return result
 
 
-def exotic_status_note_for_username(username, cfg):
+def exotic_status_note_for_username(
+    username, cfg, current_job_id="", current_job_seen_age=None
+):
+    """Return a package-facing Exotic health note for the current Roblox server.
+
+    V4.81.15 binds EXOTIC_STARTED to the current state job_id. A stale status
+    from the previous server can no longer make a fresh rejoin look healthy.
+    """
     status = exotic_status_for_username(username)
+    expected_job = str(current_job_id or "").strip()
+    warn_after = max(60, int(cfg.get("exotic_key_status_warn_after_seconds", 180) or 180))
+    try:
+        seen_age = int(current_job_seen_age) if current_job_seen_age is not None else None
+    except Exception:
+        seen_age = None
+
     if not status:
+        if expected_job and seen_age is not None:
+            if seen_age >= warn_after:
+                return "EXOTIC FAILED current server has no status"
+            return f"EXOTIC waiting current server {max(0, warn_after - seen_age)}s"
         return ""
+
     stage = str(status.get("stage") or "").strip().upper()
     age = int(status.get("age", 999999) or 999999)
     err = cut(str(status.get("error") or ""), 70)
+    status_job = str(status.get("job_id") or status.get("jobId") or "").strip()
+
+    if expected_job:
+        current_match = bool(status_job) and status_job == expected_job
+        if not current_match:
+            if seen_age is not None and seen_age >= warn_after:
+                return "EXOTIC FAILED current server unconfirmed"
+            if seen_age is not None:
+                return f"EXOTIC waiting current server {max(0, warn_after - seen_age)}s"
+            return "EXOTIC current server unconfirmed"
+
     failures = {
         "KEY_MISSING",
         "EXOTIC_DOWNLOAD_FAILED",
@@ -24750,7 +24901,6 @@ def exotic_status_note_for_username(username, cfg):
     }
     if stage in failures:
         return "EXOTIC " + stage.replace("EXOTIC_", "") + (f": {err}" if err else "")
-    warn_after = max(60, int(cfg.get("exotic_key_status_warn_after_seconds", 180) or 180))
     if stage and stage != "EXOTIC_STARTED" and age >= warn_after:
         return f"EXOTIC {stage} stuck {format_age(age)}"
     if stage == "EXOTIC_STARTED" and bool(cfg.get("exotic_key_status_show_ok", False)):
