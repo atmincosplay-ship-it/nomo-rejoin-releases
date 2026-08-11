@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.51 — AUDIT BATCH: MARKET AUTOEXEC + EXOTIC BACKEND + WRITER VERIFY
+# - Market runtime markers are now consumed by the Python watchdog instead of write-only telemetry.
+#   A current Trade World session with missing/stuck/failed NOMO Market AutoExec gets one safe recovery
+#   generation per Market source identity; ALIVE Noka stays route-only with no PID-stop hard fallback.
+# - Cloudflare Hatcher/Booster reporting now treats a confirmed current-server Exotic failure as
+#   non-reportable state, preserving the last-good backend route instead of advertising a broken clone online.
+# - Writer cloud verification is independent from generation/upload retry waits. A same-key early-renewal
+#   backoff no longer suppresses the scheduled second-writer verification READ.
+# - Option 6 behavior, Exotic 4-hour renewal, 10-minute reader cadence, and rate-limit backoffs are unchanged.
+#
 # V4.81.50 — EXOTIC KEY MENU LIVE REFRESH
 # - Exotic Key Manager no longer blocks forever on input() with a frozen status snapshot.
 # - While the menu is open it redraws about every 2 seconds and continues running the normal
@@ -1087,7 +1097,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.50"
+__version__ = "V4.81.51"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1684,6 +1694,8 @@ DEFAULT_CONFIG = {
     "exotic_key_writer_verify_retry_seconds": 300,
     "exotic_key_status_warn_after_seconds": 180,
     "exotic_key_status_show_ok": False,
+    "market_runtime_status_warn_after_seconds": 180,
+    "market_runtime_status_show_ok": False,
 
     "delta_key_browser_package": "mark.via.gq",
     "delta_key_license_path": str(DELTA_KEY_DEFAULT_LICENSE_FILE),
@@ -15343,7 +15355,11 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
             core=core,
             visible_home_fail_after_seconds=(
                 max(20, int(cfg.get("option6_alive_noka_home_confirm_seconds", 45) or 45))
-                if (item.get("option6_alive_noka_route_only") or item.get("exotic_alive_noka_route_only"))
+                if (
+                    item.get("option6_alive_noka_route_only")
+                    or item.get("exotic_alive_noka_route_only")
+                    or item.get("market_alive_noka_route_only")
+                )
                 and _is_noka_clone_package(pkg)
                 and actual_open_mode == "route"
                 else None
@@ -15473,6 +15489,56 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                 1,
                 int(cfg.get("join_failures_before_hard_rejoin", 3) or 3),
             )
+
+            # V4.81.51: Market AutoExec uses the same App-Cloner safety rule.
+            # A live Noka may receive route/task-reuse retries, but this automatic
+            # script-health recovery must never escalate into a target PID-stop.
+            market_alive_noka_route_only = bool(
+                item.get("market_alive_noka_route_only")
+                and _is_noka_clone_package(pkg)
+                and alive_for_retry
+            )
+            if market_alive_noka_route_only:
+                market_route_limit = max(
+                    failures_before_hard,
+                    int(cfg.get("option6_alive_noka_route_retry_limit", 3) or 3),
+                )
+                if join_fail_count < market_route_limit:
+                    retry_meta = {
+                        "solver_preflight_done": True,
+                        "skip_solver_once": True,
+                        "skip_solver_probe": True,
+                        "solver_result": str(item.get("solver_result", "") or ""),
+                        "market_runtime_recovery": True,
+                        "market_alive_noka_route_only": True,
+                    }
+                    retry_reason = (
+                        f"Market AutoExec alive Noka route retry {join_fail_count}/{market_route_limit - 1} "
+                        f"after {fresh_msg}"
+                    )
+                    added, _ = core.queue_route_retry(
+                        tab, target, retry_reason, metadata=retry_meta
+                    )
+                    rt_tab["note"] = (
+                        f"{fresh_msg}; Market AutoExec route-only "
+                        + ("retry queued" if added else "retry already queued")
+                    )
+                    log_activity(
+                        f"Market AutoExec alive Noka route retry {join_fail_count}/{market_route_limit - 1}; "
+                        "hard fallback blocked for sibling safety",
+                        pkg, YELLOW,
+                    )
+                else:
+                    rt_tab["note"] = (
+                        f"{fresh_msg}; Market AutoExec route-only retries exhausted; "
+                        "no hard fallback while package remains alive"
+                    )
+                    log_activity(
+                        "Market AutoExec alive Noka route retries exhausted; no PID-stop fallback",
+                        pkg, YELLOW,
+                    )
+                core.save()
+                return True
 
             # V4.81.49: an Exotic AutoExec recovery on an already-ALIVE Noka
             # must never escalate into a PID-stop. A route reload is enough to
@@ -15608,6 +15674,10 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                     "exotic_alive_noka_route_only": bool(
                         item.get("exotic_alive_noka_route_only")
                     ),
+                    "market_runtime_recovery": bool(item.get("market_runtime_recovery")),
+                    "market_alive_noka_route_only": bool(
+                        item.get("market_alive_noka_route_only")
+                    ),
                 }
                 retry_reason = f"join fail {join_fail_count}/{failures_before_hard}; route retry after {fresh_msg}"
                 added, _ = core.queue_route_retry(
@@ -15692,8 +15762,18 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                 and _is_noka_clone_package(pkg)
                 and fallback_status == "ALIVE"
             )
-            if block_option6_noka_hard or block_exotic_noka_hard:
-                owner = "Exotic" if block_exotic_noka_hard else "Option 6"
+            block_market_noka_hard = bool(
+                item.get("market_alive_noka_route_only")
+                and _is_noka_clone_package(pkg)
+                and fallback_status == "ALIVE"
+            )
+            if block_option6_noka_hard or block_exotic_noka_hard or block_market_noka_hard:
+                if block_market_noka_hard:
+                    owner = "Market AutoExec"
+                elif block_exotic_noka_hard:
+                    owner = "Exotic"
+                else:
+                    owner = "Option 6"
                 rt_tab["note"] = f"{owner} route open failed; hard fallback blocked while Noka remains alive"
                 log_activity(
                     f"{owner} route open failed; no PID-stop fallback while Noka remains alive",
@@ -15947,13 +16027,123 @@ def _nomo_start_market_rejoin_original(cfg):
                 status = rj_status or status
                 note = rj_note or note
 
+            # V4.81.51: the Market loader has written a detailed runtime marker
+            # since V4.81.4, but the Python watchdog previously never consumed it.
+            # Bind that marker to the current Trade World JobId and give a failed
+            # AutoExec one target-only recovery generation per Market source ID.
+            current_place_id = str((state or {}).get("place_id") or "").strip()
+            current_market_job = str((state or {}).get("job_id") or "").strip()
+            market_job_seen_age = None
+            market_runtime_note = ""
+            market_runtime_block_market_actions = False
+            if (
+                state
+                and health.get("clean_fresh")
+                and current_place_id == "129954712878723"
+                and str(target or "market").lower() == "market"
+            ):
+                if current_market_job:
+                    if str(rt_tab.get("market_runtime_expected_job_id") or "") != current_market_job:
+                        rt_tab["market_runtime_expected_job_id"] = current_market_job
+                        rt_tab["market_runtime_expected_job_seen_at"] = now()
+                    market_seen_at = int(rt_tab.get("market_runtime_expected_job_seen_at", 0) or 0)
+                    if market_seen_at <= 0:
+                        rt_tab["market_runtime_expected_job_seen_at"] = now()
+                        market_seen_at = int(rt_tab["market_runtime_expected_job_seen_at"])
+                    market_job_seen_age = max(0, now() - market_seen_at)
+
+                market_runtime_note = market_runtime_status_note_for_username(
+                    user, cfg, current_market_job, market_job_seen_age
+                )
+                market_started_current = market_runtime_started_for_current_job(
+                    user, current_market_job
+                )
+                if market_started_current:
+                    rt_tab["market_runtime_recovery_attempt_source_id"] = ""
+                    rt_tab["market_runtime_recovery_attempt_at"] = 0
+                    rt_tab["market_runtime_recovery_last_failure"] = ""
+
+                if market_runtime_note:
+                    note = (market_runtime_note + "; " + str(note or "")).strip("; ")
+
+                if market_runtime_note_needs_recovery(market_runtime_note):
+                    # A known-broken Market AutoExec must not simultaneously enter
+                    # pet routing, scheduled-hop, or periodic-hard-refresh paths.
+                    # Those would bypass the one-recovery-per-source guard.
+                    market_runtime_block_market_actions = True
+
+                if market_runtime_block_market_actions and not rj_handled:
+                    status = "Market fail"
+                    market_marker = market_runtime_for_username(user)
+                    source_id = market_runtime_generation_id(market_marker)
+                    attempted_source_id = str(
+                        rt_tab.get("market_runtime_recovery_attempt_source_id") or ""
+                    )
+                    if not source_id:
+                        note = (market_runtime_note + "; waiting for Market runtime identity").strip("; ")
+                    elif attempted_source_id == source_id:
+                        note = (
+                            market_runtime_note
+                            + "; already retried this Market source; waiting for a new source/manual refresh"
+                        ).strip("; ")
+                    elif process_status == "UNKNOWN":
+                        note = (market_runtime_note + "; process UNKNOWN; recovery deferred").strip("; ")
+                    elif manual_login_blocked(rt_tab, cfg, pkg):
+                        note = (market_runtime_note + "; manual auth hold; Market recovery deferred").strip("; ")
+                    elif core.idle_for(pkg, include_solver=True):
+                        rt_tab["homepage_join_fail_count"] = 0
+                        rt_tab["homepage_hard_retries"] = 0
+                        recovery_meta = {
+                            "market_runtime_recovery": True,
+                            "market_alive_noka_route_only": bool(
+                                process_status == "ALIVE" and _is_noka_clone_package(pkg)
+                            ),
+                        }
+                        if process_status == "ALIVE":
+                            added, recovery_note = core.queue_route_retry(
+                                tab,
+                                "market",
+                                "Market AutoExec current-server failure reload",
+                                metadata=recovery_meta,
+                                bypass_manual=False,
+                            )
+                        else:
+                            added, recovery_note = core.queue_crash_recovery(
+                                tab,
+                                "market",
+                                "Market AutoExec failed after package death",
+                                metadata=recovery_meta,
+                            )
+                        if added:
+                            rt_tab["market_runtime_recovery_attempt_source_id"] = source_id
+                            rt_tab["market_runtime_recovery_attempt_at"] = now()
+                            rt_tab["market_runtime_recovery_last_failure"] = market_runtime_note
+                            status = "Queued"
+                            note = (market_runtime_note + "; Market reload queued").strip("; ")
+                            log_activity(
+                                "Market AutoExec failure -> queued one recovery for current source",
+                                pkg,
+                                YELLOW,
+                            )
+                        else:
+                            note = (
+                                market_runtime_note
+                                + "; recovery not queued: "
+                                + str(recovery_note or "busy")
+                            ).strip("; ")
+
             # V3.84: provider probing is intentionally NOT done from the pool
             # dashboard. It runs once only after this package is actually opened.
 
             # -----------------------------------------------------
             # MARKET-ONLY: pet routing + scheduled hop.
             # -----------------------------------------------------
-            if state and not rj_handled and health.get("clean_fresh"):
+            if (
+                state
+                and not rj_handled
+                and health.get("clean_fresh")
+                and not market_runtime_block_market_actions
+            ):
                 status = "Ingame"
                 note = note or "ok"
 
@@ -16029,7 +16219,13 @@ def _nomo_start_market_rejoin_original(cfg):
                                 note = "hop queued"
 
             due_refresh, refresh_left = periodic_hard_refresh_due(rt_tab, cfg)
-            if due_refresh and not rj_handled and not manual_login_blocked(rt_tab, cfg, pkg) and core.idle_for(pkg):
+            if (
+                due_refresh
+                and not rj_handled
+                and not market_runtime_block_market_actions
+                and not manual_login_blocked(rt_tab, cfg, pkg)
+                and core.idle_for(pkg)
+            ):
                 added, _ = core.queue_hard_retry(tab, target, "periodic hard refresh")
                 if added:
                     mark_periodic_hard_refresh(rt_tab)
@@ -18964,6 +19160,30 @@ def hatcher_report_once(hcfg, force=True, state_cache=None, main_runtime=None):
                     reasons.append("visible Roblox Home")
                 report_state = None
                 report_state_err = "; ".join(reasons) or "state not reportable"
+
+            # V4.81.51: a clean pet-counter heartbeat is not enough when the
+            # current-server Exotic AutoExec explicitly failed. Reuse the same
+            # JobId-bound grace used by the local watchdog; after the grace,
+            # preserve Cloudflare's last-good route instead of advertising this
+            # broken clone as ONLINE.
+            if report_state is not None:
+                exotic_job = str((state or {}).get("job_id") or "").strip()
+                exotic_seen_age = None
+                if exotic_job:
+                    if str(rt_tab.get("exotic_backend_expected_job_id") or "") != exotic_job:
+                        rt_tab["exotic_backend_expected_job_id"] = exotic_job
+                        rt_tab["exotic_backend_expected_job_seen_at"] = now()
+                    exotic_seen_at = int(rt_tab.get("exotic_backend_expected_job_seen_at", 0) or 0)
+                    if exotic_seen_at <= 0:
+                        rt_tab["exotic_backend_expected_job_seen_at"] = now()
+                        exotic_seen_at = int(rt_tab["exotic_backend_expected_job_seen_at"])
+                    exotic_seen_age = max(0, now() - exotic_seen_at)
+                exotic_backend_note = exotic_status_note_for_username(
+                    name, main_cfg, exotic_job, exotic_seen_age
+                )
+                if exotic_note_needs_recovery(exotic_backend_note):
+                    report_state = None
+                    report_state_err = "Exotic current-server failure: " + exotic_backend_note
 
         entry = hatcher_entry(eff, report_state, report_state_err)
         status = str(entry.get("status", "")).lower()
@@ -26828,10 +27048,9 @@ def exotic_key_manager_tick(cfg, force_read=False, force_generate=False):
         # Explicit manual generation is allowed to recover/take ownership deliberately.
         if force_generate:
             return "writer_started" if _start_exotic_key_job(cfg, "generate") else "writer_busy"
-        retry_at = int(state.get("next_writer_retry_at", 0) or 0)
-        if retry_at > t:
-            return "writer_retry_wait"
-
+        # V4.81.51: generation/upload retry waits must not suppress the periodic
+        # non-mutating second-writer verification. Verify first when due, then
+        # honor the writer retry timer for mutating generation/upload work.
         verify_interval = max(300, int(cfg.get("exotic_key_writer_verify_interval_seconds", 600) or 600))
         next_verify = int(state.get("next_writer_verify_at", 0) or 0)
         last_verified = int(state.get("writer_cloud_verified_at", 0) or 0)
@@ -26843,6 +27062,10 @@ def exotic_key_manager_tick(cfg, force_read=False, force_generate=False):
             return "writer_verify_started" if _start_exotic_key_job(cfg, "verify") else "writer_busy"
         if bool(state.get("writer_conflict_suspected", False)):
             return "writer_conflict"
+
+        retry_at = int(state.get("next_writer_retry_at", 0) or 0)
+        if retry_at > t:
+            return "writer_retry_wait"
         if state.get("cloud_pending") and local_key:
             return "upload_started" if _start_exotic_key_job(cfg, "upload") else "writer_busy"
 
@@ -26884,6 +27107,140 @@ def exotic_key_manager_tick(cfg, force_read=False, force_generate=False):
     if force_read or next_check <= 0 or t >= next_check:
         return "reader_started" if _start_exotic_key_job(cfg, "read") else "reader_busy"
     return "reader_ok"
+
+
+_MARKET_RUNTIME_STATUS_CACHE = {"ts": 0, "items": []}
+
+
+def _market_runtime_status_files():
+    global _MARKET_RUNTIME_STATUS_CACHE
+    t = now()
+    if t - int(_MARKET_RUNTIME_STATUS_CACHE.get("ts", 0) or 0) < 5:
+        return list(_MARKET_RUNTIME_STATUS_CACHE.get("items", []))
+    items = []
+    seen = set()
+    for root in _exotic_workspace_roots():
+        folder = root / "Nomo"
+        try:
+            if not folder.exists():
+                continue
+            paths = list(folder.glob("market_runtime_*.json"))
+        except Exception:
+            paths = []
+        for path in paths:
+            if str(path) in seen:
+                continue
+            seen.add(str(path))
+            payload = load_json(path, {})
+            if isinstance(payload, dict):
+                payload = dict(payload)
+                payload["_path"] = str(path)
+                items.append(payload)
+    _MARKET_RUNTIME_STATUS_CACHE = {"ts": t, "items": items}
+    return list(items)
+
+
+def market_runtime_for_username(username):
+    wanted = str(username or "").strip().lower()
+    if not wanted:
+        return None
+    best = None
+    best_ts = -1
+    for payload in _market_runtime_status_files():
+        if str(payload.get("username") or "").strip().lower() != wanted:
+            continue
+        try:
+            ts = int(payload.get("updated_at", 0) or 0)
+        except Exception:
+            ts = 0
+        if ts >= best_ts:
+            best = payload
+            best_ts = ts
+    if not best:
+        return None
+    result = dict(best)
+    result["age"] = max(0, now() - max(0, best_ts)) if best_ts > 0 else 999999
+    return result
+
+
+def market_runtime_status_note_for_username(
+    username, cfg, current_job_id="", current_job_seen_age=None
+):
+    status = market_runtime_for_username(username)
+    expected_job = str(current_job_id or "").strip()
+    warn_after = max(60, int(cfg.get("market_runtime_status_warn_after_seconds", 180) or 180))
+    try:
+        seen_age = int(current_job_seen_age) if current_job_seen_age is not None else None
+    except Exception:
+        seen_age = None
+
+    if not status:
+        if expected_job and seen_age is not None:
+            if seen_age >= warn_after:
+                return "MARKET FAILED current server has no runtime marker"
+            return f"MARKET waiting AutoExec {max(0, warn_after - seen_age)}s"
+        return ""
+
+    stage = str(status.get("stage") or "").strip().upper()
+    age = int(status.get("age", 999999) or 999999)
+    err = cut(str(status.get("error") or status.get("market_remote_error") or ""), 70)
+    status_job = str(status.get("job_id") or status.get("jobId") or "").strip()
+
+    if expected_job:
+        current_match = bool(status_job) and status_job == expected_job
+        if not current_match:
+            if seen_age is not None and seen_age >= warn_after:
+                return "MARKET FAILED current server unconfirmed"
+            if seen_age is not None:
+                return f"MARKET waiting AutoExec {max(0, warn_after - seen_age)}s"
+            return "MARKET current server unconfirmed"
+
+    if stage in {"SOURCE_UNAVAILABLE", "RUNTIME_FAILED"}:
+        label = stage.replace("_", " ")
+        return "MARKET " + label + (f": {err}" if err else "")
+    if stage in {"LOADER_STARTED", "SOURCE_READY"} and age >= warn_after:
+        return f"MARKET {stage.replace('_', ' ')} stuck {format_age(age)}"
+    if stage == "MARKET_RUNNING" and bool(cfg.get("market_runtime_status_show_ok", False)):
+        return f"Market OK {format_age(age)}"
+    return ""
+
+
+def market_runtime_generation_id(status=None):
+    status = status if isinstance(status, dict) else {}
+    pieces = [
+        str(status.get("loader_version") or status.get("loader_build") or ""),
+        str(status.get("market_version") or "UNKNOWN"),
+        str(status.get("market_source") or "none"),
+    ]
+    if not any(piece.strip() for piece in pieces):
+        return ""
+    return hashlib.sha256("|".join(pieces).encode("utf-8", "ignore")).hexdigest()[:16]
+
+
+def market_runtime_note_needs_recovery(note):
+    text = str(note or "").strip().upper()
+    if not text.startswith("MARKET"):
+        return False
+    markers = (
+        "FAILED",
+        "SOURCE UNAVAILABLE",
+        "RUNTIME FAILED",
+        " STUCK ",
+    )
+    return any(marker in text for marker in markers)
+
+
+def market_runtime_started_for_current_job(username, current_job_id):
+    status = market_runtime_for_username(username)
+    if not status:
+        return False
+    if str(status.get("stage") or "").strip().upper() != "MARKET_RUNNING":
+        return False
+    expected = str(current_job_id or "").strip()
+    if not expected:
+        return True
+    actual = str(status.get("job_id") or status.get("jobId") or "").strip()
+    return bool(actual) and actual == expected
 
 
 def _exotic_status_files():
