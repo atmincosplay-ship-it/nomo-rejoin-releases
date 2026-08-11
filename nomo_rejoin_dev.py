@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.50 — EXOTIC KEY MENU LIVE REFRESH
+# - Exotic Key Manager no longer blocks forever on input() with a frozen status snapshot.
+# - While the menu is open it redraws about every 2 seconds and continues running the normal
+#   Exotic manager tick, so scheduled writer verify/generate and reader sync work are not paused.
+# - Actual Cloudflare/key traffic keeps the existing manager throttles and due-time checks; the
+#   live UI refresh itself does not bypass reader cadence, verification cadence, or backoff.
+# - Menu choices still use the same numbered actions; this is UI/control-loop behavior only.
+#
 # V4.81.49 — EXOTIC EXPIRY GAP + SELF-RECOVERY
 # - Writer renewal now starts 4 hours before the 24-hour Exotic key expiry instead of only 15 minutes before;
 #   existing default-15m schedules migrate in place, while custom refresh buffers are preserved.
@@ -1079,7 +1087,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.49"
+__version__ = "V4.81.50"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -27119,8 +27127,18 @@ def _exotic_writer_readiness(cfg, state):
 
 
 def exotic_key_settings_menu(cfg):
+    # V4.81.50: this menu used to block indefinitely inside input(), freezing both
+    # the visible countdowns and the normal Exotic manager tick.  Keep the menu
+    # live with a short select() wait so scheduled writer/reader work continues
+    # while an operator leaves this screen open.
+    drain_stdin()
+    menu_refresh_seconds = 2.0
     while True:
         cfg = load_config()
+        try:
+            exotic_key_manager_tick(cfg)
+        except Exception as exc:
+            log_activity(f"Exotic key manager menu tick failed: {cut(exc, 90)}", "", YELLOW)
         state = load_exotic_key_state()
         clear()
         banner("EXOTIC KEY MANAGER", cfg)
@@ -27197,8 +27215,20 @@ def exotic_key_settings_menu(cfg):
         print("9. Import legacy key_cloudflare.json")
         print("10. Re-sync saved key to local UID files")
         print("0. Back")
-        drain_stdin()
-        ch = input("\nChoose: ").strip()
+        print(col("Live refresh: ~2s (Key Manager keeps running while this menu is open)", DIM))
+        print("\nChoose: ", end="", flush=True)
+        try:
+            ready, _, _ = select.select([sys.stdin], [], [], menu_refresh_seconds)
+        except Exception:
+            # Fallback for an unusual TTY where select() is unavailable.
+            ch = normalize_menu_choice(input())
+        else:
+            if not ready:
+                # No completed input line yet: redraw from fresh state.
+                continue
+            raw_choice = sys.stdin.readline()
+            ch = normalize_menu_choice(raw_choice)
+
         if ch == "0":
             return
         if ch == "1":
@@ -27294,8 +27324,8 @@ def exotic_key_settings_menu(cfg):
             }
             text = labels.get(result, f"Writer result: {result}")
             print(col(text, RED if text.startswith("BLOCKED") else CYAN))
-            print(col("Refresh this menu in a few seconds to see Generated/Cloud/Secret verification status.", DIM))
-            time.sleep(2)
+            print(col("This menu refreshes automatically; Generated/Cloud/Secret status will update here.", DIM))
+            time.sleep(1)
         elif ch == "9":
             ok, note = exotic_key_import_legacy_config(cfg)
             print(col(note, GREEN if ok else YELLOW))
