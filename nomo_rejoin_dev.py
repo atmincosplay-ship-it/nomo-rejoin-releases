@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
-# V4.81.48 — EXOTIC WRITER STUCK-JOB WATCHDOG
-# - Exotic key background jobs now have a bounded stale-job timeout (default 180s). A wedged
-#   GENERATE/UPLOAD/VERIFY/READ job can no longer leave the Writer permanently BUSY.
-# - Stale jobs are retired with a generation token. If an old worker thread later wakes up, its
-#   state writes/local-key sync are ignored so it cannot overwrite a newer replacement job.
-# - Writer UI shows the active background-job age and records a clear timeout error when a stale
-#   job is superseded. The next manager tick may retry immediately; normal retry/rate-limit rules remain.
-# - Option 6 V4.81.47 route/Home safety is unchanged.
+# V4.81.49 — EXOTIC EXPIRY GAP + SELF-RECOVERY
+# - Writer renewal now starts 4 hours before the 24-hour Exotic key expiry instead of only 15 minutes before;
+#   existing default-15m schedules migrate in place, while custom refresh buffers are preserved.
+# - Reader devices keep the proven 10-minute Cloudflare cadence. A slow Writer therefore gets a much larger
+#   safety window without creating extra steady-state Worker traffic on every reader. Early renewal only advances
+#   expiry when Exotic returns a different key; the same token is treated as "not renewed yet" and retried later.
+# - Current-server Exotic failures (missing key/status, download/compile/source/runtime failure, or a stuck loader)
+#   now trigger one safe target-only reload attempt for the current key instead of only changing the dashboard row.
+# - ALIVE Noka/App-Cloner Exotic recovery is route-only with the same Home-aware retry safety: no PID-stop hard
+#   fallback while the clone remains ALIVE. DEAD uses normal exact-PID crash/start recovery; UNKNOWN defers.
+# - If that same key fails again, NOMO waits instead of looping. When a reader receives a different shared key,
+#   the key fingerprint changes and NOMO automatically retries so AutoExec can actually start Exotic with it.
+# - V4.81.48 experimental Writer watchdog was not adopted and is intentionally not part of this build.
 #
 # V4.81.47 — OPTION 6 MARKET HOME RETRY FIX
 # - Option 6 ALIVE-Noka route generations now run the same rect-scoped Roblox Home watcher for Market
@@ -1074,7 +1079,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.48"
+__version__ = "V4.81.49"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1665,9 +1670,8 @@ DEFAULT_CONFIG = {
     "exotic_key_reader_retry_seconds": 300,
     "exotic_key_rate_limit_backoff_seconds": 21600,
     "exotic_key_expiry_seconds": 86400,
-    "exotic_key_refresh_buffer_seconds": 900,
+    "exotic_key_refresh_buffer_seconds": 14400,
     "exotic_key_writer_retry_seconds": 600,
-    "exotic_key_job_timeout_seconds": 180,
     "exotic_key_writer_verify_interval_seconds": 600,
     "exotic_key_writer_verify_retry_seconds": 300,
     "exotic_key_status_warn_after_seconds": 180,
@@ -3574,6 +3578,23 @@ def load_config():
         if k not in cfg:
             cfg[k] = v
             changed = True
+
+    # V4.81.49: the historical 15-minute Writer refresh buffer was too narrow.
+    # A slow Exotic generator could cross expiry before readers ever received the
+    # replacement key. Migrate only the known old default; preserve real custom values.
+    try:
+        exotic_refresh_policy = int(cfg.get("exotic_key_refresh_policy_version", 0) or 0)
+    except Exception:
+        exotic_refresh_policy = 0
+    if exotic_refresh_policy < 2:
+        try:
+            old_exotic_buffer = int(cfg.get("exotic_key_refresh_buffer_seconds", 900) or 900)
+        except Exception:
+            old_exotic_buffer = 900
+        if old_exotic_buffer == 900:
+            cfg["exotic_key_refresh_buffer_seconds"] = 14400
+        cfg["exotic_key_refresh_policy_version"] = 2
+        changed = True
 
     # V4.58.42: migrate the previous built-in bootstrap place/wait on existing
     # installations. Preserve any unrelated custom PlaceId.
@@ -15314,7 +15335,7 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
             core=core,
             visible_home_fail_after_seconds=(
                 max(20, int(cfg.get("option6_alive_noka_home_confirm_seconds", 45) or 45))
-                if item.get("option6_alive_noka_route_only")
+                if (item.get("option6_alive_noka_route_only") or item.get("exotic_alive_noka_route_only"))
                 and _is_noka_clone_package(pkg)
                 and actual_open_mode == "route"
                 else None
@@ -15445,6 +15466,57 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                 int(cfg.get("join_failures_before_hard_rejoin", 3) or 3),
             )
 
+            # V4.81.49: an Exotic AutoExec recovery on an already-ALIVE Noka
+            # must never escalate into a PID-stop. A route reload is enough to
+            # rerun AutoExec; if that cannot join, wait for the next watchdog/key
+            # change instead of risking a sibling floating task.
+            exotic_alive_noka_route_only = bool(
+                item.get("exotic_alive_noka_route_only")
+                and _is_noka_clone_package(pkg)
+                and alive_for_retry
+            )
+            if exotic_alive_noka_route_only:
+                exotic_route_limit = max(
+                    failures_before_hard,
+                    int(cfg.get("option6_alive_noka_route_retry_limit", 3) or 3),
+                )
+                if join_fail_count < exotic_route_limit:
+                    retry_meta = {
+                        "solver_preflight_done": True,
+                        "skip_solver_once": True,
+                        "skip_solver_probe": True,
+                        "solver_result": str(item.get("solver_result", "") or ""),
+                        "exotic_recovery": True,
+                        "exotic_alive_noka_route_only": True,
+                    }
+                    retry_reason = (
+                        f"Exotic alive Noka route retry {join_fail_count}/{exotic_route_limit - 1} "
+                        f"after {fresh_msg}"
+                    )
+                    added, _ = core.queue_route_retry(
+                        tab, target, retry_reason, metadata=retry_meta
+                    )
+                    rt_tab["note"] = (
+                        f"{fresh_msg}; Exotic route-only "
+                        + ("retry queued" if added else "retry already queued")
+                    )
+                    log_activity(
+                        f"Exotic alive Noka route retry {join_fail_count}/{exotic_route_limit - 1}; "
+                        "hard fallback blocked for sibling safety",
+                        pkg, YELLOW,
+                    )
+                else:
+                    rt_tab["note"] = (
+                        f"{fresh_msg}; Exotic route-only retries exhausted; "
+                        "no hard fallback while package remains alive"
+                    )
+                    log_activity(
+                        "Exotic alive Noka route retries exhausted; no PID-stop fallback",
+                        pkg, YELLOW,
+                    )
+                core.save()
+                return True
+
             # V4.81.44: App Cloner proved that the delayed hard fallback itself
             # can collapse a sibling floating task even though exact-PID stop
             # verified siblings immediately beforehand.  For an Option 6
@@ -15523,6 +15595,10 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                     "option6_route_first": bool(item.get("option6_route_first")),
                     "option6_alive_noka_route_only": bool(
                         item.get("option6_alive_noka_route_only")
+                    ),
+                    "exotic_recovery": bool(item.get("exotic_recovery")),
+                    "exotic_alive_noka_route_only": bool(
+                        item.get("exotic_alive_noka_route_only")
                     ),
                 }
                 retry_reason = f"join fail {join_fail_count}/{failures_before_hard}; route retry after {fresh_msg}"
@@ -15603,10 +15679,16 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                 and _is_noka_clone_package(pkg)
                 and fallback_status == "ALIVE"
             )
-            if block_option6_noka_hard:
-                rt_tab["note"] = "Option 6 route open failed; hard fallback blocked while Noka remains alive"
+            block_exotic_noka_hard = bool(
+                item.get("exotic_alive_noka_route_only")
+                and _is_noka_clone_package(pkg)
+                and fallback_status == "ALIVE"
+            )
+            if block_option6_noka_hard or block_exotic_noka_hard:
+                owner = "Exotic" if block_exotic_noka_hard else "Option 6"
+                rt_tab["note"] = f"{owner} route open failed; hard fallback blocked while Noka remains alive"
                 log_activity(
-                    "Option 6 route open failed; no PID-stop fallback while Noka remains alive",
+                    f"{owner} route open failed; no PID-stop fallback while Noka remains alive",
                     pkg,
                     YELLOW,
                 )
@@ -19677,10 +19759,76 @@ def start_hatcher_reporter(main_cfg=None):
             exotic_note = exotic_status_note_for_username(
                 display_user, cfg, current_exotic_job, exotic_job_seen_age
             )
+            exotic_started_current = exotic_status_started_for_current_job(
+                display_user, current_exotic_job
+            )
+            if exotic_started_current:
+                # A confirmed successful current-server start closes the previous
+                # one-attempt-per-key guard. A later failure on the same key may
+                # therefore receive one fresh recovery attempt.
+                rt_tab["exotic_recovery_attempt_key_id"] = ""
+                rt_tab["exotic_recovery_attempt_at"] = 0
+                rt_tab["exotic_recovery_last_failure"] = ""
+
             if exotic_note:
                 note = (exotic_note + "; " + str(note or "")).strip("; ")
-                if ("FAILED" in exotic_note or "KEY_MISSING" in exotic_note or "KEY MISSING" in exotic_note):
-                    status = "Exotic fail"
+
+            if exotic_note_needs_recovery(exotic_note):
+                status = "Exotic fail"
+                key_state = load_exotic_key_state()
+                key_id = exotic_key_generation_id(key_state)
+                attempted_key_id = str(rt_tab.get("exotic_recovery_attempt_key_id") or "")
+
+                if not key_id:
+                    note = (exotic_note + "; waiting for local Exotic key").strip("; ")
+                elif attempted_key_id == key_id:
+                    note = (
+                        exotic_note
+                        + "; already retried this key; waiting for fresh shared key"
+                    ).strip("; ")
+                elif process_status == "UNKNOWN":
+                    note = (exotic_note + "; process UNKNOWN; recovery deferred").strip("; ")
+                elif manual_login_blocked(rt_tab, cfg, pkg):
+                    note = (exotic_note + "; manual auth hold; Exotic recovery deferred").strip("; ")
+                elif core.idle_for(pkg, include_solver=True):
+                    rt_tab["homepage_join_fail_count"] = 0
+                    rt_tab["homepage_hard_retries"] = 0
+                    recovery_meta = {
+                        "exotic_recovery": True,
+                        "exotic_alive_noka_route_only": bool(
+                            process_status == "ALIVE" and _is_noka_clone_package(pkg)
+                        ),
+                    }
+                    if process_status == "ALIVE":
+                        added, recovery_note = core.queue_route_retry(
+                            tab,
+                            "hatcher",
+                            "Exotic current-server failure reload",
+                            metadata=recovery_meta,
+                            bypass_manual=False,
+                        )
+                    else:
+                        added, recovery_note = core.queue_crash_recovery(
+                            tab,
+                            "hatcher",
+                            "Exotic failed after package death",
+                            metadata=recovery_meta,
+                        )
+                    if added:
+                        rt_tab["exotic_recovery_attempt_key_id"] = key_id
+                        rt_tab["exotic_recovery_attempt_at"] = now()
+                        rt_tab["exotic_recovery_last_failure"] = exotic_note
+                        status = "Queued"
+                        note = (exotic_note + "; Exotic reload queued").strip("; ")
+                        log_activity(
+                            "Exotic failure -> queued one recovery for current key",
+                            pkg,
+                            YELLOW,
+                        )
+                    else:
+                        note = (
+                            exotic_note + "; recovery not queued: " + str(recovery_note or "busy")
+                        ).strip("; ")
 
             update_clone_session(rt_tab, status, cfg, state)
             rows.append({
@@ -26042,75 +26190,9 @@ end)
 _EXOTIC_KEY_JOB_LOCK = threading.Lock()
 _EXOTIC_STATE_LOCK = threading.RLock()
 _EXOTIC_LOCAL_SYNC_LOCK = threading.Lock()
-_EXOTIC_KEY_JOB = {"running": False, "mode": "", "started_at": 0, "generation": 0}
-_EXOTIC_JOB_CONTEXT = threading.local()
+_EXOTIC_KEY_JOB = {"running": False, "mode": "", "started_at": 0}
 _EXOTIC_KEY_LAST_TICK = 0
 _EXOTIC_STATUS_CACHE = {"ts": 0, "items": []}
-
-
-def _exotic_job_timeout_seconds(cfg):
-    return max(60, int((cfg or {}).get("exotic_key_job_timeout_seconds", 180) or 180))
-
-
-def _exotic_job_is_current():
-    """False only for a superseded Exotic background worker thread."""
-    token = getattr(_EXOTIC_JOB_CONTEXT, "generation", None)
-    if token is None:
-        return True
-    with _EXOTIC_KEY_JOB_LOCK:
-        return bool(
-            _EXOTIC_KEY_JOB.get("running")
-            and int(_EXOTIC_KEY_JOB.get("generation", 0) or 0) == int(token)
-        )
-
-
-def _exotic_key_job_snapshot(cfg=None, recover_stale=False):
-    """Return current job state; optionally retire a background job that exceeded its hard age."""
-    timeout = _exotic_job_timeout_seconds(cfg or {})
-    stale = None
-    with _EXOTIC_KEY_JOB_LOCK:
-        running = bool(_EXOTIC_KEY_JOB.get("running"))
-        mode = str(_EXOTIC_KEY_JOB.get("mode") or "")
-        started_at = int(_EXOTIC_KEY_JOB.get("started_at", 0) or 0)
-        generation = int(_EXOTIC_KEY_JOB.get("generation", 0) or 0)
-        age = max(0, now() - started_at) if running and started_at > 0 else 0
-        if recover_stale and running and started_at > 0 and age >= timeout:
-            stale = {"mode": mode, "age": age, "generation": generation, "timeout": timeout}
-            # Invalidate the old worker token before releasing BUSY. A replacement
-            # job gets a newer generation and the old thread cannot clear/write it.
-            _EXOTIC_KEY_JOB["running"] = False
-            _EXOTIC_KEY_JOB["mode"] = ""
-            _EXOTIC_KEY_JOB["started_at"] = 0
-            _EXOTIC_KEY_JOB["generation"] = generation + 1
-            running = False
-            mode = ""
-            started_at = 0
-            generation += 1
-            age = 0
-    if stale:
-        note = (
-            f"{str(stale.get('mode') or 'background').upper()} background job timed out "
-            f"after {int(stale.get('age', 0))}s; stale worker superseded"
-        )
-        _update_exotic_key_state({
-            "last_writer_attempt_at": now(),
-            "last_writer_error": note,
-            # Do not impose the normal 10-minute writer retry merely because the
-            # local worker wedged. The next manager tick may start a clean job.
-            "next_writer_retry_at": 0,
-            "last_background_job_timeout_at": now(),
-            "last_background_job_timeout_mode": str(stale.get("mode") or ""),
-        })
-        log_activity("Exotic key watchdog: " + note, "", RED)
-    return {
-        "running": running,
-        "mode": mode,
-        "started_at": started_at,
-        "generation": generation,
-        "age": age,
-        "timeout": timeout,
-        "stale_recovered": stale,
-    }
 
 
 def _exotic_clean_key(value):
@@ -26138,11 +26220,7 @@ def save_exotic_key_state(state):
 
 
 def _update_exotic_key_state(updates=None, *, expected_key=None):
-    """Merge fields into latest state; superseded background workers fail closed."""
-    if not _exotic_job_is_current():
-        with _EXOTIC_STATE_LOCK:
-            state = _protected_json_read_dict(EXOTIC_KEY_STATE_FILE, {})
-            return (dict(state) if isinstance(state, dict) else {}), False
+    """Merge fields into the latest on-disk state under one re-entrant lock."""
     with _EXOTIC_STATE_LOCK:
         state = _protected_json_read_dict(EXOTIC_KEY_STATE_FILE, {})
         if not isinstance(state, dict):
@@ -26386,8 +26464,6 @@ def _exotic_generate_key_from_site(cfg):
 
 def _exotic_reader_job(cfg_snapshot):
     key, err = _exotic_cloud_read(cfg_snapshot)
-    if not _exotic_job_is_current():
-        return
     t = now()
     if not key:
         backoff = (
@@ -26422,8 +26498,6 @@ def _exotic_reader_job(cfg_snapshot):
         latest["saved_at"] = now()
         _protected_json_write_dict(EXOTIC_KEY_STATE_FILE, latest)
 
-    if not _exotic_job_is_current():
-        return
     ok, _note, shared_count, uid_count = sync_exotic_key_to_local_workspaces(key, source="cloud_reader")
     if changed:
         log_activity(f"Exotic key changed; local sync shared={shared_count} uid={uid_count}", "", GREEN if ok else YELLOW)
@@ -26437,13 +26511,9 @@ def _exotic_verify_published_key(cfg_snapshot, expected_key):
     # KV propagation can be briefly stale, so retry a few times before warning.
     last_note = ""
     for attempt in range(3):
-        if not _exotic_job_is_current():
-            return False, "superseded background job"
         if attempt:
             time.sleep(2)
         cloud_key, note = _exotic_cloud_read(cfg_snapshot)
-        if not _exotic_job_is_current():
-            return False, "superseded background job"
         if cloud_key == expected_key:
             return True, "cloud key verified"
         if cloud_key:
@@ -26470,8 +26540,6 @@ def _exotic_writer_verify_job(cfg_snapshot):
         return
 
     cloud_key, note = _exotic_cloud_read(cfg_snapshot)
-    if not _exotic_job_is_current():
-        return
     t = now()
     if cloud_key == expected_key:
         _update_exotic_key_state({
@@ -26531,13 +26599,9 @@ def _exotic_writer_job(cfg_snapshot, mode):
             mode = "generate"
         else:
             ok, note = _exotic_cloud_write(cfg_snapshot, key)
-            if not _exotic_job_is_current():
-                return
             t = now()
             if ok:
                 verified, verify_note = _exotic_verify_published_key(cfg_snapshot, key)
-                if not _exotic_job_is_current():
-                    return
                 updates = {
                     "cloud_pending": False,
                     "last_writer_attempt_at": t,
@@ -26580,12 +26644,12 @@ def _exotic_writer_job(cfg_snapshot, mode):
             return
 
     if mode == "generate":
+        before_state = load_exotic_key_state()
+        previous_key = _exotic_clean_key(before_state.get("key"))
         try:
             key, err = _exotic_generate_key_from_site(cfg_snapshot)
         except Exception as exc:
             key, err = "", str(exc)
-        if not _exotic_job_is_current():
-            return
         t = now()
         if not key:
             _update_exotic_key_state({
@@ -26596,9 +26660,26 @@ def _exotic_writer_job(cfg_snapshot, mode):
             log_activity(f"Exotic writer generation failed; retry {format_age(retry)}: {cut(err, 100)}", "", RED)
             return
 
+        # An early renewal must produce a different token. If Exotic returns the
+        # still-current key, do not pretend its 24-hour expiry was extended.
+        # Keep the old expiry and retry later with a calmer cadence.
+        if previous_key and key == previous_key:
+            same_key_retry = max(1800, retry)
+            _update_exotic_key_state({
+                "last_writer_attempt_at": t,
+                "last_writer_error": "renewal returned current key; waiting for a fresh token",
+                "next_writer_retry_at": t + same_key_retry,
+            }, expected_key=previous_key)
+            log_activity(
+                f"Exotic writer renewal returned the current key; retry {format_age(same_key_retry)}",
+                "",
+                YELLOW,
+            )
+            return
+
         expiry = max(3600, int(cfg_snapshot.get("exotic_key_expiry_seconds", 86400) or 86400))
-        buffer_seconds = max(60, min(expiry - 60, int(cfg_snapshot.get("exotic_key_refresh_buffer_seconds", 900) or 900)))
-        _latest_state, generation_applied = _update_exotic_key_state({
+        buffer_seconds = max(60, min(expiry - 60, int(cfg_snapshot.get("exotic_key_refresh_buffer_seconds", 14400) or 14400)))
+        _update_exotic_key_state({
             "key": key,
             "key_source": "local_writer",
             "generated_at": t,
@@ -26615,21 +26696,13 @@ def _exotic_writer_job(cfg_snapshot, mode):
             "writer_cloud_verify_note": "",
             "next_writer_verify_at": 0,
         })
-        if not generation_applied or not _exotic_job_is_current():
-            return
         ok_local, _note, shared_count, uid_count = sync_exotic_key_to_local_workspaces(key, source="local_writer")
         log_activity(f"Exotic writer generated new key; local sync shared={shared_count} uid={uid_count}", "", GREEN if ok_local else YELLOW)
 
-        if not _exotic_job_is_current():
-            return
         ok, note = _exotic_cloud_write(cfg_snapshot, key)
-        if not _exotic_job_is_current():
-            return
         t2 = now()
         if ok:
             verified, verify_note = _exotic_verify_published_key(cfg_snapshot, key)
-            if not _exotic_job_is_current():
-                return
             updates = {
                 "last_writer_attempt_at": t2,
                 "cloud_pending": False,
@@ -26673,8 +26746,7 @@ def _exotic_writer_job(cfg_snapshot, mode):
             )
 
 
-def _exotic_key_job_wrapper(cfg_snapshot, mode, generation):
-    _EXOTIC_JOB_CONTEXT.generation = int(generation)
+def _exotic_key_job_wrapper(cfg_snapshot, mode):
     try:
         if mode == "read":
             _exotic_reader_job(cfg_snapshot)
@@ -26683,36 +26755,23 @@ def _exotic_key_job_wrapper(cfg_snapshot, mode, generation):
         else:
             _exotic_writer_job(cfg_snapshot, mode)
     except Exception as exc:
-        if _exotic_job_is_current():
-            log_activity(f"Exotic key background job failed: {cut(exc, 110)}", "", RED)
+        log_activity(f"Exotic key background job failed: {cut(exc, 110)}", "", RED)
     finally:
         with _EXOTIC_KEY_JOB_LOCK:
-            # A stale/superseded worker must never clear a newer job's BUSY flag.
-            if int(_EXOTIC_KEY_JOB.get("generation", 0) or 0) == int(generation):
-                _EXOTIC_KEY_JOB["running"] = False
-                _EXOTIC_KEY_JOB["mode"] = ""
-                _EXOTIC_KEY_JOB["started_at"] = 0
-        try:
-            delattr(_EXOTIC_JOB_CONTEXT, "generation")
-        except Exception:
-            pass
+            _EXOTIC_KEY_JOB["running"] = False
+            _EXOTIC_KEY_JOB["mode"] = ""
 
 
 def _start_exotic_key_job(cfg, mode):
-    # Recover a wedged daemon worker before testing BUSY. This is intentionally
-    # local-only and does not alter Cloudflare/rate-limit state.
-    _exotic_key_job_snapshot(cfg, recover_stale=True)
     with _EXOTIC_KEY_JOB_LOCK:
         if _EXOTIC_KEY_JOB.get("running"):
             return False
-        generation = int(_EXOTIC_KEY_JOB.get("generation", 0) or 0) + 1
-        _EXOTIC_KEY_JOB["generation"] = generation
         _EXOTIC_KEY_JOB["running"] = True
         _EXOTIC_KEY_JOB["mode"] = str(mode)
         _EXOTIC_KEY_JOB["started_at"] = now()
     thread = threading.Thread(
         target=_exotic_key_job_wrapper,
-        args=(dict(cfg or {}), str(mode), generation),
+        args=(dict(cfg or {}), str(mode)),
         name="nomo-exotic-key-" + str(mode),
         daemon=True,
     )
@@ -26730,7 +26789,6 @@ def exotic_key_manager_tick(cfg, force_read=False, force_generate=False):
         return "idle"
     _EXOTIC_KEY_LAST_TICK = t
 
-    _exotic_key_job_snapshot(cfg, recover_stale=True)
     state = load_exotic_key_state()
     local_key = _exotic_clean_key(state.get("key"))
     key_source = str(state.get("key_source") or "persisted")
@@ -26781,6 +26839,16 @@ def exotic_key_manager_tick(cfg, force_read=False, force_generate=False):
             return "upload_started" if _start_exotic_key_job(cfg, "upload") else "writer_busy"
 
         refresh_at = int(state.get("refresh_at", 0) or 0)
+        if local_key:
+            expires_at = int(state.get("expires_at", 0) or 0)
+            expiry = max(3600, int(cfg.get("exotic_key_expiry_seconds", 86400) or 86400))
+            buffer_seconds = max(60, min(expiry - 60, int(cfg.get("exotic_key_refresh_buffer_seconds", 14400) or 14400)))
+            if expires_at > 0:
+                desired_refresh = max(1, expires_at - buffer_seconds)
+                if refresh_at <= 0 or refresh_at > desired_refresh + 5:
+                    latest, _updated = _update_exotic_key_state({"refresh_at": desired_refresh}, expected_key=local_key)
+                    state = latest
+                    refresh_at = int(state.get("refresh_at", desired_refresh) or desired_refresh)
         if not local_key or refresh_at <= 0 or t >= refresh_at:
             return "writer_started" if _start_exotic_key_job(cfg, "generate") else "writer_busy"
         return "writer_ok"
@@ -26914,6 +26982,45 @@ def exotic_status_note_for_username(
     return ""
 
 
+def exotic_key_generation_id(state=None):
+    """Stable non-secret ID for the currently cached Exotic key."""
+    if state is None:
+        state = load_exotic_key_state()
+    key = _exotic_clean_key((state or {}).get("key"))
+    if not key:
+        return ""
+    return hashlib.sha256(key.encode("utf-8", "ignore")).hexdigest()[:16]
+
+
+def exotic_note_needs_recovery(note):
+    """True only for current-server Exotic states that cannot be left running."""
+    text = str(note or "").strip().upper()
+    if not text.startswith("EXOTIC"):
+        return False
+    markers = (
+        "FAILED",
+        "KEY_MISSING",
+        "KEY MISSING",
+        "SOURCE_UNAVAILABLE",
+        "SOURCE UNAVAILABLE",
+        " STUCK ",
+    )
+    return any(marker in text for marker in markers)
+
+
+def exotic_status_started_for_current_job(username, current_job_id):
+    status = exotic_status_for_username(username)
+    if not status:
+        return False
+    if str(status.get("stage") or "").strip().upper() != "EXOTIC_STARTED":
+        return False
+    expected = str(current_job_id or "").strip()
+    if not expected:
+        return True
+    actual = str(status.get("job_id") or status.get("jobId") or "").strip()
+    return bool(actual) and actual == expected
+
+
 def exotic_key_import_legacy_config(cfg):
     candidates = [
         BASE_DIR / "key_cloudflare.json",
@@ -26987,12 +27094,11 @@ def _exotic_writer_readiness(cfg, state):
         return "BLOCKED - WORKER URL INVALID", RED
     if not secret:
         return "BLOCKED - WRITER SECRET MISSING", RED
-    job = _exotic_key_job_snapshot(cfg, recover_stale=True)
-    running = bool(job.get("running"))
-    mode = str(job.get("mode") or "").upper()
+    with _EXOTIC_KEY_JOB_LOCK:
+        running = bool(_EXOTIC_KEY_JOB.get("running"))
+        mode = str(_EXOTIC_KEY_JOB.get("mode") or "").upper()
     if running:
-        age = int(job.get("age", 0) or 0)
-        return f"BUSY - {mode or 'BACKGROUND JOB'} {format_age(age)}", CYAN
+        return f"BUSY - {mode or 'BACKGROUND JOB'}", CYAN
     if bool(state.get("writer_conflict_suspected", False)):
         return "BLOCKED - WRITER CONFLICT / CLOUD KEY DIFFERS", RED
     retry_at = int(state.get("next_writer_retry_at", 0) or 0)
@@ -27028,19 +27134,11 @@ def exotic_key_settings_menu(cfg):
         verified_at = int(state.get("writer_secret_verified_at", 0) or 0)
         key = _exotic_clean_key(state.get("key"))
 
-        job = _exotic_key_job_snapshot(cfg, recover_stale=True)
-        job_running = bool(job.get("running"))
-        job_mode = str(job.get("mode") or "").upper()
-        job_age = int(job.get("age", 0) or 0)
-        job_timeout = int(job.get("timeout", _exotic_job_timeout_seconds(cfg)) or _exotic_job_timeout_seconds(cfg))
+        with _EXOTIC_KEY_JOB_LOCK:
+            job_running = bool(_EXOTIC_KEY_JOB.get("running"))
+            job_mode = str(_EXOTIC_KEY_JOB.get("mode") or "").upper()
 
-        # Readiness may also recover a stale job; reload the snapshot/state after it.
         ready_text, ready_color = _exotic_writer_readiness(cfg, state)
-        job = _exotic_key_job_snapshot(cfg, recover_stale=False)
-        job_running = bool(job.get("running"))
-        job_mode = str(job.get("mode") or "").upper()
-        job_age = int(job.get("age", 0) or 0)
-        state = load_exotic_key_state()
         role = "WRITER" if writer else "READER"
 
         print(col(f"ROLE:            {role}", YELLOW if writer else GREEN))
@@ -27066,12 +27164,7 @@ def exotic_key_settings_menu(cfg):
         else:
             secret_line = col("SET - not verified yet", YELLOW)
         print(f"Writer secret:   {secret_line}")
-        background_line = (
-            f"{job_mode} {format_age(job_age)} / {format_age(job_timeout)} max"
-            if job_running
-            else "IDLE"
-        )
-        print(f"Background job:  {background_line}")
+        print(f"Background job:  {job_mode if job_running else 'IDLE'}")
         print("")
 
         print(f"Local key:       {mask_secret(key) if key else '-'}")
