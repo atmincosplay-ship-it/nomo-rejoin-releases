@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.52 — MARKET AUTOEXEC PROOF + IN-PLACE SELF-HEAL
+# - Fixes V4.81.51 test finding: a fresh normal state no longer proves Market AutoExec recovered.
+#   Recovery completion now also requires the current Trade World JobId marker to return MARKET_RUNNING.
+# - ALIVE Market-script failures no longer send a route/deep-link retry (that does not rerun AutoExec).
+#   They wait for the installed Market loader's bounded in-place self-heal instead; no PID-stop is used.
+# - The Market loader retries a runtime failure up to 3 times with 30-second spacing and writes a local
+#   MARKET_RUNNING heartbeat every 60 seconds, so stale/forced failure markers self-correct without network spam.
+# - DEAD Market targets still get one normal exact-PID crash/start recovery, with no second hard fallback;
+#   UNKNOWN/manual-auth states defer. Option 6 and the Exotic key flow are unchanged.
+#
 # V4.81.51 — AUDIT BATCH: MARKET AUTOEXEC + EXOTIC BACKEND + WRITER VERIFY
 # - Market runtime markers are now consumed by the Python watchdog instead of write-only telemetry.
 #   A current Trade World session with missing/stuck/failed NOMO Market AutoExec gets one safe recovery
@@ -1097,7 +1107,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.51"
+__version__ = "V4.81.52"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -14317,6 +14327,7 @@ def wait_until_fresh_after_open(
     expected_job_id="",
     core=None,
     visible_home_fail_after_seconds=None,
+    require_market_runtime=False,
 ):
     if not cfg.get("wait_fresh_after_open", True):
         return True, "fresh wait disabled"
@@ -14618,9 +14629,27 @@ def wait_until_fresh_after_open(
                 )
             )
 
+        market_runtime_ok = True
+        if require_market_runtime and fresh and route_ok:
+            market_user = str(
+                (tab or {}).get("user_name")
+                or (tab or {}).get("username")
+                or ""
+            ).strip()
+            market_job = str((state or {}).get("job_id") or "").strip()
+            market_runtime_ok = market_runtime_started_for_current_job(
+                market_user, market_job
+            )
+            if not market_runtime_ok:
+                rt_tab["note"] = (
+                    f"waiting Market AutoExec proof for current JobId {elapsed}/{timeout}s"
+                )
+                core.save()
+
         clean_fresh = bool(
             fresh
             and route_ok
+            and market_runtime_ok
             and not visible_home
             and not state_disconnect_ui(state)
             and not state_login_challenge_detail(state)
@@ -15364,6 +15393,7 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                 and actual_open_mode == "route"
                 else None
             ),
+            require_market_runtime=bool(item.get("market_runtime_recovery")),
         )
         if actual_open_mode == "soft":
             rt_tab["note"] = "soft " + fresh_msg
@@ -16079,49 +16109,76 @@ def _nomo_start_market_rejoin_original(cfg):
                     attempted_source_id = str(
                         rt_tab.get("market_runtime_recovery_attempt_source_id") or ""
                     )
+                    attempt_at = int(
+                        rt_tab.get("market_runtime_recovery_attempt_at", 0) or 0
+                    )
+                    self_heal_wait = 150
+
                     if not source_id:
                         note = (market_runtime_note + "; waiting for Market runtime identity").strip("; ")
+                    elif process_status == "UNKNOWN":
+                        note = (market_runtime_note + "; process UNKNOWN; recovery deferred").strip("; ")
+                    elif manual_login_blocked(rt_tab, cfg, pkg):
+                        note = (market_runtime_note + "; manual auth hold; Market recovery deferred").strip("; ")
+                    elif process_status == "ALIVE":
+                        # V4.81.52: a route/deep-link does NOT rerun AutoExec on an
+                        # already-live App Cloner task. Let the installed loader's
+                        # bounded in-place runtime retry own this failure instead.
+                        if attempted_source_id != source_id or attempt_at <= 0:
+                            rt_tab["market_runtime_recovery_attempt_source_id"] = source_id
+                            rt_tab["market_runtime_recovery_attempt_at"] = now()
+                            rt_tab["market_runtime_recovery_last_failure"] = market_runtime_note
+                            status = "Market heal"
+                            note = (
+                                market_runtime_note
+                                + "; waiting for in-place Market loader self-heal (no Android reopen)"
+                            ).strip("; ")
+                            log_activity(
+                                "Market AutoExec failure -> waiting for in-place loader self-heal; no route/PID-stop",
+                                pkg,
+                                YELLOW,
+                            )
+                        else:
+                            waited = max(0, now() - attempt_at)
+                            if waited < self_heal_wait:
+                                status = "Market heal"
+                                note = (
+                                    market_runtime_note
+                                    + f"; waiting loader self-heal {waited}/{self_heal_wait}s"
+                                ).strip("; ")
+                            else:
+                                status = "Market hold"
+                                note = (
+                                    market_runtime_note
+                                    + "; in-place retries exhausted; waiting for new Market source/manual refresh"
+                                ).strip("; ")
                     elif attempted_source_id == source_id:
                         note = (
                             market_runtime_note
                             + "; already retried this Market source; waiting for a new source/manual refresh"
                         ).strip("; ")
-                    elif process_status == "UNKNOWN":
-                        note = (market_runtime_note + "; process UNKNOWN; recovery deferred").strip("; ")
-                    elif manual_login_blocked(rt_tab, cfg, pkg):
-                        note = (market_runtime_note + "; manual auth hold; Market recovery deferred").strip("; ")
                     elif core.idle_for(pkg, include_solver=True):
-                        rt_tab["homepage_join_fail_count"] = 0
-                        rt_tab["homepage_hard_retries"] = 0
+                        # DEAD target: one exact-PID crash/start is allowed so
+                        # AutoExec gets a real fresh execution. Never chain a
+                        # second hard fallback merely because Market proof is late.
                         recovery_meta = {
                             "market_runtime_recovery": True,
-                            "market_alive_noka_route_only": bool(
-                                process_status == "ALIVE" and _is_noka_clone_package(pkg)
-                            ),
+                            "no_hard_fallback": True,
                         }
-                        if process_status == "ALIVE":
-                            added, recovery_note = core.queue_route_retry(
-                                tab,
-                                "market",
-                                "Market AutoExec current-server failure reload",
-                                metadata=recovery_meta,
-                                bypass_manual=False,
-                            )
-                        else:
-                            added, recovery_note = core.queue_crash_recovery(
-                                tab,
-                                "market",
-                                "Market AutoExec failed after package death",
-                                metadata=recovery_meta,
-                            )
+                        added, recovery_note = core.queue_crash_recovery(
+                            tab,
+                            "market",
+                            "Market AutoExec failed after package death",
+                            metadata=recovery_meta,
+                        )
                         if added:
                             rt_tab["market_runtime_recovery_attempt_source_id"] = source_id
                             rt_tab["market_runtime_recovery_attempt_at"] = now()
                             rt_tab["market_runtime_recovery_last_failure"] = market_runtime_note
                             status = "Queued"
-                            note = (market_runtime_note + "; Market reload queued").strip("; ")
+                            note = (market_runtime_note + "; one dead/start recovery queued").strip("; ")
                             log_activity(
-                                "Market AutoExec failure -> queued one recovery for current source",
+                                "Market AutoExec failure on DEAD package -> queued one exact-PID recovery",
                                 pkg,
                                 YELLOW,
                             )
@@ -27807,7 +27864,7 @@ def cleanup_nomo_autoexec_backup_artifacts(cfg):
 def upgrade_known_nomo_market_loader_once(cfg):
     """Upgrade only known NOMO loader generations; preserve unrelated/custom AutoExec."""
     marker = "-- NOMO Market / GAG loader"
-    target_revision = 7
+    target_revision = 8
     target_marker = f"-- NOMO Market loader revision {target_revision}"
     old_worker = "https://nomo-key.atmincosplay.workers.dev/key"
     local_key_marker = 'local sharedKeyFile = sharedFolder .. "/exotic_key.json"'
@@ -27904,7 +27961,7 @@ def upgrade_known_nomo_aux_loaders_once(cfg):
 
 
 MARKET_LOADER_AUTOEXEC_TEMPLATE = r'''-- NOMO Market / GAG loader
--- NOMO Market loader revision 7
+-- NOMO Market loader revision 8
 if not game:IsLoaded() then
     game.Loaded:Wait()
 end
@@ -27980,8 +28037,8 @@ if game.PlaceId == 126884695634066 then
             exotic_source = scriptSource,
             exotic_cache_file = exoticCacheFile,
             exotic_cache_available = (type(isfile) == "function" and isfile(exoticCacheFile)) or false,
-            loader_build = "V4.81.41",
-            loader_revision = 7,
+            loader_build = "V4.81.52",
+            loader_revision = 8,
             error = tostring(err or ""),
         }
         pcall(function()
@@ -28269,9 +28326,9 @@ elseif game.PlaceId == 129954712878723 then
         local source = tostring(state and state.SharedConfigSource or "")
         return {
             marker_version = 5,
-            loader_version = "V4.81.41",
-            loader_build = "V4.81.41",
-            loader_revision = 7,
+            loader_version = "V4.81.52",
+            loader_build = "V4.81.52",
+            loader_revision = 8,
             market_version = tostring(marketVersion or "UNKNOWN"),
             market_source = tostring(marketSourceName or "none"),
             market_remote_error = tostring(marketRemoteError or ""),
@@ -28491,10 +28548,44 @@ elseif game.PlaceId == 129954712878723 then
     marketVersion = marketSource:match('local%s+VERSION%s*=%s*"([^"]+)"') or "UNKNOWN"
     writeRuntime("SOURCE_READY", "")
 
-    local runOk, runErr = pcall(marketChunk)
+    -- V4.81.52: bounded in-place runtime self-heal. A transient dependency
+    -- failure must not require an Android reopen just to rerun this AutoExec
+    -- chunk. Never retry forever: three attempts, 30 seconds apart.
+    local runtimeRetryLimit = 3
+    local runtimeRetrySeconds = 30
+    local runOk = false
+    local runErr = ""
+    for attempt = 1, runtimeRetryLimit do
+        runOk, runErr = pcall(marketChunk)
+        if runOk then
+            break
+        end
+
+        -- If the source raised after it had already brought Market up, trust
+        -- the live state and do not execute a duplicate copy on top of it.
+        local partialState = marketState()
+        if partialState ~= nil and partialState.Running ~= false then
+            runOk = true
+            runErr = ""
+            break
+        end
+
+        writeRuntime(
+            "RUNTIME_FAILED",
+            "attempt " .. tostring(attempt) .. "/" .. tostring(runtimeRetryLimit)
+                .. ": " .. tostring(runErr)
+        )
+        warn(
+            "[NOMO MARKET] " .. tostring(marketSourceName)
+                .. " runtime failed attempt " .. tostring(attempt)
+                .. "/" .. tostring(runtimeRetryLimit) .. ":",
+            tostring(runErr)
+        )
+        if attempt < runtimeRetryLimit then
+            task.wait(runtimeRetrySeconds)
+        end
+    end
     if not runOk then
-        writeRuntime("RUNTIME_FAILED", tostring(runErr))
-        warn("[NOMO MARKET] " .. tostring(marketSourceName) .. " runtime failed:", tostring(runErr))
         return
     end
 
@@ -28511,8 +28602,9 @@ elseif game.PlaceId == 129954712878723 then
 
     writeRuntime("MARKET_RUNNING", "")
 
-    -- Update only when interesting state changes, plus a 5-minute local heartbeat.
-    -- This watcher performs NO HTTP/Worker requests.
+    -- Update on interesting state changes, plus a 60-second LOCAL heartbeat.
+    -- V4.81.52: this lets a stale/forced failure marker self-correct quickly
+    -- when Market is actually still running. This performs NO HTTP/Worker requests.
     task.spawn(function()
         local lastSignature = ""
         local lastWriteAt = 0
@@ -28538,7 +28630,7 @@ elseif game.PlaceId == 129954712878723 then
                 tostring(game.JobId or ""),
             }, "|")
             local nowTs = epochNow()
-            if signature ~= lastSignature or lastWriteAt <= 0 or (nowTs - lastWriteAt) >= 300 then
+            if signature ~= lastSignature or lastWriteAt <= 0 or (nowTs - lastWriteAt) >= 60 then
                 writeRuntime(running and "MARKET_RUNNING" or "MARKET_STOPPED", "")
                 lastSignature = signature
                 lastWriteAt = nowTs
