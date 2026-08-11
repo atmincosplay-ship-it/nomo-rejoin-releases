@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.47 — OPTION 6 MARKET HOME RETRY FIX
+# - Option 6 ALIVE-Noka route generations now run the same rect-scoped Roblox Home watcher for Market
+#   as Hatcher/Booster; the watcher is keyed to the safe route-only generation, not the destination role.
+# - A continuously visible Home screen ends that route attempt after the configured 45s and drains the next
+#   safe route retry, up to the existing 3-attempt limit. No PID-stop fallback is allowed while Noka stays ALIVE.
+# - Option 6 post-check now treats the Home detector as mandatory truth and can use the current generation's
+#   recent rect-scoped Home observation if a final uiautomator refresh is temporarily unavailable.
+# - Existing exact-PID DEAD recovery, sibling verification, solver/CAPTCHA policy, and normal Option 1 behavior
+#   are unchanged.
+#
 # V4.81.46 — OPTION 6 RECT-SCOPED HOME DETECTOR
 # - App Cloner can expose Roblox UI nodes under a shared/original Android package name, so package-name-only
 #   uiautomator scoping can miss a visibly obvious Roblox Home screen. Home detection now falls back to UI
@@ -1055,7 +1065,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.46-option6-rect-scoped-home-detector"
+__version__ = "V4.81.47"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -7991,6 +8001,9 @@ def manual_restart_tabs_via_queue(
         core.cancel(pkg)
         rt_tab["homepage_join_fail_count"] = 0
         rt_tab["homepage_hard_retries"] = 0
+        rt_tab["option6_visible_home_at"] = 0
+        rt_tab["option6_visible_home_hits"] = ""
+        rt_tab["option6_visible_home_target"] = ""
         rt_tab["last_option6_recovery_chain"] = "option1_route_first"
 
         process_status, process_note = package_alive_status(pkg, cfg, fresh=True)
@@ -8120,9 +8133,22 @@ def verify_option6_open_results(cfg, tabs, label="tabs"):
         # Force a fresh UI snapshot: a visible Roblox Home shell must never be
         # reported as a successful Option 6 restart merely because an old Lua
         # heartbeat or the App Cloner process remains alive behind it.
-        home = android_roblox_home_ui_detail(pkg, cfg, force=True)
-        if home:
-            print(f"  {short_pkg(pkg):<10} {col('ROBLOX HOME - NOT INGAME', YELLOW)}")
+        home = android_roblox_home_ui_detail(pkg, cfg, force=True, required=True)
+        recent_home_at = int(rt_tab.get("option6_visible_home_at", 0) or 0)
+        recent_home = bool(
+            recent_home_at > 0
+            and request_at > 0
+            and recent_home_at >= request_at
+            and now() - recent_home_at <= max(60, int(cfg.get("option6_alive_noka_home_confirm_seconds", 45) or 45) + 30)
+        )
+        if home or recent_home:
+            detail = ""
+            if home:
+                detail = ",".join(home.get("hits", [])[:5])
+            elif recent_home:
+                detail = str(rt_tab.get("option6_visible_home_hits", "") or "")
+            suffix = f" ({cut(detail, 42)})" if detail else ""
+            print(f"  {short_pkg(pkg):<10} {col('ROBLOX HOME - NOT INGAME' + suffix, YELLOW)}")
             continue
 
         activity_status, activity_note = package_activity_status(pkg, cfg)
@@ -13085,7 +13111,7 @@ def android_ui_text_for_package(pkg, cfg, force=False):
     return texts, str(snapshot.get("error", "") or "")
 
 
-def android_roblox_home_ui_detail(pkg, cfg, force=False):
+def android_roblox_home_ui_detail(pkg, cfg, force=False, required=False):
     """Return a high-confidence clone-scoped Roblox Home/navigation signal.
 
     App Cloner can keep an old in-game Lua heartbeat alive behind the visible
@@ -13098,7 +13124,10 @@ def android_roblox_home_ui_detail(pkg, cfg, force=False):
     supplement it only with nodes whose bounds fall inside this clone's exact
     Option 16 saved rectangle. We never use global/unscoped sibling text.
     """
-    if not cfg.get("hatcher_home_ui_detection_enabled", True):
+    # Option 6's route-only recovery depends on this observation for safety and
+    # must not silently lose Home truth because an old Hatcher-only toggle was off.
+    # Normal background Hatcher probing still respects the existing toggle.
+    if not required and not cfg.get("hatcher_home_ui_detection_enabled", True):
         return None
 
     snapshot = capture_android_ui_snapshot(cfg, force=force)
@@ -14277,13 +14306,38 @@ def wait_until_fresh_after_open(
         fresh, state, err = state_fresh_after_open(tab, cfg, opened_at)
         pending_target = str(rt_tab.get("core_pending_open_target") or rt_tab.get("core_last_rejoin_target") or "").lower()
         visible_home = None
-        if alive and pending_target == "hatcher" and hatcher_visible_home_watch_active(rt_tab, cfg):
-            visible_home = android_roblox_home_ui_detail(pkg, cfg, force=False)
+
+        # V4.81.47: Option 6 Home watching is a property of the ALIVE-Noka
+        # route-only generation, not of target=hatcher. Market Option 6 must see
+        # the exact same Home screen and retry safely instead of waiting 240s.
+        option6_home_watch = bool(
+            alive
+            and visible_home_fail_after > 0
+            and _is_noka_clone_package(pkg)
+            and hatcher_visible_home_watch_active(rt_tab, cfg)
+        )
+        hatcher_home_watch = bool(
+            alive
+            and pending_target == "hatcher"
+            and hatcher_visible_home_watch_active(rt_tab, cfg)
+        )
+        if option6_home_watch or hatcher_home_watch:
+            visible_home = android_roblox_home_ui_detail(
+                pkg,
+                cfg,
+                force=False,
+                required=option6_home_watch,
+            )
             if visible_home:
-                rt_tab["hatcher_visible_home_at"] = now()
+                seen_at = now()
+                rt_tab["hatcher_visible_home_at"] = seen_at
                 rt_tab["hatcher_visible_home_hits"] = ",".join(visible_home.get("hits", [])[:8])
+                if option6_home_watch:
+                    rt_tab["option6_visible_home_at"] = seen_at
+                    rt_tab["option6_visible_home_hits"] = ",".join(visible_home.get("hits", [])[:8])
+                    rt_tab["option6_visible_home_target"] = pending_target
                 if visible_home_since <= 0:
-                    visible_home_since = now()
+                    visible_home_since = seen_at
             else:
                 visible_home_since = 0
 
