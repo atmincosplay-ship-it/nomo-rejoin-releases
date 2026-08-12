@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.59 — MODERATION-FIRST OPEN GATE
+# - Every queued Roblox open/route now runs a package-scoped direct Not Approved moderation guard BEFORE any
+#   route intent, solver/provider preflight, Android PID decision, or legacy API bypass. A known ban payload or
+#   the captured Account-Locked restriction source=5/moderationStatus=2 immediately holds that package.
+# - Manual Option 6 may still bypass the solver/provider preflight for its ALIVE Noka route-only probe, but it can
+#   no longer bypass the direct moderation guard. Banned/face-locked accounts therefore never receive the probe.
+# - The legacy API precheck now recognizes account-locked/face-lock/banned/terminated restriction detail as a
+#   moderation hold too. Direct restriction proof cancels duplicate queued opens before any PID-stop.
+# - Solver ordering is now explicit: moderation guard first; only unrestricted/unknown sessions can reach CAPTCHA
+#   challenge handling. Direct face-lock/moderation proof is never submitted to the solver provider.
+#
 # V4.81.58 — DIRECT FACE-LOCK RESTRICTION API
 # - Roblox's Not Approved endpoint can return a restriction-only payload for Account Locked / face-lock instead of
 #   the ban-style punishedUserId payload. The captured known-safe signature is restriction.source=5 plus
@@ -1176,7 +1187,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.58"
+__version__ = "V4.81.59"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8175,6 +8186,10 @@ def manual_restart_tabs_via_queue(
             "option6_auth_probe_route": bool(
                 process_status == "ALIVE" and _is_noka_clone_package(pkg)
             ),
+            # V4.81.59: this legacy bypass no longer bypasses the direct
+            # moderation-first guard in process_open_queue. It only preserves
+            # Option 6's route-only behavior against the older cookie/provider
+            # precheck after the moderation guard has already cleared/been unknown.
             "bypass_api_precheck": bool(
                 process_status == "ALIVE" and _is_noka_clone_package(pkg)
             ),
@@ -11931,8 +11946,12 @@ def disconnect_ui_api_precheck(tab, rt_tab, cfg, reason="kick popup", require_di
         return True, rt_tab["note"]
 
     detail_l = detail.lower()
-    if "invalid" in detail_l or "expired" in detail_l or "moderated" in detail_l:
-        api_status = "moderated" if "moderated" in detail_l else "invalid"
+    restriction_terms = (
+        "moderated", "account locked", "face lock", "/not-approved",
+        "account banned", "account terminated", "user moderated", "user banned",
+    )
+    if "invalid" in detail_l or "expired" in detail_l or any(term in detail_l for term in restriction_terms):
+        api_status = "moderated" if any(term in detail_l for term in restriction_terms) else "invalid"
         if api_status == "invalid" and cfg.get("api_precheck_refresh_invalid_cookie_enabled", True):
             refreshed_cookie, refresh_note = refresh_cached_cookie_for_package(pkg)
             if refreshed_cookie:
@@ -13316,6 +13335,118 @@ def roblox_cookie_not_approved_api_detection(cookie, expected_user_id=None, cfg=
         return None, f"moderation api HTTP {e.code}", {}
     except Exception as exc:
         return None, "moderation api unavailable: " + cut(exc, 80), {}
+
+
+
+def direct_moderation_guard_before_open(tab, rt_tab, cfg, reason="queued open"):
+    """Run the direct Roblox Not Approved moderation check before ANY open intent.
+
+    This guard is deliberately independent from the CAPTCHA solver and from the
+    older API-precheck bypass used by manual Option 6. A strong ban payload or
+    the captured Account-Locked restriction signature blocks the package before
+    route/open/PID activity. Network/schema ambiguity is non-destructive and
+    falls through to the existing visual/API gates.
+    """
+    if not cfg.get("api_precheck_not_approved_enabled", True):
+        return False, "direct moderation guard disabled"
+
+    pkg = str((tab or {}).get("package", "") or "").strip()
+    if not pkg:
+        return False, "direct moderation guard no package"
+
+    if manual_login_blocked(rt_tab, cfg, pkg) and _runtime_auth_hint(rt_tab):
+        return True, str(rt_tab.get("note") or "existing auth/moderation hold")
+
+    cookie, cookie_source, cookie_note = solver_cookie_for_package(pkg, cfg)
+    cookie = str(cookie or "").strip()
+    rt_tab["moderation_guard_cookie_source"] = str(cookie_source or "")
+    rt_tab["moderation_guard_cookie_note"] = cut(str(cookie_note or ""), 120)
+    rt_tab["moderation_guard_last_check"] = now()
+
+    if not cookie:
+        rt_tab["moderation_guard_last_status"] = "no_cookie"
+        return False, "direct moderation guard: no package cookie"
+
+    expected_user_id = ""
+    try:
+        cache = load_cookie_cache()
+        ent = cache.get(pkg) if isinstance(cache, dict) else {}
+        if isinstance(ent, dict):
+            expected_user_id = str(ent.get("user_id") or ent.get("userID") or "").strip()
+    except Exception:
+        expected_user_id = ""
+
+    if not expected_user_id:
+        try:
+            info = get_roblox_user_info(cookie) or {}
+            expected_user_id = str(info.get("userID") or info.get("id") or "").strip()
+        except Exception:
+            expected_user_id = ""
+
+    hit, detail, payload = roblox_cookie_not_approved_api_detection(
+        cookie, expected_user_id, cfg
+    )
+    detail = str(detail or "")
+    detail_l = detail.lower()
+    rt_tab["moderation_guard_last_detail"] = cut(detail, 220)
+
+    if hit is not True:
+        rt_tab["moderation_guard_last_status"] = "unknown" if hit is None else "clear"
+        return False, detail
+
+    retry_seconds = max(600, int(cfg.get("manual_auth_retry_seconds", 3600) or 3600))
+    restriction = payload.get("restriction") if isinstance(payload, dict) else None
+    is_face_lock = "account locked" in detail_l or "face lock" in detail_l
+    if isinstance(restriction, dict):
+        try:
+            is_face_lock = is_face_lock or (
+                int(restriction.get("source")) == 5
+                and int(restriction.get("moderationStatus")) == 2
+            )
+        except Exception:
+            pass
+
+    if is_face_lock:
+        rt_tab["moderation_guard_last_status"] = "face_lock"
+        rt_tab["face_lock_detected"] = True
+        rt_tab["face_lock_detail"] = detail or "api account locked / face lock"
+        rt_tab["face_lock_last_seen_at"] = now()
+        if not int(rt_tab.get("face_lock_detected_at", 0) or 0):
+            rt_tab["face_lock_detected_at"] = now()
+        mark_manual_login_block(
+            rt_tab,
+            "face_lock",
+            detail or "api account locked / face lock",
+            "FACE LOCK HOLD - direct moderation API",
+            int(rt_tab.get("face_lock_detected_at", now()) or now()),
+            retry_seconds,
+        )
+        set_hold(pkg, "face_lock", retry_seconds)
+        rt_tab["note"] = "FACE LOCK HOLD - direct moderation API"
+        log_activity(
+            f"{reason}; direct moderation API = FACE LOCK; open blocked before route/PID/solver",
+            pkg,
+            RED,
+        )
+        return True, rt_tab["note"]
+
+    rt_tab["moderation_guard_last_status"] = "moderated"
+    mark_manual_login_block(
+        rt_tab,
+        "api user moderated",
+        detail or "api user moderated/banned",
+        "AUTH / MODERATION HOLD - direct moderation API",
+        now(),
+        retry_seconds,
+    )
+    set_hold(pkg, "api user moderated", retry_seconds)
+    rt_tab["note"] = "AUTH / MODERATION HOLD - direct moderation API"
+    log_activity(
+        f"{reason}; direct moderation API = restricted/banned; open blocked before route/PID/solver",
+        pkg,
+        RED,
+    )
+    return True, rt_tab["note"]
 
 
 def roblox_cookie_web_route_detection(cookie, cfg=None):
@@ -15395,8 +15526,8 @@ def solver_preflight_before_open(open_queue, item, tab, rt_tab, pkg, target, cfg
         item["solver_result"] = "OPTION6_AUTH_PROBE_ROUTE"
         item["skip_solver_once"] = True
         item["skip_solver_probe"] = False
-        rt_tab["note"] = "Option 6 auth probe; safe route without cookie preflight"
-        log_activity("Option 6 auth probe: cookie/provider preflight bypassed for route-only intent", pkg, YELLOW)
+        rt_tab["note"] = "Option 6 auth probe; safe route after moderation guard"
+        log_activity("Option 6 auth probe: solver/provider preflight bypassed after moderation guard", pkg, YELLOW)
         core.save()
         return "ready", item
 
@@ -15571,6 +15702,25 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
 
     item_mode = str(item.get("mode", "hard") or "hard").lower()
     is_hard = item_mode not in ("soft", "route", "switch", "reuse_task")
+
+    # V4.81.59: MODERATION FIRST. This is deliberately before Option 6's
+    # legacy API bypass, solver/provider work, staggering, PID guards, and the
+    # Android route/open itself. Strong direct Not Approved proof must stop the
+    # generation before ANY rejoin intent.
+    moderation_blocked, moderation_note = direct_moderation_guard_before_open(
+        tab, rt_tab, cfg, f"before open: {reason}"
+    )
+    if moderation_blocked:
+        removed = core.cancel(pkg)
+        rt_tab["note"] = moderation_note or rt_tab.get("note") or "moderation hold"
+        if removed:
+            log_activity(
+                f"direct moderation hold cancelled {removed} queued duplicate(s)",
+                pkg,
+                RED,
+            )
+        core.save()
+        return True
 
     # V4.81.56: strong auth evidence outranks bypass_manual/recovery_must_open_once.
     # An old hard item that predates Account Locked/529 must die here, before
