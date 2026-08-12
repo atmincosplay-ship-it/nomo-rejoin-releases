@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.62 — AGE / ACCESS BANNER FALSE-POSITIVE REVERT
+# - Reverts V4.81.61 after live proof showed the Roblox "Access to popular games has changed / check your age /
+#   Unlock" panel does NOT prevent this client from joining a game. Those age/access banner phrases are now
+#   informational only: they never create a manual/auth hold, never call the solver, never create peer-auth hold,
+#   and never suppress normal route/recovery.
+# - The V4.81.61 main-loop AGE / ACCESS GATE early-return is removed completely.
+# - Generic UI challenge detection also ignores the age-banner phrases globally so older/manual route paths cannot
+#   reintroduce the same false positive. Explicit parental/account restriction text remains a manual join block.
+# - V4.81.60 package-local Face Lock/Ban moderation ordering and safe peer-route rules remain unchanged.
+#
 # V4.81.60 — PACKAGE-LOCAL AUTH CLASSIFICATION + SAFE PEER ROUTE
 # - A peer Noka face-lock/ban no longer short-circuits another package before that package gets its own direct
 #   moderation API classification. A second face-locked account can therefore become FACE LOCK HOLD independently.
@@ -1195,7 +1205,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.60"
+__version__ = "V4.81.62"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -12477,6 +12487,9 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
             "face_lock_detail": face_lock,
         }
 
+    # V4.81.62: age/access banner is informational in this client and must not
+    # create a hold or suppress normal join/recovery.
+
     # V4.29: visual CAPTCHA uses the same Loading-only gate and shared raw frame
     # as face lock. Once the package has a clean post-open heartbeat, clear stale
     # screenshot confirmations and perform no more visual/accessibility checks.
@@ -14894,13 +14907,11 @@ def ui_login_challenge_detection(
             + " (CAPTCHA or face lock)",
         )
 
-    # These screens block joining but are not CAPTCHA challenges. Sending them
-    # to the solver only returns NO_CAPTCHA and creates a rejoin loop.
+    # V4.81.62: the visible age/access banner ("Access to popular games has
+    # changed" / "check your age" / "Unlock") is informational in this client
+    # and does not prevent joining, so it must never become an auth/manual hold.
+    # Keep only explicit restriction text that is actually intended as a blocker.
     manual_gate_terms = [
-        "access to popular games has changed",
-        "check your age",
-        "verify your age",
-        "age verification",
         "parental controls",
         "parental restriction",
         "account restrictions",
