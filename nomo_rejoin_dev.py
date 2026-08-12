@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.64 — ROUTE-ONLY HARD-FALLBACK + AGE-HOLD MIGRATION SAFETY
+# - `no_hard_fallback` is now a first-class immutable queue contract: any queued soft/route generation carrying it
+#   cannot be upgraded in-place to hard/hard_force by a later duplicate watchdog/recovery item; safety metadata is
+#   sticky even when a safe route merges into an already-pending equal-priority route.
+# - Route/open failure and terminal soft-fallback branches honor `no_hard_fallback` before queueing any hard retry;
+#   DEAD recovery, when appropriate, must arrive later as a new watchdog generation rather than mutating the safe route.
+# - The V4.81.63 age/access migration now clears runtime state only when manual_login_reason is exactly age_access_gate,
+#   clears captcha_hold.json only when that file itself contains the obsolete age hold, and never calls the generic
+#   manual-login clearer that also wipes face-lock runtime. Stale detail/note text cannot erase a newer real auth hold.
+#
 # V4.81.63 — CLEAR OBSOLETE V4.81.61 AGE-HOLD STATE
 # - V4.81.62 stopped treating the Roblox age/access banner as a blocker, but a package that was already seen by
 #   V4.81.61 could keep its persisted manual_login_reason=age_access_gate and captcha_hold.json entry for up to an
@@ -1214,7 +1224,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.63"
+__version__ = "V4.81.64"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -10796,12 +10806,27 @@ def _merge_queue_duplicate(existing, target, reason, force=False, skip_if_alive=
     old_mode = str(existing.get("mode") or "hard")
     new_mode = str(mode or "hard")
 
-    # V4.81.56: once an ALIVE Noka generation is explicitly route-only, a
+    # Safety metadata is sticky even when the duplicate has equal priority.
+    # Otherwise a safe route queued onto an already-pending route could lose
+    # its no-hard contract before a later watchdog duplicate arrives.
+    if isinstance(metadata, dict):
+        for key in (
+            "no_hard_fallback",
+            "option6_alive_noka_route_only",
+            "exotic_alive_noka_route_only",
+            "market_alive_noka_route_only",
+            "peer_auth_safe_route_only",
+        ):
+            if metadata.get(key):
+                existing[key] = True
+
+    # V4.81.56/V4.81.64: once a generation is explicitly route-only, a
     # duplicate old-state/no-state watchdog item must never mutate that SAME
     # generation into hard_force. This was the remaining path where Option 6
     # could be queued safely, then silently become destructive seconds later.
     route_only_generation = bool(
-        existing.get("option6_alive_noka_route_only")
+        existing.get("no_hard_fallback")
+        or existing.get("option6_alive_noka_route_only")
         or existing.get("exotic_alive_noka_route_only")
         or existing.get("market_alive_noka_route_only")
         or existing.get("peer_auth_safe_route_only")
@@ -12365,25 +12390,19 @@ def state_is_clean_fresh(state, cfg, seconds=None):
 
 
 def clear_obsolete_age_access_hold(rt_tab, pkg):
-    """V4.81.63: remove only the false V4.81.61 age/access manual hold.
+    """V4.81.64: narrowly remove only the false V4.81.61 age/access hold.
 
-    The visible age/access banner is informational on this client and does not
-    prevent joining. V4.81.61 persisted it as a one-hour manual/CAPTCHA hold;
-    V4.81.62 stopped creating new holds but intentionally did not mutate old
-    runtime. Migrate that exact obsolete reason without touching real auth holds.
+    The age/access banner is informational on this client.  Migration is keyed
+    only by the authoritative stored reason, never by a stale detail/note.  The
+    package hold file is cleared independently only when its own reason is the
+    obsolete age_access_gate value.  Real face-lock/CAPTCHA/moderation runtime
+    is deliberately left untouched.
     """
     if not isinstance(rt_tab, dict):
         return False
 
     reason = str(rt_tab.get("manual_login_reason", "") or "").strip().lower()
-    detail = str(rt_tab.get("manual_login_detail", "") or "").strip().lower()
-    note = str(rt_tab.get("note", "") or "").strip().lower()
-
-    obsolete_runtime = (
-        reason == "age_access_gate"
-        or "age / access gate" in detail
-        or "age / access gate" in note
-    )
+    obsolete_runtime = reason == "age_access_gate"
 
     hold_reason = ""
     try:
@@ -12396,19 +12415,32 @@ def clear_obsolete_age_access_hold(rt_tab, pkg):
         return False
 
     if obsolete_runtime:
-        clear_manual_login_block(rt_tab)
+        # Do NOT call clear_manual_login_block(): that helper also clears
+        # face-lock runtime, which may contain newer/stronger auth evidence.
+        rt_tab["manual_login_needed"] = False
+        rt_tab["manual_login_reason"] = ""
+        rt_tab["manual_login_detail"] = ""
+        rt_tab["manual_login_detected_at"] = 0
+        rt_tab["manual_login_retry_at"] = 0
+        rt_tab["manual_login_retry_seconds"] = 0
+        rt_tab.pop("solver_attempted", None)  # legacy V3.80 field
 
-    if obsolete_file_hold or obsolete_runtime:
+    if obsolete_file_hold:
         try:
             clear_hold(pkg)
         except Exception:
             pass
 
-    # A route may have been suppressed/consumed while the stale hold existed.
-    # Let the current dashboard generation queue a fresh safe route immediately.
-    rt_tab["peer_auth_safe_route_last"] = 0
-    rt_tab["manual_login_last_recover_check"] = 0
-    rt_tab["note"] = "obsolete age/access hold cleared; normal recovery allowed"
+    # Only reset route/manual-recovery suppression when the obsolete runtime
+    # block itself was removed.  If a newer real runtime auth hold exists while
+    # only the old file hold is stale, preserve its pacing and status.
+    if obsolete_runtime:
+        rt_tab["peer_auth_safe_route_last"] = 0
+        rt_tab["manual_login_last_recover_check"] = 0
+        rt_tab["note"] = "obsolete age/access hold cleared; normal recovery allowed"
+    elif not str(rt_tab.get("manual_login_reason", "") or "").strip():
+        rt_tab["note"] = "obsolete age/access file hold cleared"
+
     rt_tab["age_access_false_hold_cleared_at"] = now()
     return True
 
@@ -12420,7 +12452,7 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
     crash signal; fresh clean Lua state can still prove the clone is healthy.
     """
     pkg = tab.get("package")
-    # V4.81.63 migration: V4.81.61 may have persisted the now-invalid
+    # V4.81.64 migration hardening: V4.81.61 may have persisted the now-invalid
     # age_access_gate hold. Remove only that exact false-positive before any
     # health/queue decision so a safe route is not swallowed by stale state.
     if clear_obsolete_age_access_hold(rt_tab, pkg):
@@ -16914,7 +16946,11 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                     )
                     core.save()
 
-            elif actual_open_mode == "soft" and cfg.get("soft_hop_fallback_hard", True):
+            elif (
+                actual_open_mode == "soft"
+                and cfg.get("soft_hop_fallback_hard", True)
+                and not item.get("no_hard_fallback")
+            ):
                 core.queue_hard_retry(tab, target, "soft fallback hard", front=True)
     else:
         rt_tab["note"] = msg
@@ -16922,6 +16958,16 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
         core.save()
 
         if mode in ("soft", "route") and cfg.get("soft_hop_fallback_hard", True):
+            if item.get("no_hard_fallback"):
+                rt_tab["note"] = "route open failed; this generation forbids hard fallback"
+                log_activity(
+                    "route open failed; no_hard_fallback preserved (no PID-stop escalation)",
+                    pkg,
+                    YELLOW,
+                )
+                core.save()
+                return True
+
             fallback_status, _fallback_note = package_alive_status(pkg, cfg, fresh=True)
             block_option6_noka_hard = bool(
                 item.get("option6_alive_noka_route_only")
