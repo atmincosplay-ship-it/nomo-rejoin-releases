@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.60 — PACKAGE-LOCAL AUTH CLASSIFICATION + SAFE PEER ROUTE
+# - A peer Noka face-lock/ban no longer short-circuits another package before that package gets its own direct
+#   moderation API classification. A second face-locked account can therefore become FACE LOCK HOLD independently.
+# - Peer auth safety now suppresses only destructive ALIVE stale/no-state hard recovery. After its own moderation
+#   check is clear/unknown, an ALIVE sibling may receive a bounded route-only recovery so a hidden/closed App Cloner
+#   task can be brought back without PID-stop. Confirmed DEAD crash recovery remains unchanged and never waits on a peer.
+# - Peer-auth safe routes are immutable route-only generations and cannot be upgraded later to hard_force.
+#
 # V4.81.59 — MODERATION-FIRST OPEN GATE
 # - Every queued Roblox open/route now runs a package-scoped direct Not Approved moderation guard BEFORE any
 #   route intent, solver/provider preflight, Android PID decision, or legacy API bypass. A known ban payload or
@@ -1187,7 +1195,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.59"
+__version__ = "V4.81.60"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -10777,6 +10785,7 @@ def _merge_queue_duplicate(existing, target, reason, force=False, skip_if_alive=
         existing.get("option6_alive_noka_route_only")
         or existing.get("exotic_alive_noka_route_only")
         or existing.get("market_alive_noka_route_only")
+        or existing.get("peer_auth_safe_route_only")
     )
     if route_only_generation and _queue_mode_priority(new_mode) > _queue_mode_priority("route"):
         existing["duplicate_hard_upgrade_blocked_at"] = now()
@@ -12963,15 +12972,45 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
         if in_grace:
             return "Loading", f"loading grace {format_age(now() - last_open)}", True
 
-        # old past trigger -> hard recovery only when no peer Noka auth incident
+        # old past trigger -> hard recovery, except a peer auth incident may
+        # downgrade an ALIVE sibling to a safe route-only generation. Always
+        # classify THIS package with the direct moderation API first; otherwise
+        # one face-locked clone could hide a second face-locked clone forever.
         if age >= trigger:
             if alive and _is_noka_clone_package(pkg):
                 peer_pkg, peer_reason = active_noka_auth_incident(cfg, rt, exclude_pkg=pkg)
                 if peer_pkg:
-                    rt_tab["note"] = f"peer auth hold {short_pkg(peer_pkg)}; alive hard recovery suppressed"
-                    core.cancel(pkg)
+                    own_blocked, own_note = direct_moderation_guard_before_open(
+                        tab, rt_tab, cfg, f"peer-auth classify before {mode} old-state recovery"
+                    )
+                    if own_blocked:
+                        core.cancel(pkg)
+                        core.save()
+                        return "Manual", own_note or rt_tab.get("note") or "auth/moderation hold", True
+
+                    interval = max(30, int(cfg.get("noka_peer_auth_safe_route_retry_seconds", 45) or 45))
+                    last_peer_route = int(rt_tab.get("peer_auth_safe_route_last", 0) or 0)
+                    if last_peer_route > 0 and now() - last_peer_route < interval:
+                        left = max(1, interval - (now() - last_peer_route))
+                        rt_tab["note"] = f"peer auth {short_pkg(peer_pkg)}; safe route cooldown {left}s"
+                        core.save()
+                        return "Waiting", rt_tab["note"], True
+
+                    meta = {
+                        "peer_auth_safe_route_only": True,
+                        "no_hard_fallback": True,
+                        "bypass_recheck": True,
+                    }
+                    added, _ = core.queue_route_retry(
+                        tab, target, f"peer auth {short_pkg(peer_pkg)}; safe ALIVE route", metadata=meta
+                    )
+                    rt_tab["peer_auth_safe_route_last"] = now()
+                    rt_tab["note"] = (
+                        f"peer auth {short_pkg(peer_pkg)}; safe route queued"
+                        if added else f"peer auth {short_pkg(peer_pkg)}; safe route already queued"
+                    )
                     core.save()
-                    return "Waiting", rt_tab["note"], True
+                    return ("Queued" if added else "Waiting"), rt_tab["note"], True
             added, _ = core.queue_alive_old_state_recovery(
                 tab,
                 target,
@@ -12992,10 +13031,37 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
         if _is_noka_clone_package(pkg):
             peer_pkg, peer_reason = active_noka_auth_incident(cfg, rt, exclude_pkg=pkg)
             if peer_pkg:
-                rt_tab["note"] = f"peer auth hold {short_pkg(peer_pkg)}; alive no-state hard suppressed"
-                core.cancel(pkg)
+                own_blocked, own_note = direct_moderation_guard_before_open(
+                    tab, rt_tab, cfg, f"peer-auth classify before {mode} no-state recovery"
+                )
+                if own_blocked:
+                    core.cancel(pkg)
+                    core.save()
+                    return "Manual", own_note or rt_tab.get("note") or "auth/moderation hold", True
+
+                interval = max(30, int(cfg.get("noka_peer_auth_safe_route_retry_seconds", 45) or 45))
+                last_peer_route = int(rt_tab.get("peer_auth_safe_route_last", 0) or 0)
+                if last_peer_route > 0 and now() - last_peer_route < interval:
+                    left = max(1, interval - (now() - last_peer_route))
+                    rt_tab["note"] = f"peer auth {short_pkg(peer_pkg)}; safe route cooldown {left}s"
+                    core.save()
+                    return "Waiting", rt_tab["note"], True
+
+                meta = {
+                    "peer_auth_safe_route_only": True,
+                    "no_hard_fallback": True,
+                    "bypass_recheck": True,
+                }
+                added, _ = core.queue_route_retry(
+                    tab, target, f"peer auth {short_pkg(peer_pkg)}; safe ALIVE no-state route", metadata=meta
+                )
+                rt_tab["peer_auth_safe_route_last"] = now()
+                rt_tab["note"] = (
+                    f"peer auth {short_pkg(peer_pkg)}; safe route queued"
+                    if added else f"peer auth {short_pkg(peer_pkg)}; safe route already queued"
+                )
                 core.save()
-                return "Waiting", rt_tab["note"], True
+                return ("Queued" if added else "Waiting"), rt_tab["note"], True
         added, _ = core.queue_alive_no_state_recovery(
             tab,
             target,
