@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.67 — TARGET-LOCAL AUTH HOLDS
+# - Removes the device-wide peer-auth recovery veto. A face-lock/529/CAPTCHA/Account-Locked state on one Noka clone
+#   no longer downgrades, waits, or suppresses recovery for a different clone.
+# - Old-state and no-state ALIVE recovery now classify the TARGET package normally regardless of sibling auth state.
+# - Hard recovery execution no longer consults sibling auth state or needs an Error-288 peer-auth exception.
+# - Safety remains target-local at the destructive boundary: exact target process state is refreshed, the target account
+#   API moderation precheck still runs, and the target's own package/Option-16 UI is freshly checked for Account Locked,
+#   529, or verification immediately before any PID stop.
+# - Legacy queued peer-auth safe-route generations are retired on upgrade and reclassified by the normal watchdog so an
+#   old V4.81.65/.66 queue item cannot preserve the sibling hold after V4.81.67 starts.
+# - Existing exact-PID sibling isolation, no_hard_fallback protection, Error-524 manual hold, and UNKNOWN process deferral
+#   are unchanged.
+#
 # V4.81.66 — PEER-AUTH + CONFIRMED ERROR 288 RECOVERY
 # - Fixes an ALIVE sibling with a real package-scoped Error 288 / server-shutdown popup being queued for recovery,
 #   then dropped forever by the peer-auth hard-suppression gate while another Noka is held on face-lock/529/CAPTCHA.
@@ -1247,7 +1260,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.66"
+__version__ = "V4.81.67"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -13155,56 +13168,11 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
         if in_grace:
             return "Loading", f"loading grace {format_age(now() - last_open)}", True
 
-        # old past trigger -> hard recovery, except a peer auth incident may
-        # downgrade an ALIVE sibling to a safe route-only generation. Always
-        # classify THIS package with the direct moderation API first; otherwise
-        # one face-locked clone could hide a second face-locked clone forever.
+        # V4.81.67: auth holds are target-local. A sibling's face-lock/529/CAPTCHA
+        # must never downgrade or suppress recovery for this package. Retire any
+        # legacy peer-safe-route marker, then classify this target normally.
         if age >= trigger:
-            if alive and _is_noka_clone_package(pkg):
-                peer_pkg, peer_reason = active_noka_auth_incident(cfg, rt, exclude_pkg=pkg)
-                if peer_pkg:
-                    own_blocked, own_note = direct_moderation_guard_before_open(
-                        tab, rt_tab, cfg, f"peer-auth classify before {mode} old-state recovery"
-                    )
-                    if own_blocked:
-                        core.cancel(pkg)
-                        core.save()
-                        return "Manual", own_note or rt_tab.get("note") or "auth/moderation hold", True
-
-                    _adopt_recent_legacy_peer_auth_safe_route_attempt(rt_tab, peer_pkg, grace)
-                    if _peer_auth_safe_route_attempted(rt_tab, peer_pkg):
-                        rt_tab["note"] = (
-                            f"peer auth {short_pkg(peer_pkg)}; safe route already tried; "
-                            "waiting for fresh state / peer clear"
-                        )
-                        core.save()
-                        return "Waiting", rt_tab["note"], True
-
-                    interval = max(30, int(cfg.get("noka_peer_auth_safe_route_retry_seconds", 45) or 45))
-                    last_peer_route = int(rt_tab.get("peer_auth_safe_route_last", 0) or 0)
-                    if last_peer_route > 0 and now() - last_peer_route < interval:
-                        left = max(1, interval - (now() - last_peer_route))
-                        rt_tab["note"] = f"peer auth {short_pkg(peer_pkg)}; safe route cooldown {left}s"
-                        core.save()
-                        return "Waiting", rt_tab["note"], True
-
-                    meta = {
-                        "peer_auth_safe_route_only": True,
-                        "peer_auth_peer_pkg": str(peer_pkg or ""),
-                        "no_hard_fallback": True,
-                        "bypass_recheck": True,
-                    }
-                    added, _ = core.queue_route_retry(
-                        tab, target, f"peer auth {short_pkg(peer_pkg)}; safe ALIVE route", metadata=meta
-                    )
-                    rt_tab["peer_auth_safe_route_last"] = now()
-                    rt_tab["note"] = (
-                        f"peer auth {short_pkg(peer_pkg)}; safe route queued"
-                        if added else f"peer auth {short_pkg(peer_pkg)}; safe route already queued"
-                    )
-                    core.save()
-                    return ("Queued" if added else "Waiting"), rt_tab["note"], True
-                _clear_peer_auth_safe_route_attempt(rt_tab)
+            _clear_peer_auth_safe_route_attempt(rt_tab)
             added, _ = core.queue_alive_old_state_recovery(
                 tab,
                 target,
@@ -13222,51 +13190,9 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
     if alive:
         if in_grace:
             return "Loading", "no state grace", True
-        if _is_noka_clone_package(pkg):
-            peer_pkg, peer_reason = active_noka_auth_incident(cfg, rt, exclude_pkg=pkg)
-            if peer_pkg:
-                own_blocked, own_note = direct_moderation_guard_before_open(
-                    tab, rt_tab, cfg, f"peer-auth classify before {mode} no-state recovery"
-                )
-                if own_blocked:
-                    core.cancel(pkg)
-                    core.save()
-                    return "Manual", own_note or rt_tab.get("note") or "auth/moderation hold", True
-
-                _adopt_recent_legacy_peer_auth_safe_route_attempt(rt_tab, peer_pkg, grace)
-                if _peer_auth_safe_route_attempted(rt_tab, peer_pkg):
-                    rt_tab["note"] = (
-                        f"peer auth {short_pkg(peer_pkg)}; safe route already tried; "
-                        "waiting for fresh state / peer clear"
-                    )
-                    core.save()
-                    return "Waiting", rt_tab["note"], True
-
-                interval = max(30, int(cfg.get("noka_peer_auth_safe_route_retry_seconds", 45) or 45))
-                last_peer_route = int(rt_tab.get("peer_auth_safe_route_last", 0) or 0)
-                if last_peer_route > 0 and now() - last_peer_route < interval:
-                    left = max(1, interval - (now() - last_peer_route))
-                    rt_tab["note"] = f"peer auth {short_pkg(peer_pkg)}; safe route cooldown {left}s"
-                    core.save()
-                    return "Waiting", rt_tab["note"], True
-
-                meta = {
-                    "peer_auth_safe_route_only": True,
-                    "peer_auth_peer_pkg": str(peer_pkg or ""),
-                    "no_hard_fallback": True,
-                    "bypass_recheck": True,
-                }
-                added, _ = core.queue_route_retry(
-                    tab, target, f"peer auth {short_pkg(peer_pkg)}; safe ALIVE no-state route", metadata=meta
-                )
-                rt_tab["peer_auth_safe_route_last"] = now()
-                rt_tab["note"] = (
-                    f"peer auth {short_pkg(peer_pkg)}; safe route queued"
-                    if added else f"peer auth {short_pkg(peer_pkg)}; safe route already queued"
-                )
-                core.save()
-                return ("Queued" if added else "Waiting"), rt_tab["note"], True
-            _clear_peer_auth_safe_route_attempt(rt_tab)
+        # V4.81.67: sibling auth state is informational only. Recover this target
+        # from its own process/state/API/UI evidence and retire any legacy marker.
+        _clear_peer_auth_safe_route_attempt(rt_tab)
         added, _ = core.queue_alive_no_state_recovery(
             tab,
             target,
@@ -15972,6 +15898,16 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
     item_mode = str(item.get("mode", "hard") or "hard").lower()
     is_hard = item_mode not in ("soft", "route", "switch", "reuse_task")
 
+    # V4.81.67 migration: peer-auth safe routes were a cross-package workaround.
+    # They are obsolete now. Drop a persisted generation and let the next watchdog
+    # tick reclassify this target from its own state instead of resetting load grace.
+    if item.get("peer_auth_safe_route_only"):
+        _clear_peer_auth_safe_route_attempt(rt_tab)
+        rt_tab["note"] = "legacy peer-auth route retired; target will reclassify"
+        log_activity("legacy peer-auth safe route retired; target-local recheck next", pkg, DIM)
+        core.save()
+        return True
+
     # V4.81.59: MODERATION FIRST. This is deliberately before Option 6's
     # legacy API bypass, solver/provider work, staggering, PID guards, and the
     # Android route/open itself. Strong direct Not Approved proof must stop the
@@ -16064,49 +16000,8 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
             core.save()
             return True
 
-    # V4.81.54: if another Noka clone is in CAPTCHA/529/face-lock/banned state,
-    # never execute a destructive hard action against an ALIVE sibling. App Cloner
-    # can collapse sibling floating tasks even when exact-PID signaling is correct.
-    if (
-        is_hard
-        and process_status == "ALIVE"
-        and _is_noka_clone_package(pkg)
-        and cfg.get("noka_peer_auth_hard_suppression_enabled", True)
-    ):
-        peer_pkg, peer_reason = active_noka_auth_incident(cfg, rt, exclude_pkg=pkg)
-        if peer_pkg:
-            # V4.81.66: peer auth protects speculative ALIVE stale/no-state/bubble
-            # recovery, but a freshly re-confirmed Error 288/server-shutdown popup
-            # is authoritative target failure. Allow only that disconnect generation
-            # to continue to the normal exact-PID + last-second target-auth gates.
-            peer_disconnect_288 = False
-            if item.get("disconnect_recovery"):
-                live_disconnect = android_disconnect_ui_detail(pkg, cfg, force=True)
-                live_code = str((live_disconnect or {}).get("code", "") or "").strip()
-                if live_disconnect and live_code == "288":
-                    peer_disconnect_288 = True
-                    item["peer_auth_disconnect_288_override"] = True
-                    item["peer_auth_disconnect_peer_pkg"] = str(peer_pkg or "")
-                    item["peer_auth_disconnect_confirmed_at"] = now()
-                    log_activity(
-                        f"confirmed Error 288; exact-PID recovery allowed despite peer "
-                        f"{short_pkg(peer_pkg)} auth hold",
-                        pkg,
-                        YELLOW,
-                    )
-
-            if not peer_disconnect_288:
-                # Drop this speculative ALIVE hard item instead of requeueing it at
-                # the front forever; the dashboard may rediscover it after auth clears.
-                # Confirmed DEAD crash recovery stays unblocked, and Error 288 is the
-                # only ALIVE peer-auth exception above.
-                rt_tab["note"] = f"peer auth hold {short_pkg(peer_pkg)}; hard open suppressed"
-                log_activity(
-                    f"hard recovery suppressed; peer {short_pkg(peer_pkg)} auth incident ({cut(peer_reason, 55)})",
-                    pkg, YELLOW,
-                )
-                core.save()
-                return True
+    # V4.81.67: no sibling/peer auth veto here. Auth/moderation safety is checked
+    # only against THIS target below, immediately before any destructive PID stop.
 
     # V4.81.28: a bubble-only item is a speculative fast-track. Revalidate the
     # Android activity immediately before execution; if the shell materialized,
@@ -16187,6 +16082,10 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
             rt_tab["note"] = f"stagger wait {max(1, stagger - since)}s"
             core.save()
             return True
+
+    if is_hard and process_status == "ALIVE":
+        _clear_peer_auth_safe_route_attempt(rt_tab)
+        log_activity("target-local hard preflight; sibling auth ignored", pkg, DIM)
 
     if not item.get("bypass_api_precheck"):
         api_blocked, api_note = api_precheck_before_rejoin(
