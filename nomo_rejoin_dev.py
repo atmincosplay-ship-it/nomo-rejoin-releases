@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.54 — 529 VISUAL AUTH CHAIN + PEER HARD-SAFETY GATE
+# - A previously observed Account Locked/face-lock incident now remains authoritative when a safe route exposes
+#   Roblox's native Join Error wrapper but App Cloner hides its text from uiautomator. A strict per-Option-16-cell
+#   dark Join-Error modal detector supplies the missing visual fallback; it is promoted to 529 auth only when the
+#   same package already has face-lock/auth context, while exact text 529 remains authoritative without a hint.
+# - Visible Account Locked text is accepted immediately as face-lock; explicit banned/terminated/moderated text is
+#   held as account-banned and is never sent to the CAPTCHA provider. Existing API moderation checks remain a
+#   supplemental signal only.
+# - NO_CAPTCHA while the 529/auth wrapper remains visible now becomes CAPTCHA/FACE-LOCK HOLD in-place instead of
+#   clearing the incident. CAPTCHA_SUCCESS may queue one safe task-reuse route retry; it never PID-stops Noka.
+# - While any Noka package has an active CAPTCHA/529/face-lock/banned incident, speculative HARD recovery of other
+#   ALIVE Noka packages is deferred. Confirmed DEAD crash/start recovery remains allowed. The execution gate also
+#   catches already-queued hard items, preventing sibling floating-window collapse during an auth incident.
+#
 # V4.81.53 — AUTH-HOLD FINAL GATE + RECT-SCOPED 529
 # - App Cloner may expose Error 529 / disconnect accessibility nodes under Roblox's shared/original package.
 #   Auth/disconnect checks now supplement exact-package text only with nodes physically inside that clone's saved
@@ -1119,7 +1133,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.53"
+__version__ = "V4.81.54"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1824,6 +1838,13 @@ DEFAULT_CONFIG = {
     # On these cloned Android clients, this native Join Error 529 screen is
     # commonly the wrapper shown for CAPTCHA or face verification.
     "join_error_529_auth_challenge_enabled": True,
+    # V4.81.54: uiautomator can hide Join Error text. The visual fallback is only
+    # promoted to auth/529 when this exact package already has face-lock/auth context.
+    "join_error_529_visual_fallback_enabled": True,
+    "join_error_visual_scan_seconds": 10,
+    "join_error_visual_confirmations_required": 1,
+    "noka_peer_auth_hard_suppression_enabled": True,
+    "noka_peer_auth_recent_seconds": 900,
     # V4.81.53: before any destructive hard recovery, re-check the selected clone's
     # current auth/account-lock UI inside its saved Option 16 rectangle.
     "preopen_auth_ui_guard_enabled": True,
@@ -3433,6 +3454,16 @@ def apply_update_migrations(cfg):
         set_cfg("face_lock_visual_confirmations_required", 2)
     if "face_lock_auto_hold" not in cfg:
         set_cfg("face_lock_auto_hold", True)
+    if "join_error_529_visual_fallback_enabled" not in cfg:
+        set_cfg("join_error_529_visual_fallback_enabled", True)
+    if _int_cfg(cfg.get("join_error_visual_scan_seconds"), 0) < 5:
+        set_cfg("join_error_visual_scan_seconds", 10)
+    if _int_cfg(cfg.get("join_error_visual_confirmations_required"), 0) < 1:
+        set_cfg("join_error_visual_confirmations_required", 1)
+    if "noka_peer_auth_hard_suppression_enabled" not in cfg:
+        set_cfg("noka_peer_auth_hard_suppression_enabled", True)
+    if _int_cfg(cfg.get("noka_peer_auth_recent_seconds"), 0) < 120:
+        set_cfg("noka_peer_auth_recent_seconds", 900)
 
     # V3.59/V3.60: stale runtime queue self-heal. This replaces manual
     # rm runtime.json for interrupted open/wait cycles, but waits longer so it
@@ -12261,7 +12292,25 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
             clear_manual_login_block(rt_tab)
             clear_hold(pkg)
             log_activity("clean in-game state; face-lock hold cleared", pkg, GREEN)
-    face_lock = visual_face_lock_detail(pkg, cfg, force=False) if face_lock_scan_eligible else None
+    account_ui = android_account_status_ui_detail(pkg, cfg, force=False) if face_lock_scan_eligible else None
+    if account_ui and account_ui.get("kind") == "account_banned":
+        detail = str(account_ui.get("text") or "account banned/terminated")
+        retry_seconds = max(3600, int(cfg.get("manual_auth_retry_seconds", 3600) or 3600))
+        mark_manual_login_block(rt_tab, "account_banned", detail, "ACCOUNT BANNED / TERMINATED - held", None, retry_seconds)
+        set_hold(pkg, "account_banned", retry_seconds)
+        rt_tab["note"] = "ACCOUNT BANNED / TERMINATED - held"
+        return {
+            "pkg": pkg, "user": tab.get("user_name", pkg), "alive": bool(raw_alive),
+            "state": state, "state_err": err, "fresh": False, "clean_fresh": False,
+            "pets": int(state.get("pet_count", 0) or 0) if state else "-",
+            "eggs": int(state.get("egg_total", 0) or 0) if state else "-",
+            "age": state_age_seconds(state) if state else "-",
+            "status": "Banned", "note": rt_tab["note"], "bad": "account_banned",
+            "visible_window": True, "account_status_detail": account_ui,
+        }
+
+    text_face = account_ui if account_ui and account_ui.get("kind") == "face_lock" else None
+    face_lock = text_face or (visual_face_lock_detail(pkg, cfg, force=False) if face_lock_scan_eligible else None)
     if face_lock:
         first_hit = not bool(rt_tab.get("face_lock_detected"))
         detail = str(face_lock.get("text", "") or "account locked")
@@ -12307,7 +12356,9 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
     )
     if not captcha_scan_eligible:
         clear_visual_captcha_confirmation(pkg)
-    captcha_ui = android_login_challenge_ui_detail(pkg, cfg, force=False) if captcha_scan_eligible else None
+    captcha_ui = android_login_challenge_ui_detail(
+        pkg, cfg, force=False, auth_hint=_runtime_auth_hint(rt_tab)
+    ) if captcha_scan_eligible else None
     if captcha_ui:
         detail = ",".join(captcha_ui.get("hits", []) or []) or "verification UI"
         rt_tab["captcha_ui_visible"] = True
@@ -12502,7 +12553,7 @@ def maybe_queue_solver_busy_retry(open_queue, tab, target, rt_tab, cfg, health, 
     alive = bool((health or {}).get("alive"))
     state = (health or {}).get("state") or {}
     challenge_detail = state_login_challenge_detail(state)
-    visible = android_login_challenge_ui_detail(pkg, cfg, force=True) if alive else None
+    visible = android_login_challenge_ui_detail(pkg, cfg, force=True, auth_hint=_runtime_auth_hint(rt_tab)) if alive else None
 
     if not alive:
         # Solver retry does not own crash recovery. Let the normal dead-package
@@ -12598,7 +12649,7 @@ def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, he
         rt_tab["solver_busy_retry_at"] = 0
         rt_tab["solver_retry_reason"] = ""
 
-    detail_obj = android_login_challenge_ui_detail(pkg, cfg, force=True)
+    detail_obj = android_login_challenge_ui_detail(pkg, cfg, force=True, auth_hint=_runtime_auth_hint(rt_tab))
     detail = str(
         (detail_obj or {}).get("text")
         or (detail_obj or {}).get("reason")
@@ -12652,6 +12703,13 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
     grace = int(cfg.get("post_open_grace_seconds", 360) or 360)
 
     # --- join/login challenge: solve current live challenge in-place ---
+    if bad == "account_banned":
+        removed = core.cancel(pkg)
+        rt_tab["note"] = rt_tab.get("note") or "ACCOUNT BANNED / TERMINATED - held"
+        if removed:
+            core.save()
+        return "Banned", rt_tab["note"], True
+
     if bad == "challenge" or (state and state_login_challenge_detail(state)):
         if alive:
             removed = core.cancel(pkg)
@@ -12784,8 +12842,15 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
         if in_grace:
             return "Loading", f"loading grace {format_age(now() - last_open)}", True
 
-        # old past trigger -> kill + open THIS one clone
+        # old past trigger -> hard recovery only when no peer Noka auth incident
         if age >= trigger:
+            if alive and _is_noka_clone_package(pkg):
+                peer_pkg, peer_reason = active_noka_auth_incident(cfg, rt, exclude_pkg=pkg)
+                if peer_pkg:
+                    rt_tab["note"] = f"peer auth hold {short_pkg(peer_pkg)}; alive hard recovery suppressed"
+                    core.cancel(pkg)
+                    core.save()
+                    return "Waiting", rt_tab["note"], True
             added, _ = core.queue_alive_old_state_recovery(
                 tab,
                 target,
@@ -12803,6 +12868,13 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
     if alive:
         if in_grace:
             return "Loading", "no state grace", True
+        if _is_noka_clone_package(pkg):
+            peer_pkg, peer_reason = active_noka_auth_incident(cfg, rt, exclude_pkg=pkg)
+            if peer_pkg:
+                rt_tab["note"] = f"peer auth hold {short_pkg(peer_pkg)}; alive no-state hard suppressed"
+                core.cancel(pkg)
+                core.save()
+                return "Waiting", rt_tab["note"], True
         added, _ = core.queue_alive_no_state_recovery(
             tab,
             target,
@@ -13856,6 +13928,225 @@ def clear_face_lock_runtime(rt_tab):
     return changed
 
 
+def _runtime_auth_hint(rt_tab, recent_seconds=3600):
+    """True when this package recently proved CAPTCHA/529/face-lock/auth trouble."""
+    if not isinstance(rt_tab, dict):
+        return False
+    reason = " ".join(str(rt_tab.get(k, "") or "") for k in (
+        "manual_login_reason", "manual_login_detail", "captcha_ui_detail",
+        "face_lock_detail",
+    )).lower()
+    if any(term in reason for term in (
+        "face_lock", "face lock", "account locked", "529", "captcha",
+        "verification", "auth challenge", "account_banned", "account banned",
+        "terminated", "moderated",
+    )):
+        return True
+    if bool(rt_tab.get("face_lock_detected")):
+        return True
+    if bool(rt_tab.get("captcha_ui_visible")):
+        seen = int(rt_tab.get("captcha_ui_last_seen_at", 0) or 0)
+        if seen <= 0 or now() - seen <= max(120, int(recent_seconds or 3600)):
+            return True
+    for key in ("face_lock_last_seen_at", "face_lock_detected_at"):
+        seen = int(rt_tab.get(key, 0) or 0)
+        if seen > 0 and now() - seen <= max(120, int(recent_seconds or 3600)):
+            return True
+    return False
+
+
+def android_account_status_ui_detail(pkg, cfg, force=False):
+    """Exact package/rect text for Account Locked or explicit moderation/banned UI."""
+    texts, _ = android_ui_text_for_package_or_rect(str(pkg or ""), cfg, force=force)
+    if not texts:
+        return None
+    joined = "\n".join(str(v) for v in texts if str(v or "").strip())
+    low = joined.lower()
+
+    locked = "account locked" in low and any(term in low for term in (
+        "suspicious activity", "confirming that you're a human",
+        "confirming that you are a human", "unlock your account", "continue",
+    ))
+    if locked:
+        return {
+            "kind": "face_lock",
+            "title": "Roblox Account Locked",
+            "text": joined,
+            "reason": "android_package_scoped_account_locked_text",
+            "hits": ["account locked"],
+        }
+
+    banned_terms = (
+        "account terminated", "account has been terminated", "account deleted",
+        "account has been deleted", "account banned", "you have been banned",
+        "banned from roblox", "account moderated", "account has been moderated",
+    )
+    hit = next((term for term in banned_terms if term in low), "")
+    if hit:
+        return {
+            "kind": "account_banned",
+            "title": "Roblox Account Moderated",
+            "text": joined,
+            "reason": "android_package_scoped_account_moderation_text",
+            "hits": [hit],
+        }
+    return None
+
+
+_JOIN_ERROR_VISUAL_CACHE = {
+    "ts": 0, "width": 0, "height": 0,
+    "raw_candidates": {}, "metrics": {}, "error": "not captured",
+}
+_JOIN_ERROR_VISUAL_CONFIRM = {}
+
+
+def _join_error_cell_metrics(frame, rect):
+    """Detect the neutral dark Roblox Join Error modal without OCR.
+
+    This deliberately does NOT decide the error code. Promotion to auth/529 is
+    allowed only when the package already has face-lock/auth context (or exact
+    accessibility text independently proves 529).
+    """
+    width = int(frame["width"]); height = int(frame["height"]); pixels = frame["pixels"]
+    try:
+        left, top, right, bottom = [int(x) for x in rect]
+    except Exception:
+        return {"candidate": False, "dark_neutral_ratio": 0.0, "panel_mean": 0.0, "samples": 0}
+    left = max(0, min(width - 1, left)); right = max(left + 1, min(width, right))
+    top = max(0, min(height - 1, top)); bottom = max(top + 1, min(height, bottom))
+    cw, ch = right - left, bottom - top
+    if cw < 120 or ch < 100:
+        return {"candidate": False, "dark_neutral_ratio": 0.0, "panel_mean": 0.0, "samples": 0}
+
+    # Join Error's modal occupies the broad center and is unusually uniform,
+    # neutral dark gray. Black loading screens are excluded by the lower mean bound.
+    x1, x2 = left + int(cw * 0.12), left + int(cw * 0.88)
+    y1, y2 = top + int(ch * 0.18), top + int(ch * 0.78)
+    step = max(3, min(8, min(cw, ch) // 55))
+    dark_neutral = total = 0
+    gray_sum = 0.0
+    for y in range(y1, y2, step):
+        row = y * width * 4
+        for x in range(x1, x2, step):
+            i = row + x * 4
+            r = int(pixels[i]); g = int(pixels[i + 1]); b = int(pixels[i + 2])
+            mean = (r + g + b) / 3.0
+            total += 1; gray_sum += mean
+            if 35 <= mean <= 125 and max(r, g, b) - min(r, g, b) <= 30:
+                dark_neutral += 1
+    ratio = (dark_neutral / total) if total else 0.0
+    panel_mean = (gray_sum / total) if total else 0.0
+    candidate = bool(total >= 80 and ratio >= 0.58 and 42 <= panel_mean <= 105)
+    return {
+        "candidate": candidate,
+        "dark_neutral_ratio": ratio,
+        "panel_mean": panel_mean,
+        "samples": total,
+    }
+
+
+def capture_visual_join_error_snapshot(cfg, force=False):
+    global _JOIN_ERROR_VISUAL_CACHE
+    if not cfg.get("join_error_529_visual_fallback_enabled", True) and not force:
+        return _JOIN_ERROR_VISUAL_CACHE
+    t = now()
+    scan_seconds = max(5, int(cfg.get("join_error_visual_scan_seconds", 10) or 10))
+    if not force and int(_JOIN_ERROR_VISUAL_CACHE.get("ts", 0) or 0) > 0:
+        if t - int(_JOIN_ERROR_VISUAL_CACHE.get("ts", 0) or 0) < scan_seconds:
+            return _JOIN_ERROR_VISUAL_CACHE
+    shared = _capture_loading_visual_frame(cfg, force=force)
+    t = int(shared.get("ts", t) or t); frame = shared.get("frame")
+    if not frame:
+        _JOIN_ERROR_VISUAL_CACHE = {
+            "ts": t, "width": 0, "height": 0, "raw_candidates": {},
+            "metrics": {}, "error": str(shared.get("error", "") or ""),
+        }
+        return _JOIN_ERROR_VISUAL_CACHE
+    raw = {}; metrics = {}
+    for tab in (cfg or {}).get("tabs", []):
+        pkg = str((tab or {}).get("package", "") or "")
+        if not pkg or pkg in raw:
+            continue
+        rect = _loading_visual_rect_for_package(pkg, cfg)
+        if not rect:
+            continue
+        m = _join_error_cell_metrics(frame, rect)
+        m["rect"] = list(rect)
+        metrics[pkg] = m; raw[pkg] = bool(m.get("candidate"))
+    _JOIN_ERROR_VISUAL_CACHE = {
+        "ts": t, "width": frame["width"], "height": frame["height"],
+        "raw_candidates": raw, "metrics": metrics, "error": "",
+    }
+    return _JOIN_ERROR_VISUAL_CACHE
+
+
+def visual_join_error_detail(pkg, cfg, force=False, bypass_confirm=False):
+    snapshot = capture_visual_join_error_snapshot(cfg, force=force)
+    pkg = str(pkg or "")
+    metrics = (snapshot.get("metrics") or {}).get(pkg) or {}
+    candidate = bool((snapshot.get("raw_candidates") or {}).get(pkg, False))
+    snap_ts = int(snapshot.get("ts", 0) or 0)
+    rec = _JOIN_ERROR_VISUAL_CONFIRM.setdefault(pkg, {"count": 0, "snapshot_ts": 0, "last_seen": 0})
+    if snap_ts and snap_ts != int(rec.get("snapshot_ts", 0) or 0):
+        rec["snapshot_ts"] = snap_ts
+        if candidate:
+            rec["count"] = int(rec.get("count", 0) or 0) + 1; rec["last_seen"] = snap_ts
+        else:
+            rec["count"] = 0
+    required = max(1, int(cfg.get("join_error_visual_confirmations_required", 1) or 1))
+    if not candidate or (not bypass_confirm and int(rec.get("count", 0) or 0) < required):
+        return None
+    return {
+        "title": "Roblox Join Error",
+        "text": (
+            f"visual dark-neutral={float(metrics.get('dark_neutral_ratio', 0.0)):.3f} "
+            f"mean={float(metrics.get('panel_mean', 0.0)):.1f}"
+        ),
+        "reason": "android_package_scoped_visual_join_error",
+        "hits": ["visual dark Join Error modal"],
+        "visual_metrics": metrics,
+    }
+
+
+def _auth_incident_runtime_reason(rt_tab, cfg):
+    if not isinstance(rt_tab, dict):
+        return ""
+    recent = max(120, int(cfg.get("noka_peer_auth_recent_seconds", 900) or 900))
+    reason = " ".join(str(rt_tab.get(k, "") or "") for k in (
+        "manual_login_reason", "manual_login_detail", "captcha_ui_detail", "face_lock_detail",
+    )).lower()
+    if bool(rt_tab.get("face_lock_detected")):
+        return "face lock"
+    if any(term in reason for term in (
+        "account locked", "face_lock", "face lock", "529", "captcha", "verification",
+        "account_banned", "account banned", "terminated", "moderated",
+    )):
+        return cut(reason, 70)
+    if bool(rt_tab.get("captcha_ui_visible")):
+        seen = int(rt_tab.get("captcha_ui_last_seen_at", 0) or 0)
+        if seen <= 0 or now() - seen <= recent:
+            return "verification UI"
+    return ""
+
+
+def active_noka_auth_incident(cfg, rt, exclude_pkg=""):
+    """Return (package, reason) for any active Noka auth blocker in this pool."""
+    if not cfg.get("noka_peer_auth_hard_suppression_enabled", True):
+        return "", ""
+    exclude_pkg = str(exclude_pkg or "")
+    for tab in (cfg or {}).get("tabs", []):
+        pkg = str((tab or {}).get("package", "") or "")
+        if not pkg or pkg == exclude_pkg or not _is_noka_clone_package(pkg):
+            continue
+        rt_tab = get_runtime_tab(rt, pkg)
+        reason = _auth_incident_runtime_reason(rt_tab, cfg)
+        if reason:
+            return pkg, reason
+        if solver_job_running(pkg):
+            return pkg, "solver/auth job running"
+    return "", ""
+
+
 def join_error_529_auth_detail(
     texts,
     cfg=None,
@@ -13927,6 +14218,7 @@ def android_login_challenge_ui_detail(
     pkg,
     cfg,
     force=False,
+    auth_hint=False,
 ):
     """Return a strong package-scoped Roblox verification/auth signal."""
     if not cfg.get(
@@ -13963,6 +14255,22 @@ def android_login_challenge_ui_detail(
     )
     if auth_529:
         return auth_529
+
+    # V4.81.54: exact text remains preferred. If App Cloner hides that text, a
+    # strict Join Error visual may stand in for 529 only when this exact package
+    # already carries face-lock/auth context from the preceding Account Locked UI.
+    if auth_hint and cfg.get("join_error_529_visual_fallback_enabled", True):
+        visual_join = visual_join_error_detail(pkg, cfg, force=force, bypass_confirm=force)
+        if visual_join:
+            visual_join = dict(visual_join)
+            visual_join.update({
+                "title": "Roblox Authentication Hold",
+                "code": "529",
+                "reason": "android_package_scoped_visual_529_after_auth",
+                "challenge_kind": "captcha_or_face_lock",
+                "visual_only": True,
+            })
+            return visual_join
 
     if cfg.get(
         "captcha_visual_screenshot_only",
@@ -14509,7 +14817,7 @@ def wait_until_fresh_after_open(
 
         # build a status note for the table
         status_note = ""
-        visible_captcha = android_login_challenge_ui_detail(pkg, cfg, force=False) if alive else None
+        visible_captcha = android_login_challenge_ui_detail(pkg, cfg, force=False, auth_hint=_runtime_auth_hint(rt_tab)) if alive else None
         if visible_captcha:
             rt_tab["captcha_ui_visible"] = True
             rt_tab["captcha_ui_last_seen_at"] = now()
@@ -14990,6 +15298,28 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
             core.save()
             return True
 
+    # V4.81.54: if another Noka clone is in CAPTCHA/529/face-lock/banned state,
+    # never execute a destructive hard action against an ALIVE sibling. App Cloner
+    # can collapse sibling floating tasks even when exact-PID signaling is correct.
+    if (
+        is_hard
+        and process_status == "ALIVE"
+        and _is_noka_clone_package(pkg)
+        and cfg.get("noka_peer_auth_hard_suppression_enabled", True)
+    ):
+        peer_pkg, peer_reason = active_noka_auth_incident(cfg, rt, exclude_pkg=pkg)
+        if peer_pkg:
+            # Drop this speculative ALIVE hard item instead of requeueing it at
+            # the front forever; the dashboard may rediscover it after auth clears.
+            # This keeps confirmed DEAD crash recovery for other packages unblocked.
+            rt_tab["note"] = f"peer auth hold {short_pkg(peer_pkg)}; hard open suppressed"
+            log_activity(
+                f"hard recovery suppressed; peer {short_pkg(peer_pkg)} auth incident ({cut(peer_reason, 55)})",
+                pkg, YELLOW,
+            )
+            core.save()
+            return True
+
     # V4.81.28: a bubble-only item is a speculative fast-track. Revalidate the
     # Android activity immediately before execution; if the shell materialized,
     # died, or the query became inconclusive while queued, cancel this special
@@ -15096,7 +15426,32 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
             core.save()
             return True
         if auth_status == "ALIVE":
-            visible_auth = android_login_challenge_ui_detail(pkg, cfg, force=True)
+            account_ui = android_account_status_ui_detail(pkg, cfg, force=True)
+            if account_ui:
+                retry_seconds = max(600, int(cfg.get("manual_auth_retry_seconds", 3600) or 3600))
+                detail = str(account_ui.get("text") or account_ui.get("title") or "account auth hold")
+                if account_ui.get("kind") == "account_banned":
+                    mark_manual_login_block(rt_tab, "account_banned", detail, "ACCOUNT BANNED / TERMINATED - hard recovery blocked", None, retry_seconds)
+                    set_hold(pkg, "account_banned", retry_seconds)
+                    rt_tab["note"] = "ACCOUNT BANNED / TERMINATED - hard recovery blocked"
+                    log_activity("banned/terminated account blocked queued hard recovery before PID stop", pkg, RED)
+                    core.save()
+                    return True
+                rt_tab["face_lock_detected"] = True
+                rt_tab["face_lock_detail"] = detail
+                rt_tab["face_lock_last_seen_at"] = now()
+                if not int(rt_tab.get("face_lock_detected_at", 0) or 0):
+                    rt_tab["face_lock_detected_at"] = now()
+                mark_manual_login_block(rt_tab, "face_lock", detail, "account locked; hard recovery blocked", int(rt_tab.get("face_lock_detected_at", now()) or now()), retry_seconds)
+                set_hold(pkg, "face_lock", retry_seconds)
+                rt_tab["note"] = "account locked; hard recovery blocked"
+                log_activity("Account Locked text blocked queued hard recovery before PID stop", pkg, RED)
+                core.save()
+                return True
+
+            visible_auth = android_login_challenge_ui_detail(
+                pkg, cfg, force=True, auth_hint=_runtime_auth_hint(rt_tab)
+            )
             if visible_auth:
                 detail = str(
                     visible_auth.get("text")
@@ -15119,6 +15474,17 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
                 )
                 core.save()
                 return True
+
+            if _runtime_auth_hint(rt_tab):
+                visual_join = visual_join_error_detail(pkg, cfg, force=True, bypass_confirm=True)
+                if visual_join:
+                    rt_tab["note"] = "visual Join Error after auth/face-lock; hard recovery blocked"
+                    rt_tab["captcha_ui_visible"] = True
+                    rt_tab["captcha_ui_last_seen_at"] = now()
+                    rt_tab["captcha_ui_detail"] = "visual 529/auth Join Error"
+                    log_activity("visual Join Error after auth context blocked queued hard recovery before PID stop", pkg, YELLOW)
+                    core.save()
+                    return True
 
             # The Account-Locked visual detector is deliberately stricter during
             # normal monitoring (two confirmations). At the destructive boundary,
@@ -32879,29 +33245,42 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
             changed = True
             continue
 
-        # The provider may return NO_CAPTCHA while the clone still displays the
-        # native 529/verification wrapper. Record that mismatch, then continue
-        # into the common result path below, which performs exactly one recovery.
+        # V4.81.54: NO_CAPTCHA + still-visible 529/auth wrapper means the problem
+        # is not a solvable CAPTCHA. Keep this package in face-lock/auth hold and
+        # never bounce Roblox or disturb sibling Noka tasks.
+        visible_ui = None
         if no_captcha_result:
             visible_ui = android_login_challenge_ui_detail(
                 pkg,
                 cfg,
                 force=True,
+                auth_hint=_runtime_auth_hint(rt_tab),
             )
             if visible_ui:
                 rt_tab["captcha_ui_visible"] = True
                 rt_tab["captcha_ui_false_negative"] = True
                 rt_tab["captcha_ui_last_seen_at"] = now()
                 rt_tab["solver_state"] = "clear_ui_still_visible"
-                rt_tab["solver_last_error"] = (
-                    "provider NO_CAPTCHA while auth UI remains visible"
+                rt_tab["solver_last_error"] = "provider NO_CAPTCHA while auth UI remains visible"
+                is_529_auth = bool(
+                    str(visible_ui.get("code") or "") == "529"
+                    or visible_ui.get("challenge_kind") == "captcha_or_face_lock"
                 )
-                log_activity(
-                    "solver NO_CAPTCHA but auth UI remains; "
-                    "one exact-PID recovery will run",
-                    pkg,
-                    YELLOW,
-                )
+                if is_529_auth:
+                    retry_seconds = max(600, int(cfg.get("manual_auth_retry_seconds", 3600) or 3600))
+                    detail = str(visible_ui.get("text") or visible_ui.get("reason") or "529/auth UI remains")
+                    mark_manual_login_block(rt_tab, "face_lock", detail, "CAPTCHA / FACE LOCK HOLD", None, retry_seconds)
+                    set_hold(pkg, "face_lock", retry_seconds)
+                    rt_tab["face_lock_detected"] = True
+                    rt_tab["face_lock_detail"] = detail
+                    rt_tab["face_lock_last_seen_at"] = now()
+                    if not int(rt_tab.get("face_lock_detected_at", 0) or 0):
+                        rt_tab["face_lock_detected_at"] = now()
+                    rt_tab["note"] = "NO_CAPTCHA + 529; FACE LOCK HOLD (no reopen)"
+                    log_activity("solver NO_CAPTCHA + 529/auth UI; FACE LOCK HOLD, no package reopen", pkg, RED)
+                    changed = True
+                    continue
+                log_activity("solver NO_CAPTCHA but verification UI remains; held in-place", pkg, YELLOW)
 
         # V4.09: keep NO_CAPTCHA separate from CAPTCHA_SUCCESS. The provider
         # returning NO_CAPTCHA means there was nothing to solve, so a package that
@@ -32935,6 +33314,9 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
         if no_captcha_result or solved_result:
             result_label = "NO_CAPTCHA" if no_captcha_result else "CAPTCHA_SUCCESS"
             detail = _solver_probe_detail(response)
+            solved_visible_auth = android_login_challenge_ui_detail(
+                pkg, cfg, force=True, auth_hint=_runtime_auth_hint(rt_tab)
+            ) if solved_result else None
 
             clear_hold(pkg)
             clear_manual_login_block(rt_tab)
@@ -32955,11 +33337,23 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
             # disturb another clone's queued recovery.
             core.cancel(pkg)
 
-            # This is a post-open provider result. Keep it package-local: do not
-            # PID-stop/reopen Roblox just because the solver answered. On Noka,
-            # that recovery can disturb sibling clone windows. The existing
-            # session either continues loading, or normal stale-state recovery
-            # handles it later.
+            # This is a post-open provider result. Never PID-stop Noka here. If a
+            # solved CAPTCHA leaves the 529/auth wrapper visible, deliver one safe
+            # task-reuse route so Roblox can retry the join without touching PIDs.
+            if solved_result and solved_visible_auth and _is_noka_clone_package(pkg):
+                meta = {
+                    "solver_preflight_done": True, "skip_solver_once": True,
+                    "skip_solver_probe": True, "no_hard_fallback": True,
+                    "auth_529_post_solver_route": True,
+                }
+                added, _ = core.queue_route_retry(
+                    tab, target, "CAPTCHA_SUCCESS; safe 529 route retry", metadata=meta, bypass_manual=True
+                )
+                rt_tab["note"] = "CAPTCHA_SUCCESS; safe route retry queued" if added else "CAPTCHA_SUCCESS; safe route retry already queued"
+                log_activity("CAPTCHA_SUCCESS + 529/auth UI; safe route retry (no PID stop)", pkg, GREEN)
+                changed = True
+                continue
+
             should_rejoin = False
 
             if should_rejoin:
