@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.63 — CLEAR OBSOLETE V4.81.61 AGE-HOLD STATE
+# - V4.81.62 stopped treating the Roblox age/access banner as a blocker, but a package that was already seen by
+#   V4.81.61 could keep its persisted manual_login_reason=age_access_gate and captcha_hold.json entry for up to an
+#   hour. That ghost hold could consume/drop the new peer-auth safe route before Android ever received the intent.
+# - Package health now migrates that one obsolete hold in-place: only age_access_gate / the V4.81.61 AGE / ACCESS
+#   note is cleared. Real face_lock, CAPTCHA/529, parental/account restriction, and ban/moderation holds are untouched.
+# - Clearing the obsolete hold also resets the peer-auth safe-route cooldown so the unrestricted package can queue
+#   and execute its route immediately on the same Option-1 run. V4.81.60-.62 Face Lock API/peer-hard safety stays intact.
+#
 # V4.81.62 — AGE / ACCESS BANNER FALSE-POSITIVE REVERT
 # - Reverts V4.81.61 after live proof showed the Roblox "Access to popular games has changed / check your age /
 #   Unlock" panel does NOT prevent this client from joining a game. Those age/access banner phrases are now
@@ -1205,7 +1214,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.62"
+__version__ = "V4.81.63"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -12355,6 +12364,55 @@ def state_is_clean_fresh(state, cfg, seconds=None):
     return state_is_fresh(state, cfg, seconds=seconds) and state_is_clean(state)
 
 
+def clear_obsolete_age_access_hold(rt_tab, pkg):
+    """V4.81.63: remove only the false V4.81.61 age/access manual hold.
+
+    The visible age/access banner is informational on this client and does not
+    prevent joining. V4.81.61 persisted it as a one-hour manual/CAPTCHA hold;
+    V4.81.62 stopped creating new holds but intentionally did not mutate old
+    runtime. Migrate that exact obsolete reason without touching real auth holds.
+    """
+    if not isinstance(rt_tab, dict):
+        return False
+
+    reason = str(rt_tab.get("manual_login_reason", "") or "").strip().lower()
+    detail = str(rt_tab.get("manual_login_detail", "") or "").strip().lower()
+    note = str(rt_tab.get("note", "") or "").strip().lower()
+
+    obsolete_runtime = (
+        reason == "age_access_gate"
+        or "age / access gate" in detail
+        or "age / access gate" in note
+    )
+
+    hold_reason = ""
+    try:
+        hold_reason = str(get_hold_reason(pkg) or "").strip().lower()
+    except Exception:
+        hold_reason = ""
+    obsolete_file_hold = hold_reason.startswith("age_access_gate")
+
+    if not obsolete_runtime and not obsolete_file_hold:
+        return False
+
+    if obsolete_runtime:
+        clear_manual_login_block(rt_tab)
+
+    if obsolete_file_hold or obsolete_runtime:
+        try:
+            clear_hold(pkg)
+        except Exception:
+            pass
+
+    # A route may have been suppressed/consumed while the stale hold existed.
+    # Let the current dashboard generation queue a fresh safe route immediately.
+    rt_tab["peer_auth_safe_route_last"] = 0
+    rt_tab["manual_login_last_recover_check"] = 0
+    rt_tab["note"] = "obsolete age/access hold cleared; normal recovery allowed"
+    rt_tab["age_access_false_hold_cleared_at"] = now()
+    return True
+
+
 def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=None, raw_alive=None, state=None, err=None, process_status=None, process_note=""):
     """One shared answer for Market/Hatcher package health.
 
@@ -12362,6 +12420,12 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
     crash signal; fresh clean Lua state can still prove the clone is healthy.
     """
     pkg = tab.get("package")
+    # V4.81.63 migration: V4.81.61 may have persisted the now-invalid
+    # age_access_gate hold. Remove only that exact false-positive before any
+    # health/queue decision so a safe route is not swallowed by stale state.
+    if clear_obsolete_age_access_hold(rt_tab, pkg):
+        log_activity("obsolete V4.81.61 age/access hold cleared", pkg, GREEN)
+
     if process_status is None:
         if raw_alive is None:
             process_status, process_note = package_alive_status(pkg, cfg)
