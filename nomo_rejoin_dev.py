@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.66 — PEER-AUTH + CONFIRMED ERROR 288 RECOVERY
+# - Fixes an ALIVE sibling with a real package-scoped Error 288 / server-shutdown popup being queued for recovery,
+#   then dropped forever by the peer-auth hard-suppression gate while another Noka is held on face-lock/529/CAPTCHA.
+# - Peer-auth suppression still blocks speculative ALIVE stale/no-state/bubble hard recovery. The only new exception is
+#   a disconnect_recovery generation whose target is freshly re-confirmed, inside that exact package/Option-16 rectangle,
+#   as Error 288. That target may perform its normal exact-PID recovery even while a different clone is auth-held.
+# - Error 524 remains a manual private-server permission hold and is never covered by this exception. Target-side
+#   Account Locked/529/auth checks still run immediately before PID stop and can cancel the recovery.
+# - android_disconnect_ui_detail() now accepts force=True so the peer-auth exception never relies on a stale UI cache.
+# - Fixes the V4.81.65 packaging/version-stamp mistake: the prior ZIP header said V4.81.65 but __version__ remained
+#   V4.81.64. This build is internally stamped V4.81.66 so the Termux banner/version command reports the real build.
+#
 # V4.81.65 — BOUNDED PEER-AUTH SAFE ROUTE
 # - Fixes an ALIVE stale/no-state sibling getting trapped in an endless peer-auth route -> post-open grace loop while
 #   another Noka remains on face-lock/529/CAPTCHA/moderation hold. Each target now gets one automatic task-reuse
@@ -1235,7 +1247,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.64"
+__version__ = "V4.81.66"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -14099,12 +14111,12 @@ def hatcher_visible_home_watch_active(rt_tab, cfg):
     return now() - last_open <= watch
 
 
-def android_disconnect_ui_detail(pkg, cfg):
+def android_disconnect_ui_detail(pkg, cfg, force=False):
     """High-confidence package-scoped native Roblox disconnect detection."""
     if not cfg.get("android_disconnect_ui_detection_enabled", True):
         return None
 
-    texts, _ = android_ui_text_for_package_or_rect(pkg, cfg, force=False)
+    texts, _ = android_ui_text_for_package_or_rect(pkg, cfg, force=bool(force))
     if not texts:
         return None
 
@@ -16063,16 +16075,38 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
     ):
         peer_pkg, peer_reason = active_noka_auth_incident(cfg, rt, exclude_pkg=pkg)
         if peer_pkg:
-            # Drop this speculative ALIVE hard item instead of requeueing it at
-            # the front forever; the dashboard may rediscover it after auth clears.
-            # This keeps confirmed DEAD crash recovery for other packages unblocked.
-            rt_tab["note"] = f"peer auth hold {short_pkg(peer_pkg)}; hard open suppressed"
-            log_activity(
-                f"hard recovery suppressed; peer {short_pkg(peer_pkg)} auth incident ({cut(peer_reason, 55)})",
-                pkg, YELLOW,
-            )
-            core.save()
-            return True
+            # V4.81.66: peer auth protects speculative ALIVE stale/no-state/bubble
+            # recovery, but a freshly re-confirmed Error 288/server-shutdown popup
+            # is authoritative target failure. Allow only that disconnect generation
+            # to continue to the normal exact-PID + last-second target-auth gates.
+            peer_disconnect_288 = False
+            if item.get("disconnect_recovery"):
+                live_disconnect = android_disconnect_ui_detail(pkg, cfg, force=True)
+                live_code = str((live_disconnect or {}).get("code", "") or "").strip()
+                if live_disconnect and live_code == "288":
+                    peer_disconnect_288 = True
+                    item["peer_auth_disconnect_288_override"] = True
+                    item["peer_auth_disconnect_peer_pkg"] = str(peer_pkg or "")
+                    item["peer_auth_disconnect_confirmed_at"] = now()
+                    log_activity(
+                        f"confirmed Error 288; exact-PID recovery allowed despite peer "
+                        f"{short_pkg(peer_pkg)} auth hold",
+                        pkg,
+                        YELLOW,
+                    )
+
+            if not peer_disconnect_288:
+                # Drop this speculative ALIVE hard item instead of requeueing it at
+                # the front forever; the dashboard may rediscover it after auth clears.
+                # Confirmed DEAD crash recovery stays unblocked, and Error 288 is the
+                # only ALIVE peer-auth exception above.
+                rt_tab["note"] = f"peer auth hold {short_pkg(peer_pkg)}; hard open suppressed"
+                log_activity(
+                    f"hard recovery suppressed; peer {short_pkg(peer_pkg)} auth incident ({cut(peer_reason, 55)})",
+                    pkg, YELLOW,
+                )
+                core.save()
+                return True
 
     # V4.81.28: a bubble-only item is a speculative fast-track. Revalidate the
     # Android activity immediately before execution; if the shell materialized,
