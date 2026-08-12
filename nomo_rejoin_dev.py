@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.56 — OPTION 6 AUTH-PROBE + ROUTE-ONLY QUEUE LOCK
+# - Manual Option 6 on an already-ALIVE Noka is allowed to send exactly the safe task-reuse route even when a
+#   manual/API-cookie hold exists. The route bypasses API/provider preflight only for that non-destructive probe,
+#   so Account Locked can reliably expose native 529 for package-scoped detection without any PID-stop.
+# - An ALIVE-Noka route-only generation (Option 6, Exotic, or Market) can no longer be upgraded in-place to
+#   hard_force by a later duplicate old-state/no-state watchdog item. A later genuinely DEAD cycle may queue its
+#   own crash recovery after the route generation is gone.
+# - Strong auth evidence (Account Locked, 529/verification, CAPTCHA, /not-approved moderation, banned/terminated)
+#   now survives stale/invalid-cookie API checks. API-valid/invalid alone cannot clear a stronger visible/auth hold;
+#   only a genuinely fresh clean in-game state or explicit recovery clears it. Already-queued HARD items for a held
+#   package are discarded before any PID-stop, while CAPTCHA_SUCCESS auth-result recovery remains allowed.
+#
 # V4.81.55 — /NOT-APPROVED WEB-SESSION AUTH GATE
 # - A valid Roblox cookie is no longer treated as proof that the account is usable. Before risky recovery, NOMO
 #   also checks the authenticated website route: a session that lands on /not-approved is held immediately as an
@@ -1144,7 +1156,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.55"
+__version__ = "V4.81.56"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -8137,6 +8149,15 @@ def manual_restart_tabs_via_queue(
             "manual_option6": True,
             "option6_normal_recovery_chain": True,
             "option6_route_first": True,
+            # V4.81.56: explicit operator auth probe. This ONLY permits the
+            # non-killing route intent to run while an auth/cookie hold exists;
+            # it never authorizes PID-stop or a hard fallback.
+            "option6_auth_probe_route": bool(
+                process_status == "ALIVE" and _is_noka_clone_package(pkg)
+            ),
+            "bypass_api_precheck": bool(
+                process_status == "ALIVE" and _is_noka_clone_package(pkg)
+            ),
             # V4.81.44: a healthy Noka/App-Cloner target may reuse/route its
             # existing task, but must never silently escalate into a PID-stop
             # later in the same manual recovery generation.
@@ -8164,7 +8185,9 @@ def manual_restart_tabs_via_queue(
                 target,
                 "Option 6 Option-1 route recovery",
                 metadata=metadata,
-                bypass_manual=False,
+                # Safe route probe is allowed through an existing auth hold so
+                # it can expose Account-Locked -> 529 without killing anything.
+                bypass_manual=bool(metadata.get("option6_auth_probe_route")),
             )
             action = "ROUTE-FIRST QUEUED"
         else:
@@ -10710,6 +10733,26 @@ def _merge_queue_duplicate(existing, target, reason, force=False, skip_if_alive=
 
     old_mode = str(existing.get("mode") or "hard")
     new_mode = str(mode or "hard")
+
+    # V4.81.56: once an ALIVE Noka generation is explicitly route-only, a
+    # duplicate old-state/no-state watchdog item must never mutate that SAME
+    # generation into hard_force. This was the remaining path where Option 6
+    # could be queued safely, then silently become destructive seconds later.
+    route_only_generation = bool(
+        existing.get("option6_alive_noka_route_only")
+        or existing.get("exotic_alive_noka_route_only")
+        or existing.get("market_alive_noka_route_only")
+    )
+    if route_only_generation and _queue_mode_priority(new_mode) > _queue_mode_priority("route"):
+        existing["duplicate_hard_upgrade_blocked_at"] = now()
+        existing["duplicate_hard_upgrade_blocked_reason"] = str(reason or "")
+        existing["duplicate_hard_upgrade_blocked_mode"] = new_mode
+        if isinstance(metadata, dict):
+            for key, value in metadata.items():
+                if key.startswith("note_") or key in {"solver_result", "disconnect_recovery_stage"}:
+                    existing[key] = value
+        return False
+
     stronger = _queue_mode_priority(new_mode) > _queue_mode_priority(old_mode)
     if force and not bool(existing.get("force", False)):
         stronger = True
@@ -11812,6 +11855,10 @@ def disconnect_ui_api_precheck(tab, rt_tab, cfg, reason="kick popup", require_di
                 if refreshed_blocked is False:
                     rt_tab["disconnect_ui_api_last_status"] = "valid"
                     rt_tab["disconnect_ui_api_last_detail"] = refreshed_detail
+                    if _runtime_auth_hint(rt_tab):
+                        rt_tab["note"] = "API cookie valid, but stronger auth/face-lock hold remains"
+                        log_activity("API cookie valid; preserving stronger visible/auth hold", pkg, YELLOW)
+                        return True, rt_tab["note"]
                     clear_hold(pkg)
                     clear_manual_login_block(rt_tab)
                     rt_tab["note"] = f"api cookie refreshed; {refreshed_detail}"
@@ -11835,6 +11882,11 @@ def disconnect_ui_api_precheck(tab, rt_tab, cfg, reason="kick popup", require_di
 
     if blocked is False:
         rt_tab["disconnect_ui_api_last_status"] = "valid"
+        if _runtime_auth_hint(rt_tab):
+            rt_tab["disconnect_ui_api_last_detail"] = detail
+            rt_tab["note"] = "API valid, but stronger auth/face-lock hold remains"
+            log_activity("API valid; preserving stronger visible/auth hold", pkg, YELLOW)
+            return True, rt_tab["note"]
         clear_hold(pkg)
         clear_manual_login_block(rt_tab)
         return False, detail
@@ -11869,6 +11921,10 @@ def disconnect_ui_api_precheck(tab, rt_tab, cfg, reason="kick popup", require_di
                 if refreshed_blocked is False:
                     rt_tab["disconnect_ui_api_last_status"] = "valid"
                     rt_tab["disconnect_ui_api_last_detail"] = refreshed_detail
+                    if _runtime_auth_hint(rt_tab):
+                        rt_tab["note"] = "API cookie valid, but stronger auth/face-lock hold remains"
+                        log_activity(f"{reason}; API valid; preserving stronger visible/auth hold", pkg, YELLOW)
+                        return True, rt_tab["note"]
                     clear_hold(pkg)
                     clear_manual_login_block(rt_tab)
                     rt_tab["note"] = f"api cookie refreshed; {refreshed_detail}"
@@ -11881,6 +11937,13 @@ def disconnect_ui_api_precheck(tab, rt_tab, cfg, reason="kick popup", require_di
             if invalid_process_status == "ALIVE":
                 rt_tab["disconnect_ui_api_last_status"] = "invalid_alive"
                 rt_tab["disconnect_ui_api_last_detail"] = detail
+                if _runtime_auth_hint(rt_tab):
+                    rt_tab["note"] = "api invalid/expired; stronger auth/face-lock hold remains"
+                    log_activity(
+                        f"{reason}; API invalid/expired but stronger auth hold exists - preserving hold",
+                        pkg, YELLOW,
+                    )
+                    return True, rt_tab["note"]
                 clear_hold(pkg)
                 clear_manual_login_block(rt_tab)
                 rt_tab["note"] = "api invalid/expired, but app is alive"
@@ -15174,6 +15237,23 @@ def solver_preflight_before_open(open_queue, item, tab, rt_tab, pkg, target, cfg
     if core is None:
         core = RejoinCore(open_queue, cfg, rt)
 
+    # V4.81.56: manual Option 6 auth probing must be able to send the safe
+    # route even when the package cookie is invalid/missing. Pre-open provider
+    # work is skipped for this route only; post-open package-scoped 529/Account
+    # Locked detection remains armed and can hand a real CAPTCHA to the solver.
+    if (
+        item.get("option6_auth_probe_route")
+        and str(item.get("mode", "") or "").lower() == "route"
+    ):
+        item["solver_preflight_done"] = True
+        item["solver_result"] = "OPTION6_AUTH_PROBE_ROUTE"
+        item["skip_solver_once"] = True
+        item["skip_solver_probe"] = False
+        rt_tab["note"] = "Option 6 auth probe; safe route without cookie preflight"
+        log_activity("Option 6 auth probe: cookie/provider preflight bypassed for route-only intent", pkg, YELLOW)
+        core.save()
+        return "ready", item
+
     if (
         not cfg.get("solver_enabled", False)
         or not cfg.get("solver_once_per_rejoin", True)
@@ -15343,6 +15423,30 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
     reason = item.get("reason", "queued open")
     mode = str(item.get("mode", "hard") or "hard").lower()
 
+    item_mode = str(item.get("mode", "hard") or "hard").lower()
+    is_hard = item_mode not in ("soft", "route", "switch", "reuse_task")
+
+    # V4.81.56: strong auth evidence outranks bypass_manual/recovery_must_open_once.
+    # An old hard item that predates Account Locked/529 must die here, before
+    # API checks, staggering, solver preflight, or any PID signal. The only
+    # exception is a deliberate post-CAPTCHA SUCCESS auth-result recovery.
+    if (
+        is_hard
+        and manual_login_blocked(rt_tab, cfg, pkg)
+        and _runtime_auth_hint(rt_tab)
+        and not item.get("auth_result_recovery")
+    ):
+        removed = core.cancel(pkg)
+        rt_tab["note"] = "auth hold; queued hard recovery discarded"
+        log_activity(
+            "auth hold invalidated queued HARD recovery before PID stop"
+            + (f"; removed {removed} duplicate(s)" if removed else ""),
+            pkg,
+            RED,
+        )
+        core.save()
+        return True
+
     # A confirmed kick/disconnect is an in-session failure, not a reason to let
     # an older persisted manual-login hold discard the recovery item. Kick items
     # are allowed to perform one target-only restart even when that stale flag exists.
@@ -15380,9 +15484,6 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
         rt_tab["note"] = "cooldown queued"
         core.save()
         return True
-
-    item_mode = str(item.get("mode", "hard") or "hard").lower()
-    is_hard = item_mode not in ("soft", "route", "switch", "reuse_task")
 
     # V4.81.17: fail closed at execution time too. A recovery queued from a
     # previously confirmed condition must not execute while Android `ps` is UNKNOWN.
