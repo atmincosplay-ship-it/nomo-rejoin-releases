@@ -1,5 +1,25 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.58 — DIRECT FACE-LOCK RESTRICTION API
+# - Roblox's Not Approved endpoint can return a restriction-only payload for Account Locked / face-lock instead of
+#   the ban-style punishedUserId payload. The captured known-safe signature is restriction.source=5 plus
+#   moderationStatus=2, with startTime/endTime metadata. NOMO now treats that exact schema as FACE LOCK HOLD.
+# - The restriction signal is non-solver and non-destructive: no PID-stop, no hard rejoin, and existing peer ALIVE
+#   hard suppression remains active. Manual Option 6 may still send its immutable route-only probe when explicitly
+#   requested, so native 529 can be exposed without turning the hold into a destructive recovery.
+# - Unknown restriction source/status values remain UNKNOWN; NOMO does not invent meanings for undocumented numeric
+#   values. Ban-style punishedUserId/intervention payload handling from V4.81.57 remains unchanged.
+#
+# V4.81.57 — DIRECT ROBLOX MODERATION API GATE
+# - After the authenticated-user cookie check succeeds, NOMO now queries Roblox's own Not Approved moderation
+#   endpoint (usermoderation.roblox.com/v2/not-approved) before relying on the website redirect heuristic.
+# - A moderation response is accepted only when it has strong punishment identity (matching punishedUserId plus an
+#   intervention/punishment/message field). The hold records the punishment type and begin/end dates when present.
+# - Direct moderation proof is a non-solver AUTH/MODERATION hold: no PID-stop, no hard rejoin, and V4.81.54 peer
+#   ALIVE-hard suppression remains active. /home -> /not-approved stays as fallback; Account Locked/529 remain the
+#   package-scoped face-lock/CAPTCHA path. Network errors, malformed JSON, user-id mismatch, or ambiguous payloads
+#   stay UNKNOWN/non-destructive and never become a false ban.
+#
 # V4.81.56 — OPTION 6 AUTH-PROBE + ROUTE-ONLY QUEUE LOCK
 # - Manual Option 6 on an already-ALIVE Noka is allowed to send exactly the safe task-reuse route even when a
 #   manual/API-cookie hold exists. The route bypasses API/provider preflight only for that non-destructive probe,
@@ -1156,7 +1176,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.56"
+__version__ = "V4.81.58"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -13190,6 +13210,114 @@ def _roblox_not_approved_url(value):
     return (host == "roblox.com" or host.endswith(".roblox.com")) and path == "/not-approved"
 
 
+def roblox_cookie_not_approved_api_detection(cookie, expected_user_id=None, cfg=None):
+    """Return (restricted, detail, payload) from Roblox's own moderation endpoint.
+
+    ``restricted`` is True only for either (a) a strong Not Approved punishment
+    payload belonging to the authenticated user, or (b) the captured exact
+    Account-Locked restriction signature source=5/moderationStatus=2. None means
+    network/schema ambiguity and must never be treated as a ban/lock by itself.
+    We intentionally keep False rare because Roblox does not document a stable
+    "clean account" response contract here.
+    """
+    if not cookie:
+        return None, "moderation api no cookie", {}
+    cfg = cfg or {}
+    if not cfg.get("api_precheck_not_approved_enabled", True):
+        return None, "moderation api check disabled", {}
+
+    timeout = max(5, min(30, int(cfg.get("api_precheck_not_approved_timeout_seconds", 12) or 12)))
+    url = "https://usermoderation.roblox.com/v2/not-approved"
+    headers = {
+        "Cookie": f".ROBLOSECURITY={cookie}",
+        "User-Agent": f"NOMO-Rejoin/{__version__}",
+        "Accept": "application/json, text/plain, */*",
+    }
+    try:
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+            status = int(getattr(resp, "status", 200) or 200)
+        if status != 200:
+            return None, f"moderation api HTTP {status}", {}
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return None, "moderation api invalid json", {}
+        if not isinstance(data, dict):
+            return None, "moderation api unexpected payload", {}
+
+        punished = str(data.get("punishedUserId") or "").strip()
+        expected = str(expected_user_id or "").strip()
+        intervention = str(data.get("interventionId") or "").strip()
+        punishment = str(data.get("punishmentTypeDescription") or "").strip()
+        message = str(data.get("messageToUser") or "").strip()
+        begin = str(data.get("beginDate") or "").strip()
+        end = str(data.get("endDate") or "").strip()
+        verification = str(data.get("verificationCategory") or "").strip()
+
+        # V4.81.58: Account Locked / face-lock can use a restriction-only shape
+        # with no punishedUserId. Only promote the exact captured signature;
+        # unknown numeric values stay ambiguous until we have evidence for them.
+        restriction = data.get("restriction")
+        if isinstance(restriction, dict):
+            try:
+                restriction_source = int(restriction.get("source"))
+            except Exception:
+                restriction_source = None
+            try:
+                restriction_status = int(restriction.get("moderationStatus"))
+            except Exception:
+                restriction_status = None
+            restriction_start = str(restriction.get("startTime") or "").strip()
+            restriction_end = str(restriction.get("endTime") or "").strip()
+            restriction_duration = restriction.get("durationSeconds")
+
+            if restriction_source == 5 and restriction_status == 2:
+                bits = ["api account locked / face lock", "restriction source=5 status=2"]
+                if restriction_start:
+                    bits.append("start=" + restriction_start)
+                if restriction_end:
+                    bits.append("end=" + restriction_end)
+                elif restriction.get("endTime") is None:
+                    bits.append("end=none")
+                if restriction_duration not in (None, ""):
+                    bits.append("durationSeconds=" + str(restriction_duration))
+                return True, "; ".join(bits), data
+
+            return None, (
+                "moderation api unknown restriction "
+                f"source={restriction_source} status={restriction_status}"
+            ), data
+
+        # A payload for a different user must never poison the selected package.
+        if expected and punished and punished != expected:
+            return None, f"moderation api user mismatch {punished}", {}
+
+        # Roblox's Not Approved page returns punishment identity such as
+        # punishedUserId + interventionId + punishmentTypeDescription/message.
+        strong = bool(punished and (intervention or punishment or message))
+        if not strong:
+            return None, "moderation api no strong punishment payload", data
+
+        bits = ["api user moderated/banned"]
+        if punishment:
+            bits.append(punishment)
+        if begin:
+            bits.append("begin=" + begin)
+        if end:
+            bits.append("end=" + end)
+        if verification:
+            bits.append("verification=" + verification)
+        return True, "; ".join(bits), data
+    except urllib.error.HTTPError as e:
+        # 401/403/404 are not clean-account proof; website route/UI fallbacks
+        # remain authoritative. Never manufacture a ban from an HTTP failure.
+        return None, f"moderation api HTTP {e.code}", {}
+    except Exception as exc:
+        return None, "moderation api unavailable: " + cut(exc, 80), {}
+
+
 def roblox_cookie_web_route_detection(cookie, cfg=None):
     """Return (restricted, detail) from the authenticated Roblox website route.
 
@@ -13244,10 +13372,18 @@ def roblox_cookie_detection(cookie, cfg=None):
         username = info.get("username", "") if info else ""
         user_id = info.get("userID") or info.get("id")
 
-        # V4.81.55: /v1/users/authenticated can remain valid while the website
-        # session is restricted. Check /home redirect/final URL before declaring
-        # the cookie/account usable. /not-approved is a restriction signal, not
-        # a specific ban reason.
+        # V4.81.57: Roblox's own Not Approved page calls the direct moderation
+        # endpoint. Strong punishment metadata is better proof than a browser
+        # redirect, so check it first. /home -> /not-approved remains fallback.
+        moderation_hit, moderation_detail, _moderation_payload = roblox_cookie_not_approved_api_detection(
+            cookie, user_id, cfg
+        )
+        if moderation_hit is True:
+            return None, moderation_detail
+
+        # V4.81.55 fallback: /v1/users/authenticated can remain valid while the
+        # website session is restricted. /not-approved is a restriction signal,
+        # not a specific ban reason.
         web_restricted, web_detail = roblox_cookie_web_route_detection(cookie, cfg)
         if web_restricted is True:
             return None, "api/web user moderated/locked: /not-approved"
@@ -14750,11 +14886,21 @@ def detect_and_mark_manual_login(tab, cfg, rt, rt_tab, reason):
     retry_seconds = max(600, int(cfg.get("manual_auth_retry_seconds", 3600) or 3600))
     mark_manual_login_block(rt_tab, reason, detail, "", None, retry_seconds)
     low_detail = detail.lower()
-    if "/not-approved" in low_detail or "moderated/locked" in low_detail:
+    if (
+        "account locked" in low_detail
+        or "face lock" in low_detail
+    ):
+        rt_tab["note"] = "FACE LOCK HOLD"
+    elif (
+        "/not-approved" in low_detail
+        or "moderated/locked" in low_detail
+        or "user moderated" in low_detail
+        or "account banned" in low_detail
+        or "punishment" in low_detail
+    ):
         rt_tab["note"] = "AUTH / MODERATION HOLD"
     elif (
         "529" in low_detail
-        or "face lock" in low_detail
         or "auth challenge" in low_detail
     ):
         rt_tab["note"] = "CAPTCHA / FACE LOCK HOLD"
