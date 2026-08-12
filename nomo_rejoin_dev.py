@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.53 — AUTH-HOLD FINAL GATE + RECT-SCOPED 529
+# - App Cloner may expose Error 529 / disconnect accessibility nodes under Roblox's shared/original package.
+#   Auth/disconnect checks now supplement exact-package text only with nodes physically inside that clone's saved
+#   Option 16 rectangle, so a visible 529/288/524 cannot be missed merely because the package attribute is wrong.
+# - Every queued HARD recovery performs one last package-scoped auth/Account-Locked check immediately before any
+#   PID-stop. A confirmed 529/verification is handed to the existing one-shot solver/hold path in-place; a visual
+#   Account-Locked signal cancels the destructive open and holds only that package. UNKNOWN still defers.
+# - Market failure UI now checks the active loader revision. An already-running rev<8 session is shown as
+#   "rev8 staged; self-heal after next real restart" instead of pretending the new in-place self-heal is active.
+# - Existing cookie/API moderation probe also recognizes explicit locked/suspicious/terminated moderation text when
+#   Roblox returns it. API-valid alone is never treated as proof that the visible client is unlocked.
+#
 # V4.81.52 — MARKET AUTOEXEC PROOF + IN-PLACE SELF-HEAL
 # - Fixes V4.81.51 test finding: a fresh normal state no longer proves Market AutoExec recovered.
 #   Recovery completion now also requires the current Trade World JobId marker to return MARKET_RUNNING.
@@ -1107,7 +1119,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.52"
+__version__ = "V4.81.53"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1812,6 +1824,9 @@ DEFAULT_CONFIG = {
     # On these cloned Android clients, this native Join Error 529 screen is
     # commonly the wrapper shown for CAPTCHA or face verification.
     "join_error_529_auth_challenge_enabled": True,
+    # V4.81.53: before any destructive hard recovery, re-check the selected clone's
+    # current auth/account-lock UI inside its saved Option 16 rectangle.
+    "preopen_auth_ui_guard_enabled": True,
     "login_challenge_skip_blocked_packages": True,
     "login_challenge_webhook_url": "",
     "login_challenge_alert_cooldown_seconds": 1800,
@@ -13049,8 +13064,20 @@ def roblox_cookie_moderation_detection(cookie, user_id):
             body = e.read().decode(errors="ignore")
         except Exception:
             body = ""
-        if "user is moderated" in body.lower():
-            return "api user moderated"
+        body_low = body.lower()
+        moderation_terms = (
+            "user is moderated",
+            "account is moderated",
+            "account has been moderated",
+            "account locked",
+            "account is locked",
+            "suspicious activity",
+            "account terminated",
+            "account has been terminated",
+        )
+        hit = next((term for term in moderation_terms if term in body_low), "")
+        if hit:
+            return "api user moderated/locked: " + hit
         return ""
     except Exception:
         return ""
@@ -13172,6 +13199,48 @@ def android_ui_text_for_package(pkg, cfg, force=False):
     return texts, str(snapshot.get("error", "") or "")
 
 
+def android_ui_text_for_package_or_rect(pkg, cfg, force=False):
+    """Package text with a saved-rectangle fallback for App Cloner package aliasing.
+
+    The fallback never consumes unscoped global text: only accessibility nodes whose
+    center point is physically inside this package's exact Option 16 rectangle are
+    added. This is the same isolation rule used by the Home detector.
+    """
+    pkg = str(pkg or "")
+    snapshot = capture_android_ui_snapshot(cfg, force=force)
+    by_pkg = snapshot.get("by_pkg", {}) if isinstance(snapshot, dict) else {}
+    values = []
+    for node_pkg, node_values in (by_pkg or {}).items():
+        if node_pkg == pkg or node_pkg.startswith(pkg + ":"):
+            values.extend(node_values if isinstance(node_values, list) else [str(node_values)])
+
+    rect = _loading_visual_rect_for_package(pkg, cfg)
+    if rect and isinstance(snapshot, dict):
+        try:
+            rx1, ry1, rx2, ry2 = (int(v) for v in rect)
+        except Exception:
+            rx1 = ry1 = rx2 = ry2 = 0
+        if rx2 > rx1 and ry2 > ry1:
+            for node in snapshot.get("text_nodes", []) or []:
+                if not isinstance(node, dict):
+                    continue
+                bounds = node.get("bounds")
+                text = str(node.get("text", "") or "").strip()
+                if not text or not isinstance(bounds, (list, tuple)) or len(bounds) != 4:
+                    continue
+                try:
+                    x1, y1, x2, y2 = (int(v) for v in bounds)
+                except Exception:
+                    continue
+                cx = (x1 + x2) / 2.0
+                cy = (y1 + y2) / 2.0
+                if rx1 <= cx <= rx2 and ry1 <= cy <= ry2:
+                    values.append(text)
+
+    values = list(dict.fromkeys(str(v or "").strip() for v in values if str(v or "").strip()))
+    return values, str(snapshot.get("error", "") or "")
+
+
 def android_roblox_home_ui_detail(pkg, cfg, force=False, required=False):
     """Return a high-confidence clone-scoped Roblox Home/navigation signal.
 
@@ -13289,7 +13358,7 @@ def android_disconnect_ui_detail(pkg, cfg):
     if not cfg.get("android_disconnect_ui_detection_enabled", True):
         return None
 
-    texts, _ = android_ui_text_for_package(pkg, cfg, force=False)
+    texts, _ = android_ui_text_for_package_or_rect(pkg, cfg, force=False)
     if not texts:
         return None
 
@@ -13883,7 +13952,7 @@ def android_login_challenge_ui_detail(
 
     # Join Error 529 is a native package-scoped popup. Check it even when
     # screenshot-only CAPTCHA mode is enabled.
-    texts, _ = android_ui_text_for_package(
+    texts, _ = android_ui_text_for_package_or_rect(
         str(pkg or ""),
         cfg,
         force=force,
@@ -13995,7 +14064,7 @@ def ui_login_challenge_detection(
         cfg,
         force=force,
     )
-    scoped, _ = android_ui_text_for_package(
+    scoped, _ = android_ui_text_for_package_or_rect(
         pkg,
         cfg,
         force=False,
@@ -15012,6 +15081,74 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
             rt_tab["note"] = api_note or rt_tab.get("note") or "api hold before rejoin"
             core.save()
             return True
+
+    # V4.81.53: LAST-SECOND AUTH / ACCOUNT-LOCK GATE. The dashboard can queue
+    # an old-state hard recovery before a native 529 or Account-Locked modal is
+    # visible. Re-check the selected clone immediately before any destructive
+    # open, using exact-package + Option-16-rectangle UI isolation. Never signal
+    # the PID while a live auth blocker is visible.
+    if is_hard and cfg.get("preopen_auth_ui_guard_enabled", True):
+        auth_status, auth_process_note = package_alive_status(pkg, cfg, fresh=True)
+        if auth_status == "UNKNOWN":
+            core.requeue_front(item)
+            rt_tab["note"] = "auth pre-open check deferred: process UNKNOWN"
+            log_activity("auth pre-open guard UNKNOWN; no PID stop/open", pkg, YELLOW)
+            core.save()
+            return True
+        if auth_status == "ALIVE":
+            visible_auth = android_login_challenge_ui_detail(pkg, cfg, force=True)
+            if visible_auth:
+                detail = str(
+                    visible_auth.get("text")
+                    or visible_auth.get("reason")
+                    or visible_auth.get("title")
+                    or "visible auth challenge"
+                )
+                rt_tab["captcha_ui_visible"] = True
+                rt_tab["captcha_ui_detail"] = ",".join(visible_auth.get("hits", []) or []) or detail
+                rt_tab["captcha_ui_last_seen_at"] = now()
+                solver_status, solver_note = core.handle_detected_solver_challenge(
+                    tab, rt_tab, detail
+                )
+                rt_tab["note"] = solver_note
+                log_activity(
+                    "visible 529/verification blocked queued hard recovery before PID stop; "
+                    + str(solver_status),
+                    pkg,
+                    YELLOW,
+                )
+                core.save()
+                return True
+
+            # The Account-Locked visual detector is deliberately stricter during
+            # normal monitoring (two confirmations). At the destructive boundary,
+            # a raw candidate only defers this hard open; it does not create a
+            # persistent hold until the normal detector confirms it.
+            face_snap = capture_visual_face_lock_snapshot(cfg, force=True)
+            raw_face = bool((face_snap.get("raw_candidates") or {}).get(pkg, False))
+            confirmed_face = visual_face_lock_detail(pkg, cfg, force=False, bypass_confirm=False)
+            if confirmed_face:
+                retry_seconds = max(600, int(cfg.get("manual_auth_retry_seconds", 3600) or 3600))
+                detail = str(confirmed_face.get("text") or "account locked")
+                rt_tab["face_lock_detected"] = True
+                rt_tab["face_lock_detail"] = detail
+                rt_tab["face_lock_last_seen_at"] = now()
+                if not int(rt_tab.get("face_lock_detected_at", 0) or 0):
+                    rt_tab["face_lock_detected_at"] = now()
+                mark_manual_login_block(
+                    rt_tab, "face_lock", detail, "account locked; hard recovery blocked",
+                    int(rt_tab.get("face_lock_detected_at", now()) or now()), retry_seconds,
+                )
+                set_hold(pkg, "face_lock", retry_seconds)
+                rt_tab["note"] = "account locked; hard recovery blocked"
+                log_activity("Account Locked blocked queued hard recovery before PID stop", pkg, RED)
+                core.save()
+                return True
+            if raw_face:
+                rt_tab["note"] = "possible Account Locked UI; hard recovery deferred for confirmation"
+                log_activity("possible Account Locked UI; destructive recovery deferred", pkg, YELLOW)
+                core.save()
+                return True
 
     preflight_state, preflight_item = core.solver_preflight_before_open(
         item, tab, rt_tab, pkg, target
@@ -16124,7 +16261,29 @@ def _nomo_start_market_rejoin_original(cfg):
                         # V4.81.52: a route/deep-link does NOT rerun AutoExec on an
                         # already-live App Cloner task. Let the installed loader's
                         # bounded in-place runtime retry own this failure instead.
-                        if attempted_source_id != source_id or attempt_at <= 0:
+                        # V4.81.53: staging rev8 on disk cannot upgrade a loader
+                        # already running in memory. Tell the truth and wait for the
+                        # clone's next genuine restart instead of pretending rev8
+                        # self-heal is active on an older session.
+                        try:
+                            active_loader_rev = int((market_marker or {}).get("loader_revision", 0) or 0)
+                        except Exception:
+                            active_loader_rev = 0
+                        if active_loader_rev < 8:
+                            status = "Market hold"
+                            note = (
+                                market_runtime_note
+                                + f"; loader rev{active_loader_rev or '?'} active; rev8 staged - self-heal after next real restart (no forced reopen)"
+                            ).strip("; ")
+                            rt_tab["market_runtime_recovery_attempt_source_id"] = source_id
+                            rt_tab["market_runtime_recovery_attempt_at"] = now()
+                            rt_tab["market_runtime_recovery_last_failure"] = market_runtime_note
+                            log_activity(
+                                f"Market failure on loader rev{active_loader_rev or '?'}; rev8 staged, waiting next real restart; no route/PID-stop",
+                                pkg,
+                                YELLOW,
+                            )
+                        elif attempted_source_id != source_id or attempt_at <= 0:
                             rt_tab["market_runtime_recovery_attempt_source_id"] = source_id
                             rt_tab["market_runtime_recovery_attempt_at"] = now()
                             rt_tab["market_runtime_recovery_last_failure"] = market_runtime_note
