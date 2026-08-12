@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.55 — /NOT-APPROVED WEB-SESSION AUTH GATE
+# - A valid Roblox cookie is no longer treated as proof that the account is usable. Before risky recovery, NOMO
+#   also checks the authenticated website route: a session that lands on /not-approved is held immediately as an
+#   account restriction/moderation signal, before any PID-stop. This catches locked/moderated sessions even when
+#   App Cloner hides Account Locked/529 text from uiautomator.
+# - /not-approved is intentionally classified only as AUTH/MODERATION RESTRICTED; it does not guess whether the
+#   exact cause is face-lock, temporary moderation, parental/daily-limit restriction, or termination. The existing
+#   package-scoped Account Locked / 529 / banned visual chain remains authoritative for the specific reason.
+# - Website-route probing is package-cookie scoped and shares the existing API precheck cooldown/backoff, so it is
+#   not polled every dashboard tick. Network errors or unrelated redirects are non-destructive/unknown, never bans.
+#
 # V4.81.54 — 529 VISUAL AUTH CHAIN + PEER HARD-SAFETY GATE
 # - A previously observed Account Locked/face-lock incident now remains authoritative when a safe route exposes
 #   Roblox's native Join Error wrapper but App Cloner hides its text from uiautomator. A strict per-Option-16-cell
@@ -1133,7 +1144,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.54"
+__version__ = "V4.81.55"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -2165,6 +2176,10 @@ DEFAULT_CONFIG = {
     "disconnect_ui_api_precheck_enabled": True,
     "disconnect_ui_api_precheck_cooldown_seconds": 120,
     "api_precheck_before_rejoin_enabled": True,
+    # V4.81.55: authenticated website routing can reveal moderated/restricted
+    # sessions that still return 200 from /v1/users/authenticated.
+    "api_precheck_not_approved_enabled": True,
+    "api_precheck_not_approved_timeout_seconds": 12,
     "api_precheck_block_retry_seconds": 600,
     "api_precheck_refresh_invalid_cookie_enabled": True,
     "manual_auth_open_package_enabled": True,
@@ -3506,6 +3521,10 @@ def apply_update_migrations(cfg):
         set_cfg("disconnect_ui_api_precheck_cooldown_seconds", 120)
     if "api_precheck_before_rejoin_enabled" not in cfg:
         set_cfg("api_precheck_before_rejoin_enabled", True)
+    if "api_precheck_not_approved_enabled" not in cfg:
+        set_cfg("api_precheck_not_approved_enabled", True)
+    if "api_precheck_not_approved_timeout_seconds" not in cfg:
+        set_cfg("api_precheck_not_approved_timeout_seconds", 12)
     if "api_precheck_block_retry_seconds" not in cfg:
         set_cfg("api_precheck_block_retry_seconds", 600)
     if "api_precheck_refresh_invalid_cookie_enabled" not in cfg:
@@ -11789,7 +11808,7 @@ def disconnect_ui_api_precheck(tab, rt_tab, cfg, reason="kick popup", require_di
         if status == "invalid" and cfg.get("api_precheck_refresh_invalid_cookie_enabled", True):
             refreshed_cookie, refresh_note = refresh_cached_cookie_for_package(pkg)
             if refreshed_cookie:
-                refreshed_blocked, refreshed_detail = roblox_cookie_detection(refreshed_cookie)
+                refreshed_blocked, refreshed_detail = roblox_cookie_detection(refreshed_cookie, cfg)
                 if refreshed_blocked is False:
                     rt_tab["disconnect_ui_api_last_status"] = "valid"
                     rt_tab["disconnect_ui_api_last_detail"] = refreshed_detail
@@ -11811,7 +11830,7 @@ def disconnect_ui_api_precheck(tab, rt_tab, cfg, reason="kick popup", require_di
         rt_tab["disconnect_ui_api_last_status"] = "no_cookie"
         return False, ""
 
-    blocked, detail = roblox_cookie_detection(cookie)
+    blocked, detail = roblox_cookie_detection(cookie, cfg)
     detail = str(detail or "")
 
     if blocked is False:
@@ -11845,7 +11864,7 @@ def disconnect_ui_api_precheck(tab, rt_tab, cfg, reason="kick popup", require_di
         if api_status == "invalid" and cfg.get("api_precheck_refresh_invalid_cookie_enabled", True):
             refreshed_cookie, refresh_note = refresh_cached_cookie_for_package(pkg)
             if refreshed_cookie:
-                refreshed_blocked, refreshed_detail = roblox_cookie_detection(refreshed_cookie)
+                refreshed_blocked, refreshed_detail = roblox_cookie_detection(refreshed_cookie, cfg)
                 refreshed_detail = str(refreshed_detail or "")
                 if refreshed_blocked is False:
                     rt_tab["disconnect_ui_api_last_status"] = "valid"
@@ -13097,7 +13116,63 @@ def solver_cookie_for_package(pkg, cfg=None):
     return "", "none", str(note or "package cookie unavailable")
 
 
-def roblox_cookie_detection(cookie):
+def _roblox_not_approved_url(value):
+    """True only for Roblox's authenticated /not-approved web route."""
+    try:
+        parsed = urllib.parse.urlparse(str(value or ""))
+        host = str(parsed.hostname or "").lower()
+        path = (str(parsed.path or "").rstrip("/") or "/").lower()
+    except Exception:
+        return False
+    return (host == "roblox.com" or host.endswith(".roblox.com")) and path == "/not-approved"
+
+
+def roblox_cookie_web_route_detection(cookie, cfg=None):
+    """Return (restricted, detail) from the authenticated Roblox website route.
+
+    ``restricted`` is True only when the valid cookie lands on /not-approved.
+    False means /home stayed usable. None means network/redirect ambiguity and
+    must never be treated as moderation by itself.
+    """
+    if not cookie:
+        return None, "web route no cookie"
+    cfg = cfg or {}
+    if not cfg.get("api_precheck_not_approved_enabled", True):
+        return None, "web route check disabled"
+    timeout = max(5, min(30, int(cfg.get("api_precheck_not_approved_timeout_seconds", 12) or 12)))
+    url = "https://www.roblox.com/home"
+    headers = {
+        "Cookie": f".ROBLOSECURITY={cookie}",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    try:
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            final_url = str(resp.geturl() or url)
+            if _roblox_not_approved_url(final_url):
+                return True, "web session restricted: /not-approved"
+            try:
+                parsed = urllib.parse.urlparse(final_url)
+                host = str(parsed.hostname or "").lower()
+                path = str(parsed.path or "/")
+            except Exception:
+                host, path = "", ""
+            if (host == "roblox.com" or host.endswith(".roblox.com")) and path.rstrip("/").lower() == "/home":
+                return False, "web session home"
+            return None, f"web session redirected to {host}{path}"
+    except urllib.error.HTTPError as e:
+        location = str(e.headers.get("Location") or "")
+        if location:
+            target = urllib.parse.urljoin(url, location)
+            if _roblox_not_approved_url(target):
+                return True, "web session restricted: /not-approved"
+        return None, f"web route HTTP {e.code}"
+    except Exception as exc:
+        return None, "web route unavailable: " + cut(exc, 80)
+
+
+def roblox_cookie_detection(cookie, cfg=None):
     if not cookie:
         return None, "no cached cookie"
     status = check_cookie_challenge(cookie)
@@ -13105,10 +13180,20 @@ def roblox_cookie_detection(cookie):
         info = get_roblox_user_info(cookie)
         username = info.get("username", "") if info else ""
         user_id = info.get("userID") or info.get("id")
+
+        # V4.81.55: /v1/users/authenticated can remain valid while the website
+        # session is restricted. Check /home redirect/final URL before declaring
+        # the cookie/account usable. /not-approved is a restriction signal, not
+        # a specific ban reason.
+        web_restricted, web_detail = roblox_cookie_web_route_detection(cookie, cfg)
+        if web_restricted is True:
+            return None, "api/web user moderated/locked: /not-approved"
+
         moderated = roblox_cookie_moderation_detection(cookie, user_id)
         if moderated:
             return None, moderated
-        return False, f"api valid {username}".strip()
+        suffix = f"; {web_detail}" if web_restricted is False and web_detail else ""
+        return False, (f"api valid {username}" + suffix).strip()
     elif status == "challenge":
         return True, "api challenge (captcha required)"
     elif status == "invalid":
@@ -14558,9 +14643,16 @@ def detect_and_mark_manual_login(tab, cfg, rt, rt_tab, reason):
 
     # API detection
     if cookie and cfg.get("login_challenge_api_detection_enabled", True):
-        api_hit, api_detail = roblox_cookie_detection(cookie)
+        api_hit, api_detail = roblox_cookie_detection(cookie, cfg)
         details.append(api_detail)
+        api_detail_low = str(api_detail or "").lower()
         if api_hit is True:
+            detected = True
+        elif api_hit is None and any(marker in api_detail_low for marker in (
+            "/not-approved", "moderated/locked", "user moderated", "account locked",
+            "account terminated", "account banned", "suspicious activity",
+        )):
+            # Restriction/moderation is a manual hold, never a CAPTCHA-provider job.
             detected = True
     elif cfg.get("login_challenge_api_detection_enabled", True):
         details.append("api skipped no cookie")
@@ -14575,7 +14667,13 @@ def detect_and_mark_manual_login(tab, cfg, rt, rt_tab, reason):
     if not detected:
         return False, "; ".join(details)
 
-    manual_join_block = any("manual join block" in str(x).lower() for x in details)
+    manual_join_block = any(
+        any(marker in str(x).lower() for marker in (
+            "manual join block", "/not-approved", "moderated/locked",
+            "user moderated", "account locked", "account terminated", "account banned",
+        ))
+        for x in details
+    )
 
     # Only genuine CAPTCHA/challenge signals go to the provider. Age gates,
     # parental restrictions, and other manual join blocks are isolated locally.
@@ -14589,7 +14687,9 @@ def detect_and_mark_manual_login(tab, cfg, rt, rt_tab, reason):
     retry_seconds = max(600, int(cfg.get("manual_auth_retry_seconds", 3600) or 3600))
     mark_manual_login_block(rt_tab, reason, detail, "", None, retry_seconds)
     low_detail = detail.lower()
-    if (
+    if "/not-approved" in low_detail or "moderated/locked" in low_detail:
+        rt_tab["note"] = "AUTH / MODERATION HOLD"
+    elif (
         "529" in low_detail
         or "face lock" in low_detail
         or "auth challenge" in low_detail
@@ -14641,7 +14741,7 @@ def maybe_clear_manual_login_prejoin(tab, cfg, rt, rt_tab, min_interval=120):
             cookie = refreshed_cookie
         elif refresh_note:
             rt_tab["manual_login_last_refresh_note"] = refresh_note
-    api_hit, api_detail = roblox_cookie_detection(cookie) if cookie else (None, "api skipped no cookie")
+    api_hit, api_detail = roblox_cookie_detection(cookie, cfg) if cookie else (None, "api skipped no cookie")
     ui_hit, ui_detail = ui_login_challenge_detection(tab, cfg, force=True, allow_unscoped=False) if cfg.get("login_challenge_ui_detection_enabled", True) else (None, "ui skipped")
 
     if api_hit is False and ui_hit is not True:
@@ -14680,7 +14780,7 @@ def test_login_challenge_detection_menu(cfg):
             else:
                 print(col("No private route available; skipped foreground open.", YELLOW))
         cookie = get_cookie_from_package(pkg) or cached_cookie_for_package(pkg)
-        api_hit, api_detail = roblox_cookie_detection(cookie) if cookie else (None, "no cookie")
+        api_hit, api_detail = roblox_cookie_detection(cookie, cfg) if cookie else (None, "no cookie")
         ui_hit, ui_detail = ui_login_challenge_detection(tab, cfg)
         print("")
         print(f"API: {api_hit} | {api_detail}")
@@ -32681,7 +32781,7 @@ def _solver_probe_worker(package, tab, cookie, cfg_snapshot, place_id):
     cookie_precheck_ok = False
     try:
         if cookie and cfg_snapshot.get("login_challenge_api_detection_enabled", True):
-            api_hit, api_detail = roblox_cookie_detection(cookie)
+            api_hit, api_detail = roblox_cookie_detection(cookie, cfg_snapshot)
             details.append(api_detail)
             locally_detected = locally_detected or (api_hit is True)
             # False means authenticated/valid; True means Roblox itself returned
@@ -32948,10 +33048,16 @@ def start_solver_job(tab, cfg, rt, rt_tab, reason, force=False, phase="solve", o
             YELLOW,
         )
 
-    api_hit, api_detail = roblox_cookie_detection(cookie)
+    api_hit, api_detail = roblox_cookie_detection(cookie, cfg)
     if cfg.get("solver_require_cookie_precheck", True) and api_hit is None:
-        if "invalid/expired" in str(api_detail).lower():
+        api_detail_low = str(api_detail or "").lower()
+        if "invalid/expired" in api_detail_low:
             return False, "solver: package cookie invalid/expired"
+        if any(marker in api_detail_low for marker in (
+            "/not-approved", "moderated/locked", "user moderated", "account locked",
+            "account terminated", "account banned",
+        )):
+            return False, "solver: account restricted/moderated; provider not sent"
         # An API timeout/unavailable response is not proof that the cookie is bad.
         # Continue with the freshly extracted package cookie when available.
         log_activity(
