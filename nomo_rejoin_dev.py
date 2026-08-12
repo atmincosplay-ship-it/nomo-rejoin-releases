@@ -1,5 +1,21 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.68 — THREE-TRY CAPTCHA GENERATIONS + TARGET REOPEN
+# - A confirmed package-scoped CAPTCHA/verification screen starts one solver generation for that exact clone. The
+#   package/Option-16 UI guard is used only to confirm attempt #1 (or the first attempt after a solver-triggered reopen).
+# - Attempts #2 and #3 reuse that confirmed live challenge generation without rescanning the unchanged Start Puzzle UI.
+#   Provider retries still refresh the package cookie and keep Roblox moderation/API checks; only the stale visual CAPTCHA
+#   confirmation is skipped inside the same generation.
+# - CAPTCHA_SUCCESS and authoritative NO_CAPTCHA now immediately queue one exact-target-PID reopen. The old challenge UI
+#   is intentionally not required to disappear first because this client keeps that page visible until Roblox is reopened.
+# - Three failed/timeout/provider-rejected attempts trigger the same exact-target-PID safety reopen instead of holding the
+#   package forever. After the reopen succeeds, the generation resets to attempt #1 and the new session is freshly guarded.
+# - A provider HTTP 403 / INVALID_COOKIES label is no longer treated as proof that .ROBLOSECURITY is bad when NOMO's
+#   independent Roblox cookie/API check still authenticates it. Such results remain solver failures and follow the 3-try
+#   generation policy. A genuinely invalid/expired cookie still enters the existing package-local manual auth hold.
+# - Solver-generation reopen bypasses only the stale CAPTCHA/529 visual veto for that target. Direct moderation API,
+#   Account Locked/ban checks, UNKNOWN-process deferral, exact-PID sibling isolation, and V4.81.67 peer independence stay intact.
+#
 # V4.81.67 — TARGET-LOCAL AUTH HOLDS
 # - Removes the device-wide peer-auth recovery veto. A face-lock/529/CAPTCHA/Account-Locked state on one Noka clone
 #   no longer downgrades, waits, or suppresses recovery for a different clone.
@@ -1260,7 +1276,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.67"
+__version__ = "V4.81.68"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -2075,9 +2091,10 @@ DEFAULT_CONFIG = {
     # simply no CAPTCHA task to solve. Automatic mode therefore sends only after
     # a real API/UI challenge signal. Manual Solver Test is always explicit/direct.
     "solver_provider_challenge_only": True,
+    # Legacy knobs retained for config compatibility. V4.81.68 challenge-confirmed
+    # generations reopen the exact target after CAPTCHA_SUCCESS/NO_CAPTCHA regardless
+    # of these old flags; non-challenge probes keep their historical behavior.
     "solver_rejoin_on_success": False,
-    # Solver retries are package-local now. Do not reopen Roblox just because the
-    # provider returned NO_CAPTCHA/CAPTCHA_SUCCESS after the package is already up.
     "solver_rejoin_on_no_captcha": False,
     # After CAPTCHA_SUCCESS, allow one clean rejoin. If that rejoin
     # still produces no fresh state, isolate only that package instead of
@@ -2088,6 +2105,10 @@ DEFAULT_CONFIG = {
     # without repeatedly reopening the clone.
     "manual_auth_retry_seconds": 3600,
     "solver_failure_retry_seconds": 600,
+    # V4.81.68: one confirmed CAPTCHA screen gets three provider attempts.
+    # Attempt #1 owns the fresh UI guard; #2/#3 skip rescanning that unchanged
+    # screen. Three failed attempts trigger one exact-target-PID safety reopen.
+    "solver_challenge_generation_max_attempts": 3,
 
     "active_rejoin_mode": "market",
     "market_mode_enabled": True,
@@ -3420,8 +3441,8 @@ def apply_update_migrations(cfg):
     # behavior. This avoids treating ordinary stale-state rejoins as CAPTCHA jobs.
     if "solver_provider_challenge_only" not in cfg:
         set_cfg("solver_provider_challenge_only", True)
-    # V4.80.20: solver results should not reopen the Roblox package after it is
-    # already running. Reopening one clone can disturb sibling Noka windows.
+    # Legacy flags remain false for non-challenge probes. V4.81.68 uses the safer
+    # exact-target-PID recovery path only for a confirmed solver generation.
     set_cfg("solver_rejoin_on_success", False)
     set_cfg("solver_rejoin_on_no_captcha", False)
     # V4.80: preflight is useful, but a recent NO_CAPTCHA answer is trusted for
@@ -3437,6 +3458,9 @@ def apply_update_migrations(cfg):
     set_cfg("solver_preflight_open_on_failure", False)
     if _int_cfg(cfg.get("solver_preflight_server_busy_retry_seconds"), 0) < 600:
         set_cfg("solver_preflight_server_busy_retry_seconds", 600)
+    # V4.81.68 generation policy is intentionally fixed at three tries so an old
+    # nomo.json cannot restore an unbounded solver loop.
+    set_cfg("solver_challenge_generation_max_attempts", 3)
     if "manual_hold_after_solver_rejoin_timeout" not in cfg:
         set_cfg("manual_hold_after_solver_rejoin_timeout", True)
 
@@ -12676,10 +12700,17 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
     # as face lock. Once the package has a clean post-open heartbeat, clear stale
     # screenshot confirmations and perform no more visual/accessibility checks.
     captcha_loading_only = bool(cfg.get("captcha_visual_loading_only", True))
+    # V4.81.68: once attempt #1 has confirmed this exact live challenge, attempts
+    # #2/#3 must not keep rescanning the unchanged Start Puzzle rectangle. The
+    # generation owns the package until success/NO_CAPTCHA or the 3-try reopen.
+    solver_generation_owns_old_ui = bool(
+        solver_challenge_generation_active(rt_tab)
+        and rt_tab.get("solver_challenge_guard_done")
+    )
     captcha_scan_eligible = bool(raw_alive) and (
         (not captcha_loading_only) or (not loading_online_proof)
-    )
-    if not captcha_scan_eligible:
+    ) and not solver_generation_owns_old_ui
+    if not captcha_scan_eligible and not solver_generation_owns_old_ui:
         clear_visual_captcha_confirmation(pkg)
     captcha_ui = android_login_challenge_ui_detail(
         pkg, cfg, force=False, auth_hint=_runtime_auth_hint(rt_tab)
@@ -12699,9 +12730,9 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
             "bad": "ui_challenge", "visible_window": True,
             "ui_challenge_detail": captcha_ui,
         }
-    elif rt_tab.get("captcha_ui_visible"):
-        # The shared snapshot has moved past the challenge. Fresh state below can
-        # clear any false-negative hold without reopening the package.
+    elif rt_tab.get("captcha_ui_visible") and not solver_generation_owns_old_ui:
+        # Only clear this evidence when we actually inspected the current session.
+        # During attempts #2/#3 V4.81.68 intentionally does not rescan old UI.
         rt_tab["captcha_ui_visible"] = False
         rt_tab["captcha_ui_detail"] = ""
 
@@ -12842,72 +12873,117 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
 
 
 def maybe_queue_solver_busy_retry(open_queue, tab, target, rt_tab, cfg, health, core=None):
-    """Retry temporary provider failures against the current challenge, never by reopening Roblox.
+    """Retry a confirmed CAPTCHA generation without rescanning its stale UI.
 
-    V4.81.16 removes the legacy cooldown -> hard-reopen -> provider-retry loop.
-    On Noka/App Cloner, relaunching one Roblox task can disturb sibling floating tasks.
-    A provider retry therefore requires a still-live, package-scoped challenge signal.
+    Attempt #1 is created only after a fresh package-scoped guard. Once that
+    generation exists, #2/#3 are provider retries against the same live session.
+    Three failed attempts trigger one exact-target-PID safety reopen.
     """
     if core is None:
         core = RejoinCore(open_queue, cfg, None)
+    pkg = str((tab or {}).get("package", "") or "")
+    generation_active = solver_challenge_generation_active(rt_tab)
+
+    if generation_active and solver_job_running(pkg):
+        return "Solving", solver_job_note(pkg), True
+
+    if generation_active and rt_tab.get("solver_challenge_reopen_pending"):
+        return "Queued", "solver generation target reopen pending", True
+
+    # Recover a persisted generation after NOMO/Termux restart. The HTTP worker is
+    # not persistent, but the attempt count is. Never fall back to ordinary stale
+    # recovery while this package still belongs to its solver generation.
+    if generation_active and not rt_tab.get("solver_busy_retry_pending"):
+        attempts = int(rt_tab.get("solver_challenge_attempts", 0) or 0)
+        limit = solver_challenge_attempt_limit(cfg)
+        if attempts >= limit:
+            added, _ = queue_solver_generation_reopen(
+                core, tab, target, rt_tab, cfg, f"SOLVER_STUCK_{attempts}", safety=True
+            )
+            core.save()
+            return (
+                "Queued" if added else "Waiting",
+                f"solver failed {attempts}/{limit}; exact target safety reopen",
+                True,
+            )
+        retry_at = max(
+            now(),
+            int(rt_tab.get("solver_last_attempt", 0) or 0)
+            + max(600, int(cfg.get("solver_failure_retry_seconds", 600) or 600)),
+        )
+        rt_tab["solver_busy_retry_pending"] = True
+        rt_tab["solver_busy_retry_at"] = retry_at
+        rt_tab["solver_busy_retry_seconds"] = max(1, retry_at - now())
+        rt_tab["solver_retry_reason"] = "CAPTCHA_GENERATION"
+
     if not rt_tab.get("solver_busy_retry_pending"):
         return None
 
-    if health.get("clean_fresh"):
-        rt_tab["solver_busy_retry_pending"] = False
-        rt_tab["solver_busy_retry_at"] = 0
-        rt_tab["solver_retry_reason"] = ""
-        rt_tab["note"] = "fresh state; solver retry cancelled"
-        return None
-
-    pkg = str((tab or {}).get("package", "") or "")
     retry_reason = str(rt_tab.get("solver_retry_reason") or "SERVER_BUSY")
     retry_at = int(rt_tab.get("solver_busy_retry_at", 0) or 0)
     if retry_at <= 0 or now() < retry_at:
         left = max(1, retry_at - now()) if retry_at else 600
-        # A pending solver retry must own this package's challenge incident. Do
-        # not let an old-state/dashboard branch leave a hard reopen queued behind it.
         removed = core.cancel(pkg)
         if removed:
             core.save()
-        return "Waiting", f"solver {retry_reason}; retry provider in {format_age(left)} (no reopen)", True
+        attempts = int(rt_tab.get("solver_challenge_attempts", 0) or 0)
+        suffix = f" attempt {attempts + 1}/3" if generation_active else ""
+        return "Waiting", f"solver{suffix}; retry provider in {format_age(left)} (no reopen yet)", True
 
     if solver_job_running(pkg):
         return "Solving", solver_job_note(pkg), True
 
     alive = bool((health or {}).get("alive"))
-    state = (health or {}).get("state") or {}
-    challenge_detail = state_login_challenge_detail(state)
-    visible = android_login_challenge_ui_detail(pkg, cfg, force=True, auth_hint=_runtime_auth_hint(rt_tab)) if alive else None
-
     if not alive:
-        # Solver retry does not own crash recovery. Let the normal dead-package
-        # path reopen it if required, but never create a reopen solely for solver.
-        rt_tab["solver_busy_retry_pending"] = False
-        rt_tab["solver_busy_retry_at"] = 0
-        rt_tab["solver_retry_reason"] = ""
-        rt_tab["note"] = "solver retry cancelled; package is not alive"
+        # A dead package is no longer the same live CAPTCHA session. Let ordinary
+        # crash recovery own it and reset the old solver generation.
+        clear_solver_runtime_block(rt_tab)
+        reset_solver_challenge_generation(rt_tab, "package died")
+        rt_tab["note"] = "solver generation ended; package is not alive"
         core.save()
         return None
 
-    if not visible and not challenge_detail:
-        # Challenge-only invariant: do not blindly call the provider and do not
-        # bounce Roblox merely to rediscover a challenge. Recheck shortly.
-        wait_again = 60
-        rt_tab["solver_busy_retry_at"] = now() + wait_again
-        rt_tab["note"] = "solver retry due; waiting for current challenge (no reopen)"
-        removed = core.cancel(pkg)
+    removed = core.cancel(pkg)
+    clear_solver_runtime_block(rt_tab)
+    if removed:
+        log_activity("solver generation owns package; cancelled unrelated queued reopen", pkg, YELLOW)
+
+    if generation_active:
+        # V4.81.68 key rule: #2/#3 deliberately skip the old rectangle/UI guard.
+        # start_solver_job still refreshes the package cookie and Roblox API checks.
+        next_attempt = int(rt_tab.get("solver_challenge_attempts", 0) or 0) + 1
+        started, note = start_solver_job(
+            tab, cfg, core.rt, rt_tab,
+            f"confirmed CAPTCHA generation retry #{next_attempt}",
+            force=False, phase="solve", target_override=target, core=core,
+            challenge_confirmed=True,
+        )
+        if started:
+            core.save()
+            log_activity(f"solver attempt {next_attempt}/3 started; old CAPTCHA UI guard skipped", pkg, CYAN)
+            return "Solving", note, True
+
+        # A provider gate/cooldown is not a reason to drop the generation or turn
+        # it into a manual-login hold. Keep it package-local and retry later.
+        retry_after = max(600, int(cfg.get("solver_failure_retry_seconds", 600) or 600))
+        apply_solver_retry_later(pkg, rt_tab, cfg, "CAPTCHA_GENERATION", retry_after)
+        rt_tab["note"] = f"solver generation retry deferred: {cut(note, 70)}"
         core.save()
-        if removed:
-            log_activity("solver retry cancelled queued reopen; waiting for challenge in-place", pkg, YELLOW)
         return "Waiting", rt_tab["note"], True
 
-    removed = core.cancel(pkg)
-    rt_tab["solver_busy_retry_pending"] = False
-    rt_tab["solver_busy_retry_at"] = 0
-    rt_tab["solver_retry_reason"] = ""
-    if removed:
-        log_activity("verification owns package; cancelled pending reopen before solver retry", pkg, YELLOW)
+    # Legacy/non-generation busy retry path keeps the old fresh challenge check.
+    state = (health or {}).get("state") or {}
+    challenge_detail = state_login_challenge_detail(state)
+    visible = android_login_challenge_ui_detail(
+        pkg, cfg, force=True, auth_hint=_runtime_auth_hint(rt_tab)
+    )
+    if not visible and not challenge_detail:
+        rt_tab["solver_busy_retry_pending"] = True
+        rt_tab["solver_busy_retry_at"] = now() + 60
+        rt_tab["solver_retry_reason"] = retry_reason
+        rt_tab["note"] = "solver retry due; waiting for current challenge (no reopen)"
+        core.save()
+        return "Waiting", rt_tab["note"], True
 
     detail = (
         str((visible or {}).get("text") or (visible or {}).get("reason") or "").strip()
@@ -12916,12 +12992,8 @@ def maybe_queue_solver_busy_retry(open_queue, tab, target, rt_tab, cfg, health, 
     status, note = core.handle_detected_solver_challenge(
         tab, rt_tab, detail or f"{retry_reason} retry on current verification UI"
     )
-    log_activity(
-        f"solver {retry_reason} cooldown done; provider retry in-place (no reopen)",
-        pkg,
-        CYAN if status == "Solving" else YELLOW,
-    )
     return status, note, True
+
 
 def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, health, core=None):
     """Solve one package-scoped visible challenge in-place without reopening Roblox.
@@ -16136,9 +16208,16 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
                 core.save()
                 return True
 
-            visible_auth = android_login_challenge_ui_detail(
+            solver_generation_reopen = bool(item.get("solver_generation_reopen"))
+            visible_auth = None if solver_generation_reopen else android_login_challenge_ui_detail(
                 pkg, cfg, force=True, auth_hint=_runtime_auth_hint(rt_tab)
             )
+            if solver_generation_reopen:
+                log_activity(
+                    "solver-generation reopen: stale CAPTCHA/529 visual veto skipped; "
+                    "moderation + Account Locked guards remain active",
+                    pkg, DIM,
+                )
             if visible_auth:
                 detail = str(
                     visible_auth.get("text")
@@ -16162,7 +16241,7 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
                 core.save()
                 return True
 
-            if _runtime_auth_hint(rt_tab):
+            if _runtime_auth_hint(rt_tab) and not solver_generation_reopen:
                 visual_join = visual_join_error_detail(pkg, cfg, force=True, bypass_confirm=True)
                 if visual_join:
                     rt_tab["note"] = "visual Join Error after auth/face-lock; hard recovery blocked"
@@ -16433,6 +16512,20 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
     core.save()
 
     if ok:
+        if item.get("solver_generation_reopen"):
+            attempts = int(item.get("solver_generation_attempt", 0) or 0)
+            result_label = str(item.get("solver_result", "solver generation") or "solver generation")
+            reset_solver_challenge_generation(rt_tab, "target reopened")
+            clear_captcha_ui_runtime(rt_tab)
+            rt_tab["solver_challenge_last_reopen_at"] = int(opened_at or now())
+            rt_tab["solver_challenge_last_reopen_result"] = result_label
+            rt_tab["note"] = f"solver target reopened after attempt {attempts}; fresh guard armed"
+            log_activity(
+                f"solver target reopen complete after attempt {attempts}; new session will use fresh CAPTCHA guard",
+                pkg, GREEN,
+            )
+            core.save()
+
         if item.get("bubble_only_recovery") and target == "hatcher":
             opened_at, bubble_second_note = hatcher_bubble_second_private_intent(
                 tab, rt_tab, cfg, rt, target, reason, opened_at, core
@@ -33196,6 +33289,135 @@ _SOLVER_JOBS = {}
 _SOLVER_LOCK = threading.RLock()
 
 
+def solver_challenge_attempt_limit(cfg):
+    # V4.81.68: fixed safety contract. Three provider attempts belong to one
+    # confirmed on-screen challenge generation, then that target is reopened.
+    return 3
+
+
+def solver_challenge_generation_active(rt_tab):
+    return bool(isinstance(rt_tab, dict) and rt_tab.get("solver_challenge_generation_active"))
+
+
+def begin_solver_challenge_generation(rt_tab, pkg, reason=""):
+    if not isinstance(rt_tab, dict):
+        return ""
+    if not solver_challenge_generation_active(rt_tab):
+        token = f"{int(now())}:{time.time_ns()}:{str(pkg or '')}"
+        rt_tab["solver_challenge_generation_active"] = True
+        rt_tab["solver_challenge_generation"] = token
+        rt_tab["solver_challenge_attempts"] = 0
+        rt_tab["solver_challenge_guard_done"] = True
+        rt_tab["solver_challenge_started_at"] = now()
+        rt_tab["solver_challenge_reason"] = cut(str(reason or "visible captcha"), 180)
+        rt_tab["solver_challenge_reopen_pending"] = False
+        rt_tab["solver_challenge_last_result"] = ""
+    return str(rt_tab.get("solver_challenge_generation", "") or "")
+
+
+def reset_solver_challenge_generation(rt_tab, reason=""):
+    if not isinstance(rt_tab, dict):
+        return False
+    changed = bool(rt_tab.get("solver_challenge_generation_active") or rt_tab.get("solver_challenge_attempts"))
+    last_token = str(rt_tab.get("solver_challenge_generation", "") or "")
+    rt_tab["solver_challenge_generation_active"] = False
+    rt_tab["solver_challenge_generation"] = ""
+    rt_tab["solver_challenge_attempts"] = 0
+    rt_tab["solver_challenge_guard_done"] = False
+    rt_tab["solver_challenge_started_at"] = 0
+    rt_tab["solver_challenge_reason"] = ""
+    rt_tab["solver_challenge_reopen_pending"] = False
+    rt_tab["solver_challenge_last_reset_at"] = now()
+    rt_tab["solver_challenge_last_reset_reason"] = str(reason or "reopen")
+    if last_token:
+        rt_tab["solver_challenge_last_generation"] = last_token
+    return changed
+
+
+def _solver_challenge_clear_transient_hold(pkg, rt_tab):
+    """Clear only CAPTCHA/solver transient holds before a solver-owned reopen.
+
+    Never erase a real face-lock/account-lock/ban/moderation hold here. The direct
+    moderation gate still runs again at execution time as the final authority.
+    """
+    reason = str((rt_tab or {}).get("manual_login_reason", "") or "").lower()
+    hold_reason = str(get_hold_reason(pkg) or "").lower() if pkg else ""
+    strong_terms = (
+        "face_lock", "face lock", "account locked", "account_banned",
+        "banned", "terminated", "moderated", "parental",
+    )
+    strong = any(x in reason for x in strong_terms)
+    hold_strong = any(x in hold_reason for x in strong_terms)
+    if not strong and not hold_strong and (
+        "captcha" in reason or "challenge" in reason or "solver" in reason or not reason
+    ):
+        clear_manual_login_block(rt_tab)
+    if pkg and not strong and not hold_strong:
+        clear_hold(pkg)
+
+
+def solver_package_cookie_auth_state(pkg, cfg):
+    """Return True=authenticated, False=definitely invalid/expired, None=ambiguous.
+
+    Provider-side 'cookie flagged' wording is not authoritative. Roblox's own
+    authenticated endpoint/precheck decides whether NOMO may call it invalid.
+    """
+    cookie, _source, note = solver_cookie_for_package(pkg, cfg)
+    cookie = str(cookie or "").strip()
+    if not cookie:
+        return None, "no package cookie: " + cut(str(note or ""), 80)
+    try:
+        info = get_roblox_user_info(cookie) or {}
+    except Exception as exc:
+        return None, "cookie API unavailable: " + cut(str(exc), 80)
+    if info.get("valid") is True:
+        return True, "cookie/API authenticated"
+    status = str(info.get("status", "") or "").lower()
+    if "invalid/expired" in status or "http 401" in status:
+        return False, str(info.get("status") or "invalid/expired")
+    # HTTP 403 / challenge is not proof of an expired .ROBLOSECURITY cookie.
+    return None, str(info.get("status") or "cookie auth ambiguous")
+
+
+def queue_solver_generation_reopen(core, tab, target, rt_tab, cfg, result_label, safety=False):
+    pkg = str((tab or {}).get("package", "") or "")
+    if not pkg:
+        return False, "solver generation reopen: missing package"
+    if rt_tab.get("solver_challenge_reopen_pending"):
+        return False, "solver generation reopen already pending"
+
+    attempts = int(rt_tab.get("solver_challenge_attempts", 0) or 0)
+    token = str(rt_tab.get("solver_challenge_generation", "") or "")
+    _solver_challenge_clear_transient_hold(pkg, rt_tab)
+    clear_captcha_ui_runtime(rt_tab)
+    clear_solver_runtime_block(rt_tab)
+    core.cancel(pkg)
+
+    rt_tab["solver_challenge_reopen_pending"] = True
+    rt_tab["solver_challenge_last_result"] = str(result_label or "")
+    rt_tab["solver_challenge_reopen_queued_at"] = now()
+    rt_tab["solver_challenge_reopen_safety"] = bool(safety)
+    metadata = {
+        "solver_generation_reopen": True,
+        "solver_generation_safety_reopen": bool(safety),
+        "solver_generation_token": token,
+        "solver_generation_attempt": attempts,
+        # This exception is intentionally narrower than Option 6: it skips only
+        # the stale visible CAPTCHA/529 veto. Moderation/account-lock guards remain.
+        "auth_result_recovery": True,
+        # Generic API challenge precheck would intentionally hold a still-live
+        # CAPTCHA session and prevent the solver-owned reopen. Skip only that
+        # generic gate; direct moderation/API Account Locked still runs first.
+        "bypass_api_precheck": True,
+    }
+    added, note = core.queue_solver_result_recovery(
+        tab, target, str(result_label or "SOLVER_GENERATION"), metadata
+    )
+    if not added:
+        rt_tab["solver_challenge_reopen_pending"] = False
+    return added, note
+
+
 def solver_job_running(package):
     with _SOLVER_LOCK:
         job = _SOLVER_JOBS.get(str(package or ""))
@@ -33716,6 +33938,14 @@ def start_solver_job(tab, cfg, rt, rt_tab, reason, force=False, phase="solve", o
         "cookie_source": cookie_source,
         "response": None,
     }
+    if str(phase or "solve") == "solve" and challenge_confirmed:
+        generation = begin_solver_challenge_generation(rt_tab, pkg, reason)
+        attempt = int(rt_tab.get("solver_challenge_attempts", 0) or 0) + 1
+        rt_tab["solver_challenge_attempts"] = attempt
+        rt_tab["solver_challenge_last_attempt_at"] = now()
+        job["challenge_generation"] = generation
+        job["challenge_attempt"] = attempt
+        job["challenge_guard_done"] = bool(rt_tab.get("solver_challenge_guard_done"))
     with _SOLVER_LOCK:
         _SOLVER_JOBS[pkg] = job
 
@@ -33735,7 +33965,10 @@ def start_solver_job(tab, cfg, rt, rt_tab, reason, force=False, phase="solve", o
     generation_note = (
         f" gen={str(job.get('open_generation', ''))[-8:]}"
         if job["phase"] == "preopen"
-        else ""
+        else (
+            f" attempt={int(job.get('challenge_attempt', 0) or 0)}/3"
+            if job.get("challenge_generation") else ""
+        )
     )
     log_activity(
         f"{prefix}{generation_note}: {cut(job['reason'], 60)} | cookie={cookie_source}",
@@ -33764,18 +33997,34 @@ def _solver_error_text(response):
 
 
 def handle_detected_solver_challenge(tab, cfg, rt, rt_tab, reason, core=None):
-    """Start/describe a solver job, or isolate the package if unavailable."""
+    """Start attempt #1 for a freshly confirmed target-local CAPTCHA generation."""
     pkg = str((tab or {}).get("package", "") or "")
-    started, note = start_solver_job(tab, cfg, rt, rt_tab, reason, core=core, challenge_confirmed=True)
+    begin_solver_challenge_generation(rt_tab, pkg, reason)
+
+    started, note = start_solver_job(
+        tab, cfg, rt, rt_tab, reason, core=core, challenge_confirmed=True
+    )
     if started:
-        rt_tab["note"] = note
+        attempt = int(rt_tab.get("solver_challenge_attempts", 0) or 0)
+        rt_tab["note"] = f"solver attempt {attempt}/3" if attempt else note
         if core is not None:
             core.save()
         else:
             save_runtime(rt)
-        return "Solving", note
+        return "Solving", rt_tab["note"]
 
-    # Disabled, missing credentials/cookie, or cooldown after a failed attempt.
+    note_low = str(note or "").lower()
+    if any(x in note_low for x in ("cooldown", "retry in", "provider cooldown")):
+        retry_seconds = max(600, int(cfg.get("solver_failure_retry_seconds", 600) or 600))
+        apply_solver_retry_later(pkg, rt_tab, cfg, "CAPTCHA_GENERATION", retry_seconds)
+        rt_tab["note"] = f"CAPTCHA confirmed; solver attempt 1/3 deferred: {cut(note, 65)}"
+        if core is not None:
+            core.save()
+        else:
+            save_runtime(rt)
+        return "Captcha", rt_tab["note"]
+
+    # Missing solver credentials/cookie is still a real manual intervention case.
     retry_seconds = max(600, int(cfg.get("solver_failure_retry_seconds", 600) or 600))
     mark_manual_login_block(
         rt_tab,
@@ -33956,6 +34205,113 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
                     pkg,
                     YELLOW,
                 )
+            changed = True
+            continue
+
+        # V4.81.68: challenge-confirmed jobs are governed by the three-try
+        # generation, not by the old "UI must disappear first" logic. This client
+        # leaves Start Puzzle visible until the target package is reopened.
+        challenge_generation = str(job.get("challenge_generation", "") or "")
+        challenge_attempt = int(job.get("challenge_attempt", 0) or 0)
+        current_generation = str(rt_tab.get("solver_challenge_generation", "") or "")
+        challenge_job = bool(
+            challenge_generation
+            and solver_challenge_generation_active(rt_tab)
+            and challenge_generation == current_generation
+        )
+
+        if challenge_job and (no_captcha_result or solved_result):
+            result_label = "NO_CAPTCHA" if no_captcha_result else "CAPTCHA_SUCCESS"
+            detail = _solver_probe_detail(response)
+            _solver_challenge_clear_transient_hold(pkg, rt_tab)
+            clear_solver_runtime_block(rt_tab)
+            rt_tab["solver_state"] = "success" if solved_result else "clear"
+            rt_tab["solver_last_success"] = now()
+            rt_tab["solver_last_error"] = ""
+            rt_tab["solver_last_probe"] = detail
+            rt_tab["solver_challenge_last_result"] = result_label
+            added, _ = queue_solver_generation_reopen(
+                core, tab, target, rt_tab, cfg, result_label, safety=False
+            )
+            rt_tab["note"] = (
+                f"{result_label}; exact target reopen queued"
+                if added else f"{result_label}; target reopen already pending"
+            )
+            log_activity(
+                f"solver {result_label} attempt {challenge_attempt}/3; exact target PID reopen "
+                "(old CAPTCHA UI intentionally not rechecked)",
+                pkg, GREEN,
+            )
+            changed = True
+            continue
+
+        if challenge_job:
+            err = _solver_error_text(response)
+            rt_tab["solver_state"] = "failed"
+            rt_tab["solver_last_error"] = err
+            rt_tab["solver_challenge_last_result"] = status_code or "FAILED"
+
+            invalid_label = status_code in {"INVALID_COOKIES", "INVALID_COOKIE", "UNAUTHORIZED", "AUTH_FAILED"}
+            cookie_auth, cookie_auth_note = solver_package_cookie_auth_state(pkg, cfg)
+            if invalid_label and cookie_auth is False:
+                reset_solver_challenge_generation(rt_tab, "cookie invalid")
+                clear_solver_runtime_block(rt_tab)
+                retry_seconds = max(600, int(cfg.get("manual_auth_retry_seconds", 3600) or 3600))
+                mark_manual_login_block(
+                    rt_tab, "invalid package cookie", err,
+                    "INVALID_COOKIES - refresh account cookie", None, retry_seconds,
+                )
+                set_hold(pkg, "solver + Roblox API confirmed invalid/expired package cookie", retry_seconds)
+                log_activity(
+                    f"solver invalid-cookie result confirmed by Roblox API; retry in {format_age(retry_seconds)}",
+                    pkg, RED,
+                )
+                changed = True
+                continue
+
+            if invalid_label and cookie_auth is True:
+                log_activity(
+                    f"provider said {status_code}, but cookie/API still authenticates; treating as solver failure",
+                    pkg, YELLOW,
+                )
+            elif solver_response_http_status(response) == 403 and cookie_auth is True:
+                log_activity(
+                    "solver/challenge HTTP 403; cookie/API still valid, cookie retained",
+                    pkg, YELLOW,
+                )
+
+            limit = solver_challenge_attempt_limit(cfg)
+            attempts = max(challenge_attempt, int(rt_tab.get("solver_challenge_attempts", 0) or 0))
+            if attempts >= limit:
+                clear_solver_runtime_block(rt_tab)
+                added, _ = queue_solver_generation_reopen(
+                    core, tab, target, rt_tab, cfg, f"SOLVER_FAILED_{attempts}", safety=True
+                )
+                rt_tab["note"] = (
+                    f"solver failed {attempts}/{limit}; exact target safety reopen queued"
+                    if added else f"solver failed {attempts}/{limit}; target safety reopen pending"
+                )
+                log_activity(
+                    f"solver failed {attempts}/{limit}; exact target PID safety reopen "
+                    "(A/B/C/D peers untouched)",
+                    pkg, YELLOW,
+                )
+                changed = True
+                continue
+
+            retry_seconds = max(600, int(cfg.get("solver_failure_retry_seconds", 600) or 600))
+            retry_after = apply_solver_retry_later(
+                pkg, rt_tab, cfg, "CAPTCHA_GENERATION", retry_seconds
+            )
+            rt_tab["note"] = (
+                f"solver failed {attempts}/{limit}; attempt {attempts + 1}/{limit} "
+                f"after {format_age(retry_after)} (old UI guard skipped)"
+            )
+            log_activity(
+                f"solver attempt {attempts}/{limit} failed: {cut(err, 75)}; "
+                f"retry #{attempts + 1} in {format_age(retry_after)} without CAPTCHA rescan",
+                pkg, YELLOW,
+            )
             changed = True
             continue
 
