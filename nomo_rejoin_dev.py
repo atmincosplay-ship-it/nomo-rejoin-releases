@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.65 — BOUNDED PEER-AUTH SAFE ROUTE
+# - Fixes an ALIVE stale/no-state sibling getting trapped in an endless peer-auth route -> post-open grace loop while
+#   another Noka remains on face-lock/529/CAPTCHA/moderation hold. Each target now gets one automatic task-reuse
+#   safe route per active peer-auth incident; a failed/no-fresh-state attempt is not automatically repeated forever.
+# - After that one safe route, the target waits non-destructively for either a fresh clean state, the peer auth incident
+#   to clear/change, or a genuinely DEAD process. Fresh state / peer-clear resets the one-shot guard; confirmed DEAD
+#   crash recovery remains allowed exactly as before. No PID-stop is introduced for an ALIVE peer-protected target.
+# - A recent V4.81.64 peer_auth_safe_route_last is adopted as the already-used one-shot on upgrade, so a device
+#   currently caught in this loop does not need to send yet another automatic route before settling to Waiting.
+# - Keeps V4.81.64's immutable no_hard_fallback contract and exact age_access_gate-only migration unchanged.
+#
 # V4.81.64 — ROUTE-ONLY HARD-FALLBACK + AGE-HOLD MIGRATION SAFETY
 # - `no_hard_fallback` is now a first-class immutable queue contract: any queued soft/route generation carrying it
 #   cannot be upgraded in-place to hard/hard_force by a later duplicate watchdog/recovery item; safety metadata is
@@ -10819,6 +10830,8 @@ def _merge_queue_duplicate(existing, target, reason, force=False, skip_if_alive=
         ):
             if metadata.get(key):
                 existing[key] = True
+        if metadata.get("peer_auth_safe_route_only") and metadata.get("peer_auth_peer_pkg"):
+            existing["peer_auth_peer_pkg"] = str(metadata.get("peer_auth_peer_pkg") or "")
 
     # V4.81.56/V4.81.64: once a generation is explicitly route-only, a
     # duplicate old-state/no-state watchdog item must never mutate that SAME
@@ -12445,6 +12458,54 @@ def clear_obsolete_age_access_hold(rt_tab, pkg):
     return True
 
 
+def _peer_auth_safe_route_attempted(rt_tab, peer_pkg):
+    if not isinstance(rt_tab, dict):
+        return False
+    peer = str(peer_pkg or "").strip()
+    if not peer:
+        return False
+    attempted_peer = str(rt_tab.get("peer_auth_safe_route_attempted_peer", "") or "").strip()
+    attempted_at = int(rt_tab.get("peer_auth_safe_route_attempted_at", 0) or 0)
+    return attempted_at > 0 and attempted_peer == peer
+
+
+def _adopt_recent_legacy_peer_auth_safe_route_attempt(rt_tab, peer_pkg, grace_seconds):
+    """Treat a recent V4.81.64 peer-route timestamp as this incident's one-shot.
+
+    V4.81.64 persisted only peer_auth_safe_route_last, not the peer identity. Limit
+    adoption to a short window so old unrelated incidents do not suppress a new
+    recovery indefinitely. Skipping one extra automatic route is fail-safe.
+    """
+    if _peer_auth_safe_route_attempted(rt_tab, peer_pkg):
+        return True
+    last = int((rt_tab or {}).get("peer_auth_safe_route_last", 0) or 0)
+    window = max(600, int(grace_seconds or 0) * 2)
+    if last <= 0 or now() - last > window:
+        return False
+    rt_tab["peer_auth_safe_route_attempted_peer"] = str(peer_pkg or "").strip()
+    rt_tab["peer_auth_safe_route_attempted_at"] = last
+    rt_tab["peer_auth_safe_route_attempt_ok"] = True
+    rt_tab["peer_auth_safe_route_legacy_adopted_at"] = now()
+    return True
+
+
+def _mark_peer_auth_safe_route_attempt(rt_tab, peer_pkg, ok):
+    if not isinstance(rt_tab, dict):
+        return
+    rt_tab["peer_auth_safe_route_attempted_peer"] = str(peer_pkg or "").strip()
+    rt_tab["peer_auth_safe_route_attempted_at"] = now()
+    rt_tab["peer_auth_safe_route_attempt_ok"] = bool(ok)
+
+
+def _clear_peer_auth_safe_route_attempt(rt_tab):
+    if not isinstance(rt_tab, dict):
+        return
+    rt_tab["peer_auth_safe_route_attempted_peer"] = ""
+    rt_tab["peer_auth_safe_route_attempted_at"] = 0
+    rt_tab["peer_auth_safe_route_attempt_ok"] = False
+    rt_tab["peer_auth_safe_route_last"] = 0
+
+
 def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=None, raw_alive=None, state=None, err=None, process_status=None, process_note=""):
     """One shared answer for Market/Hatcher package health.
 
@@ -13075,6 +13136,7 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
         # fresh -> healthy, skip
         if age <= stale_limit and state_is_clean(state):
             clear_disconnect_ui_incident(rt_tab)
+            _clear_peer_auth_safe_route_attempt(rt_tab)
             return ("Ingame" if alive else "Loading"), "ok", False
 
         # old state but still loading (inside our grace window) -> wait
@@ -13097,6 +13159,15 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
                         core.save()
                         return "Manual", own_note or rt_tab.get("note") or "auth/moderation hold", True
 
+                    _adopt_recent_legacy_peer_auth_safe_route_attempt(rt_tab, peer_pkg, grace)
+                    if _peer_auth_safe_route_attempted(rt_tab, peer_pkg):
+                        rt_tab["note"] = (
+                            f"peer auth {short_pkg(peer_pkg)}; safe route already tried; "
+                            "waiting for fresh state / peer clear"
+                        )
+                        core.save()
+                        return "Waiting", rt_tab["note"], True
+
                     interval = max(30, int(cfg.get("noka_peer_auth_safe_route_retry_seconds", 45) or 45))
                     last_peer_route = int(rt_tab.get("peer_auth_safe_route_last", 0) or 0)
                     if last_peer_route > 0 and now() - last_peer_route < interval:
@@ -13107,6 +13178,7 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
 
                     meta = {
                         "peer_auth_safe_route_only": True,
+                        "peer_auth_peer_pkg": str(peer_pkg or ""),
                         "no_hard_fallback": True,
                         "bypass_recheck": True,
                     }
@@ -13120,6 +13192,7 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
                     )
                     core.save()
                     return ("Queued" if added else "Waiting"), rt_tab["note"], True
+                _clear_peer_auth_safe_route_attempt(rt_tab)
             added, _ = core.queue_alive_old_state_recovery(
                 tab,
                 target,
@@ -13148,6 +13221,15 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
                     core.save()
                     return "Manual", own_note or rt_tab.get("note") or "auth/moderation hold", True
 
+                _adopt_recent_legacy_peer_auth_safe_route_attempt(rt_tab, peer_pkg, grace)
+                if _peer_auth_safe_route_attempted(rt_tab, peer_pkg):
+                    rt_tab["note"] = (
+                        f"peer auth {short_pkg(peer_pkg)}; safe route already tried; "
+                        "waiting for fresh state / peer clear"
+                    )
+                    core.save()
+                    return "Waiting", rt_tab["note"], True
+
                 interval = max(30, int(cfg.get("noka_peer_auth_safe_route_retry_seconds", 45) or 45))
                 last_peer_route = int(rt_tab.get("peer_auth_safe_route_last", 0) or 0)
                 if last_peer_route > 0 and now() - last_peer_route < interval:
@@ -13158,6 +13240,7 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
 
                 meta = {
                     "peer_auth_safe_route_only": True,
+                    "peer_auth_peer_pkg": str(peer_pkg or ""),
                     "no_hard_fallback": True,
                     "bypass_recheck": True,
                 }
@@ -13171,6 +13254,7 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
                 )
                 core.save()
                 return ("Queued" if added else "Waiting"), rt_tab["note"], True
+            _clear_peer_auth_safe_route_attempt(rt_tab)
         added, _ = core.queue_alive_no_state_recovery(
             tab,
             target,
@@ -16387,6 +16471,13 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
         mode=mode,
     )
     opened_at = int(rt_tab.get("last_open", now()))
+
+    if item.get("peer_auth_safe_route_only"):
+        _mark_peer_auth_safe_route_attempt(
+            rt_tab,
+            item.get("peer_auth_peer_pkg"),
+            ok,
+        )
 
     if ok and item.get("manual_option6"):
         rt_tab["last_option6_restart_at"] = int(opened_at or now())
