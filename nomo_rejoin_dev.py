@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.69 — DEAD-RETRY SELF-HEAL + LEGACY SOLVER RECONCILE
+# - A package that dies while a solver/provider retry timer is pending no longer waits for that timer. NOMO clears only
+#   that target's transient solver generation/retry state and immediately falls through to normal exact-PID crash recovery.
+#   Dead targets are never sent to the solver because their old CAPTCHA session/challenge is no longer live.
+# - A legacy/non-generation provider retry can no longer own a healthy package forever. NOMO performs one fresh target-only
+#   challenge guard: current CAPTCHA => convert into the V4.81.68 generation (attempt 1/3 after the existing cooldown);
+#   no current CAPTCHA => clear the stale provider retry and resume normal Market/Hatcher recovery.
+# - A stale Lua challenge is not enough to preserve a legacy solver retry: only a current package UI confirmation or a fresh
+#   Lua challenge state may seed the new generation. This prevents 13h/19h-old state files from keeping a clone Waiting.
+# - V4.81.68 three-try generations are unchanged: guard once, #2/#3 skip the unchanged old puzzle UI, SUCCESS/NO_CAPTCHA
+#   reopen immediately, and three failed attempts exact-PID reopen only the affected target.
+#
 # V4.81.68 — THREE-TRY CAPTCHA GENERATIONS + TARGET REOPEN
 # - A confirmed package-scoped CAPTCHA/verification screen starts one solver generation for that exact clone. The
 #   package/Option-16 UI guard is used only to confirm attempt #1 (or the first attempt after a solver-triggered reopen).
@@ -1276,7 +1288,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.68"
+__version__ = "V4.81.69"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -12873,11 +12885,15 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
 
 
 def maybe_queue_solver_busy_retry(open_queue, tab, target, rt_tab, cfg, health, core=None):
-    """Retry a confirmed CAPTCHA generation without rescanning its stale UI.
+    """Own solver retries without letting stale retry state suppress recovery.
 
-    Attempt #1 is created only after a fresh package-scoped guard. Once that
-    generation exists, #2/#3 are provider retries against the same live session.
-    Three failed attempts trigger one exact-target-PID safety reopen.
+    V4.81.69 ordering:
+    - DEAD target always exits solver ownership first and falls through to normal
+      exact-PID crash recovery. There is no live CAPTCHA session left to solve.
+    - A legacy/non-generation retry is reconciled once against the CURRENT target:
+      fresh CAPTCHA => seed a generation; no CAPTCHA => clear stale retry.
+    - Active generations keep V4.81.68 behavior: #2/#3 skip the unchanged old UI,
+      and three failures queue one exact-target safety reopen.
     """
     if core is None:
         core = RejoinCore(open_queue, cfg, None)
@@ -12919,10 +12935,68 @@ def maybe_queue_solver_busy_retry(open_queue, tab, target, rt_tab, cfg, health, 
     if not rt_tab.get("solver_busy_retry_pending"):
         return None
 
+    # V4.81.69: process liveness outranks ANY provider retry cooldown. A dead
+    # clone cannot still own a usable browser/CAPTCHA challenge, so do not send
+    # stale data to the solver. Clear transient solver ownership and let the
+    # normal crash branch below queue the exact-target-PID reopen immediately.
+    alive = bool((health or {}).get("alive"))
+    if not alive:
+        had_generation = generation_active
+        clear_solver_runtime_block(rt_tab)
+        clear_captcha_ui_runtime(rt_tab)
+        if had_generation:
+            reset_solver_challenge_generation(rt_tab, "package died before solver retry")
+        rt_tab["note"] = "solver retry cleared; target dead; normal crash recovery"
+        log_activity(
+            "solver retry cleared because target is dead; normal exact-PID recovery owns reopen",
+            pkg, YELLOW,
+        )
+        core.save()
+        return None
+
     retry_reason = str(rt_tab.get("solver_retry_reason") or "SERVER_BUSY")
     retry_at = int(rt_tab.get("solver_busy_retry_at", 0) or 0)
-    if retry_at <= 0 or now() < retry_at:
-        left = max(1, retry_at - now()) if retry_at else 600
+
+    # V4.81.69 migration/self-heal for old SERVER_BUSY/PROVIDER retry state that
+    # predates challenge generations. Guard THIS live target once right now. Do
+    # not let a stale Lua state file seed a generation; only fresh state counts.
+    if not generation_active:
+        state = (health or {}).get("state") or {}
+        fresh_state_challenge = (
+            state_login_challenge_detail(state) if bool((health or {}).get("fresh")) else ""
+        )
+        visible = android_login_challenge_ui_detail(
+            pkg, cfg, force=True, auth_hint=_runtime_auth_hint(rt_tab)
+        )
+        if not visible and not fresh_state_challenge:
+            clear_solver_runtime_block(rt_tab)
+            clear_captcha_ui_runtime(rt_tab)
+            rt_tab["note"] = "stale solver retry cleared; no current challenge; normal recovery"
+            log_activity(
+                "legacy solver retry cleared; fresh target guard found no current CAPTCHA",
+                pkg, GREEN,
+            )
+            core.save()
+            return None
+
+        detail = (
+            str((visible or {}).get("text") or (visible or {}).get("reason") or "").strip()
+            if visible else str(fresh_state_challenge or "").strip()
+        )
+        begin_solver_challenge_generation(
+            rt_tab, pkg, detail or f"{retry_reason} retry; current challenge reconfirmed"
+        )
+        generation_active = True
+        rt_tab["solver_retry_reason"] = "CAPTCHA_GENERATION"
+        rt_tab["note"] = "current CAPTCHA reconfirmed; solver generation 1/3 armed"
+        log_activity(
+            "legacy solver retry reconciled: current CAPTCHA confirmed; generation 1/3 armed",
+            pkg, CYAN,
+        )
+        core.save()
+
+    if retry_at > now():
+        left = max(1, retry_at - now())
         removed = core.cancel(pkg)
         if removed:
             core.save()
@@ -12933,24 +13007,15 @@ def maybe_queue_solver_busy_retry(open_queue, tab, target, rt_tab, cfg, health, 
     if solver_job_running(pkg):
         return "Solving", solver_job_note(pkg), True
 
-    alive = bool((health or {}).get("alive"))
-    if not alive:
-        # A dead package is no longer the same live CAPTCHA session. Let ordinary
-        # crash recovery own it and reset the old solver generation.
-        clear_solver_runtime_block(rt_tab)
-        reset_solver_challenge_generation(rt_tab, "package died")
-        rt_tab["note"] = "solver generation ended; package is not alive"
-        core.save()
-        return None
-
     removed = core.cancel(pkg)
     clear_solver_runtime_block(rt_tab)
     if removed:
         log_activity("solver generation owns package; cancelled unrelated queued reopen", pkg, YELLOW)
 
     if generation_active:
-        # V4.81.68 key rule: #2/#3 deliberately skip the old rectangle/UI guard.
-        # start_solver_job still refreshes the package cookie and Roblox API checks.
+        # V4.81.68 key rule retained: #2/#3 deliberately skip the old
+        # rectangle/UI guard. V4.81.69 may also enter here for legacy retry state
+        # after the fresh target guard above has seeded attempt #1.
         next_attempt = int(rt_tab.get("solver_challenge_attempts", 0) or 0) + 1
         started, note = start_solver_job(
             tab, cfg, core.rt, rt_tab,
@@ -12960,7 +13025,11 @@ def maybe_queue_solver_busy_retry(open_queue, tab, target, rt_tab, cfg, health, 
         )
         if started:
             core.save()
-            log_activity(f"solver attempt {next_attempt}/3 started; old CAPTCHA UI guard skipped", pkg, CYAN)
+            guard_note = (
+                "fresh target guard already completed" if next_attempt == 1
+                else "old CAPTCHA UI guard skipped"
+            )
+            log_activity(f"solver attempt {next_attempt}/3 started; {guard_note}", pkg, CYAN)
             return "Solving", note, True
 
         # A provider gate/cooldown is not a reason to drop the generation or turn
@@ -12971,28 +13040,12 @@ def maybe_queue_solver_busy_retry(open_queue, tab, target, rt_tab, cfg, health, 
         core.save()
         return "Waiting", rt_tab["note"], True
 
-    # Legacy/non-generation busy retry path keeps the old fresh challenge check.
-    state = (health or {}).get("state") or {}
-    challenge_detail = state_login_challenge_detail(state)
-    visible = android_login_challenge_ui_detail(
-        pkg, cfg, force=True, auth_hint=_runtime_auth_hint(rt_tab)
-    )
-    if not visible and not challenge_detail:
-        rt_tab["solver_busy_retry_pending"] = True
-        rt_tab["solver_busy_retry_at"] = now() + 60
-        rt_tab["solver_retry_reason"] = retry_reason
-        rt_tab["note"] = "solver retry due; waiting for current challenge (no reopen)"
-        core.save()
-        return "Waiting", rt_tab["note"], True
-
-    detail = (
-        str((visible or {}).get("text") or (visible or {}).get("reason") or "").strip()
-        if visible else str(challenge_detail or "").strip()
-    )
-    status, note = core.handle_detected_solver_challenge(
-        tab, rt_tab, detail or f"{retry_reason} retry on current verification UI"
-    )
-    return status, note, True
+    # Defensive fallback only. The reconciliation above should either clear a
+    # legacy retry or convert it into an active challenge generation.
+    clear_solver_runtime_block(rt_tab)
+    rt_tab["note"] = "solver retry state reconciled; normal recovery"
+    core.save()
+    return None
 
 
 def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, health, core=None):
@@ -13028,7 +13081,27 @@ def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, he
     if busy_pending and busy_at > now():
         left = max(1, busy_at - now())
         reason = str(rt_tab.get("solver_retry_reason") or "PROVIDER")
-        note = f"verification UI; {reason} retry provider in {format_age(left)} (no reopen)"
+        if not solver_challenge_generation_active(rt_tab):
+            # V4.81.69: this is the one fresh guard for a persisted/legacy
+            # provider retry. The current target visibly has CAPTCHA, so arm a
+            # generation now but preserve the existing provider cooldown.
+            detail = str(
+                (health or {}).get("ui_challenge_detail", {}).get("text")
+                if isinstance((health or {}).get("ui_challenge_detail"), dict) else ""
+            ).strip()
+            if not detail:
+                detail = str(rt_tab.get("captcha_ui_detail") or "visible verification UI").strip()
+            begin_solver_challenge_generation(
+                rt_tab, pkg, detail or "visible verification UI; legacy retry reconciled"
+            )
+            rt_tab["solver_retry_reason"] = "CAPTCHA_GENERATION"
+            note = f"verification confirmed; solver attempt 1/3 in {format_age(left)} (no reopen)"
+            log_activity(
+                "legacy solver retry reconciled from visible CAPTCHA; generation 1/3 armed",
+                pkg, CYAN,
+            )
+        else:
+            note = f"verification UI; {reason} retry provider in {format_age(left)} (no reopen)"
         rt_tab["note"] = note
         core.save()
         return "Captcha", note, True
@@ -33290,7 +33363,7 @@ _SOLVER_LOCK = threading.RLock()
 
 
 def solver_challenge_attempt_limit(cfg):
-    # V4.81.68: fixed safety contract. Three provider attempts belong to one
+    # V4.81.69 keeps the V4.81.68 fixed safety contract. Three provider attempts belong to one
     # confirmed on-screen challenge generation, then that target is reopened.
     return 3
 
