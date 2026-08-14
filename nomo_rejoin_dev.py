@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
-# V4.81.70 — PHANTOM-TIMESTAMP GUARD (NO 24H STALE CEILING)
-# - Removes the broad 24-hour "max valid stale age" veto from Market/Hatcher recovery. A state with a real
-#   timestamp can now recover even when it is 24h, 105h, or older instead of being left Online/Minimized forever.
-# - The old 277h protection is now based on the state timestamp itself: missing/zero/non-numeric timestamps and
-#   timestamps implausibly in the future are PHANTOM and cannot trigger old-state recovery. The classic ts=0
-#   sample still renders as 999999s/277h for display, but is explicitly ignored for destructive recovery.
-# - Hatcher bubble rescue and old-state hard recovery use the same timestamp-validity rule; the legacy 24h max
-#   config keys remain readable for compatibility but no longer veto a valid stale state.
-# - V4.81.69 solver-generation, legacy retry reconciliation, target-only auth holds, and exact-PID safety are unchanged.
+# V4.81.71 — 270H PHANTOM-AGE BACKSTOP
+# - Keeps V4.81.70's timestamp validation, but restores a conservative upper stale-age backstop at 270 hours.
+#   A real 105h/200h state remains actionable; anything older than 270h is treated as PHANTOM recovery evidence.
+# - This blocks the known one-refresh ~277h bug before it can queue a pointless hard recovery, while preserving
+#   the final fresh-state pre-open cancellation as a second safety layer.
+# - Missing/zero/unreadable timestamps and implausible future timestamps remain PHANTOM exactly as in V4.81.70.
+# - V4.81.69/.70 solver-generation, legacy retry reconciliation, target-only auth holds, and exact-PID safety are unchanged.
 #
 # V4.81.69 — DEAD-RETRY SELF-HEAL + LEGACY SOLVER RECONCILE
 # - A package that dies while a solver/provider retry timer is pending no longer waits for that timer. NOMO clears only
@@ -1298,7 +1296,8 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.70"
+__version__ = "V4.81.71"
+MAX_VALID_STALE_STATE_SECONDS = 270 * 60 * 60  # V4.81.71: below the historical ~277h phantom sample
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -2171,9 +2170,9 @@ DEFAULT_CONFIG = {
     # account actually logged in. Makes the manual "get username" step optional.
     "auto_resolve_usernames_enabled": True,
     "username_resolve_interval_seconds": 600,
-    # Legacy compatibility key. V4.81.70 no longer treats every state older than
-    # this value as invalid; phantom protection validates the state's `ts` itself.
-    "alive_old_state_max_valid_seconds": 86400,
+    # V4.81.71: conservative upper stale-age backstop. Real stale states remain
+    # actionable up to 270h; older samples are treated as phantom recovery evidence.
+    "alive_old_state_max_valid_seconds": MAX_VALID_STALE_STATE_SECONDS,
 
     "open_all_on_start": True,
     "open_only_closed_on_start": True,
@@ -3318,10 +3317,9 @@ def apply_update_migrations(cfg):
     # FIX V3.78: Align migration clamp to 300 (was 180, inconsistent with V3.77 default).
     if _int_cfg(cfg.get("hatcher_alive_old_state_hard_force_seconds"), 300) > 300:
         set_cfg("hatcher_alive_old_state_hard_force_seconds", 300)
-    # Legacy compatibility only (V4.81.70): keep the historical key sane for
-    # older configs/tools, but recovery no longer uses it as an age veto.
-    if _int_cfg(cfg.get("hatcher_alive_old_state_max_valid_seconds"), 86400) < 86400:
-        set_cfg("hatcher_alive_old_state_max_valid_seconds", 86400)
+    # V4.81.71: migrate the old 24h compatibility value to the 270h backstop.
+    if _int_cfg(cfg.get("hatcher_alive_old_state_max_valid_seconds"), 0) != MAX_VALID_STALE_STATE_SECONDS:
+        set_cfg("hatcher_alive_old_state_max_valid_seconds", MAX_VALID_STALE_STATE_SECONDS)
     # Ensure the 5m old-state hard rule is actually ON (a saved False disables
     # the whole fallback, leaving clones stuck on "alive old state").
     if not bool_from_any(cfg.get("hatcher_alive_old_state_hard_force_enabled", True)):
@@ -3399,10 +3397,9 @@ def apply_update_migrations(cfg):
         set_cfg("soft_hop_wait_fresh_seconds", 240)
     if _int_cfg(cfg.get("post_open_grace_seconds"), 0) <= 180:
         set_cfg("post_open_grace_seconds", 360)
-    # Legacy compatibility only (V4.81.70). The old 24h max-age key is retained
-    # for saved configs, while phantom protection now validates state `ts`.
-    if _int_cfg(cfg.get("alive_old_state_max_valid_seconds"), 0) < 86400:
-        set_cfg("alive_old_state_max_valid_seconds", 86400)
+    # V4.81.71: migrate the old 24h max-age setting to the 270h phantom backstop.
+    if _int_cfg(cfg.get("alive_old_state_max_valid_seconds"), 0) != MAX_VALID_STALE_STATE_SECONDS:
+        set_cfg("alive_old_state_max_valid_seconds", MAX_VALID_STALE_STATE_SECONDS)
     if "jsonbin_force_refresh_on_restock_route" not in cfg:
         set_cfg("jsonbin_force_refresh_on_restock_route", True)
 
@@ -11901,10 +11898,10 @@ def hatcher_alive_old_state_hard_settings(hcfg, cfg):
     try:
         max_valid_seconds = int(hcfg.get(
             "hatcher_alive_old_state_max_valid_seconds",
-            cfg.get("hatcher_alive_old_state_max_valid_seconds", 86400)
-        ) or 86400)
+            cfg.get("hatcher_alive_old_state_max_valid_seconds", MAX_VALID_STALE_STATE_SECONDS)
+        ) or MAX_VALID_STALE_STATE_SECONDS)
     except Exception:
-        max_valid_seconds = 86400
+        max_valid_seconds = MAX_VALID_STALE_STATE_SECONDS
     try:
         cooldown_seconds = int(hcfg.get(
             "hatcher_alive_old_state_hard_force_cooldown_seconds",
@@ -11941,10 +11938,9 @@ def _queue_hatcher_alive_old_state_hard(open_queue, tab, rt_tab, hcfg, cfg, age_
         age_i = 0
     if age_i < age_seconds:
         return False, "alive old state", False
-    # V4.81.70: do not reject a real stale state merely because it is older
-    # than the legacy 24h max-valid-age setting. State-bearing callers validate
-    # ts directly before entering this queue; no-state duration is also allowed
-    # to exceed 24h and still self-heal.
+    # V4.81.71: state-bearing callers reject phantom/>270h timestamps before
+    # entering this queue. No-state duration is not a timestamp sample and may
+    # still exceed 270h so a genuinely dead/stuck package can self-heal.
 
     t = now()
     last = int(rt_tab.get("hatcher_alive_old_state_hard_last", 0) or 0)
@@ -12455,10 +12451,10 @@ def state_age_seconds(state):
 def state_phantom_timestamp_reason(state, future_slack_seconds=300):
     """Return a reason when a state timestamp is unsafe as recovery evidence.
 
-    V4.81.70 deliberately validates the timestamp instead of imposing a broad
-    24-hour age ceiling. The historical 277h bug is produced by ts=0/missing,
-    which read_state() renders as age=999999. A genuinely old state with a real
-    Unix timestamp remains actionable.
+    V4.81.71 keeps V4.81.70's explicit timestamp checks and adds a 270-hour
+    upper-age backstop. That is intentionally below the historical ~277h
+    one-refresh phantom while still allowing genuinely stale 24h/105h/200h
+    states to recover normally.
     """
     if not isinstance(state, dict):
         return "state missing"
@@ -12474,6 +12470,10 @@ def state_phantom_timestamp_reason(state, future_slack_seconds=300):
         current = 0
     if current > 0 and ts > current + max(30, int(future_slack_seconds or 300)):
         return f"timestamp in future ({ts - current}s)"
+    if current > 0:
+        age = max(0, current - ts)
+        if age > MAX_VALID_STALE_STATE_SECONDS:
+            return f"timestamp older than 270h ({format_age(age)})"
     return ""
 
 
@@ -13207,7 +13207,7 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
 
     trigger = int(cfg.get("alive_old_state_hard_seconds", 180) or 180)
     # Legacy max-valid-age config is intentionally not used as a recovery veto
-    # in V4.81.70. Validate the state timestamp itself instead.
+    # in V4.81.71. Validate the timestamp and 270h backstop instead.
     stale_limit = int(cfg.get("state_stale_seconds", 180) or 180)
     grace = int(cfg.get("post_open_grace_seconds", 360) or 360)
 
@@ -13332,9 +13332,9 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
     if state:
         age = state_age_seconds(state)
 
-        # V4.81.70: PHANTOM TIMESTAMP GUARD. Do not classify a *real* 24h+
-        # state as invalid. The classic 277h/999999s bug comes from ts=0/missing,
-        # so reject that timestamp directly. Also reject implausible future ts.
+        # V4.81.71: PHANTOM TIMESTAMP/AGE GUARD. Real stale states remain actionable
+        # through 270h; >270h, missing/zero timestamps, and implausible future ts
+        # are ignored as recovery evidence before anything destructive is queued.
         phantom_reason = state_phantom_timestamp_reason(state)
         if phantom_reason:
             return ("Ingame" if alive else "Stale"), \
