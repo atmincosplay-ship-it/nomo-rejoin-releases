@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.70 — PHANTOM-TIMESTAMP GUARD (NO 24H STALE CEILING)
+# - Removes the broad 24-hour "max valid stale age" veto from Market/Hatcher recovery. A state with a real
+#   timestamp can now recover even when it is 24h, 105h, or older instead of being left Online/Minimized forever.
+# - The old 277h protection is now based on the state timestamp itself: missing/zero/non-numeric timestamps and
+#   timestamps implausibly in the future are PHANTOM and cannot trigger old-state recovery. The classic ts=0
+#   sample still renders as 999999s/277h for display, but is explicitly ignored for destructive recovery.
+# - Hatcher bubble rescue and old-state hard recovery use the same timestamp-validity rule; the legacy 24h max
+#   config keys remain readable for compatibility but no longer veto a valid stale state.
+# - V4.81.69 solver-generation, legacy retry reconciliation, target-only auth holds, and exact-PID safety are unchanged.
+#
 # V4.81.69 — DEAD-RETRY SELF-HEAL + LEGACY SOLVER RECONCILE
 # - A package that dies while a solver/provider retry timer is pending no longer waits for that timer. NOMO clears only
 #   that target's transient solver generation/retry state and immediately falls through to normal exact-PID crash recovery.
@@ -1288,7 +1298,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.69"
+__version__ = "V4.81.70"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -2161,12 +2171,8 @@ DEFAULT_CONFIG = {
     # account actually logged in. Makes the manual "get username" step optional.
     "auto_resolve_usernames_enabled": True,
     "username_resolve_interval_seconds": 600,
-    # V3.79: MARKET phantom-age ceiling (mirror of the hatcher's
-    # hatcher_alive_old_state_max_valid_seconds). A missing `ts` in the state
-    # file makes age compute to an impossible value (e.g. 277h). Any age above
-    # this is treated as invalid and IGNORED — never drives a kill+open. This is
-    # the guard the market path was missing while the hatcher path had it, which
-    # is why one instance ran 11h and another rejoin-looped on the same 277h age.
+    # Legacy compatibility key. V4.81.70 no longer treats every state older than
+    # this value as invalid; phantom protection validates the state's `ts` itself.
     "alive_old_state_max_valid_seconds": 86400,
 
     "open_all_on_start": True,
@@ -3312,7 +3318,8 @@ def apply_update_migrations(cfg):
     # FIX V3.78: Align migration clamp to 300 (was 180, inconsistent with V3.77 default).
     if _int_cfg(cfg.get("hatcher_alive_old_state_hard_force_seconds"), 300) > 300:
         set_cfg("hatcher_alive_old_state_hard_force_seconds", 300)
-    # True 24h ceiling for ignoring copied/ancient state.
+    # Legacy compatibility only (V4.81.70): keep the historical key sane for
+    # older configs/tools, but recovery no longer uses it as an age veto.
     if _int_cfg(cfg.get("hatcher_alive_old_state_max_valid_seconds"), 86400) < 86400:
         set_cfg("hatcher_alive_old_state_max_valid_seconds", 86400)
     # Ensure the 5m old-state hard rule is actually ON (a saved False disables
@@ -3392,8 +3399,8 @@ def apply_update_migrations(cfg):
         set_cfg("soft_hop_wait_fresh_seconds", 240)
     if _int_cfg(cfg.get("post_open_grace_seconds"), 0) <= 180:
         set_cfg("post_open_grace_seconds", 360)
-    # V3.79: MARKET phantom-age ceiling must exist and be sane (>= 24h). Without
-    # it, a 277h missing-ts age passes the 180s floor and force-loops the pool.
+    # Legacy compatibility only (V4.81.70). The old 24h max-age key is retained
+    # for saved configs, while phantom protection now validates state `ts`.
     if _int_cfg(cfg.get("alive_old_state_max_valid_seconds"), 0) < 86400:
         set_cfg("alive_old_state_max_valid_seconds", 86400)
     if "jsonbin_force_refresh_on_restock_route" not in cfg:
@@ -11934,8 +11941,10 @@ def _queue_hatcher_alive_old_state_hard(open_queue, tab, rt_tab, hcfg, cfg, age_
         age_i = 0
     if age_i < age_seconds:
         return False, "alive old state", False
-    if age_i > max_valid_seconds:
-        return False, f"invalid old state ignored {age_i}s", False
+    # V4.81.70: do not reject a real stale state merely because it is older
+    # than the legacy 24h max-valid-age setting. State-bearing callers validate
+    # ts directly before entering this queue; no-state duration is also allowed
+    # to exceed 24h and still self-heal.
 
     t = now()
     last = int(rt_tab.get("hatcher_alive_old_state_hard_last", 0) or 0)
@@ -12441,6 +12450,35 @@ def state_age_seconds(state):
         return int((state or {}).get("age", 999999) or 999999)
     except Exception:
         return 999999
+
+
+def state_phantom_timestamp_reason(state, future_slack_seconds=300):
+    """Return a reason when a state timestamp is unsafe as recovery evidence.
+
+    V4.81.70 deliberately validates the timestamp instead of imposing a broad
+    24-hour age ceiling. The historical 277h bug is produced by ts=0/missing,
+    which read_state() renders as age=999999. A genuinely old state with a real
+    Unix timestamp remains actionable.
+    """
+    if not isinstance(state, dict):
+        return "state missing"
+    try:
+        ts = int(state.get("ts", 0) or 0)
+    except Exception:
+        return "timestamp unreadable"
+    if ts <= 0:
+        return "timestamp missing/zero"
+    try:
+        current = int(now())
+    except Exception:
+        current = 0
+    if current > 0 and ts > current + max(30, int(future_slack_seconds or 300)):
+        return f"timestamp in future ({ts - current}s)"
+    return ""
+
+
+def state_has_phantom_timestamp(state):
+    return bool(state_phantom_timestamp_reason(state))
 
 
 def state_is_fresh(state, cfg, seconds=None):
@@ -13168,7 +13206,8 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
             return health.get("status", ""), "SAFEMODE-off " + str(health.get("note", "")), False
 
     trigger = int(cfg.get("alive_old_state_hard_seconds", 180) or 180)
-    max_valid = int(cfg.get("alive_old_state_max_valid_seconds", 86400) or 86400)
+    # Legacy max-valid-age config is intentionally not used as a recovery veto
+    # in V4.81.70. Validate the state timestamp itself instead.
     stale_limit = int(cfg.get("state_stale_seconds", 180) or 180)
     grace = int(cfg.get("post_open_grace_seconds", 360) or 360)
 
@@ -13293,15 +13332,13 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
     if state:
         age = state_age_seconds(state)
 
-        # V3.79: PHANTOM AGE GUARD (mirror of the hatcher path).
-        # A missing `ts` field makes age compute to an impossible value like 277h.
-        # Never drive a kill+open off that — ignore it and trust the live package
-        # check instead. Checked BEFORE grace/trigger so a garbage age can't force
-        # a rejoin under any branch. This is the exact guard the market path was
-        # missing while the hatcher had it.
-        if max_valid > 0 and age > max_valid:
+        # V4.81.70: PHANTOM TIMESTAMP GUARD. Do not classify a *real* 24h+
+        # state as invalid. The classic 277h/999999s bug comes from ts=0/missing,
+        # so reject that timestamp directly. Also reject implausible future ts.
+        phantom_reason = state_phantom_timestamp_reason(state)
+        if phantom_reason:
             return ("Ingame" if alive else "Stale"), \
-                   f"invalid old state ignored {format_age(age)}", False
+                   f"phantom state ignored: {phantom_reason} ({format_age(age)})", False
 
         # fresh -> healthy, skip
         if age <= stale_limit and state_is_clean(state):
@@ -21331,8 +21368,9 @@ def start_hatcher_reporter(main_cfg=None):
                 old_open_age = (now() - last_open_for_old) if last_open_for_old > 0 else 999999
                 in_old_open_grace = old_open_age < old_after_open_grace
 
-                if alive and old_enabled and age > old_max:
-                    note = f"invalid old state ignored {age}s"
+                phantom_state_reason = state_phantom_timestamp_reason(state) if state else ""
+                if alive and old_enabled and phantom_state_reason:
+                    note = f"phantom state ignored: {phantom_state_reason} ({format_age(age)})"
                     status = "Online"
                 elif alive and old_enabled and age >= old_sec and in_old_open_grace:
                     left = max(1, old_after_open_grace - old_open_age)
@@ -22248,7 +22286,8 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                     not problem_code
                     and alive
                     and old_enabled
-                    and old_sec <= recovery_age <= old_max
+                    and recovery_age >= old_sec
+                    and not state_has_phantom_timestamp(state)
                     and not challenge_active
                 ):
                     bubble_only, bubble_note = hatcher_bubble_only_recovery_candidate(
@@ -22274,9 +22313,13 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                         "startup loading grace "
                         + format_age(max(1, startup_observe_until - now()))
                     )
-                elif alive and old_enabled and recovery_age > old_max:
+                elif alive and old_enabled and state_has_phantom_timestamp(state):
                     status = "Online"
-                    note = f"invalid old state ignored {age}s"
+                    note = (
+                        "phantom state ignored: "
+                        + state_phantom_timestamp_reason(state)
+                        + f" ({format_age(recovery_age)})"
+                    )
                 elif alive and old_enabled and recovery_age >= old_sec and in_old_open_grace:
                     status = "Loading"
                     note = f"old-state open grace {max(1, old_after_open_grace - old_open_age)}s"
@@ -22324,7 +22367,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                             # FIX V3.78: use `or 180` instead of `or 120` to avoid 0->120 falsy fallback
                             # that made 277h state appear fresh
                             if (recovery_age >= int(cfg.get("hatcher_alive_old_state_hard_force_seconds", 180) or 180)
-                                    and recovery_age <= int(cfg.get("hatcher_alive_old_state_max_valid_seconds", 86400) or 86400)
+                                    and not state_has_phantom_timestamp(state)
                                     and cfg.get("rejoin_if_crash", True)):
                                 added, hard_note, _ = core.queue_hatcher_old_state_hard(
                                     tab,
@@ -22531,7 +22574,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
         hatcher_rejoin_status_screen(rows, hcfg, cfg, session_start, loops, last_msg)
         _old_on, _old_sec, _old_max, _old_cd = hatcher_alive_old_state_hard_settings(hcfg, cfg)
         print(col(
-            f"  Hatcher: old state {format_age(_old_sec)}..{format_age(_old_max)} => exact-PID restart affected tab only; above max ignored.",
+            f"  Hatcher: old state >= {format_age(_old_sec)} => exact-PID restart affected tab only; broken/missing ts ignored.",
             GREEN,
         ))
 
