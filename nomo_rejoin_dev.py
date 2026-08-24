@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.74 — EXTERNAL FACE-LOCK RELEASE + FLAGGED-COOKIE SAFE ROUTE
+# - A package held for Face Lock now performs a bounded background Roblox-side unlock probe (default every 5 minutes).
+#   If its package cookie still authenticates, Roblox moderation is clear, and /home is usable, NOMO keeps the hold but
+#   queues ONE target-only route/open so a Face Lock solved on another device can refresh the Redfinger session itself.
+# - The external-unlock route is non-destructive: no PID stop, no hard fallback, no sibling action. The Face Lock hold
+#   clears only after a fresh clean in-game heartbeat. Confirmed moderation/Account Locked still blocks the route.
+# - Solver/provider wording such as "Your Cookie is flagged" is explicitly non-authoritative. If Roblox independently
+#   says the cookie/session is clean, NOMO uses one safe route refresh instead of demanding a new cookie or reaching the
+#   three-failure PID safety reopen. A cookie is called invalid only when Roblox itself confirms invalid/expired (401).
+# - V4.81.73 Exotic master paths/merge behavior and all V4.81.71/.69 target-local recovery safety remain unchanged.
+#
 # V4.81.73 — EXOTIC MASTER ROOT-PATH SUPPORT
 # - Option 17 now prefers /storage/emulated/0/exotic_master.zip, matching the normal Redfinger upload/export location.
 # - /storage/emulated/0/Download/exotic_master.zip remains a fallback; Exotic merge behavior is otherwise unchanged.
@@ -1310,7 +1321,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.73"
+__version__ = "V4.81.74"
 MAX_VALID_STALE_STATE_SECONDS = 270 * 60 * 60  # V4.81.71: below the historical ~277h phantom sample
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -2075,6 +2086,12 @@ DEFAULT_CONFIG = {
     "face_lock_visual_min_blue_ratio": 0.035,
     "face_lock_visual_min_left_gray_ratio": 0.10,
     "face_lock_auto_hold": True,
+    # V4.81.74: when Face Lock is solved on another device, periodically ask
+    # Roblox whether this package's existing session is now clean. A positive
+    # result earns only a route/task-reuse refresh; it never earns a PID stop.
+    "face_lock_external_unlock_probe_enabled": True,
+    "face_lock_external_unlock_probe_seconds": 300,
+    "face_lock_external_unlock_route_cooldown_seconds": 600,
 
     # Shared values used by the built-in layout manager and visual detector.
     "layout_gap": 8,
@@ -3643,6 +3660,12 @@ def apply_update_migrations(cfg):
         set_cfg("face_lock_visual_confirmations_required", 2)
     if "face_lock_auto_hold" not in cfg:
         set_cfg("face_lock_auto_hold", True)
+    if "face_lock_external_unlock_probe_enabled" not in cfg:
+        set_cfg("face_lock_external_unlock_probe_enabled", True)
+    if _int_cfg(cfg.get("face_lock_external_unlock_probe_seconds"), 0) < 120:
+        set_cfg("face_lock_external_unlock_probe_seconds", 300)
+    if _int_cfg(cfg.get("face_lock_external_unlock_route_cooldown_seconds"), 0) < 300:
+        set_cfg("face_lock_external_unlock_route_cooldown_seconds", 600)
     if "join_error_529_visual_fallback_enabled" not in cfg:
         set_cfg("join_error_529_visual_fallback_enabled", True)
     if _int_cfg(cfg.get("join_error_visual_scan_seconds"), 0) < 5:
@@ -11479,7 +11502,9 @@ class RejoinCore:
         return True
 
     def poll_solver_jobs(self):
-        return poll_solver_jobs(self.cfg, self.rt, self.open_queue, self)
+        solver_changed = poll_solver_jobs(self.cfg, self.rt, self.open_queue, self)
+        unlock_changed = poll_face_unlock_probe_jobs(self.cfg, self.rt, self.open_queue, self)
+        return bool(solver_changed or unlock_changed)
 
     def has(self, package):
         return _queue_has(self.open_queue, package)
@@ -12751,13 +12776,20 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
                     pkg,
                     RED,
                 )
+        maybe_start_face_unlock_probe(
+            tab, cfg, rt_tab, reason=detail
+        )
+        face_note = str(
+            rt_tab.get("face_unlock_probe_note")
+            or "account locked; manual verification"
+        )
         return {
             "pkg": pkg, "user": tab.get("user_name", pkg), "alive": bool(raw_alive),
             "state": state, "state_err": err, "fresh": False, "clean_fresh": False,
             "pets": int(state.get("pet_count", 0) or 0) if state else "-",
             "eggs": int(state.get("egg_total", 0) or 0) if state else "-",
             "age": state_age_seconds(state) if state else "-",
-            "status": "Face Lock", "note": "account locked; manual verification",
+            "status": "Face Lock", "note": face_note,
             "bad": "face_lock", "visible_window": True,
             "face_lock_detail": face_lock,
         }
@@ -12859,12 +12891,22 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
 
     if manual_login_blocked(rt_tab, cfg, pkg) and not state_login_challenge_detail(state):
         face_locked = str(rt_tab.get("manual_login_reason", "") or "") == "face_lock" or bool(rt_tab.get("face_lock_detected"))
+        if face_locked:
+            maybe_start_face_unlock_probe(
+                tab, cfg, rt_tab,
+                reason=str(rt_tab.get("face_lock_detail") or "persisted face lock hold"),
+            )
+        manual_note = (
+            str(rt_tab.get("face_unlock_probe_note") or "account locked; use Recovery Tools")
+            if face_locked
+            else (rt_tab.get("note") or "needs manual login")
+        )
         return {
             "pkg": pkg, "user": tab.get("user_name", pkg), "alive": bool(raw_alive),
             "state": state, "state_err": err, "fresh": fresh, "clean_fresh": clean_fresh,
             "pets": pets, "eggs": eggs, "age": age,
             "status": "Face Lock" if face_locked else "Manual",
-            "note": ("account locked; use Recovery Tools" if face_locked else (rt_tab.get("note") or "needs manual login")),
+            "note": manual_note,
             "bad": "face_lock" if face_locked else "manual",
             "visible_window": visible_window,
         }
@@ -13736,7 +13778,9 @@ def roblox_cookie_not_approved_api_detection(cookie, expected_user_id=None, cfg=
 
 
 
-def direct_moderation_guard_before_open(tab, rt_tab, cfg, reason="queued open"):
+def direct_moderation_guard_before_open(
+    tab, rt_tab, cfg, reason="queued open", allow_existing_auth_recheck=False
+):
     """Run the direct Roblox Not Approved moderation check before ANY open intent.
 
     This guard is deliberately independent from the CAPTCHA solver and from the
@@ -13752,8 +13796,25 @@ def direct_moderation_guard_before_open(tab, rt_tab, cfg, reason="queued open"):
     if not pkg:
         return False, "direct moderation guard no package"
 
-    if manual_login_blocked(rt_tab, cfg, pkg) and _runtime_auth_hint(rt_tab):
-        return True, str(rt_tab.get("note") or "existing auth/moderation hold")
+    existing_auth_hold = bool(
+        manual_login_blocked(rt_tab, cfg, pkg) and _runtime_auth_hint(rt_tab)
+    )
+    if existing_auth_hold:
+        manual_reason = str(rt_tab.get("manual_login_reason", "") or "").lower()
+        never_probe_terms = (
+            "account_banned", "banned", "terminated", "api user moderated",
+            "parental", "daily limit",
+        )
+        may_recheck = bool(
+            allow_existing_auth_recheck
+            and not any(term in manual_reason for term in never_probe_terms)
+        )
+        if not may_recheck:
+            return True, str(rt_tab.get("note") or "existing auth/moderation hold")
+        # V4.81.74: this is a non-destructive route that was already earned by
+        # an independent Roblox clean-session probe. Re-check direct moderation
+        # freshly instead of letting the persisted Face Lock/CAPTCHA flag veto
+        # the route before Roblox can refresh the old Redfinger screen.
 
     cookie, cookie_source, cookie_note = solver_cookie_for_package(pkg, cfg)
     cookie = str(cookie or "").strip()
@@ -16114,7 +16175,14 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
     # Android route/open itself. Strong direct Not Approved proof must stop the
     # generation before ANY rejoin intent.
     moderation_blocked, moderation_note = direct_moderation_guard_before_open(
-        tab, rt_tab, cfg, f"before open: {reason}"
+        tab,
+        rt_tab,
+        cfg,
+        f"before open: {reason}",
+        allow_existing_auth_recheck=bool(
+            item.get("external_face_unlock_route")
+            or item.get("provider_flagged_safe_route")
+        ),
     )
     if moderation_blocked:
         removed = core.cancel(pkg)
@@ -27931,7 +27999,7 @@ end)
 
 
 # ============================================================
-# EXOTIC MASTER CONFIG MERGER (V4.81.73)
+# EXOTIC MASTER CONFIG MERGER (V4.81.74)
 # ============================================================
 
 _EXOTIC_MASTER_BRACED_UUID_RE = re.compile(
@@ -34041,6 +34109,246 @@ def auto_fetch_private_servers(
 
 
 # ============================================================
+# V4.81.74 BACKGROUND EXTERNAL FACE-LOCK RELEASE PROBE
+# ============================================================
+
+_FACE_UNLOCK_JOBS = {}
+_FACE_UNLOCK_LOCK = threading.RLock()
+
+
+def _face_unlock_reason_active(rt_tab):
+    if not isinstance(rt_tab, dict):
+        return False
+    reason = str(rt_tab.get("manual_login_reason", "") or "").strip().lower()
+    return bool(
+        reason == "face_lock"
+        or bool(rt_tab.get("face_lock_detected"))
+    )
+
+
+def _face_unlock_probe_worker(package, cfg_snapshot):
+    result = {
+        "state": "unknown",
+        "detail": "probe not run",
+        "cookie_source": "",
+        "cookie_note": "",
+    }
+    try:
+        cookie, source, note = solver_cookie_for_package(package, cfg_snapshot)
+        cookie = str(cookie or "").strip()
+        result["cookie_source"] = str(source or "")
+        result["cookie_note"] = cut(str(note or ""), 120)
+        if not cookie:
+            result["state"] = "unknown"
+            result["detail"] = "no package cookie"
+        else:
+            blocked, detail = roblox_cookie_detection(cookie, cfg_snapshot)
+            result["detail"] = cut(str(detail or ""), 220)
+            if blocked is False:
+                # roblox_cookie_detection(False) means: authenticated endpoint
+                # succeeded, no strong moderation proof, and /home stayed usable.
+                result["state"] = "clear"
+            elif blocked is True:
+                result["state"] = "challenge"
+            else:
+                low = str(detail or "").lower()
+                if "invalid" in low or "expired" in low:
+                    result["state"] = "invalid"
+                elif any(x in low for x in (
+                    "moderated", "account locked", "face lock",
+                    "/not-approved", "banned", "terminated",
+                )):
+                    result["state"] = "restricted"
+                else:
+                    result["state"] = "unknown"
+    except Exception as exc:
+        result["state"] = "unknown"
+        result["detail"] = "unlock probe error: " + cut(str(exc), 120)
+
+    with _FACE_UNLOCK_LOCK:
+        job = _FACE_UNLOCK_JOBS.get(str(package or ""))
+        if job:
+            job["result"] = result
+            job["done"] = True
+            job["finished_at"] = now()
+
+
+def maybe_start_face_unlock_probe(tab, cfg, rt_tab, reason="face lock"):
+    """Start a bounded non-blocking Roblox-side release check for one held clone."""
+    if not cfg.get("face_lock_external_unlock_probe_enabled", True):
+        return False, "external unlock probe disabled"
+    if not _face_unlock_reason_active(rt_tab):
+        return False, "not a face-lock hold"
+
+    pkg = str((tab or {}).get("package", "") or "").strip()
+    if not pkg:
+        return False, "no package"
+
+    interval = max(
+        120,
+        int(cfg.get("face_lock_external_unlock_probe_seconds", 300) or 300),
+    )
+    last = int(rt_tab.get("face_unlock_probe_last_started_at", 0) or 0)
+
+    with _FACE_UNLOCK_LOCK:
+        existing = _FACE_UNLOCK_JOBS.get(pkg)
+        if existing and not existing.get("done"):
+            rt_tab["face_unlock_probe_note"] = "account locked; checking external unlock"
+            return False, "unlock probe already running"
+        if existing and existing.get("done"):
+            # Let the main-thread poller consume the completed result first.
+            return False, "unlock probe result pending"
+        if last > 0 and now() - last < interval:
+            left = max(1, interval - (now() - last))
+            return False, f"unlock probe cooldown {format_age(left)}"
+
+        job = {
+            "package": pkg,
+            "tab": dict(tab or {}),
+            "target": str(rt_tab.get("target") or ("hatcher" if (tab or {}).get("server_link") else "market")),
+            "reason": cut(str(reason or "face lock"), 180),
+            "started_at": now(),
+            "done": False,
+            "result": None,
+        }
+        _FACE_UNLOCK_JOBS[pkg] = job
+
+    rt_tab["face_unlock_probe_last_started_at"] = int(job["started_at"])
+    rt_tab["face_unlock_probe_note"] = "account locked; checking external unlock"
+
+    thread = threading.Thread(
+        target=_face_unlock_probe_worker,
+        args=(pkg, dict(cfg or {})),
+        name=f"nomo-face-unlock-{pkg}",
+        daemon=True,
+    )
+    thread.start()
+    return True, "external unlock probe started"
+
+
+def _queue_verified_auth_safe_route(
+    core, tab, target, rt_tab, reason, metadata_key
+):
+    """Queue one route-only refresh after independent Roblox clean-session proof."""
+    pkg = str((tab or {}).get("package", "") or "").strip()
+    if not pkg:
+        return False, "missing package"
+
+    meta = {
+        str(metadata_key): True,
+        "verified_auth_route_probe": True,
+        "no_hard_fallback": True,
+        # The independent probe already did the generic API/web check. Skip the
+        # older precheck because it intentionally preserves persisted auth hints.
+        # The moderation-first gate is NOT skipped and runs freshly at execution.
+        "bypass_api_precheck": True,
+        "solver_preflight_done": True,
+        "skip_solver_once": True,
+        # Do not immediately hit the same provider again during this refresh.
+        # Normal monitoring can detect a genuinely new/current challenge later.
+        "skip_solver_probe": True,
+    }
+    return core.queue_route_retry(
+        tab,
+        target,
+        reason,
+        metadata=meta,
+        bypass_manual=True,
+    )
+
+
+def poll_face_unlock_probe_jobs(cfg, rt, open_queue, core=None):
+    if core is None:
+        core = RejoinCore(open_queue, cfg, rt)
+
+    completed = []
+    with _FACE_UNLOCK_LOCK:
+        for pkg, job in list(_FACE_UNLOCK_JOBS.items()):
+            if job.get("done"):
+                completed.append((pkg, dict(job)))
+                del _FACE_UNLOCK_JOBS[pkg]
+
+    if not completed:
+        return False
+
+    changed = False
+    for pkg, job in completed:
+        rt_tab = get_runtime_tab(rt, pkg)
+        result = job.get("result") if isinstance(job.get("result"), dict) else {}
+        state = str(result.get("state") or "unknown")
+        detail = str(result.get("detail") or "")
+
+        rt_tab["face_unlock_probe_last_finished_at"] = now()
+        rt_tab["face_unlock_probe_last_state"] = state
+        rt_tab["face_unlock_probe_last_detail"] = cut(detail, 220)
+
+        # The hold may have healed while the network job was in flight.
+        if not _face_unlock_reason_active(rt_tab):
+            rt_tab["face_unlock_probe_note"] = ""
+            changed = True
+            continue
+
+        if state == "clear":
+            cooldown = max(
+                300,
+                int(cfg.get("face_lock_external_unlock_route_cooldown_seconds", 600) or 600),
+            )
+            last_route = int(rt_tab.get("face_unlock_route_last_at", 0) or 0)
+            if last_route > 0 and now() - last_route < cooldown:
+                left = max(1, cooldown - (now() - last_route))
+                rt_tab["face_unlock_probe_note"] = (
+                    f"Roblox unlock detected; route cooldown {format_age(left)}"
+                )
+                changed = True
+                continue
+
+            tab = dict(job.get("tab") or {"package": pkg})
+            target = str(
+                job.get("target")
+                or rt_tab.get("target")
+                or ("hatcher" if tab.get("server_link") else "market")
+            )
+            added, qnote = _queue_verified_auth_safe_route(
+                core,
+                tab,
+                target,
+                rt_tab,
+                "external Face Lock release detected; safe route refresh",
+                "external_face_unlock_route",
+            )
+            if added:
+                rt_tab["face_unlock_route_last_at"] = now()
+                rt_tab["face_unlock_probe_note"] = "external unlock detected; safe route queued"
+                rt_tab["note"] = rt_tab["face_unlock_probe_note"]
+                log_activity(
+                    "Roblox account now clean after Face Lock; safe target route queued "
+                    "(no PID stop, hold kept until fresh state)",
+                    pkg,
+                    GREEN,
+                )
+            else:
+                rt_tab["face_unlock_probe_note"] = (
+                    "external unlock detected; " + cut(str(qnote or "route pending"), 70)
+                )
+            changed = True
+            continue
+
+        if state == "restricted":
+            rt_tab["face_unlock_probe_note"] = "account still restricted; Face Lock hold kept"
+        elif state == "invalid":
+            rt_tab["face_unlock_probe_note"] = "account unlocked check: Roblox cookie invalid/expired"
+        elif state == "challenge":
+            rt_tab["face_unlock_probe_note"] = "account still requires verification"
+        else:
+            rt_tab["face_unlock_probe_note"] = "external unlock check inconclusive; hold kept"
+        changed = True
+
+    if changed:
+        core.save()
+    return changed
+
+
+# ============================================================
 # V3.82 BACKGROUND CAPTCHA SOLVER JOBS
 # ============================================================
 
@@ -34285,6 +34593,23 @@ def solver_response_http_status(data):
     return 0
 
 
+def solver_response_cookie_flagged(data):
+    """Provider-side cookie-flag wording; never proof that Roblox auth is dead."""
+    text = solver_response_text_blob(data)
+    return bool(
+        "cookie is flagged" in text
+        or "cookie flagged" in text
+        or "flagged cookie" in text
+        or "re-login to your account and get a new cookie" in text
+        or "relogin to your account and get a new cookie" in text
+        or (
+            "verification passed" in text
+            and "roblox returned an error" in text
+            and "cookie" in text
+        )
+    )
+
+
 def solver_response_provider_unavailable(data):
     if not isinstance(data, dict):
         return False
@@ -34327,6 +34652,7 @@ def solver_response_retry_later(data):
     return (
         solver_response_provider_cooldown(data)
         or solver_response_provider_unavailable(data)
+        or solver_response_cookie_flagged(data)
         or "cookie flagged refresh denied" in text
         or "cache flagged refresh denied" in text
         or "flagged refresh" in text
@@ -35011,7 +35337,50 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
             rt_tab["solver_challenge_last_result"] = status_code or "FAILED"
 
             invalid_label = status_code in {"INVALID_COOKIES", "INVALID_COOKIE", "UNAUTHORIZED", "AUTH_FAILED"}
+            provider_cookie_flagged = solver_response_cookie_flagged(response)
             cookie_auth, cookie_auth_note = solver_package_cookie_auth_state(pkg, cfg)
+
+            if provider_cookie_flagged and cookie_auth is True:
+                # The provider's wording is not authority. Ask Roblox's full
+                # auth/moderation/web-route chain. If Roblox says the session is
+                # clean, verification likely succeeded but this Redfinger task
+                # is stale: route it once without any PID stop.
+                probe_cookie, _probe_source, _probe_note = solver_cookie_for_package(pkg, cfg)
+                session_blocked, session_detail = (
+                    roblox_cookie_detection(probe_cookie, cfg)
+                    if probe_cookie else (None, "no package cookie")
+                )
+                if session_blocked is False:
+                    reset_solver_challenge_generation(rt_tab, "provider flagged but Roblox clean")
+                    clear_solver_runtime_block(rt_tab)
+                    added, qnote = _queue_verified_auth_safe_route(
+                        core,
+                        tab,
+                        target,
+                        rt_tab,
+                        "solver verification passed; provider cookie-flagged but Roblox clean",
+                        "provider_flagged_safe_route",
+                    )
+                    rt_tab["note"] = (
+                        "provider cookie-flagged; Roblox clean; safe route queued"
+                        if added
+                        else "provider cookie-flagged; Roblox clean; " + cut(str(qnote), 60)
+                    )
+                    log_activity(
+                        "provider reported cookie flagged after verification, but Roblox "
+                        "auth/moderation/home is clean; safe route refresh only (no PID stop)",
+                        pkg,
+                        GREEN,
+                    )
+                    changed = True
+                    continue
+                log_activity(
+                    "provider reported cookie flagged; Roblox clean-session proof was not "
+                    "available, so cookie is NOT marked invalid: " + cut(str(session_detail), 75),
+                    pkg,
+                    YELLOW,
+                )
+
             if invalid_label and cookie_auth is False:
                 reset_solver_challenge_generation(rt_tab, "cookie invalid")
                 clear_solver_runtime_block(rt_tab)
