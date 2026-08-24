@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.75 — DEAD NOKA BLACK-SHELL START SAFETY
+# - Fixes the Redfinger/App Cloner state where a Noka floating window survives as a black
+#   task shell while Android reports the exact Roblox package PID as DEAD. V4.81.74 could
+#   treat that as a normal Hatcher cold start and queue hard_force; the subsequent launch
+#   can disturb/collapse sibling floating tasks.
+# - Immediately before AUTOMATIC hard recovery, a DEAD Noka target is checked for a
+#   surviving package ActivityRecord or visible package window. If found, the generation
+#   becomes ONE dead-shell task-reuse route (CLEAR_TOP|SINGLE_TOP): no PID stop and no
+#   hard fallback. Truly DEAD + no shell keeps normal cold-start recovery.
+# - UNKNOWN/inconclusive Android shell checks defer with no stop/open. Explicit manual
+#   force actions keep their previous behavior.
+# - V4.81.74 Face Lock/provider-cookie logic and V4.81.73 Exotic master behavior are unchanged.
+#
 # V4.81.74 — EXTERNAL FACE-LOCK RELEASE + FLAGGED-COOKIE SAFE ROUTE
 # - A package held for Face Lock now performs a bounded background Roblox-side unlock probe (default every 5 minutes).
 #   If its package cookie still authenticates, Roblox moderation is clear, and /home is usable, NOMO keeps the hold but
@@ -1321,7 +1334,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.74"
+__version__ = "V4.81.75"
 MAX_VALID_STALE_STATE_SECONDS = 270 * 60 * 60  # V4.81.71: below the historical ~277h phantom sample
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -4437,6 +4450,54 @@ def package_visible_window(pkg, cfg):
     if pkg.lower() in low:
         return True, "visible window"
     return False, "minimized/no visible window"
+
+
+def noka_dead_task_shell_status(pkg, cfg, process_status=None):
+    """Classify DEAD exact package + surviving App Cloner task/window shell.
+
+    Returns:
+      True  -> exact package is DEAD but Android still reports its task/window.
+      False -> confirmed DEAD with no task/window shell evidence.
+      None  -> observation is inconclusive; callers must defer.
+    """
+    pkg = str(pkg or "").strip()
+    if not _is_noka_clone_package(pkg):
+        return False, "not a Noka clone"
+
+    ps = process_status
+    ps_note = ""
+    if ps is None:
+        ps, ps_note = package_alive_status(pkg, cfg, fresh=True)
+
+    if ps == "UNKNOWN":
+        return None, "process UNKNOWN" + (": " + cut(ps_note, 60) if ps_note else "")
+    if ps != "DEAD":
+        return False, f"process {ps}"
+
+    activity_status, activity_note = package_activity_status(pkg, cfg)
+    if activity_status == "ACTIVITY":
+        return True, "DEAD PID + surviving ActivityRecord"
+
+    visible, visible_note = package_visible_window(pkg, cfg)
+    if visible is True:
+        return True, "DEAD PID + surviving package window"
+
+    # Both negative => ordinary cold-dead target.
+    if activity_status == "NO_ACTIVITY" and visible is False:
+        return False, "DEAD PID + no ActivityRecord/window"
+
+    # One query can be missing as long as the other gives a conclusive negative.
+    if activity_status == "NO_ACTIVITY":
+        return False, "DEAD PID + no ActivityRecord"
+    if visible is False:
+        return False, "DEAD PID + no visible package window"
+
+    return None, (
+        "dead-shell check inconclusive: "
+        + cut(activity_note or "activity unknown", 55)
+        + " | "
+        + cut(visible_note or "window unknown", 55)
+    )
 
 
 def _kill_exact_package_pids(pkg, pids, signal_name, cfg):
@@ -10709,10 +10770,12 @@ def _alive_recovery_soft_allowed(reason, pkg_alive, cfg):
 def classify_open_mode(mode):
     """Normalize requested open mode into the core rejoin policy fields."""
     mode_s = str(mode or "hard").lower()
-    intentional_route = mode_s in ["route", "switch", "reuse_task"]
+    dead_task_reuse = mode_s in ["dead_shell_route", "dead-shell-route"]
+    intentional_route = mode_s in ["route", "switch", "reuse_task"] or dead_task_reuse
     return {
         "mode": mode_s,
         "intentional_route": intentional_route,
+        "dead_task_reuse": dead_task_reuse,
         "soft": (mode_s == "soft") or intentional_route,
         "hard_force": mode_s in ["hard_force", "force", "force_stop", "force-stop"],
     }
@@ -10722,6 +10785,7 @@ def resolve_open_policy(cfg, reason, pkg_alive, mode):
     """Resolve the target-open request into one reusable core decision."""
     open_mode = classify_open_mode(mode)
     intentional_route = open_mode["intentional_route"]
+    dead_task_reuse = bool(open_mode.get("dead_task_reuse"))
     soft = open_mode["soft"]
     hard_force = open_mode["hard_force"]
 
@@ -10741,9 +10805,10 @@ def resolve_open_policy(cfg, reason, pkg_alive, mode):
         soft = True
         hard_force = False
 
-    # A route can reuse a task only while the selected package is alive.
-    # If it is genuinely dead, fall back to the ordinary exact-PID hard open.
-    if soft and not pkg_alive:
+    # Normal routes can reuse a task only while the selected package is alive.
+    # V4.81.75 exception: a confirmed surviving Noka task shell may be reused
+    # even when the exact package PID is DEAD. It must never become a hard open.
+    if soft and not pkg_alive and not dead_task_reuse:
         soft = False
         if intentional_route:
             hard_force = True
@@ -10907,7 +10972,7 @@ def _queue_mode_priority(mode):
         return 40
     if value in {"hard", "restart"}:
         return 30
-    if value in {"route", "deep_link", "deeplink"}:
+    if value in {"route", "deep_link", "deeplink", "dead_shell_route", "dead-shell-route"}:
         return 20
     if value in {"soft", "reuse", "task"}:
         return 10
@@ -10933,6 +10998,7 @@ def _merge_queue_duplicate(existing, target, reason, force=False, skip_if_alive=
             "option6_alive_noka_route_only",
             "exotic_alive_noka_route_only",
             "market_alive_noka_route_only",
+            "dead_noka_shell_route_only",
             "peer_auth_safe_route_only",
         ):
             if metadata.get(key):
@@ -10949,6 +11015,7 @@ def _merge_queue_duplicate(existing, target, reason, force=False, skip_if_alive=
         or existing.get("option6_alive_noka_route_only")
         or existing.get("exotic_alive_noka_route_only")
         or existing.get("market_alive_noka_route_only")
+        or existing.get("dead_noka_shell_route_only")
         or existing.get("peer_auth_safe_route_only")
     )
     if route_only_generation and _queue_mode_priority(new_mode) > _queue_mode_priority("route"):
@@ -16158,7 +16225,10 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
     mode = str(item.get("mode", "hard") or "hard").lower()
 
     item_mode = str(item.get("mode", "hard") or "hard").lower()
-    is_hard = item_mode not in ("soft", "route", "switch", "reuse_task")
+    is_hard = item_mode not in (
+        "soft", "route", "switch", "reuse_task",
+        "dead_shell_route", "dead-shell-route",
+    )
 
     # V4.81.67 migration: peer-auth safe routes were a cross-package workaround.
     # They are obsolete now. Drop a persisted generation and let the next watchdog
@@ -16268,6 +16338,53 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
             )
             core.save()
             return True
+
+    # V4.81.75: a DEAD exact package can still have a surviving black
+    # App Cloner task/window. A cold hard-start intent in that state can disturb
+    # sibling floating tasks. Convert only automatic Noka recoveries to one
+    # task-reuse route; explicit manual force actions remain untouched.
+    if (
+        is_hard
+        and process_status == "DEAD"
+        and _is_noka_clone_package(pkg)
+        and not item.get("manual_option6_force_override")
+        and "manual force" not in str(reason or "").lower()
+        and "force restart" not in str(reason or "").lower()
+    ):
+        shell_state, shell_note = noka_dead_task_shell_status(
+            pkg, cfg, process_status=process_status
+        )
+        if shell_state is None:
+            core.requeue_front(item)
+            rt_tab["note"] = "dead-shell safety check inconclusive; open deferred"
+            log_activity(
+                "DEAD Noka shell check inconclusive; hard start deferred "
+                "(no PID stop/open): " + cut(shell_note, 80),
+                pkg,
+                YELLOW,
+            )
+            core.save()
+            return True
+
+        if shell_state is True:
+            peer_snapshot, peer_errors = _sibling_pid_snapshot(pkg, cfg)
+            item["mode"] = "dead_shell_route"
+            item["no_hard_fallback"] = True
+            item["dead_noka_shell_route_only"] = True
+            item["dead_shell_route_peer_snapshot"] = peer_snapshot
+            item["dead_shell_route_peer_snapshot_errors"] = peer_errors
+            item["dead_shell_route_note"] = str(shell_note or "")
+            mode = "dead_shell_route"
+            item_mode = mode
+            is_hard = False
+            rt_tab["note"] = "black/dead task shell; route-only recovery"
+            log_activity(
+                "DEAD Noka task shell detected; hard_force downgraded to one "
+                "task-reuse route (no PID stop / no hard fallback): "
+                + cut(shell_note, 75),
+                pkg,
+                CYAN,
+            )
 
     # V4.81.67: no sibling/peer auth veto here. Auth/moderation safety is checked
     # only against THIS target below, immediately before any destructive PID stop.
@@ -16680,6 +16797,27 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
         mode=mode,
     )
     opened_at = int(rt_tab.get("last_open", now()))
+
+    if item.get("dead_noka_shell_route_only") and ok:
+        peer_snapshot = item.get("dead_shell_route_peer_snapshot")
+        if isinstance(peer_snapshot, dict) and peer_snapshot:
+            time.sleep(1.0)
+            peer_ok, peer_note = _verify_sibling_pid_snapshot(
+                peer_snapshot, cfg, pkg
+            )
+            if not peer_ok:
+                rt_tab["dead_shell_route_sibling_loss"] = True
+                rt_tab["dead_shell_route_sibling_loss_note"] = str(peer_note or "")
+                rt_tab["dead_shell_route_sibling_loss_at"] = now()
+                rt_tab["note"] = "shell route peer loss detected; generation stopped"
+                log_activity(
+                    "DEAD-SHELL ROUTE SIBLING LOSS; no further auto action "
+                    "this generation: " + cut(peer_note, 100),
+                    pkg,
+                    RED,
+                )
+            else:
+                rt_tab["dead_shell_route_sibling_loss"] = False
 
     if item.get("peer_auth_safe_route_only"):
         _mark_peer_auth_safe_route_attempt(
@@ -17195,6 +17333,10 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                     "market_alive_noka_route_only": bool(
                         item.get("market_alive_noka_route_only")
                     ),
+                    "dead_noka_shell_route_only": bool(
+                        item.get("dead_noka_shell_route_only")
+                    ),
+                    "no_hard_fallback": bool(item.get("no_hard_fallback")),
                 }
                 retry_reason = f"join fail {join_fail_count}/{failures_before_hard}; route retry after {fresh_msg}"
                 added, _ = core.queue_route_retry(
@@ -27999,7 +28141,7 @@ end)
 
 
 # ============================================================
-# EXOTIC MASTER CONFIG MERGER (V4.81.74)
+# EXOTIC MASTER CONFIG MERGER (V4.81.75)
 # ============================================================
 
 _EXOTIC_MASTER_BRACED_UUID_RE = re.compile(
