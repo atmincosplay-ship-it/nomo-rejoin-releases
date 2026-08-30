@@ -1,5 +1,23 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.76 — ALIVE HATCHER SERVER-QUEUE / SLOW-LOAD PROTECTION
+# - ALIVE Noka Hatcher joins with no fresh Lua state are no longer treated as
+#   failed merely because the normal ~4 minute fresh-state timeout expires.
+#   This covers legitimate Roblox queue/loading states such as
+#   "Waiting for an available server".
+# - If the target is still ALIVE and no strong Home/disconnect/auth failure is
+#   visible, NOMO starts a persistent loading guard instead of queuing a
+#   homepage/no-state hard retry. The single-flight lock is released so other
+#   clones can continue.
+# - The guarded clone waits up to 15 minutes from its last open. If still
+#   ALIVE/no-fresh, it receives at most ONE route-only refresh with no hard
+#   fallback. If it still does not join, automatic hard recovery stays blocked
+#   for that incident; manual review is required.
+# - Fresh clean Hatcher state clears the guard. A genuinely DEAD package clears
+#   it and returns to normal crash recovery.
+# - Dedicated Home/disconnect/auth recovery still wins when positively detected.
+# - V4.81.75 dead-shell safety and earlier Face Lock/Exotic behavior are unchanged.
+#
 # V4.81.75 — DEAD NOKA BLACK-SHELL START SAFETY
 # - Fixes the Redfinger/App Cloner state where a Noka floating window survives as a black
 #   task shell while Android reports the exact Roblox package PID as DEAD. V4.81.74 could
@@ -1334,7 +1352,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.75"
+__version__ = "V4.81.76"
 MAX_VALID_STALE_STATE_SECONDS = 270 * 60 * 60  # V4.81.71: below the historical ~277h phantom sample
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -2307,6 +2325,9 @@ DEFAULT_CONFIG = {
     "homepage_stuck_fallback_seconds": 240,
     "homepage_stuck_max_hard_retries": 1,
     "join_failures_before_hard_rejoin": 3,
+    "hatcher_alive_loading_guard_enabled": True,
+    "hatcher_alive_loading_hold_seconds": 900,
+    "hatcher_alive_loading_route_retry_limit": 1,
 
     # Queue/runtime self-heal:
     # If Termux is stopped during an open/wait cycle, runtime.json may keep a
@@ -3552,6 +3573,12 @@ def apply_update_migrations(cfg):
         set_cfg("homepage_stuck_max_hard_retries", 1)
     if _int_cfg(cfg.get("join_failures_before_hard_rejoin"), 0) <= 0:
         set_cfg("join_failures_before_hard_rejoin", 3)
+    if "hatcher_alive_loading_guard_enabled" not in cfg:
+        set_cfg("hatcher_alive_loading_guard_enabled", True)
+    if _int_cfg(cfg.get("hatcher_alive_loading_hold_seconds"), 0) < 600:
+        set_cfg("hatcher_alive_loading_hold_seconds", 900)
+    if _int_cfg(cfg.get("hatcher_alive_loading_route_retry_limit"), -1) < 0:
+        set_cfg("hatcher_alive_loading_route_retry_limit", 1)
 
     # V4.23: roll back alive soft-open recovery. On App Cloner builds a second
     # VIEW intent to an already-open task creates duplicate/cascaded windows.
@@ -11988,6 +12015,89 @@ def state_login_challenge_detail(state):
 
 
 
+def hatcher_alive_loading_guard_active(rt_tab):
+    return bool(isinstance(rt_tab, dict) and rt_tab.get("hatcher_alive_loading_guard"))
+
+
+def hatcher_alive_loading_hold_left(rt_tab):
+    if not isinstance(rt_tab, dict):
+        return 0
+    until = int(rt_tab.get("hatcher_alive_loading_hold_until", 0) or 0)
+    return max(0, until - now())
+
+
+def start_hatcher_alive_loading_guard(rt_tab, cfg, opened_at=0, reason="alive loading"):
+    if not isinstance(rt_tab, dict):
+        return 0
+    hold_seconds = max(
+        600,
+        int(cfg.get("hatcher_alive_loading_hold_seconds", 900) or 900),
+    )
+    base = int(opened_at or rt_tab.get("last_open", 0) or now())
+    desired_until = base + hold_seconds
+    if desired_until <= now():
+        desired_until = now() + 120
+    rt_tab["hatcher_alive_loading_guard"] = True
+    rt_tab["hatcher_alive_loading_hold_until"] = max(
+        int(rt_tab.get("hatcher_alive_loading_hold_until", 0) or 0),
+        desired_until,
+    )
+    rt_tab["hatcher_alive_loading_guard_reason"] = str(reason or "alive loading")
+    rt_tab["hatcher_alive_loading_guard_started_at"] = int(
+        rt_tab.get("hatcher_alive_loading_guard_started_at", 0) or now()
+    )
+    return hatcher_alive_loading_hold_left(rt_tab)
+
+
+def clear_hatcher_alive_loading_guard(rt_tab, reason=""):
+    if not isinstance(rt_tab, dict):
+        return
+    rt_tab["hatcher_alive_loading_guard"] = False
+    rt_tab["hatcher_alive_loading_hold_until"] = 0
+    rt_tab["hatcher_alive_loading_guard_reason"] = ""
+    rt_tab["hatcher_alive_loading_guard_started_at"] = 0
+    rt_tab["hatcher_alive_loading_route_retries"] = 0
+    if reason:
+        rt_tab["hatcher_alive_loading_last_clear_reason"] = str(reason)
+        rt_tab["hatcher_alive_loading_last_clear_at"] = now()
+
+
+def hatcher_alive_loading_maybe_route_retry(core, tab, rt_tab, cfg):
+    """After the long safe wait, allow one non-killing route refresh only."""
+    if not hatcher_alive_loading_guard_active(rt_tab):
+        return False, "not guarded"
+    if hatcher_alive_loading_hold_left(rt_tab) > 0:
+        return False, "hold active"
+
+    limit = max(
+        0,
+        int(cfg.get("hatcher_alive_loading_route_retry_limit", 1) or 0),
+    )
+    retries = int(rt_tab.get("hatcher_alive_loading_route_retries", 0) or 0)
+    if retries >= limit:
+        return False, "route-only retries exhausted"
+
+    metadata = {
+        "hatcher_alive_loading_route_only": True,
+        "no_hard_fallback": True,
+        "skip_solver_probe": True,
+        "solver_preflight_done": True,
+        "skip_solver_once": True,
+    }
+    added, note = core.queue_route_retry(
+        tab,
+        "hatcher",
+        f"alive loading safe route retry {retries + 1}/{limit}",
+        metadata=metadata,
+        bypass_manual=True,
+    )
+    if added:
+        rt_tab["hatcher_alive_loading_route_retries"] = retries + 1
+        rt_tab["hatcher_alive_loading_hold_until"] = 0
+        return True, f"alive loading route retry {retries + 1}/{limit} queued"
+    return False, str(note or "route retry already queued")
+
+
 def hatcher_alive_old_state_hard_settings(hcfg, cfg):
     """Return safe Hatcher old-state recovery thresholds.
 
@@ -12032,6 +12142,11 @@ def hatcher_alive_old_state_hard_settings(hcfg, cfg):
 
 
 def _queue_hatcher_alive_old_state_hard(open_queue, tab, rt_tab, hcfg, cfg, age_or_seconds, reason, core=None):
+    if hatcher_alive_loading_guard_active(rt_tab):
+        left = hatcher_alive_loading_hold_left(rt_tab)
+        if left > 0:
+            return False, f"alive loading/server queue hold {format_age(left)}", False
+        return False, "alive loading guard active; automatic hard recovery blocked", False
     """Queue one affected Hatcher package for verified exact-PID restart."""
     enabled, age_seconds, max_valid_seconds, cooldown_seconds = hatcher_alive_old_state_hard_settings(hcfg, cfg)
     pkg = str((tab or {}).get("package", "") or "")
@@ -15999,6 +16114,8 @@ def wait_until_fresh_after_open(
             clear_manual_login_block(rt_tab)
             clear_captcha_ui_runtime(rt_tab)
             clear_disconnect_ui_incident(rt_tab)
+            if pending_target == "hatcher":
+                clear_hatcher_alive_loading_guard(rt_tab, "fresh clean state")
             rt_tab["solver_busy_retry_pending"] = False
             rt_tab["solver_busy_retry_at"] = 0
             rt_tab["solver_retry_reason"] = ""
@@ -17138,6 +17255,51 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                 core.save()
                 return True
             alive_for_retry = retry_process_status == "ALIVE"
+
+            # V4.81.76: ALIVE Hatcher Noka + no fresh state is not enough proof
+            # for a destructive retry. Roblox can legitimately remain in a
+            # server queue/loading screen beyond the normal fresh-state timeout.
+            if (
+                target == "hatcher"
+                and alive_for_retry
+                and _is_noka_clone_package(pkg)
+                and cfg.get("hatcher_alive_loading_guard_enabled", True)
+                and fresh_msg == "fresh timeout"
+                and not item.get("disconnect_recovery")
+                and not item.get("solver_recovery")
+                and not item.get("manual_booster_route")
+                and not item.get("manual_booster_hard_route")
+            ):
+                strong_home = android_roblox_home_ui_detail(
+                    pkg, cfg, force=True, required=True
+                )
+                strong_disconnect = android_disconnect_ui_detail(
+                    pkg, cfg, force=True
+                )
+                strong_auth = android_login_challenge_ui_detail(
+                    pkg, cfg, force=True, auth_hint=_runtime_auth_hint(rt_tab)
+                )
+                if not strong_home and not strong_disconnect and not strong_auth:
+                    left = start_hatcher_alive_loading_guard(
+                        rt_tab,
+                        cfg,
+                        opened_at=opened_at,
+                        reason="alive no fresh state after Hatcher open",
+                    )
+                    rt_tab["note"] = (
+                        "alive loading/server queue protected; "
+                        f"no hard retry for {format_age(left)}"
+                    )
+                    log_activity(
+                        "ALIVE Hatcher join produced no fresh state, but no strong "
+                        "failure UI is visible; protecting slow/server-queue load "
+                        f"for {format_age(left)} (no PID stop / no hard retry)",
+                        pkg,
+                        CYAN,
+                    )
+                    core.save()
+                    return True
+
             join_fail_count = int(rt_tab.get("homepage_join_fail_count", 0) or 0) + 1
             rt_tab["homepage_join_fail_count"] = join_fail_count
             failures_before_hard = max(
@@ -17335,6 +17497,9 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                     ),
                     "dead_noka_shell_route_only": bool(
                         item.get("dead_noka_shell_route_only")
+                    ),
+                    "hatcher_alive_loading_route_only": bool(
+                        item.get("hatcher_alive_loading_route_only")
                     ),
                     "no_hard_fallback": bool(item.get("no_hard_fallback")),
                 }
@@ -22461,6 +22626,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                 if health.get("clean_fresh"):
                     clear_manual_login_block(rt_tab)
                     clear_captcha_ui_runtime(rt_tab)
+                    clear_hatcher_alive_loading_guard(rt_tab, "fresh Hatcher health")
 
                 problem_code, problem_note = hatcher_teleport_problem(
                     tab, state, hcfg, cfg
@@ -22509,6 +22675,13 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                 in_startup_observe = bool(
                     alive and startup_observe_until > now()
                 )
+                alive_loading_guard = bool(
+                    alive and hatcher_alive_loading_guard_active(rt_tab)
+                )
+                alive_loading_left = (
+                    hatcher_alive_loading_hold_left(rt_tab)
+                    if alive_loading_guard else 0
+                )
 
                 bubble_rescue_handled = False
                 if (
@@ -22536,6 +22709,26 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                     pass
                 elif bubble_rescue_handled:
                     pass
+                elif alive_loading_guard and not challenge_active and alive_loading_left > 0:
+                    status = "Loading"
+                    note = (
+                        "alive loading/server queue hold "
+                        + format_age(alive_loading_left)
+                    )
+                elif alive_loading_guard and not challenge_active:
+                    route_added, route_note = hatcher_alive_loading_maybe_route_retry(
+                        core, tab, rt_tab, cfg
+                    )
+                    if route_added or core.has(pkg):
+                        status = "Queued"
+                        note = route_note
+                    else:
+                        status = "Loading"
+                        note = (
+                            "alive loading persists; "
+                            + str(route_note)
+                            + "; automatic hard recovery blocked"
+                        )
                 elif in_startup_observe and recovery_age >= old_sec:
                     status = "Loading"
                     note = (
@@ -22644,9 +22837,34 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                     )
 
                     challenge_active = str(health.get("bad") or "") in {"ui_challenge", "challenge"}
+                    alive_loading_guard = hatcher_alive_loading_guard_active(rt_tab)
+                    alive_loading_left = (
+                        hatcher_alive_loading_hold_left(rt_tab)
+                        if alive_loading_guard else 0
+                    )
                     if challenge_active:
                         status = "Captcha"
                         note = "verification UI detected; solver owns package (no reopen)"
+                    elif alive_loading_guard and alive_loading_left > 0:
+                        status = "Loading"
+                        note = (
+                            "alive loading/server queue hold "
+                            + format_age(alive_loading_left)
+                        )
+                    elif alive_loading_guard:
+                        route_added, route_note = hatcher_alive_loading_maybe_route_retry(
+                            core, tab, rt_tab, cfg
+                        )
+                        if route_added or core.has(pkg):
+                            status = "Queued"
+                            note = route_note
+                        else:
+                            status = "Loading"
+                            note = (
+                                "alive loading persists; "
+                                + str(route_note)
+                                + "; automatic hard recovery blocked"
+                            )
                     elif rt_tab.get("last_open") and in_post_open_grace(rt_tab, cfg):
                         status = "Loading"
                         note = f"waiting for {expected_state_name(tab)}"
@@ -22684,6 +22902,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                 else:
                     rt_tab["hatcher_no_state_since"] = 0
                     rt_tab["hatcher_startup_observe_until"] = 0
+                    clear_hatcher_alive_loading_guard(rt_tab, "package no longer alive")
                     status = "Offline"
 
             # Clear a previous incident as soon as the counter reports a clean
@@ -22750,7 +22969,13 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
             # gets its normal turn; its queued generation performs one solver check before opening.
 
             due_refresh, refresh_left = periodic_hard_refresh_due(rt_tab, cfg)
-            if due_refresh and captcha_action is None and not manual_login_blocked(rt_tab, cfg, pkg) and core.idle_for(pkg):
+            if (
+                due_refresh
+                and captcha_action is None
+                and not manual_login_blocked(rt_tab, cfg, pkg)
+                and not (alive and hatcher_alive_loading_guard_active(rt_tab))
+                and core.idle_for(pkg)
+            ):
                 added, _ = core.queue_hard_retry(tab, "hatcher", "periodic hard refresh")
                 if added:
                     mark_periodic_hard_refresh(rt_tab)
@@ -28141,7 +28366,7 @@ end)
 
 
 # ============================================================
-# EXOTIC MASTER CONFIG MERGER (V4.81.75)
+# EXOTIC MASTER CONFIG MERGER (V4.81.76)
 # ============================================================
 
 _EXOTIC_MASTER_BRACED_UUID_RE = re.compile(
