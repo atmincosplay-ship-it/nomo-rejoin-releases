@@ -1,5 +1,21 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.77 — FIVE-MINUTE HIDDEN-CAPTCHA RESCUE
+# - Removes the provider submission immediately before every normal rejoin. A
+#   healthy rejoin that becomes fresh within five minutes uses no solver credit.
+# - An ALIVE Noka Hatcher join that is still not fresh five minutes after its
+#   actual open receives ONE provider check for that open, even when Lua,
+#   uiautomator, and the saved visual rectangle cannot see the CAPTCHA. This
+#   covers a CAPTCHA hidden behind Roblox's frozen experience-loading card.
+# - NO_CAPTCHA does not restart Roblox; the V4.81.76 slow/server-queue guard
+#   continues normally. CAPTCHA_SUCCESS queues one existing exact-target-PID
+#   solver recovery so the externally solved challenge is reflected inside the
+#   stale Redfinger client. Direct moderation/auth checks and UNKNOWN-process
+#   deferral still run immediately before the target PID can be stopped.
+# - The delayed rescue is one-shot per last_open token. Provider errors keep the
+#   existing >=10 minute provider cooldown and cannot create a five-minute loop.
+#   Sibling packages are never submitted, queued, stopped, or opened by it.
+#
 # V4.81.76 — ALIVE HATCHER SERVER-QUEUE / SLOW-LOAD PROTECTION
 # - ALIVE Noka Hatcher joins with no fresh Lua state are no longer treated as
 #   failed merely because the normal ~4 minute fresh-state timeout expires.
@@ -1352,7 +1368,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.76"
+__version__ = "V4.81.77"
 MAX_VALID_STALE_STATE_SECONDS = 270 * 60 * 60  # V4.81.71: below the historical ~277h phantom sample
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -2137,13 +2153,9 @@ DEFAULT_CONFIG = {
     # contains a path is used exactly as entered. Automatic jobs start only after
     # a real challenge is detected and run outside the dashboard/main loop.
     "solver_enabled": False,
-    # V4.14: one provider submission immediately before every actual NOMO open.
-    # The unique queue generation prevents duplicate submissions during the same
-    # rejoin attempt. Healthy packages skipped at startup never reach this gate.
+    # Retained for compatibility; V4.81.77 disables the pre-open provider gate.
     "solver_once_per_rejoin": True,
-    # Ask the provider before real queued opens, then trust a recent NO_CAPTCHA
-    # answer instead of submitting again on every retry.
-    "solver_preflight_every_open": True,
+    "solver_preflight_every_open": False,
     "solver_no_captcha_trust_seconds": 3600,
     "solver_no_captcha_max_trusted_rejoins": 3,
     # If the provider itself errors/times out, retry the provider later instead
@@ -2160,7 +2172,7 @@ DEFAULT_CONFIG = {
     # repeatedly sending solved/NO_CAPTCHA cookies. Keep at least 10 minutes.
     "solver_retry_cooldown_seconds": 600,
     "solver_min_resubmit_seconds": 600,
-    "solver_probe_after_seconds": 180,
+    "solver_probe_after_seconds": 300,
     # If the package stays stale/no-state, re-run the provider/UI probe after
     # this cooldown. V3.82 accidentally made the startup probe a one-shot that
     # could also be skipped forever when opened_at was 0.
@@ -2174,6 +2186,12 @@ DEFAULT_CONFIG = {
     # package has produced no state for solver_probe_after_seconds, allow the
     # configured provider to make the authoritative check once for that open.
     "solver_provider_probe_on_no_state": True,
+    # V4.81.77: the provider is the fallback detector after five minutes of an
+    # actual Hatcher open. It runs once even if local/API CAPTCHA evidence is
+    # absent because Roblox can cover the challenge with its loading card.
+    "solver_stuck_loading_probe_enabled": True,
+    "solver_stuck_loading_probe_after_seconds": 300,
+    "solver_stuck_loading_unconditional_provider": True,
     # V4.81.6: BlockSolve-style providers can reject a valid cookie when there is
     # simply no CAPTCHA task to solve. Automatic mode therefore sends only after
     # a real API/UI challenge signal. Manual Solver Test is always explicit/direct.
@@ -3509,8 +3527,8 @@ def apply_update_migrations(cfg):
         set_cfg("solver_retry_cooldown_seconds", 600)
     if _int_cfg(cfg.get("solver_min_resubmit_seconds"), 0) < 600:
         set_cfg("solver_min_resubmit_seconds", 600)
-    if _int_cfg(cfg.get("solver_probe_after_seconds"), 0) < 180:
-        set_cfg("solver_probe_after_seconds", 180)
+    if _int_cfg(cfg.get("solver_probe_after_seconds"), 0) < 300:
+        set_cfg("solver_probe_after_seconds", 300)
     if _int_cfg(cfg.get("solver_probe_repeat_seconds"), 0) < 600:
         set_cfg("solver_probe_repeat_seconds", 600)
     set_cfg("solver_probe_once_per_open", True)
@@ -3520,6 +3538,12 @@ def apply_update_migrations(cfg):
     set_cfg("solver_probe_stale_state_enabled", False)
     if "solver_provider_probe_on_no_state" not in cfg:
         set_cfg("solver_provider_probe_on_no_state", True)
+    if "solver_stuck_loading_probe_enabled" not in cfg:
+        set_cfg("solver_stuck_loading_probe_enabled", True)
+    if _int_cfg(cfg.get("solver_stuck_loading_probe_after_seconds"), 0) < 300:
+        set_cfg("solver_stuck_loading_probe_after_seconds", 300)
+    if cfg.get("solver_stuck_loading_unconditional_provider") is not True:
+        set_cfg("solver_stuck_loading_unconditional_provider", True)
     if str(cfg.get("solver_provider", "") or "").strip().lower() not in {"auto", "blocksolve", "winter", "generic"}:
         set_cfg("solver_provider", "auto")
     # V4.81.6: default existing/fresh installs to challenge-only automatic provider
@@ -3530,12 +3554,12 @@ def apply_update_migrations(cfg):
     # exact-target-PID recovery path only for a confirmed solver generation.
     set_cfg("solver_rejoin_on_success", False)
     set_cfg("solver_rejoin_on_no_captcha", False)
-    # V4.80: preflight is useful, but a recent NO_CAPTCHA answer is trusted for
-    # a bounded window to avoid provider spam during normal rejoin retries.
+    # V4.81.77: do not spend a provider request before a normal open. The one
+    # unconditional provider request belongs only to a five-minute stuck load.
     if cfg.get("solver_once_per_rejoin") is not True:
         set_cfg("solver_once_per_rejoin", True)
-    if cfg.get("solver_preflight_every_open") is not True:
-        set_cfg("solver_preflight_every_open", True)
+    if cfg.get("solver_preflight_every_open") is not False:
+        set_cfg("solver_preflight_every_open", False)
     if _int_cfg(cfg.get("solver_no_captcha_trust_seconds"), 0) < 300:
         set_cfg("solver_no_captcha_trust_seconds", 3600)
     if _int_cfg(cfg.get("solver_no_captcha_max_trusted_rejoins"), 0) < 1:
@@ -12098,6 +12122,41 @@ def hatcher_alive_loading_maybe_route_retry(core, tab, rt_tab, cfg):
     return False, str(note or "route retry already queued")
 
 
+def hatcher_alive_loading_maybe_solver_rescue(core, tab, rt_tab, cfg):
+    """Submit one unconditional provider check after five minutes of this open."""
+    if not hatcher_alive_loading_guard_active(rt_tab):
+        return False, "loading guard inactive"
+    if not cfg.get("solver_stuck_loading_probe_enabled", True):
+        return False, "stuck-loading solver rescue disabled"
+    if not cfg.get("solver_enabled", False):
+        return False, "solver disabled"
+
+    opened_at = int(rt_tab.get("last_open", 0) or 0)
+    if opened_at <= 0:
+        return False, "stuck-loading rescue has no open token"
+    probe_after = max(
+        300,
+        int(cfg.get("solver_stuck_loading_probe_after_seconds", 300) or 300),
+    )
+    open_age = max(0, now() - opened_at)
+    if open_age < probe_after:
+        return False, "captcha rescue in " + format_age(probe_after - open_age)
+
+    started, note = start_challenge_probe_job(
+        tab,
+        cfg,
+        core.rt,
+        rt_tab,
+        probe_token=opened_at,
+        reason="Hatcher still loading after five minutes; hidden CAPTCHA rescue",
+        unconditional_provider=True,
+    )
+    if started:
+        rt_tab["note"] = str(note or "checking hidden captcha")
+        core.save()
+    return started, str(note or "hidden CAPTCHA rescue checked")
+
+
 def hatcher_alive_old_state_hard_settings(hcfg, cfg):
     """Return safe Hatcher old-state recovery thresholds.
 
@@ -15877,6 +15936,9 @@ def wait_until_fresh_after_open(
                 tab, cfg, rt, rt_tab,
                 probe_token=opened_at,
                 reason="wait-after-open no fresh state",
+                unconditional_provider=bool(
+                    cfg.get("solver_stuck_loading_unconditional_provider", True)
+                ),
             )
             if not started and (
                 "already checked this rejoin" in probe_note
@@ -16143,6 +16205,40 @@ def wait_until_fresh_after_open(
                 return False, "stop"
             time.sleep(1)
 
+    # The normal five-minute wait ends exactly at the rescue threshold, so the
+    # loop above may exit before its next tick can launch the one-shot check.
+    # Perform that boundary check here, then release the single-flight lock
+    # while the provider works in the background.
+    final_status, _final_status_note = package_alive_status(pkg, cfg)
+    final_fresh, _final_state, _final_err = state_fresh_after_open(
+        tab, cfg, opened_at
+    )
+    stuck_after = max(
+        300,
+        int(cfg.get("solver_stuck_loading_probe_after_seconds", 300) or 300),
+    )
+    if (
+        allow_solver_probe
+        and cfg.get("solver_stuck_loading_probe_enabled", True)
+        and final_status == "ALIVE"
+        and not final_fresh
+        and now() - int(opened_at or start) >= stuck_after
+    ):
+        started, _probe_note = start_challenge_probe_job(
+            tab,
+            cfg,
+            rt,
+            rt_tab,
+            probe_token=opened_at,
+            reason="five-minute no-fresh boundary; hidden CAPTCHA rescue",
+            unconditional_provider=True,
+        )
+        if started:
+            core.save()
+            return False, "solver pending"
+        if solver_job_completion_state(pkg):
+            return False, "solver result"
+
     return False, "fresh timeout"
 
 
@@ -16340,6 +16436,19 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
     target = item.get("target", rt_tab.get("target", "market"))
     reason = item.get("reason", "queued open")
     mode = str(item.get("mode", "hard") or "hard").lower()
+
+    # A solver may clear the Roblox challenge outside Redfinger. Give that
+    # server-side result a few seconds to propagate before restarting only the
+    # affected target. Requeueing keeps the dashboard responsive to siblings.
+    not_before = int(item.get("not_before", 0) or 0)
+    if not_before > now():
+        open_queue.append(item)
+        rt_tab["note"] = (
+            "CAPTCHA_SUCCESS; target rejoin in "
+            + format_age(not_before - now())
+        )
+        core.save()
+        return True
 
     item_mode = str(item.get("mode", "hard") or "hard").lower()
     is_hard = item_mode not in (
@@ -22709,26 +22818,37 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                     pass
                 elif bubble_rescue_handled:
                     pass
-                elif alive_loading_guard and not challenge_active and alive_loading_left > 0:
-                    status = "Loading"
-                    note = (
-                        "alive loading/server queue hold "
-                        + format_age(alive_loading_left)
-                    )
                 elif alive_loading_guard and not challenge_active:
-                    route_added, route_note = hatcher_alive_loading_maybe_route_retry(
-                        core, tab, rt_tab, cfg
+                    rescue_started, rescue_note = (
+                        hatcher_alive_loading_maybe_solver_rescue(
+                            core, tab, rt_tab, cfg
+                        )
                     )
-                    if route_added or core.has(pkg):
-                        status = "Queued"
-                        note = route_note
-                    else:
+                    if rescue_started or solver_job_running(pkg):
+                        status = "Solving"
+                        note = solver_job_note(pkg)
+                    elif alive_loading_left > 0:
                         status = "Loading"
                         note = (
-                            "alive loading persists; "
-                            + str(route_note)
-                            + "; automatic hard recovery blocked"
+                            "alive loading/server queue hold "
+                            + format_age(alive_loading_left)
+                            + "; "
+                            + rescue_note
                         )
+                    else:
+                        route_added, route_note = hatcher_alive_loading_maybe_route_retry(
+                            core, tab, rt_tab, cfg
+                        )
+                        if route_added or core.has(pkg):
+                            status = "Queued"
+                            note = route_note
+                        else:
+                            status = "Loading"
+                            note = (
+                                "alive loading persists; "
+                                + str(route_note)
+                                + "; automatic hard recovery blocked"
+                            )
                 elif in_startup_observe and recovery_age >= old_sec:
                     status = "Loading"
                     note = (
@@ -22845,26 +22965,37 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                     if challenge_active:
                         status = "Captcha"
                         note = "verification UI detected; solver owns package (no reopen)"
-                    elif alive_loading_guard and alive_loading_left > 0:
-                        status = "Loading"
-                        note = (
-                            "alive loading/server queue hold "
-                            + format_age(alive_loading_left)
-                        )
                     elif alive_loading_guard:
-                        route_added, route_note = hatcher_alive_loading_maybe_route_retry(
-                            core, tab, rt_tab, cfg
+                        rescue_started, rescue_note = (
+                            hatcher_alive_loading_maybe_solver_rescue(
+                                core, tab, rt_tab, cfg
+                            )
                         )
-                        if route_added or core.has(pkg):
-                            status = "Queued"
-                            note = route_note
-                        else:
+                        if rescue_started or solver_job_running(pkg):
+                            status = "Solving"
+                            note = solver_job_note(pkg)
+                        elif alive_loading_left > 0:
                             status = "Loading"
                             note = (
-                                "alive loading persists; "
-                                + str(route_note)
-                                + "; automatic hard recovery blocked"
+                                "alive loading/server queue hold "
+                                + format_age(alive_loading_left)
+                                + "; "
+                                + rescue_note
                             )
+                        else:
+                            route_added, route_note = hatcher_alive_loading_maybe_route_retry(
+                                core, tab, rt_tab, cfg
+                            )
+                            if route_added or core.has(pkg):
+                                status = "Queued"
+                                note = route_note
+                            else:
+                                status = "Loading"
+                                note = (
+                                    "alive loading persists; "
+                                    + str(route_note)
+                                    + "; automatic hard recovery blocked"
+                                )
                     elif rt_tab.get("last_open") and in_post_open_grace(rt_tab, cfg):
                         status = "Loading"
                         note = f"waiting for {expected_state_name(tab)}"
@@ -28366,7 +28497,7 @@ end)
 
 
 # ============================================================
-# EXOTIC MASTER CONFIG MERGER (V4.81.76)
+# EXOTIC MASTER CONFIG MERGER (V4.81.77)
 # ============================================================
 
 _EXOTIC_MASTER_BRACED_UUID_RE = re.compile(
@@ -35088,8 +35219,17 @@ def _solver_probe_worker(package, tab, cookie, cfg_snapshot, place_id):
             details.append(ui_detail)
             locally_detected = locally_detected or (ui_hit is True)
 
-        provider_probe = bool(cfg_snapshot.get("solver_provider_probe_on_no_state", True))
-        if cfg_snapshot.get("solver_provider_challenge_only", True):
+        unconditional_stuck_probe = bool(
+            cfg_snapshot.get("solver_stuck_loading_unconditional_provider", False)
+        )
+        provider_probe = bool(
+            cfg_snapshot.get("solver_provider_probe_on_no_state", True)
+            or unconditional_stuck_probe
+        )
+        if (
+            cfg_snapshot.get("solver_provider_challenge_only", True)
+            and not unconditional_stuck_probe
+        ):
             provider_probe = False
         should_call_provider = locally_detected or provider_probe
 
@@ -35170,14 +35310,25 @@ def reserve_solver_provider_submit(rt_tab, cfg, submitted_at=None, status="SUBMI
     return submitted
 
 
-def start_challenge_probe_job(tab, cfg, rt, rt_tab, probe_token=0, reason="wait-after-open no fresh state"):
+def start_challenge_probe_job(
+    tab,
+    cfg,
+    rt,
+    rt_tab,
+    probe_token=0,
+    reason="wait-after-open no fresh state",
+    unconditional_provider=False,
+):
     """Start one background provider check for one actual open generation.
 
     V3.84 deliberately does not periodically scan every stale package. The token
     is normally rt_tab.last_open, so the same rejoin can submit at most once.
     """
     pkg = str((tab or {}).get("package", "") or "")
-    if not pkg or not cfg.get("login_challenge_detection_enabled", True):
+    if not pkg or (
+        not cfg.get("login_challenge_detection_enabled", True)
+        and not unconditional_provider
+    ):
         return False, "challenge probe disabled"
 
     token = int(probe_token or 0)
@@ -35212,6 +35363,7 @@ def start_challenge_probe_job(tab, cfg, rt, rt_tab, probe_token=0, reason="wait-
         "target": str(rt_tab.get("target", "") or ("hatcher" if (tab or {}).get("server_link") else "market")),
         "reason": str(reason or "wait-after-open no fresh state"),
         "phase": "probe",
+        "stuck_loading_probe": bool(unconditional_provider),
         "probe_token": token,
         "started_at": now(),
         "timeout": timeout,
@@ -35231,6 +35383,9 @@ def start_challenge_probe_job(tab, cfg, rt, rt_tab, probe_token=0, reason="wait-
     log_activity(f"checking login/captcha once: {cut(job['reason'], 65)}", pkg, CYAN)
 
     cfg_snapshot = dict(cfg)
+    cfg_snapshot["solver_stuck_loading_unconditional_provider"] = bool(
+        unconditional_provider
+    )
     thread = threading.Thread(
         target=_solver_probe_worker,
         args=(pkg, dict(tab or {}), cookie, cfg_snapshot, place_id),
@@ -35548,6 +35703,17 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
             status_code in {"CAPTCHA_SUCCESS", "SUCCESS", "SOLVED", "COMPLETED", "OK"}
             or bool(job.get("ok"))
         )
+
+        # The open lock was released when this five-minute background check
+        # started. Keep a Hatcher target inside V4.81.76's non-destructive guard
+        # unless CAPTCHA_SUCCESS below explicitly earns its one target restart.
+        if job.get("stuck_loading_probe") and target == "hatcher":
+            start_hatcher_alive_loading_guard(
+                rt_tab,
+                cfg,
+                opened_at=int(rt_tab.get("last_open", 0) or 0),
+                reason="five-minute hidden-CAPTCHA check completed",
+            )
 
         # V4.14: pre-open jobs do not create a second queue entry. They unlock
         # the original generation exactly once, so CAPTCHA_SUCCESS and
@@ -35901,6 +36067,43 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
             # Remove only stale/duplicate queue entries for this package. Never
             # disturb another clone's queued recovery.
             core.cancel(pkg)
+
+            # V4.81.77: this provider request was made only because an actual
+            # open stayed ALIVE/no-fresh for five minutes. CAPTCHA_SUCCESS is
+            # external to Redfinger, so the frozen client must be restarted.
+            # NO_CAPTCHA was handled above and never reaches this branch.
+            if solved_result and job.get("stuck_loading_probe"):
+                if target == "hatcher":
+                    clear_hatcher_alive_loading_guard(
+                        rt_tab,
+                        "CAPTCHA_SUCCESS exact target recovery",
+                    )
+                solver_metadata = solver_result_recovery_metadata(
+                    result_label,
+                    {
+                        "stuck_loading_solver_recovery": True,
+                        "not_before": now() + 5,
+                    },
+                )
+                added, _ = core.queue_solver_result_recovery(
+                    tab,
+                    target,
+                    result_label,
+                    solver_metadata,
+                )
+                rt_tab["note"] = (
+                    "CAPTCHA_SUCCESS; exact target rejoin queued"
+                    if added
+                    else "CAPTCHA_SUCCESS; exact target rejoin already pending"
+                )
+                log_activity(
+                    "hidden CAPTCHA solved externally; exact target PID rejoin "
+                    "queued after 5s (siblings untouched)",
+                    pkg,
+                    GREEN,
+                )
+                changed = True
+                continue
 
             # This is a post-open provider result. Never PID-stop Noka here. If a
             # solved CAPTCHA leaves the 529/auth wrapper visible, deliver one safe
@@ -37392,8 +37595,9 @@ def solver_menu(cfg):
         if provider == "blocksolve":
             print("   BlockSolve contract: POST /join | X-API-Key | {cookie, placeId} | auto=challenge-only")
         print(f"3. Default place ID: {cfg.get('solver_place_id', '126884695634066')}")
-        print(f"4. Timeout / min provider interval / probe delay: {cfg.get('solver_timeout_seconds', 180)}s / {cfg.get('solver_min_resubmit_seconds', 600)}s / {cfg.get('solver_probe_after_seconds', 180)}s")
-        print(f"   Once per actual rejoin: {cfg.get('solver_probe_once_per_open', True)}")
+        print(f"4. Timeout / min provider interval / stuck-load delay: {cfg.get('solver_timeout_seconds', 180)}s / {cfg.get('solver_min_resubmit_seconds', 600)}s / {cfg.get('solver_probe_after_seconds', 300)}s")
+        print(f"   One provider check per stuck rejoin: {cfg.get('solver_probe_once_per_open', True)}")
+        print(f"   Pre-open provider check: {cfg.get('solver_preflight_every_open', False)}")
         print(f"   Cookie precheck required: {cfg.get('solver_require_cookie_precheck', True)}")
         print("5. Test solver with a package (fresh package DB cookie)")
         print("6. Test solver with a sample cookie (paste manually)")
@@ -37443,11 +37647,12 @@ def solver_menu(cfg):
             try:
                 timeout = int(input(f"Request timeout seconds [{cfg.get('solver_timeout_seconds', 180)}]: ").strip() or cfg.get("solver_timeout_seconds", 180))
                 cooldown = int(input(f"Minimum provider interval seconds [{cfg.get('solver_min_resubmit_seconds', 600)}]: ").strip() or cfg.get("solver_min_resubmit_seconds", 600))
-                probe = int(input(f"Post-rejoin no-fresh probe delay seconds [{cfg.get('solver_probe_after_seconds', 180)}]: ").strip() or cfg.get("solver_probe_after_seconds", 180))
+                probe = int(input(f"Stuck-loading solver delay seconds [{cfg.get('solver_probe_after_seconds', 300)}]: ").strip() or cfg.get("solver_probe_after_seconds", 300))
                 cfg["solver_timeout_seconds"] = max(15, timeout)
                 cfg["solver_min_resubmit_seconds"] = max(600, cooldown)
                 cfg["solver_retry_cooldown_seconds"] = max(600, cooldown)
-                cfg["solver_probe_after_seconds"] = max(10, probe)
+                cfg["solver_probe_after_seconds"] = max(300, probe)
+                cfg["solver_stuck_loading_probe_after_seconds"] = max(300, probe)
                 save_config(cfg)
                 print(col("Solver timing saved.", GREEN))
             except Exception:
