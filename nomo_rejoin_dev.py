@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.66 — VALID-TS STALE RECOVERY + NONBLOCKING HATCHER FRESH WAIT
+# - Hatcher no longer treats every state older than 24h as invalid. A real Unix `ts` is now authoritative: any
+#   clean stale state at/after the 5-minute recovery threshold remains eligible even at 24h/146h/etc. The historic
+#   `999999s` (~277h) missing/broken-timestamp sentinel is still rejected because its `ts` is absent/invalid.
+# - Automatic Hatcher opens no longer hold the whole watchdog inside the old synchronous 240s fresh-state wait.
+#   NOMO records a package-local background fresh deadline, releases the single-flight lock immediately, redraws
+#   uptime/checks normally, and keeps checking the other clones every watchdog cycle.
+# - While that background deadline is active, the old-state watchdog cannot race/upgrade the same package. A fresh
+#   post-open state clears the pending incident; if five minutes pass with no fresh state, the normal package-scoped
+#   5m recovery is queued (solver -> refreshed PS -> exact PID -> Clear Cache -> one reopen).
+# - Manual Option 6, explicit solver-result recovery, disconnect recovery, auth/manual opens, and Booster routing keep
+#   their existing synchronous verification semantics; only ordinary automatic Hatcher watchdog opens are backgrounded.
+#
 # V4.81.65 — COMBINED 5M STUCK RECOVERY (NEW PS CODE + CACHE + EXACT PID)
 # - A real Hatcher 5-minute ALIVE old/no-state incident is now one atomic recovery generation: one solver
 #   preflight (when the provider gate allows it), refresh that package's owned private-server join code, exact-target
@@ -1238,7 +1251,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.65"
+__version__ = "V4.81.66"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -2312,6 +2325,11 @@ DEFAULT_CONFIG = {
     "hatcher_combined_stuck_recovery_enabled": True,
     "hatcher_combined_stuck_refresh_private_link": True,
     "hatcher_combined_stuck_clear_cache": True,
+
+    # V4.81.66: ordinary automatic Hatcher opens are verified by the normal
+    # watchdog instead of blocking the whole UI/main loop in wait_until_fresh_after_open().
+    "hatcher_background_fresh_wait_enabled": True,
+    "hatcher_background_fresh_timeout_seconds": 300,
 
     "market_link": DEFAULT_MARKET_LINK,
     "restock_link": DEFAULT_RESTOCK_LINK,
@@ -11912,8 +11930,9 @@ def _queue_hatcher_alive_old_state_hard(open_queue, tab, rt_tab, hcfg, cfg, age_
         age_i = 0
     if age_i < age_seconds:
         return False, "alive old state", False
-    if age_i > max_valid_seconds:
-        return False, f"invalid old state ignored {age_i}s", False
+    # V4.81.66: do not reject a real stale state merely because it is older
+    # than the historical 24h ceiling. State-bearing callers validate `ts`
+    # explicitly; no-state callers pass a locally measured elapsed duration.
 
     t = now()
     last = int(rt_tab.get("hatcher_alive_old_state_hard_last", 0) or 0)
@@ -12431,6 +12450,103 @@ def state_age_seconds(state):
         return int((state or {}).get("age", 999999) or 999999)
     except Exception:
         return 999999
+
+
+def hatcher_state_timestamp_valid(state):
+    """Return True only for a real state-writer Unix timestamp.
+
+    The Lua writer uses >=1600000000 as its minimum plausible epoch. Missing or
+    broken clocks become ts=0 and read_state() maps those to the legacy 999999s
+    (~277h) sentinel. Age alone is therefore not a safe validity test.
+    """
+    if not isinstance(state, dict):
+        return False
+    try:
+        ts = int(state.get("ts", 0) or 0)
+    except Exception:
+        return False
+    if ts < 1600000000:
+        return False
+    # Reject obviously future/corrupt epochs without punishing normal clock skew.
+    return ts <= now() + 86400
+
+
+def mark_hatcher_background_fresh_wait(rt_tab, opened_at, cfg, reason="", mode=""):
+    """Start one package-local post-open fresh-state deadline."""
+    if not isinstance(rt_tab, dict):
+        return 0
+    try:
+        timeout = int(cfg.get("hatcher_background_fresh_timeout_seconds", 300) or 300)
+    except Exception:
+        timeout = 300
+    timeout = max(300, timeout)
+    opened_at = int(opened_at or now())
+    rt_tab["hatcher_background_fresh_opened_at"] = opened_at
+    rt_tab["hatcher_background_fresh_until"] = opened_at + timeout
+    rt_tab["hatcher_background_fresh_reason"] = str(reason or "")
+    rt_tab["hatcher_background_fresh_mode"] = str(mode or "")
+    rt_tab["hatcher_background_fresh_timeout_due"] = False
+    return timeout
+
+
+def clear_hatcher_background_fresh_wait(rt_tab):
+    if not isinstance(rt_tab, dict):
+        return
+    for key, value in (
+        ("hatcher_background_fresh_opened_at", 0),
+        ("hatcher_background_fresh_until", 0),
+        ("hatcher_background_fresh_reason", ""),
+        ("hatcher_background_fresh_mode", ""),
+        ("hatcher_background_fresh_timeout_due", False),
+    ):
+        rt_tab[key] = value
+
+
+def hatcher_background_fresh_wait_status(tab, rt_tab, state, cfg):
+    """Return package-local background fresh verification state.
+
+    No Android action occurs here. It only verifies a fresh post-open heartbeat
+    or turns the locally measured five-minute deadline into a timeout signal for
+    the ordinary Hatcher recovery queue.
+    """
+    try:
+        opened_at = int(rt_tab.get("hatcher_background_fresh_opened_at", 0) or 0)
+        deadline = int(rt_tab.get("hatcher_background_fresh_until", 0) or 0)
+    except Exception:
+        opened_at = 0
+        deadline = 0
+    if opened_at <= 0 or deadline <= 0:
+        return {"active": False, "timed_out": False, "verified": False, "elapsed": 0, "remaining": 0}
+
+    elapsed = max(0, now() - opened_at)
+    if (
+        state
+        and hatcher_state_timestamp_valid(state)
+        and int(state.get("ts", 0) or 0) >= opened_at - 2
+        and state_is_clean_fresh(state, cfg)
+    ):
+        state_ts = int(state.get("ts", 0) or 0)
+        clear_hatcher_background_fresh_wait(rt_tab)
+        core_finish_rejoin(rt_tab, verified=True, note="fresh state (background)", state_ts=state_ts)
+        if not int(rt_tab.get("hatcher_background_fresh_verified_at", 0) or 0) or (
+            now() - int(rt_tab.get("hatcher_background_fresh_verified_at", 0) or 0) > 5
+        ):
+            log_activity("fresh state confirmed in background", str((tab or {}).get("package") or ""), GREEN)
+        rt_tab["hatcher_background_fresh_verified_at"] = now()
+        return {"active": False, "timed_out": False, "verified": True, "elapsed": elapsed, "remaining": 0}
+
+    remaining = deadline - now()
+    if remaining > 0:
+        return {"active": True, "timed_out": False, "verified": False, "elapsed": elapsed, "remaining": remaining}
+
+    # Clear the live wait marker so the normal loop may queue one recovery. The
+    # timeout itself is real elapsed NOMO time, so it remains valid even when the
+    # old state file has ts=0 / the 999999s phantom sentinel.
+    clear_hatcher_background_fresh_wait(rt_tab)
+    rt_tab["hatcher_background_fresh_timeout_due"] = True
+    rt_tab["hatcher_background_fresh_timeout_at"] = now()
+    rt_tab["hatcher_background_fresh_timeout_elapsed"] = elapsed
+    return {"active": False, "timed_out": True, "verified": False, "elapsed": elapsed, "remaining": 0}
 
 
 def state_is_fresh(state, cfg, seconds=None):
@@ -16521,6 +16637,33 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
             rt_tab.get("last_open_mode", mode)
             or mode
         ).lower()
+
+        background_hatcher_wait = bool(
+            target == "hatcher"
+            and cfg.get("hatcher_background_fresh_wait_enabled", True)
+            and not item.get("manual_option6")
+            and not item.get("manual_booster_route")
+            and not item.get("manual_booster_hard_route")
+            and not item.get("solver_recovery")
+            and not item.get("auth_result_recovery")
+            and not item.get("disconnect_recovery")
+            and not item.get("manual_auth_open")
+            and not item.get("exotic_recovery")
+            and not item.get("market_runtime_recovery")
+        )
+        if background_hatcher_wait:
+            background_timeout = mark_hatcher_background_fresh_wait(
+                rt_tab, opened_at, cfg, reason=reason, mode=actual_open_mode
+            )
+            rt_tab["note"] = "opened; waiting fresh in background"
+            core.finish(rt_tab, verified=False, note="background fresh wait")
+            core.save()
+            log_activity(
+                f"fresh verification backgrounded for {format_age(background_timeout)}; watchdog continues",
+                pkg,
+                CYAN,
+            )
+            return True
 
         if (
             item.get("manual_booster_route")
@@ -21242,8 +21385,9 @@ def start_hatcher_reporter(main_cfg=None):
                 old_open_age = (now() - last_open_for_old) if last_open_for_old > 0 else 999999
                 in_old_open_grace = old_open_age < old_after_open_grace
 
-                if alive and old_enabled and age > old_max:
-                    note = f"invalid old state ignored {age}s"
+                state_ts_valid = hatcher_state_timestamp_valid(state)
+                if alive and old_enabled and age >= old_sec and not state_ts_valid:
+                    note = "invalid state timestamp ignored"
                     status = "Online"
                 elif alive and old_enabled and age >= old_sec and in_old_open_grace:
                     left = max(1, old_after_open_grace - old_open_age)
@@ -21964,7 +22108,13 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                 log_activity("startup process check unavailable; no reopen queued", pkg, YELLOW)
                 continue
 
-            if raw_alive and state is not None and old_enabled and old_sec <= state_age <= old_max:
+            if (
+                raw_alive
+                and state is not None
+                and old_enabled
+                and hatcher_state_timestamp_valid(state)
+                and state_age >= old_sec
+            ):
                 bubble_only, bubble_note = hatcher_bubble_only_recovery_candidate(
                     pkg, cfg, process_status=process_status
                 )
@@ -22072,6 +22222,9 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
             )
             if transition.get("dead_confirmed"):
                 alive = False
+            background_fresh = hatcher_background_fresh_wait_status(
+                tab, rt_tab, state, cfg
+            )
             note = health.get("note") or "ok"
             pets = "-"
             eggs = "-"
@@ -22159,7 +22312,8 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                     not problem_code
                     and alive
                     and old_enabled
-                    and old_sec <= recovery_age <= old_max
+                    and hatcher_state_timestamp_valid(state)
+                    and recovery_age >= old_sec
                     and not challenge_active
                 ):
                     bubble_only, bubble_note = hatcher_bubble_only_recovery_candidate(
@@ -22177,6 +22331,26 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
 
                 if problem_code:
                     pass
+                elif background_fresh.get("active") and not challenge_active:
+                    status = "Loading"
+                    note = "waiting fresh bg " + format_age(
+                        max(1, int(background_fresh.get("remaining", 0) or 0))
+                    )
+                elif background_fresh.get("timed_out") and alive and old_enabled and not challenge_active:
+                    timeout_age = max(
+                        old_sec,
+                        int(background_fresh.get("elapsed", 0) or 0),
+                    )
+                    hard_added, hard_note, hard_action = core.queue_hatcher_old_state_hard(
+                        tab, rt_tab, hcfg, timeout_age, "hatcher background fresh timeout"
+                    )
+                    rt_tab["hatcher_background_fresh_timeout_due"] = False
+                    if hard_action:
+                        note = hard_note
+                        status = "Queued" if (hard_added or hard_note == "already queued") else "Stale"
+                    else:
+                        note = hard_note
+                        status = "Stale"
                 elif bubble_rescue_handled:
                     pass
                 elif in_startup_observe and recovery_age >= old_sec:
@@ -22185,9 +22359,14 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                         "startup loading grace "
                         + format_age(max(1, startup_observe_until - now()))
                     )
-                elif alive and old_enabled and recovery_age > old_max:
+                elif (
+                    alive
+                    and old_enabled
+                    and recovery_age >= old_sec
+                    and not hatcher_state_timestamp_valid(state)
+                ):
                     status = "Online"
-                    note = f"invalid old state ignored {age}s"
+                    note = "invalid state timestamp ignored"
                 elif alive and old_enabled and recovery_age >= old_sec and in_old_open_grace:
                     status = "Loading"
                     note = f"old-state open grace {max(1, old_after_open_grace - old_open_age)}s"
@@ -22235,7 +22414,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                             # FIX V3.78: use `or 180` instead of `or 120` to avoid 0->120 falsy fallback
                             # that made 277h state appear fresh
                             if (recovery_age >= int(cfg.get("hatcher_alive_old_state_hard_force_seconds", 180) or 180)
-                                    and recovery_age <= int(cfg.get("hatcher_alive_old_state_max_valid_seconds", 86400) or 86400)
+                                    and hatcher_state_timestamp_valid(state)
                                     and cfg.get("rejoin_if_crash", True)):
                                 added, hard_note, _ = core.queue_hatcher_old_state_hard(
                                     tab,
@@ -22253,7 +22432,24 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                         status = "Online" if alive else "Offline"
             else:
                 note = f"state {err}"
-                if alive:
+                if alive and background_fresh.get("active"):
+                    status = "Loading"
+                    note = "waiting fresh bg " + format_age(
+                        max(1, int(background_fresh.get("remaining", 0) or 0))
+                    )
+                elif alive and background_fresh.get("timed_out"):
+                    old_enabled_bg, old_sec_bg, _old_max_bg, _old_cd_bg = hatcher_alive_old_state_hard_settings(hcfg, cfg)
+                    timeout_age = max(
+                        old_sec_bg,
+                        int(background_fresh.get("elapsed", 0) or 0),
+                    )
+                    hard_added, hard_note, hard_action = core.queue_hatcher_old_state_hard(
+                        tab, rt_tab, hcfg, timeout_age, "hatcher background fresh timeout"
+                    )
+                    rt_tab["hatcher_background_fresh_timeout_due"] = False
+                    note = hard_note
+                    status = "Queued" if (hard_action and (hard_added or hard_note == "already queued")) else "No state"
+                elif alive:
                     no_state_since = int(rt_tab.get("hatcher_no_state_since", 0) or 0)
                     if no_state_since <= 0:
                         rt_tab["hatcher_no_state_since"] = now()
@@ -22442,7 +22638,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
         hatcher_rejoin_status_screen(rows, hcfg, cfg, session_start, loops, last_msg)
         _old_on, _old_sec, _old_max, _old_cd = hatcher_alive_old_state_hard_settings(hcfg, cfg)
         print(col(
-            f"  Hatcher: old state {format_age(_old_sec)}..{format_age(_old_max)} => exact-PID restart affected tab only; above max ignored.",
+            f"  Hatcher: valid-ts old state >= {format_age(_old_sec)} => package-only recovery; missing/bad ts sentinel ignored.",
             GREEN,
         ))
 
