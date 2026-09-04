@@ -1,156 +1,18 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
-# V4.81.78 — OPEN-TOKEN CAPTCHA WATCHDOG
-# - Every successful Hatcher ``open ok`` arms a package-scoped watchdog from
-#   that exact open timestamp. It is independent of NOMO uptime, Lua state age,
-#   the Loading-screen detector, and the older loading-guard flag.
-# - At five minutes with the exact target still ALIVE and no fresh post-open Lua
-#   state, the watchdog submits the provider once for that open token. It runs
-#   before bubble-only/old-state recovery and cancels only that package's queued
-#   recovery, preventing an older branch from reopening the clone and resetting
-#   the five-minute timer before the provider gets its turn.
-# - Removes the provider submission immediately before every normal rejoin. A
-#   healthy rejoin that becomes fresh within five minutes uses no solver credit.
-# - An ALIVE Noka Hatcher join that is still not fresh five minutes after its
-#   actual open receives ONE provider check for that open, even when Lua,
-#   uiautomator, and the saved visual rectangle cannot see the CAPTCHA. This
-#   covers a CAPTCHA hidden behind Roblox's frozen experience-loading card.
-# - NO_CAPTCHA does not restart Roblox; the V4.81.76 slow/server-queue guard
-#   continues normally. CAPTCHA_SUCCESS queues one existing exact-target-PID
-#   solver recovery so the externally solved challenge is reflected inside the
-#   stale Redfinger client. Direct moderation/auth checks and UNKNOWN-process
-#   deferral still run immediately before the target PID can be stopped.
-# - The delayed rescue is one-shot per last_open token. Provider errors keep the
-#   existing >=10 minute provider cooldown and cannot create a five-minute loop.
-#   Sibling packages are never submitted, queued, stopped, or opened by it.
-#
-# V4.81.76 — ALIVE HATCHER SERVER-QUEUE / SLOW-LOAD PROTECTION
-# - ALIVE Noka Hatcher joins with no fresh Lua state are no longer treated as
-#   failed merely because the normal ~4 minute fresh-state timeout expires.
-#   This covers legitimate Roblox queue/loading states such as
-#   "Waiting for an available server".
-# - If the target is still ALIVE and no strong Home/disconnect/auth failure is
-#   visible, NOMO starts a persistent loading guard instead of queuing a
-#   homepage/no-state hard retry. The single-flight lock is released so other
-#   clones can continue.
-# - The guarded clone waits up to 15 minutes from its last open. If still
-#   ALIVE/no-fresh, it receives at most ONE route-only refresh with no hard
-#   fallback. If it still does not join, automatic hard recovery stays blocked
-#   for that incident; manual review is required.
-# - Fresh clean Hatcher state clears the guard. A genuinely DEAD package clears
-#   it and returns to normal crash recovery.
-# - Dedicated Home/disconnect/auth recovery still wins when positively detected.
-# - V4.81.75 dead-shell safety and earlier Face Lock/Exotic behavior are unchanged.
-#
-# V4.81.75 — DEAD NOKA BLACK-SHELL START SAFETY
-# - Fixes the Redfinger/App Cloner state where a Noka floating window survives as a black
-#   task shell while Android reports the exact Roblox package PID as DEAD. V4.81.74 could
-#   treat that as a normal Hatcher cold start and queue hard_force; the subsequent launch
-#   can disturb/collapse sibling floating tasks.
-# - Immediately before AUTOMATIC hard recovery, a DEAD Noka target is checked for a
-#   surviving package ActivityRecord or visible package window. If found, the generation
-#   becomes ONE dead-shell task-reuse route (CLEAR_TOP|SINGLE_TOP): no PID stop and no
-#   hard fallback. Truly DEAD + no shell keeps normal cold-start recovery.
-# - UNKNOWN/inconclusive Android shell checks defer with no stop/open. Explicit manual
-#   force actions keep their previous behavior.
-# - V4.81.74 Face Lock/provider-cookie logic and V4.81.73 Exotic master behavior are unchanged.
-#
-# V4.81.74 — EXTERNAL FACE-LOCK RELEASE + FLAGGED-COOKIE SAFE ROUTE
-# - A package held for Face Lock now performs a bounded background Roblox-side unlock probe (default every 5 minutes).
-#   If its package cookie still authenticates, Roblox moderation is clear, and /home is usable, NOMO keeps the hold but
-#   queues ONE target-only route/open so a Face Lock solved on another device can refresh the Redfinger session itself.
-# - The external-unlock route is non-destructive: no PID stop, no hard fallback, no sibling action. The Face Lock hold
-#   clears only after a fresh clean in-game heartbeat. Confirmed moderation/Account Locked still blocks the route.
-# - Solver/provider wording such as "Your Cookie is flagged" is explicitly non-authoritative. If Roblox independently
-#   says the cookie/session is clean, NOMO uses one safe route refresh instead of demanding a new cookie or reaching the
-#   three-failure PID safety reopen. A cookie is called invalid only when Roblox itself confirms invalid/expired (401).
-# - V4.81.73 Exotic master paths/merge behavior and all V4.81.71/.69 target-local recovery safety remain unchanged.
-#
-# V4.81.73 — EXOTIC MASTER ROOT-PATH SUPPORT
-# - Option 17 now prefers /storage/emulated/0/exotic_master.zip, matching the normal Redfinger upload/export location.
-# - /storage/emulated/0/Download/exotic_master.zip remains a fallback; Exotic merge behavior is otherwise unchanged.
-# - File 1 is selected per UID from groups.json: Hatching -> file1_hatching.json, Market -> file1_market.json,
-#   otherwise file1_default.json. Shared file2/filesession/gag2 masters are applied when present.
-# - Existing Workspace/exotichub99/<UID>*.json files remain the account-local base. Master settings overwrite normal
-#   settings, while current pet UUID references are recursively preserved and master-only pet UUID references are blocked.
-# - Curly-braced UUIDs are treated as pet references; fields explicitly named *uuid* are also account-local. This avoids
-#   misclassifying normal UUID-shaped settings such as web_api_key while protecting nested/current target pet UUID state.
-# - Target-only fields are retained, malformed JSON is skipped, all changed originals are backed up before writes, and
-#   a failed batch write rolls every changed file back from memory. No Android process/open/recovery logic is touched.
-# - V4.81.71 270h phantom-age backstop plus V4.81.69/.70 solver-generation, target-local auth holds, and exact-PID
-#   recovery safety remain unchanged.
-#
-# V4.81.71 — 270H PHANTOM-AGE BACKSTOP
-# - Keeps V4.81.70's timestamp validation, but restores a conservative upper stale-age backstop at 270 hours.
-#   A real 105h/200h state remains actionable; anything older than 270h is treated as PHANTOM recovery evidence.
-# - This blocks the known one-refresh ~277h bug before it can queue a pointless hard recovery, while preserving
-#   the final fresh-state pre-open cancellation as a second safety layer.
-# - Missing/zero/unreadable timestamps and implausible future timestamps remain PHANTOM exactly as in V4.81.70.
-# - V4.81.69/.70 solver-generation, legacy retry reconciliation, target-only auth holds, and exact-PID safety are unchanged.
-#
-# V4.81.69 — DEAD-RETRY SELF-HEAL + LEGACY SOLVER RECONCILE
-# - A package that dies while a solver/provider retry timer is pending no longer waits for that timer. NOMO clears only
-#   that target's transient solver generation/retry state and immediately falls through to normal exact-PID crash recovery.
-#   Dead targets are never sent to the solver because their old CAPTCHA session/challenge is no longer live.
-# - A legacy/non-generation provider retry can no longer own a healthy package forever. NOMO performs one fresh target-only
-#   challenge guard: current CAPTCHA => convert into the V4.81.68 generation (attempt 1/3 after the existing cooldown);
-#   no current CAPTCHA => clear the stale provider retry and resume normal Market/Hatcher recovery.
-# - A stale Lua challenge is not enough to preserve a legacy solver retry: only a current package UI confirmation or a fresh
-#   Lua challenge state may seed the new generation. This prevents 13h/19h-old state files from keeping a clone Waiting.
-# - V4.81.68 three-try generations are unchanged: guard once, #2/#3 skip the unchanged old puzzle UI, SUCCESS/NO_CAPTCHA
-#   reopen immediately, and three failed attempts exact-PID reopen only the affected target.
-#
-# V4.81.68 — THREE-TRY CAPTCHA GENERATIONS + TARGET REOPEN
-# - A confirmed package-scoped CAPTCHA/verification screen starts one solver generation for that exact clone. The
-#   package/Option-16 UI guard is used only to confirm attempt #1 (or the first attempt after a solver-triggered reopen).
-# - Attempts #2 and #3 reuse that confirmed live challenge generation without rescanning the unchanged Start Puzzle UI.
-#   Provider retries still refresh the package cookie and keep Roblox moderation/API checks; only the stale visual CAPTCHA
-#   confirmation is skipped inside the same generation.
-# - CAPTCHA_SUCCESS and authoritative NO_CAPTCHA now immediately queue one exact-target-PID reopen. The old challenge UI
-#   is intentionally not required to disappear first because this client keeps that page visible until Roblox is reopened.
-# - Three failed/timeout/provider-rejected attempts trigger the same exact-target-PID safety reopen instead of holding the
-#   package forever. After the reopen succeeds, the generation resets to attempt #1 and the new session is freshly guarded.
-# - A provider HTTP 403 / INVALID_COOKIES label is no longer treated as proof that .ROBLOSECURITY is bad when NOMO's
-#   independent Roblox cookie/API check still authenticates it. Such results remain solver failures and follow the 3-try
-#   generation policy. A genuinely invalid/expired cookie still enters the existing package-local manual auth hold.
-# - Solver-generation reopen bypasses only the stale CAPTCHA/529 visual veto for that target. Direct moderation API,
-#   Account Locked/ban checks, UNKNOWN-process deferral, exact-PID sibling isolation, and V4.81.67 peer independence stay intact.
-#
-# V4.81.67 — TARGET-LOCAL AUTH HOLDS
-# - Removes the device-wide peer-auth recovery veto. A face-lock/529/CAPTCHA/Account-Locked state on one Noka clone
-#   no longer downgrades, waits, or suppresses recovery for a different clone.
-# - Old-state and no-state ALIVE recovery now classify the TARGET package normally regardless of sibling auth state.
-# - Hard recovery execution no longer consults sibling auth state or needs an Error-288 peer-auth exception.
-# - Safety remains target-local at the destructive boundary: exact target process state is refreshed, the target account
-#   API moderation precheck still runs, and the target's own package/Option-16 UI is freshly checked for Account Locked,
-#   529, or verification immediately before any PID stop.
-# - Legacy queued peer-auth safe-route generations are retired on upgrade and reclassified by the normal watchdog so an
-#   old V4.81.65/.66 queue item cannot preserve the sibling hold after V4.81.67 starts.
-# - Existing exact-PID sibling isolation, no_hard_fallback protection, Error-524 manual hold, and UNKNOWN process deferral
-#   are unchanged.
-#
-# V4.81.66 — PEER-AUTH + CONFIRMED ERROR 288 RECOVERY
-# - Fixes an ALIVE sibling with a real package-scoped Error 288 / server-shutdown popup being queued for recovery,
-#   then dropped forever by the peer-auth hard-suppression gate while another Noka is held on face-lock/529/CAPTCHA.
-# - Peer-auth suppression still blocks speculative ALIVE stale/no-state/bubble hard recovery. The only new exception is
-#   a disconnect_recovery generation whose target is freshly re-confirmed, inside that exact package/Option-16 rectangle,
-#   as Error 288. That target may perform its normal exact-PID recovery even while a different clone is auth-held.
-# - Error 524 remains a manual private-server permission hold and is never covered by this exception. Target-side
-#   Account Locked/529/auth checks still run immediately before PID stop and can cancel the recovery.
-# - android_disconnect_ui_detail() now accepts force=True so the peer-auth exception never relies on a stale UI cache.
-# - Fixes the V4.81.65 packaging/version-stamp mistake: the prior ZIP header said V4.81.65 but __version__ remained
-#   V4.81.64. This build is internally stamped V4.81.66 so the Termux banner/version command reports the real build.
-#
-# V4.81.65 — BOUNDED PEER-AUTH SAFE ROUTE
-# - Fixes an ALIVE stale/no-state sibling getting trapped in an endless peer-auth route -> post-open grace loop while
-#   another Noka remains on face-lock/529/CAPTCHA/moderation hold. Each target now gets one automatic task-reuse
-#   safe route per active peer-auth incident; a failed/no-fresh-state attempt is not automatically repeated forever.
-# - After that one safe route, the target waits non-destructively for either a fresh clean state, the peer auth incident
-#   to clear/change, or a genuinely DEAD process. Fresh state / peer-clear resets the one-shot guard; confirmed DEAD
-#   crash recovery remains allowed exactly as before. No PID-stop is introduced for an ALIVE peer-protected target.
-# - A recent V4.81.64 peer_auth_safe_route_last is adopted as the already-used one-shot on upgrade, so a device
-#   currently caught in this loop does not need to send yet another automatic route before settling to Waiting.
-# - Keeps V4.81.64's immutable no_hard_fallback contract and exact age_access_gate-only migration unchanged.
+# V4.81.65 — COMBINED 5M STUCK RECOVERY (NEW PS CODE + CACHE + EXACT PID)
+# - A real Hatcher 5-minute ALIVE old/no-state incident is now one atomic recovery generation: one solver
+#   preflight (when the provider gate allows it), refresh that package's owned private-server join code, exact-target
+#   PID stop, forced Android CLEAR CACHE, then one launch. Cache cleanup bypasses the normal cache toggle/cooldown
+#   only for this tagged stuck generation; Clear Data / plain `pm clear <package>` remains forbidden.
+# - The stuck generation does not consume recent NO_CAPTCHA trust and explicitly permits the one provider probe even
+#   when Roblox authentication is otherwise valid. Ordinary opens keep the existing challenge-only/NO_CAPTCHA trust.
+# - Provider-only INVALID/FLAGGED wording is no longer enough to strand the stuck clone. NOMO re-checks the live
+#   package cookie against Roblox: valid auth ignores the provider claim and continues the combined recovery; Roblox-
+#   confirmed invalid/restricted auth is held; a real Roblox challenge or inconclusive verification is deferred safely.
+# - Private-server refresh validates package ownership and root place before saving the new code. Refresh failure is
+#   non-destructive to sibling clones and falls back to the already-saved route while still attempting package cache
+#   recovery; owner/place mismatch blocks the combined open. Existing moderation/529/Account-Locked final gates remain.
 #
 # V4.81.64 — ROUTE-ONLY HARD-FALLBACK + AGE-HOLD MIGRATION SAFETY
 # - `no_hard_fallback` is now a first-class immutable queue contract: any queued soft/route generation carrying it
@@ -1376,8 +1238,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.78"
-MAX_VALID_STALE_STATE_SECONDS = 270 * 60 * 60  # V4.81.71: below the historical ~277h phantom sample
+__version__ = "V4.81.65"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1407,10 +1268,6 @@ EXOTIC_KEY_STATE_FILE = BASE_DIR / "exotic_key_state.json"
 EXOTIC_KEY_SHARED_RELATIVE = Path("Nomo") / "exotic_key.json"
 EXOTIC_STATUS_FOLDER_RELATIVE = Path("Nomo")
 DEFAULT_EXOTIC_KEY_WORKER_URL = "https://nomo-key.atmincosplay.workers.dev"
-EXOTIC_MASTER_DEFAULT_ZIP = Path("/storage/emulated/0/exotic_master.zip")
-EXOTIC_MASTER_DOWNLOAD_ZIP = Path("/storage/emulated/0/Download/exotic_master.zip")
-EXOTIC_MASTER_BACKUP_DIR = BASE_DIR / "exotic_master_backups"
-EXOTIC_MASTER_WORKSPACE_FOLDER = "exotichub99"
 
 APK_DOWNLOAD_DIR = Path("/storage/emulated/0/Download/NOMO_APK")
 APK_LOCAL_DEFAULT_DIR = Path("/storage/emulated/0/")
@@ -2141,12 +1998,6 @@ DEFAULT_CONFIG = {
     "face_lock_visual_min_blue_ratio": 0.035,
     "face_lock_visual_min_left_gray_ratio": 0.10,
     "face_lock_auto_hold": True,
-    # V4.81.74: when Face Lock is solved on another device, periodically ask
-    # Roblox whether this package's existing session is now clean. A positive
-    # result earns only a route/task-reuse refresh; it never earns a PID stop.
-    "face_lock_external_unlock_probe_enabled": True,
-    "face_lock_external_unlock_probe_seconds": 300,
-    "face_lock_external_unlock_route_cooldown_seconds": 600,
 
     # Shared values used by the built-in layout manager and visual detector.
     "layout_gap": 8,
@@ -2161,9 +2012,13 @@ DEFAULT_CONFIG = {
     # contains a path is used exactly as entered. Automatic jobs start only after
     # a real challenge is detected and run outside the dashboard/main loop.
     "solver_enabled": False,
-    # Retained for compatibility; V4.81.78 disables the pre-open provider gate.
+    # V4.14: one provider submission immediately before every actual NOMO open.
+    # The unique queue generation prevents duplicate submissions during the same
+    # rejoin attempt. Healthy packages skipped at startup never reach this gate.
     "solver_once_per_rejoin": True,
-    "solver_preflight_every_open": False,
+    # Ask the provider before real queued opens, then trust a recent NO_CAPTCHA
+    # answer instead of submitting again on every retry.
+    "solver_preflight_every_open": True,
     "solver_no_captcha_trust_seconds": 3600,
     "solver_no_captcha_max_trusted_rejoins": 3,
     # If the provider itself errors/times out, retry the provider later instead
@@ -2180,7 +2035,7 @@ DEFAULT_CONFIG = {
     # repeatedly sending solved/NO_CAPTCHA cookies. Keep at least 10 minutes.
     "solver_retry_cooldown_seconds": 600,
     "solver_min_resubmit_seconds": 600,
-    "solver_probe_after_seconds": 300,
+    "solver_probe_after_seconds": 180,
     # If the package stays stale/no-state, re-run the provider/UI probe after
     # this cooldown. V3.82 accidentally made the startup probe a one-shot that
     # could also be skipped forever when opened_at was 0.
@@ -2194,20 +2049,13 @@ DEFAULT_CONFIG = {
     # package has produced no state for solver_probe_after_seconds, allow the
     # configured provider to make the authoritative check once for that open.
     "solver_provider_probe_on_no_state": True,
-    # V4.81.78: the provider is the fallback detector after five minutes of an
-    # actual Hatcher open. It runs once even if local/API CAPTCHA evidence is
-    # absent because Roblox can cover the challenge with its loading card.
-    "solver_stuck_loading_probe_enabled": True,
-    "solver_stuck_loading_probe_after_seconds": 300,
-    "solver_stuck_loading_unconditional_provider": True,
     # V4.81.6: BlockSolve-style providers can reject a valid cookie when there is
     # simply no CAPTCHA task to solve. Automatic mode therefore sends only after
     # a real API/UI challenge signal. Manual Solver Test is always explicit/direct.
     "solver_provider_challenge_only": True,
-    # Legacy knobs retained for config compatibility. V4.81.68 challenge-confirmed
-    # generations reopen the exact target after CAPTCHA_SUCCESS/NO_CAPTCHA regardless
-    # of these old flags; non-challenge probes keep their historical behavior.
     "solver_rejoin_on_success": False,
+    # Solver retries are package-local now. Do not reopen Roblox just because the
+    # provider returned NO_CAPTCHA/CAPTCHA_SUCCESS after the package is already up.
     "solver_rejoin_on_no_captcha": False,
     # After CAPTCHA_SUCCESS, allow one clean rejoin. If that rejoin
     # still produces no fresh state, isolate only that package instead of
@@ -2218,10 +2066,6 @@ DEFAULT_CONFIG = {
     # without repeatedly reopening the clone.
     "manual_auth_retry_seconds": 3600,
     "solver_failure_retry_seconds": 600,
-    # V4.81.68: one confirmed CAPTCHA screen gets three provider attempts.
-    # Attempt #1 owns the fresh UI guard; #2/#3 skip rescanning that unchanged
-    # screen. Three failed attempts trigger one exact-target-PID safety reopen.
-    "solver_challenge_generation_max_attempts": 3,
 
     "active_rejoin_mode": "market",
     "market_mode_enabled": True,
@@ -2262,9 +2106,13 @@ DEFAULT_CONFIG = {
     # account actually logged in. Makes the manual "get username" step optional.
     "auto_resolve_usernames_enabled": True,
     "username_resolve_interval_seconds": 600,
-    # V4.81.71: conservative upper stale-age backstop. Real stale states remain
-    # actionable up to 270h; older samples are treated as phantom recovery evidence.
-    "alive_old_state_max_valid_seconds": MAX_VALID_STALE_STATE_SECONDS,
+    # V3.79: MARKET phantom-age ceiling (mirror of the hatcher's
+    # hatcher_alive_old_state_max_valid_seconds). A missing `ts` in the state
+    # file makes age compute to an impossible value (e.g. 277h). Any age above
+    # this is treated as invalid and IGNORED — never drives a kill+open. This is
+    # the guard the market path was missing while the hatcher path had it, which
+    # is why one instance ran 11h and another rejoin-looped on the same 277h age.
+    "alive_old_state_max_valid_seconds": 86400,
 
     "open_all_on_start": True,
     "open_only_closed_on_start": True,
@@ -2351,9 +2199,6 @@ DEFAULT_CONFIG = {
     "homepage_stuck_fallback_seconds": 240,
     "homepage_stuck_max_hard_retries": 1,
     "join_failures_before_hard_rejoin": 3,
-    "hatcher_alive_loading_guard_enabled": True,
-    "hatcher_alive_loading_hold_seconds": 900,
-    "hatcher_alive_loading_route_retry_limit": 1,
 
     # Queue/runtime self-heal:
     # If Termux is stopped during an open/wait cycle, runtime.json may keep a
@@ -2460,6 +2305,13 @@ DEFAULT_CONFIG = {
     "hatcher_alive_old_state_max_valid_seconds": 86400,
     "hatcher_alive_old_state_after_open_grace_seconds": 180,
     "hatcher_alive_old_state_hard_force_cooldown_seconds": 900,
+
+    # V4.81.65: one true 5-minute Hatcher stuck incident uses the proven
+    # combined recovery: fresh owned PS join code + target cache + exact PID open.
+    # These are intentionally independent from the normal per-open cache toggle.
+    "hatcher_combined_stuck_recovery_enabled": True,
+    "hatcher_combined_stuck_refresh_private_link": True,
+    "hatcher_combined_stuck_clear_cache": True,
 
     "market_link": DEFAULT_MARKET_LINK,
     "restock_link": DEFAULT_RESTOCK_LINK,
@@ -3412,9 +3264,9 @@ def apply_update_migrations(cfg):
     # FIX V3.78: Align migration clamp to 300 (was 180, inconsistent with V3.77 default).
     if _int_cfg(cfg.get("hatcher_alive_old_state_hard_force_seconds"), 300) > 300:
         set_cfg("hatcher_alive_old_state_hard_force_seconds", 300)
-    # V4.81.71: migrate the old 24h compatibility value to the 270h backstop.
-    if _int_cfg(cfg.get("hatcher_alive_old_state_max_valid_seconds"), 0) != MAX_VALID_STALE_STATE_SECONDS:
-        set_cfg("hatcher_alive_old_state_max_valid_seconds", MAX_VALID_STALE_STATE_SECONDS)
+    # True 24h ceiling for ignoring copied/ancient state.
+    if _int_cfg(cfg.get("hatcher_alive_old_state_max_valid_seconds"), 86400) < 86400:
+        set_cfg("hatcher_alive_old_state_max_valid_seconds", 86400)
     # Ensure the 5m old-state hard rule is actually ON (a saved False disables
     # the whole fallback, leaving clones stuck on "alive old state").
     if not bool_from_any(cfg.get("hatcher_alive_old_state_hard_force_enabled", True)):
@@ -3492,9 +3344,10 @@ def apply_update_migrations(cfg):
         set_cfg("soft_hop_wait_fresh_seconds", 240)
     if _int_cfg(cfg.get("post_open_grace_seconds"), 0) <= 180:
         set_cfg("post_open_grace_seconds", 360)
-    # V4.81.71: migrate the old 24h max-age setting to the 270h phantom backstop.
-    if _int_cfg(cfg.get("alive_old_state_max_valid_seconds"), 0) != MAX_VALID_STALE_STATE_SECONDS:
-        set_cfg("alive_old_state_max_valid_seconds", MAX_VALID_STALE_STATE_SECONDS)
+    # V3.79: MARKET phantom-age ceiling must exist and be sane (>= 24h). Without
+    # it, a 277h missing-ts age passes the 180s floor and force-loops the pool.
+    if _int_cfg(cfg.get("alive_old_state_max_valid_seconds"), 0) < 86400:
+        set_cfg("alive_old_state_max_valid_seconds", 86400)
     if "jsonbin_force_refresh_on_restock_route" not in cfg:
         set_cfg("jsonbin_force_refresh_on_restock_route", True)
 
@@ -3535,8 +3388,8 @@ def apply_update_migrations(cfg):
         set_cfg("solver_retry_cooldown_seconds", 600)
     if _int_cfg(cfg.get("solver_min_resubmit_seconds"), 0) < 600:
         set_cfg("solver_min_resubmit_seconds", 600)
-    if _int_cfg(cfg.get("solver_probe_after_seconds"), 0) < 300:
-        set_cfg("solver_probe_after_seconds", 300)
+    if _int_cfg(cfg.get("solver_probe_after_seconds"), 0) < 180:
+        set_cfg("solver_probe_after_seconds", 180)
     if _int_cfg(cfg.get("solver_probe_repeat_seconds"), 0) < 600:
         set_cfg("solver_probe_repeat_seconds", 600)
     set_cfg("solver_probe_once_per_open", True)
@@ -3546,28 +3399,22 @@ def apply_update_migrations(cfg):
     set_cfg("solver_probe_stale_state_enabled", False)
     if "solver_provider_probe_on_no_state" not in cfg:
         set_cfg("solver_provider_probe_on_no_state", True)
-    if "solver_stuck_loading_probe_enabled" not in cfg:
-        set_cfg("solver_stuck_loading_probe_enabled", True)
-    if _int_cfg(cfg.get("solver_stuck_loading_probe_after_seconds"), 0) < 300:
-        set_cfg("solver_stuck_loading_probe_after_seconds", 300)
-    if cfg.get("solver_stuck_loading_unconditional_provider") is not True:
-        set_cfg("solver_stuck_loading_unconditional_provider", True)
     if str(cfg.get("solver_provider", "") or "").strip().lower() not in {"auto", "blocksolve", "winter", "generic"}:
         set_cfg("solver_provider", "auto")
     # V4.81.6: default existing/fresh installs to challenge-only automatic provider
     # behavior. This avoids treating ordinary stale-state rejoins as CAPTCHA jobs.
     if "solver_provider_challenge_only" not in cfg:
         set_cfg("solver_provider_challenge_only", True)
-    # Legacy flags remain false for non-challenge probes. V4.81.68 uses the safer
-    # exact-target-PID recovery path only for a confirmed solver generation.
+    # V4.80.20: solver results should not reopen the Roblox package after it is
+    # already running. Reopening one clone can disturb sibling Noka windows.
     set_cfg("solver_rejoin_on_success", False)
     set_cfg("solver_rejoin_on_no_captcha", False)
-    # V4.81.78: do not spend a provider request before a normal open. The one
-    # unconditional provider request belongs only to a five-minute stuck load.
+    # V4.80: preflight is useful, but a recent NO_CAPTCHA answer is trusted for
+    # a bounded window to avoid provider spam during normal rejoin retries.
     if cfg.get("solver_once_per_rejoin") is not True:
         set_cfg("solver_once_per_rejoin", True)
-    if cfg.get("solver_preflight_every_open") is not False:
-        set_cfg("solver_preflight_every_open", False)
+    if cfg.get("solver_preflight_every_open") is not True:
+        set_cfg("solver_preflight_every_open", True)
     if _int_cfg(cfg.get("solver_no_captcha_trust_seconds"), 0) < 300:
         set_cfg("solver_no_captcha_trust_seconds", 3600)
     if _int_cfg(cfg.get("solver_no_captcha_max_trusted_rejoins"), 0) < 1:
@@ -3575,9 +3422,6 @@ def apply_update_migrations(cfg):
     set_cfg("solver_preflight_open_on_failure", False)
     if _int_cfg(cfg.get("solver_preflight_server_busy_retry_seconds"), 0) < 600:
         set_cfg("solver_preflight_server_busy_retry_seconds", 600)
-    # V4.81.68 generation policy is intentionally fixed at three tries so an old
-    # nomo.json cannot restore an unbounded solver loop.
-    set_cfg("solver_challenge_generation_max_attempts", 3)
     if "manual_hold_after_solver_rejoin_timeout" not in cfg:
         set_cfg("manual_hold_after_solver_rejoin_timeout", True)
 
@@ -3605,12 +3449,6 @@ def apply_update_migrations(cfg):
         set_cfg("homepage_stuck_max_hard_retries", 1)
     if _int_cfg(cfg.get("join_failures_before_hard_rejoin"), 0) <= 0:
         set_cfg("join_failures_before_hard_rejoin", 3)
-    if "hatcher_alive_loading_guard_enabled" not in cfg:
-        set_cfg("hatcher_alive_loading_guard_enabled", True)
-    if _int_cfg(cfg.get("hatcher_alive_loading_hold_seconds"), 0) < 600:
-        set_cfg("hatcher_alive_loading_hold_seconds", 900)
-    if _int_cfg(cfg.get("hatcher_alive_loading_route_retry_limit"), -1) < 0:
-        set_cfg("hatcher_alive_loading_route_retry_limit", 1)
 
     # V4.23: roll back alive soft-open recovery. On App Cloner builds a second
     # VIEW intent to an already-open task creates duplicate/cascaded windows.
@@ -3732,12 +3570,6 @@ def apply_update_migrations(cfg):
         set_cfg("face_lock_visual_confirmations_required", 2)
     if "face_lock_auto_hold" not in cfg:
         set_cfg("face_lock_auto_hold", True)
-    if "face_lock_external_unlock_probe_enabled" not in cfg:
-        set_cfg("face_lock_external_unlock_probe_enabled", True)
-    if _int_cfg(cfg.get("face_lock_external_unlock_probe_seconds"), 0) < 120:
-        set_cfg("face_lock_external_unlock_probe_seconds", 300)
-    if _int_cfg(cfg.get("face_lock_external_unlock_route_cooldown_seconds"), 0) < 300:
-        set_cfg("face_lock_external_unlock_route_cooldown_seconds", 600)
     if "join_error_529_visual_fallback_enabled" not in cfg:
         set_cfg("join_error_529_visual_fallback_enabled", True)
     if _int_cfg(cfg.get("join_error_visual_scan_seconds"), 0) < 5:
@@ -4509,54 +4341,6 @@ def package_visible_window(pkg, cfg):
     if pkg.lower() in low:
         return True, "visible window"
     return False, "minimized/no visible window"
-
-
-def noka_dead_task_shell_status(pkg, cfg, process_status=None):
-    """Classify DEAD exact package + surviving App Cloner task/window shell.
-
-    Returns:
-      True  -> exact package is DEAD but Android still reports its task/window.
-      False -> confirmed DEAD with no task/window shell evidence.
-      None  -> observation is inconclusive; callers must defer.
-    """
-    pkg = str(pkg or "").strip()
-    if not _is_noka_clone_package(pkg):
-        return False, "not a Noka clone"
-
-    ps = process_status
-    ps_note = ""
-    if ps is None:
-        ps, ps_note = package_alive_status(pkg, cfg, fresh=True)
-
-    if ps == "UNKNOWN":
-        return None, "process UNKNOWN" + (": " + cut(ps_note, 60) if ps_note else "")
-    if ps != "DEAD":
-        return False, f"process {ps}"
-
-    activity_status, activity_note = package_activity_status(pkg, cfg)
-    if activity_status == "ACTIVITY":
-        return True, "DEAD PID + surviving ActivityRecord"
-
-    visible, visible_note = package_visible_window(pkg, cfg)
-    if visible is True:
-        return True, "DEAD PID + surviving package window"
-
-    # Both negative => ordinary cold-dead target.
-    if activity_status == "NO_ACTIVITY" and visible is False:
-        return False, "DEAD PID + no ActivityRecord/window"
-
-    # One query can be missing as long as the other gives a conclusive negative.
-    if activity_status == "NO_ACTIVITY":
-        return False, "DEAD PID + no ActivityRecord"
-    if visible is False:
-        return False, "DEAD PID + no visible package window"
-
-    return None, (
-        "dead-shell check inconclusive: "
-        + cut(activity_note or "activity unknown", 55)
-        + " | "
-        + cut(visible_note or "window unknown", 55)
-    )
 
 
 def _kill_exact_package_pids(pkg, pids, signal_name, cfg):
@@ -5599,7 +5383,7 @@ def invalidate_android_observation_caches():
                 cache["ok"] = False
 
 
-def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop=True, skip_force_stop=False, allow_launcher_fallback=False):
+def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop=True, skip_force_stop=False, allow_launcher_fallback=False, force_clear_cache=False):
     if not link or str(link).startswith("PUT_"):
         return False, "no link"
 
@@ -5637,7 +5421,34 @@ def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop
                 )
                 sibling_before_launch = {}
 
-    if should_clear_cache_for_open(cfg, soft):
+    # V4.81.65: combined stuck recovery must reproduce Android App Info ->
+    # Clear cache AFTER the exact target PID is confirmed stopped and BEFORE the
+    # one launch. `force=True` bypasses only NOMO's cache toggle/cooldown; the
+    # helper still uses --cache-only / cache directories and never clears app data.
+    forced_cache_attempted = False
+    if force_clear_cache:
+        if soft or not require_stop or skip_force_stop:
+            log_activity(
+                "combined cache recovery refused without exact-PID hard-stop contract",
+                pkg,
+                RED,
+            )
+            return False, "combined cache requires exact-PID hard open"
+        forced_cache_attempted = True
+        cache_ok, cache_note = clear_package_cache(
+            pkg, cfg, rt_tab=rt_tab, reason=reason, force=True
+        )
+        if rt_tab is not None:
+            rt_tab["combined_stuck_cache_attempted_at"] = now()
+            rt_tab["combined_stuck_cache_ok"] = bool(cache_ok)
+            rt_tab["combined_stuck_cache_note"] = str(cache_note or "")
+        log_activity(
+            "combined stuck cache " + ("ok: " if cache_ok else "FAILED: ") + cut(cache_note, 80),
+            pkg,
+            GREEN if cache_ok else YELLOW,
+        )
+
+    if not forced_cache_attempted and should_clear_cache_for_open(cfg, soft):
         clear_package_cache(pkg, cfg, rt_tab=rt_tab, reason=reason)
 
     # Intentional soft routes reuse the existing clone task. CLEAR_TOP +
@@ -5706,6 +5517,7 @@ def core_rejoin_package(
     target="",
     require_stop=True,
     skip_force_stop=False,
+    force_clear_cache=False,
 ):
     """Shared mode-neutral package rejoin path.
 
@@ -5740,6 +5552,7 @@ def core_rejoin_package(
         reason=reason,
         require_stop=require_stop,
         skip_force_stop=skip_force_stop,
+        force_clear_cache=force_clear_cache,
     )
 
     if rt_tab is not None:
@@ -6689,7 +6502,6 @@ MAIN_MENU_ITEMS = [
     ("12", "AutoExec manager"),
     ("13", "Redfinger setup wizard"),
     ("15", "Update NOMO"),
-    ("17", "Apply Exotic master config"),
     ("19", "Delta key manager"),
     ("20", "Executor paths"),
     ("21", "Doctor"),
@@ -10829,12 +10641,10 @@ def _alive_recovery_soft_allowed(reason, pkg_alive, cfg):
 def classify_open_mode(mode):
     """Normalize requested open mode into the core rejoin policy fields."""
     mode_s = str(mode or "hard").lower()
-    dead_task_reuse = mode_s in ["dead_shell_route", "dead-shell-route"]
-    intentional_route = mode_s in ["route", "switch", "reuse_task"] or dead_task_reuse
+    intentional_route = mode_s in ["route", "switch", "reuse_task"]
     return {
         "mode": mode_s,
         "intentional_route": intentional_route,
-        "dead_task_reuse": dead_task_reuse,
         "soft": (mode_s == "soft") or intentional_route,
         "hard_force": mode_s in ["hard_force", "force", "force_stop", "force-stop"],
     }
@@ -10844,7 +10654,6 @@ def resolve_open_policy(cfg, reason, pkg_alive, mode):
     """Resolve the target-open request into one reusable core decision."""
     open_mode = classify_open_mode(mode)
     intentional_route = open_mode["intentional_route"]
-    dead_task_reuse = bool(open_mode.get("dead_task_reuse"))
     soft = open_mode["soft"]
     hard_force = open_mode["hard_force"]
 
@@ -10864,10 +10673,9 @@ def resolve_open_policy(cfg, reason, pkg_alive, mode):
         soft = True
         hard_force = False
 
-    # Normal routes can reuse a task only while the selected package is alive.
-    # V4.81.75 exception: a confirmed surviving Noka task shell may be reused
-    # even when the exact package PID is DEAD. It must never become a hard open.
-    if soft and not pkg_alive and not dead_task_reuse:
+    # A route can reuse a task only while the selected package is alive.
+    # If it is genuinely dead, fall back to the ordinary exact-PID hard open.
+    if soft and not pkg_alive:
         soft = False
         if intentional_route:
             hard_force = True
@@ -10895,7 +10703,7 @@ def resolve_open_policy(cfg, reason, pkg_alive, mode):
 
 
 
-def open_target(tab, rt_tab, cfg, target, reason, force=False, rt=None, mode="hard", core=None):
+def open_target(tab, rt_tab, cfg, target, reason, force=False, rt=None, mode="hard", core=None, force_clear_cache=False):
     if not force and not can_open(rt_tab, cfg):
         return False, "cooldown"
 
@@ -10945,6 +10753,7 @@ def open_target(tab, rt_tab, cfg, target, reason, force=False, rt=None, mode="ha
             mode="hard",
             target=resolved_target,
             require_stop=True,
+            force_clear_cache=force_clear_cache,
         )
         rt_tab["target"] = resolved_target
         rt_tab["last_open"] = now()
@@ -10968,6 +10777,7 @@ def open_target(tab, rt_tab, cfg, target, reason, force=False, rt=None, mode="ha
         mode=open_policy["core_mode"],
         target=resolved_target,
         require_stop=open_policy["require_stop"],
+        force_clear_cache=force_clear_cache,
     )
 
     rt_tab["target"] = resolved_target
@@ -11031,7 +10841,7 @@ def _queue_mode_priority(mode):
         return 40
     if value in {"hard", "restart"}:
         return 30
-    if value in {"route", "deep_link", "deeplink", "dead_shell_route", "dead-shell-route"}:
+    if value in {"route", "deep_link", "deeplink"}:
         return 20
     if value in {"soft", "reuse", "task"}:
         return 10
@@ -11057,13 +10867,10 @@ def _merge_queue_duplicate(existing, target, reason, force=False, skip_if_alive=
             "option6_alive_noka_route_only",
             "exotic_alive_noka_route_only",
             "market_alive_noka_route_only",
-            "dead_noka_shell_route_only",
             "peer_auth_safe_route_only",
         ):
             if metadata.get(key):
                 existing[key] = True
-        if metadata.get("peer_auth_safe_route_only") and metadata.get("peer_auth_peer_pkg"):
-            existing["peer_auth_peer_pkg"] = str(metadata.get("peer_auth_peer_pkg") or "")
 
     # V4.81.56/V4.81.64: once a generation is explicitly route-only, a
     # duplicate old-state/no-state watchdog item must never mutate that SAME
@@ -11074,7 +10881,6 @@ def _merge_queue_duplicate(existing, target, reason, force=False, skip_if_alive=
         or existing.get("option6_alive_noka_route_only")
         or existing.get("exotic_alive_noka_route_only")
         or existing.get("market_alive_noka_route_only")
-        or existing.get("dead_noka_shell_route_only")
         or existing.get("peer_auth_safe_route_only")
     )
     if route_only_generation and _queue_mode_priority(new_mode) > _queue_mode_priority("route"):
@@ -11628,9 +11434,7 @@ class RejoinCore:
         return True
 
     def poll_solver_jobs(self):
-        solver_changed = poll_solver_jobs(self.cfg, self.rt, self.open_queue, self)
-        unlock_changed = poll_face_unlock_probe_jobs(self.cfg, self.rt, self.open_queue, self)
-        return bool(solver_changed or unlock_changed)
+        return poll_solver_jobs(self.cfg, self.rt, self.open_queue, self)
 
     def has(self, package):
         return _queue_has(self.open_queue, package)
@@ -12047,155 +11851,6 @@ def state_login_challenge_detail(state):
 
 
 
-def hatcher_alive_loading_guard_active(rt_tab):
-    return bool(isinstance(rt_tab, dict) and rt_tab.get("hatcher_alive_loading_guard"))
-
-
-def hatcher_alive_loading_hold_left(rt_tab):
-    if not isinstance(rt_tab, dict):
-        return 0
-    until = int(rt_tab.get("hatcher_alive_loading_hold_until", 0) or 0)
-    return max(0, until - now())
-
-
-def start_hatcher_alive_loading_guard(rt_tab, cfg, opened_at=0, reason="alive loading"):
-    if not isinstance(rt_tab, dict):
-        return 0
-    hold_seconds = max(
-        600,
-        int(cfg.get("hatcher_alive_loading_hold_seconds", 900) or 900),
-    )
-    base = int(opened_at or rt_tab.get("last_open", 0) or now())
-    desired_until = base + hold_seconds
-    if desired_until <= now():
-        desired_until = now() + 120
-    rt_tab["hatcher_alive_loading_guard"] = True
-    rt_tab["hatcher_alive_loading_hold_until"] = max(
-        int(rt_tab.get("hatcher_alive_loading_hold_until", 0) or 0),
-        desired_until,
-    )
-    rt_tab["hatcher_alive_loading_guard_reason"] = str(reason or "alive loading")
-    rt_tab["hatcher_alive_loading_guard_started_at"] = int(
-        rt_tab.get("hatcher_alive_loading_guard_started_at", 0) or now()
-    )
-    return hatcher_alive_loading_hold_left(rt_tab)
-
-
-def clear_hatcher_alive_loading_guard(rt_tab, reason=""):
-    if not isinstance(rt_tab, dict):
-        return
-    rt_tab["hatcher_alive_loading_guard"] = False
-    rt_tab["hatcher_alive_loading_hold_until"] = 0
-    rt_tab["hatcher_alive_loading_guard_reason"] = ""
-    rt_tab["hatcher_alive_loading_guard_started_at"] = 0
-    rt_tab["hatcher_alive_loading_route_retries"] = 0
-    if reason:
-        rt_tab["hatcher_alive_loading_last_clear_reason"] = str(reason)
-        rt_tab["hatcher_alive_loading_last_clear_at"] = now()
-
-
-def hatcher_alive_loading_maybe_route_retry(core, tab, rt_tab, cfg):
-    """After the long safe wait, allow one non-killing route refresh only."""
-    if not hatcher_alive_loading_guard_active(rt_tab):
-        return False, "not guarded"
-    if hatcher_alive_loading_hold_left(rt_tab) > 0:
-        return False, "hold active"
-
-    limit = max(
-        0,
-        int(cfg.get("hatcher_alive_loading_route_retry_limit", 1) or 0),
-    )
-    retries = int(rt_tab.get("hatcher_alive_loading_route_retries", 0) or 0)
-    if retries >= limit:
-        return False, "route-only retries exhausted"
-
-    metadata = {
-        "hatcher_alive_loading_route_only": True,
-        "no_hard_fallback": True,
-        "skip_solver_probe": True,
-        "solver_preflight_done": True,
-        "skip_solver_once": True,
-    }
-    added, note = core.queue_route_retry(
-        tab,
-        "hatcher",
-        f"alive loading safe route retry {retries + 1}/{limit}",
-        metadata=metadata,
-        bypass_manual=True,
-    )
-    if added:
-        rt_tab["hatcher_alive_loading_route_retries"] = retries + 1
-        rt_tab["hatcher_alive_loading_hold_until"] = 0
-        return True, f"alive loading route retry {retries + 1}/{limit} queued"
-    return False, str(note or "route retry already queued")
-
-
-def hatcher_alive_loading_maybe_solver_rescue(
-    core, tab, rt_tab, cfg, process_status="", state=None
-):
-    """Run the package-local five-minute watchdog for an actual successful open.
-
-    V4.81.77 reached this helper only through the loading-guard branch. The
-    older bubble-only branch is evaluated first, so it could queue another open,
-    replace ``last_open``, and starve the provider check indefinitely. V4.81.78
-    keys the check to a token armed directly by ``open ok`` and lets the live
-    Hatcher loop call it before any stale/bubble recovery decision.
-    """
-    if not cfg.get("solver_stuck_loading_probe_enabled", True):
-        return False, "stuck-loading solver rescue disabled"
-    if not cfg.get("solver_enabled", False):
-        return False, "solver disabled"
-
-    opened_at = int(rt_tab.get("solver_stuck_open_token", 0) or 0)
-    if opened_at <= 0:
-        return False, "stuck-loading rescue not armed by open ok"
-
-    if str(process_status or "").upper() != "ALIVE":
-        return False, "target is not confirmed ALIVE"
-
-    fresh, _fresh_state, _fresh_err = state_fresh_after_open(
-        tab, cfg, opened_at
-    )
-    if fresh:
-        rt_tab["solver_stuck_open_completed_at"] = now()
-        rt_tab["solver_stuck_open_token"] = 0
-        rt_tab["solver_stuck_open_target"] = ""
-        return False, "fresh state completed open watchdog"
-
-    probe_after = max(
-        300,
-        int(cfg.get("solver_stuck_loading_probe_after_seconds", 300) or 300),
-    )
-    open_age = max(0, now() - opened_at)
-    if open_age < probe_after:
-        return False, "captcha rescue in " + format_age(probe_after - open_age)
-
-    started, note = start_challenge_probe_job(
-        tab,
-        cfg,
-        core.rt,
-        rt_tab,
-        probe_token=opened_at,
-        reason="Hatcher still loading after five minutes; hidden CAPTCHA rescue",
-        unconditional_provider=True,
-    )
-    if started:
-        # The solver now owns only this package's incident. Remove a queued
-        # bubble/old-state retry for the same target so it cannot race the
-        # provider or replace the token. Sibling queue entries are untouched.
-        removed = core.cancel(str((tab or {}).get("package", "") or ""))
-        if removed:
-            log_activity(
-                "five-minute solver watchdog cancelled target-only queued "
-                "recovery; sibling queues untouched",
-                str((tab or {}).get("package", "") or ""),
-                CYAN,
-            )
-        rt_tab["note"] = str(note or "checking hidden captcha")
-        core.save()
-    return started, str(note or "hidden CAPTCHA rescue checked")
-
-
 def hatcher_alive_old_state_hard_settings(hcfg, cfg):
     """Return safe Hatcher old-state recovery thresholds.
 
@@ -12217,10 +11872,10 @@ def hatcher_alive_old_state_hard_settings(hcfg, cfg):
     try:
         max_valid_seconds = int(hcfg.get(
             "hatcher_alive_old_state_max_valid_seconds",
-            cfg.get("hatcher_alive_old_state_max_valid_seconds", MAX_VALID_STALE_STATE_SECONDS)
-        ) or MAX_VALID_STALE_STATE_SECONDS)
+            cfg.get("hatcher_alive_old_state_max_valid_seconds", 86400)
+        ) or 86400)
     except Exception:
-        max_valid_seconds = MAX_VALID_STALE_STATE_SECONDS
+        max_valid_seconds = 86400
     try:
         cooldown_seconds = int(hcfg.get(
             "hatcher_alive_old_state_hard_force_cooldown_seconds",
@@ -12240,11 +11895,6 @@ def hatcher_alive_old_state_hard_settings(hcfg, cfg):
 
 
 def _queue_hatcher_alive_old_state_hard(open_queue, tab, rt_tab, hcfg, cfg, age_or_seconds, reason, core=None):
-    if hatcher_alive_loading_guard_active(rt_tab):
-        left = hatcher_alive_loading_hold_left(rt_tab)
-        if left > 0:
-            return False, f"alive loading/server queue hold {format_age(left)}", False
-        return False, "alive loading guard active; automatic hard recovery blocked", False
     """Queue one affected Hatcher package for verified exact-PID restart."""
     enabled, age_seconds, max_valid_seconds, cooldown_seconds = hatcher_alive_old_state_hard_settings(hcfg, cfg)
     pkg = str((tab or {}).get("package", "") or "")
@@ -12262,9 +11912,8 @@ def _queue_hatcher_alive_old_state_hard(open_queue, tab, rt_tab, hcfg, cfg, age_
         age_i = 0
     if age_i < age_seconds:
         return False, "alive old state", False
-    # V4.81.71: state-bearing callers reject phantom/>270h timestamps before
-    # entering this queue. No-state duration is not a timestamp sample and may
-    # still exceed 270h so a genuinely dead/stuck package can self-heal.
+    if age_i > max_valid_seconds:
+        return False, f"invalid old state ignored {age_i}s", False
 
     t = now()
     last = int(rt_tab.get("hatcher_alive_old_state_hard_last", 0) or 0)
@@ -12284,6 +11933,18 @@ def _queue_hatcher_alive_old_state_hard(open_queue, tab, rt_tab, hcfg, cfg, age_
             "hatcher_old_state_recovery": True,
             "hatcher_old_state_age": age_i,
             "hatcher_old_state_reason": str(reason or "alive old state"),
+            # V4.81.65: this generation owns the one combined stuck recovery.
+            "combined_stuck_recovery": bool(
+                cfg.get("hatcher_combined_stuck_recovery_enabled", True)
+            ),
+            "combined_stuck_refresh_private_link": bool(
+                cfg.get("hatcher_combined_stuck_recovery_enabled", True)
+                and cfg.get("hatcher_combined_stuck_refresh_private_link", True)
+            ),
+            "combined_stuck_clear_cache": bool(
+                cfg.get("hatcher_combined_stuck_recovery_enabled", True)
+                and cfg.get("hatcher_combined_stuck_clear_cache", True)
+            ),
         },
     )
     if not added:
@@ -12772,39 +12433,6 @@ def state_age_seconds(state):
         return 999999
 
 
-def state_phantom_timestamp_reason(state, future_slack_seconds=300):
-    """Return a reason when a state timestamp is unsafe as recovery evidence.
-
-    V4.81.71 keeps V4.81.70's explicit timestamp checks and adds a 270-hour
-    upper-age backstop. That is intentionally below the historical ~277h
-    one-refresh phantom while still allowing genuinely stale 24h/105h/200h
-    states to recover normally.
-    """
-    if not isinstance(state, dict):
-        return "state missing"
-    try:
-        ts = int(state.get("ts", 0) or 0)
-    except Exception:
-        return "timestamp unreadable"
-    if ts <= 0:
-        return "timestamp missing/zero"
-    try:
-        current = int(now())
-    except Exception:
-        current = 0
-    if current > 0 and ts > current + max(30, int(future_slack_seconds or 300)):
-        return f"timestamp in future ({ts - current}s)"
-    if current > 0:
-        age = max(0, current - ts)
-        if age > MAX_VALID_STALE_STATE_SECONDS:
-            return f"timestamp older than 270h ({format_age(age)})"
-    return ""
-
-
-def state_has_phantom_timestamp(state):
-    return bool(state_phantom_timestamp_reason(state))
-
-
 def state_is_fresh(state, cfg, seconds=None):
     if not state:
         return False
@@ -12879,54 +12507,6 @@ def clear_obsolete_age_access_hold(rt_tab, pkg):
 
     rt_tab["age_access_false_hold_cleared_at"] = now()
     return True
-
-
-def _peer_auth_safe_route_attempted(rt_tab, peer_pkg):
-    if not isinstance(rt_tab, dict):
-        return False
-    peer = str(peer_pkg or "").strip()
-    if not peer:
-        return False
-    attempted_peer = str(rt_tab.get("peer_auth_safe_route_attempted_peer", "") or "").strip()
-    attempted_at = int(rt_tab.get("peer_auth_safe_route_attempted_at", 0) or 0)
-    return attempted_at > 0 and attempted_peer == peer
-
-
-def _adopt_recent_legacy_peer_auth_safe_route_attempt(rt_tab, peer_pkg, grace_seconds):
-    """Treat a recent V4.81.64 peer-route timestamp as this incident's one-shot.
-
-    V4.81.64 persisted only peer_auth_safe_route_last, not the peer identity. Limit
-    adoption to a short window so old unrelated incidents do not suppress a new
-    recovery indefinitely. Skipping one extra automatic route is fail-safe.
-    """
-    if _peer_auth_safe_route_attempted(rt_tab, peer_pkg):
-        return True
-    last = int((rt_tab or {}).get("peer_auth_safe_route_last", 0) or 0)
-    window = max(600, int(grace_seconds or 0) * 2)
-    if last <= 0 or now() - last > window:
-        return False
-    rt_tab["peer_auth_safe_route_attempted_peer"] = str(peer_pkg or "").strip()
-    rt_tab["peer_auth_safe_route_attempted_at"] = last
-    rt_tab["peer_auth_safe_route_attempt_ok"] = True
-    rt_tab["peer_auth_safe_route_legacy_adopted_at"] = now()
-    return True
-
-
-def _mark_peer_auth_safe_route_attempt(rt_tab, peer_pkg, ok):
-    if not isinstance(rt_tab, dict):
-        return
-    rt_tab["peer_auth_safe_route_attempted_peer"] = str(peer_pkg or "").strip()
-    rt_tab["peer_auth_safe_route_attempted_at"] = now()
-    rt_tab["peer_auth_safe_route_attempt_ok"] = bool(ok)
-
-
-def _clear_peer_auth_safe_route_attempt(rt_tab):
-    if not isinstance(rt_tab, dict):
-        return
-    rt_tab["peer_auth_safe_route_attempted_peer"] = ""
-    rt_tab["peer_auth_safe_route_attempted_at"] = 0
-    rt_tab["peer_auth_safe_route_attempt_ok"] = False
-    rt_tab["peer_auth_safe_route_last"] = 0
 
 
 def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=None, raw_alive=None, state=None, err=None, process_status=None, process_note=""):
@@ -13056,20 +12636,13 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
                     pkg,
                     RED,
                 )
-        maybe_start_face_unlock_probe(
-            tab, cfg, rt_tab, reason=detail
-        )
-        face_note = str(
-            rt_tab.get("face_unlock_probe_note")
-            or "account locked; manual verification"
-        )
         return {
             "pkg": pkg, "user": tab.get("user_name", pkg), "alive": bool(raw_alive),
             "state": state, "state_err": err, "fresh": False, "clean_fresh": False,
             "pets": int(state.get("pet_count", 0) or 0) if state else "-",
             "eggs": int(state.get("egg_total", 0) or 0) if state else "-",
             "age": state_age_seconds(state) if state else "-",
-            "status": "Face Lock", "note": face_note,
+            "status": "Face Lock", "note": "account locked; manual verification",
             "bad": "face_lock", "visible_window": True,
             "face_lock_detail": face_lock,
         }
@@ -13081,17 +12654,10 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
     # as face lock. Once the package has a clean post-open heartbeat, clear stale
     # screenshot confirmations and perform no more visual/accessibility checks.
     captcha_loading_only = bool(cfg.get("captcha_visual_loading_only", True))
-    # V4.81.68: once attempt #1 has confirmed this exact live challenge, attempts
-    # #2/#3 must not keep rescanning the unchanged Start Puzzle rectangle. The
-    # generation owns the package until success/NO_CAPTCHA or the 3-try reopen.
-    solver_generation_owns_old_ui = bool(
-        solver_challenge_generation_active(rt_tab)
-        and rt_tab.get("solver_challenge_guard_done")
-    )
     captcha_scan_eligible = bool(raw_alive) and (
         (not captcha_loading_only) or (not loading_online_proof)
-    ) and not solver_generation_owns_old_ui
-    if not captcha_scan_eligible and not solver_generation_owns_old_ui:
+    )
+    if not captcha_scan_eligible:
         clear_visual_captcha_confirmation(pkg)
     captcha_ui = android_login_challenge_ui_detail(
         pkg, cfg, force=False, auth_hint=_runtime_auth_hint(rt_tab)
@@ -13111,9 +12677,9 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
             "bad": "ui_challenge", "visible_window": True,
             "ui_challenge_detail": captcha_ui,
         }
-    elif rt_tab.get("captcha_ui_visible") and not solver_generation_owns_old_ui:
-        # Only clear this evidence when we actually inspected the current session.
-        # During attempts #2/#3 V4.81.68 intentionally does not rescan old UI.
+    elif rt_tab.get("captcha_ui_visible"):
+        # The shared snapshot has moved past the challenge. Fresh state below can
+        # clear any false-negative hold without reopening the package.
         rt_tab["captcha_ui_visible"] = False
         rt_tab["captcha_ui_detail"] = ""
 
@@ -13171,22 +12737,12 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
 
     if manual_login_blocked(rt_tab, cfg, pkg) and not state_login_challenge_detail(state):
         face_locked = str(rt_tab.get("manual_login_reason", "") or "") == "face_lock" or bool(rt_tab.get("face_lock_detected"))
-        if face_locked:
-            maybe_start_face_unlock_probe(
-                tab, cfg, rt_tab,
-                reason=str(rt_tab.get("face_lock_detail") or "persisted face lock hold"),
-            )
-        manual_note = (
-            str(rt_tab.get("face_unlock_probe_note") or "account locked; use Recovery Tools")
-            if face_locked
-            else (rt_tab.get("note") or "needs manual login")
-        )
         return {
             "pkg": pkg, "user": tab.get("user_name", pkg), "alive": bool(raw_alive),
             "state": state, "state_err": err, "fresh": fresh, "clean_fresh": clean_fresh,
             "pets": pets, "eggs": eggs, "age": age,
             "status": "Face Lock" if face_locked else "Manual",
-            "note": manual_note,
+            "note": ("account locked; use Recovery Tools" if face_locked else (rt_tab.get("note") or "needs manual login")),
             "bad": "face_lock" if face_locked else "manual",
             "visible_window": visible_window,
         }
@@ -13264,168 +12820,86 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
 
 
 def maybe_queue_solver_busy_retry(open_queue, tab, target, rt_tab, cfg, health, core=None):
-    """Own solver retries without letting stale retry state suppress recovery.
+    """Retry temporary provider failures against the current challenge, never by reopening Roblox.
 
-    V4.81.69 ordering:
-    - DEAD target always exits solver ownership first and falls through to normal
-      exact-PID crash recovery. There is no live CAPTCHA session left to solve.
-    - A legacy/non-generation retry is reconciled once against the CURRENT target:
-      fresh CAPTCHA => seed a generation; no CAPTCHA => clear stale retry.
-    - Active generations keep V4.81.68 behavior: #2/#3 skip the unchanged old UI,
-      and three failures queue one exact-target safety reopen.
+    V4.81.16 removes the legacy cooldown -> hard-reopen -> provider-retry loop.
+    On Noka/App Cloner, relaunching one Roblox task can disturb sibling floating tasks.
+    A provider retry therefore requires a still-live, package-scoped challenge signal.
     """
     if core is None:
         core = RejoinCore(open_queue, cfg, None)
-    pkg = str((tab or {}).get("package", "") or "")
-    generation_active = solver_challenge_generation_active(rt_tab)
-
-    if generation_active and solver_job_running(pkg):
-        return "Solving", solver_job_note(pkg), True
-
-    if generation_active and rt_tab.get("solver_challenge_reopen_pending"):
-        return "Queued", "solver generation target reopen pending", True
-
-    # Recover a persisted generation after NOMO/Termux restart. The HTTP worker is
-    # not persistent, but the attempt count is. Never fall back to ordinary stale
-    # recovery while this package still belongs to its solver generation.
-    if generation_active and not rt_tab.get("solver_busy_retry_pending"):
-        attempts = int(rt_tab.get("solver_challenge_attempts", 0) or 0)
-        limit = solver_challenge_attempt_limit(cfg)
-        if attempts >= limit:
-            added, _ = queue_solver_generation_reopen(
-                core, tab, target, rt_tab, cfg, f"SOLVER_STUCK_{attempts}", safety=True
-            )
-            core.save()
-            return (
-                "Queued" if added else "Waiting",
-                f"solver failed {attempts}/{limit}; exact target safety reopen",
-                True,
-            )
-        retry_at = max(
-            now(),
-            int(rt_tab.get("solver_last_attempt", 0) or 0)
-            + max(600, int(cfg.get("solver_failure_retry_seconds", 600) or 600)),
-        )
-        rt_tab["solver_busy_retry_pending"] = True
-        rt_tab["solver_busy_retry_at"] = retry_at
-        rt_tab["solver_busy_retry_seconds"] = max(1, retry_at - now())
-        rt_tab["solver_retry_reason"] = "CAPTCHA_GENERATION"
-
     if not rt_tab.get("solver_busy_retry_pending"):
         return None
 
-    # V4.81.69: process liveness outranks ANY provider retry cooldown. A dead
-    # clone cannot still own a usable browser/CAPTCHA challenge, so do not send
-    # stale data to the solver. Clear transient solver ownership and let the
-    # normal crash branch below queue the exact-target-PID reopen immediately.
-    alive = bool((health or {}).get("alive"))
-    if not alive:
-        had_generation = generation_active
-        clear_solver_runtime_block(rt_tab)
-        clear_captcha_ui_runtime(rt_tab)
-        if had_generation:
-            reset_solver_challenge_generation(rt_tab, "package died before solver retry")
-        rt_tab["note"] = "solver retry cleared; target dead; normal crash recovery"
-        log_activity(
-            "solver retry cleared because target is dead; normal exact-PID recovery owns reopen",
-            pkg, YELLOW,
-        )
-        core.save()
+    if health.get("clean_fresh"):
+        rt_tab["solver_busy_retry_pending"] = False
+        rt_tab["solver_busy_retry_at"] = 0
+        rt_tab["solver_retry_reason"] = ""
+        rt_tab["note"] = "fresh state; solver retry cancelled"
         return None
 
+    pkg = str((tab or {}).get("package", "") or "")
     retry_reason = str(rt_tab.get("solver_retry_reason") or "SERVER_BUSY")
     retry_at = int(rt_tab.get("solver_busy_retry_at", 0) or 0)
-
-    # V4.81.69 migration/self-heal for old SERVER_BUSY/PROVIDER retry state that
-    # predates challenge generations. Guard THIS live target once right now. Do
-    # not let a stale Lua state file seed a generation; only fresh state counts.
-    if not generation_active:
-        state = (health or {}).get("state") or {}
-        fresh_state_challenge = (
-            state_login_challenge_detail(state) if bool((health or {}).get("fresh")) else ""
-        )
-        visible = android_login_challenge_ui_detail(
-            pkg, cfg, force=True, auth_hint=_runtime_auth_hint(rt_tab)
-        )
-        if not visible and not fresh_state_challenge:
-            clear_solver_runtime_block(rt_tab)
-            clear_captcha_ui_runtime(rt_tab)
-            rt_tab["note"] = "stale solver retry cleared; no current challenge; normal recovery"
-            log_activity(
-                "legacy solver retry cleared; fresh target guard found no current CAPTCHA",
-                pkg, GREEN,
-            )
-            core.save()
-            return None
-
-        detail = (
-            str((visible or {}).get("text") or (visible or {}).get("reason") or "").strip()
-            if visible else str(fresh_state_challenge or "").strip()
-        )
-        begin_solver_challenge_generation(
-            rt_tab, pkg, detail or f"{retry_reason} retry; current challenge reconfirmed"
-        )
-        generation_active = True
-        rt_tab["solver_retry_reason"] = "CAPTCHA_GENERATION"
-        rt_tab["note"] = "current CAPTCHA reconfirmed; solver generation 1/3 armed"
-        log_activity(
-            "legacy solver retry reconciled: current CAPTCHA confirmed; generation 1/3 armed",
-            pkg, CYAN,
-        )
-        core.save()
-
-    if retry_at > now():
-        left = max(1, retry_at - now())
+    if retry_at <= 0 or now() < retry_at:
+        left = max(1, retry_at - now()) if retry_at else 600
+        # A pending solver retry must own this package's challenge incident. Do
+        # not let an old-state/dashboard branch leave a hard reopen queued behind it.
         removed = core.cancel(pkg)
         if removed:
             core.save()
-        attempts = int(rt_tab.get("solver_challenge_attempts", 0) or 0)
-        suffix = f" attempt {attempts + 1}/3" if generation_active else ""
-        return "Waiting", f"solver{suffix}; retry provider in {format_age(left)} (no reopen yet)", True
+        return "Waiting", f"solver {retry_reason}; retry provider in {format_age(left)} (no reopen)", True
 
     if solver_job_running(pkg):
         return "Solving", solver_job_note(pkg), True
 
-    removed = core.cancel(pkg)
-    clear_solver_runtime_block(rt_tab)
-    if removed:
-        log_activity("solver generation owns package; cancelled unrelated queued reopen", pkg, YELLOW)
+    alive = bool((health or {}).get("alive"))
+    state = (health or {}).get("state") or {}
+    challenge_detail = state_login_challenge_detail(state)
+    visible = android_login_challenge_ui_detail(pkg, cfg, force=True, auth_hint=_runtime_auth_hint(rt_tab)) if alive else None
 
-    if generation_active:
-        # V4.81.68 key rule retained: #2/#3 deliberately skip the old
-        # rectangle/UI guard. V4.81.69 may also enter here for legacy retry state
-        # after the fresh target guard above has seeded attempt #1.
-        next_attempt = int(rt_tab.get("solver_challenge_attempts", 0) or 0) + 1
-        started, note = start_solver_job(
-            tab, cfg, core.rt, rt_tab,
-            f"confirmed CAPTCHA generation retry #{next_attempt}",
-            force=False, phase="solve", target_override=target, core=core,
-            challenge_confirmed=True,
-        )
-        if started:
-            core.save()
-            guard_note = (
-                "fresh target guard already completed" if next_attempt == 1
-                else "old CAPTCHA UI guard skipped"
-            )
-            log_activity(f"solver attempt {next_attempt}/3 started; {guard_note}", pkg, CYAN)
-            return "Solving", note, True
-
-        # A provider gate/cooldown is not a reason to drop the generation or turn
-        # it into a manual-login hold. Keep it package-local and retry later.
-        retry_after = max(600, int(cfg.get("solver_failure_retry_seconds", 600) or 600))
-        apply_solver_retry_later(pkg, rt_tab, cfg, "CAPTCHA_GENERATION", retry_after)
-        rt_tab["note"] = f"solver generation retry deferred: {cut(note, 70)}"
+    if not alive:
+        # Solver retry does not own crash recovery. Let the normal dead-package
+        # path reopen it if required, but never create a reopen solely for solver.
+        rt_tab["solver_busy_retry_pending"] = False
+        rt_tab["solver_busy_retry_at"] = 0
+        rt_tab["solver_retry_reason"] = ""
+        rt_tab["note"] = "solver retry cancelled; package is not alive"
         core.save()
+        return None
+
+    if not visible and not challenge_detail:
+        # Challenge-only invariant: do not blindly call the provider and do not
+        # bounce Roblox merely to rediscover a challenge. Recheck shortly.
+        wait_again = 60
+        rt_tab["solver_busy_retry_at"] = now() + wait_again
+        rt_tab["note"] = "solver retry due; waiting for current challenge (no reopen)"
+        removed = core.cancel(pkg)
+        core.save()
+        if removed:
+            log_activity("solver retry cancelled queued reopen; waiting for challenge in-place", pkg, YELLOW)
         return "Waiting", rt_tab["note"], True
 
-    # Defensive fallback only. The reconciliation above should either clear a
-    # legacy retry or convert it into an active challenge generation.
-    clear_solver_runtime_block(rt_tab)
-    rt_tab["note"] = "solver retry state reconciled; normal recovery"
-    core.save()
-    return None
+    removed = core.cancel(pkg)
+    rt_tab["solver_busy_retry_pending"] = False
+    rt_tab["solver_busy_retry_at"] = 0
+    rt_tab["solver_retry_reason"] = ""
+    if removed:
+        log_activity("verification owns package; cancelled pending reopen before solver retry", pkg, YELLOW)
 
+    detail = (
+        str((visible or {}).get("text") or (visible or {}).get("reason") or "").strip()
+        if visible else str(challenge_detail or "").strip()
+    )
+    status, note = core.handle_detected_solver_challenge(
+        tab, rt_tab, detail or f"{retry_reason} retry on current verification UI"
+    )
+    log_activity(
+        f"solver {retry_reason} cooldown done; provider retry in-place (no reopen)",
+        pkg,
+        CYAN if status == "Solving" else YELLOW,
+    )
+    return status, note, True
 
 def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, health, core=None):
     """Solve one package-scoped visible challenge in-place without reopening Roblox.
@@ -13460,27 +12934,7 @@ def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, he
     if busy_pending and busy_at > now():
         left = max(1, busy_at - now())
         reason = str(rt_tab.get("solver_retry_reason") or "PROVIDER")
-        if not solver_challenge_generation_active(rt_tab):
-            # V4.81.69: this is the one fresh guard for a persisted/legacy
-            # provider retry. The current target visibly has CAPTCHA, so arm a
-            # generation now but preserve the existing provider cooldown.
-            detail = str(
-                (health or {}).get("ui_challenge_detail", {}).get("text")
-                if isinstance((health or {}).get("ui_challenge_detail"), dict) else ""
-            ).strip()
-            if not detail:
-                detail = str(rt_tab.get("captcha_ui_detail") or "visible verification UI").strip()
-            begin_solver_challenge_generation(
-                rt_tab, pkg, detail or "visible verification UI; legacy retry reconciled"
-            )
-            rt_tab["solver_retry_reason"] = "CAPTCHA_GENERATION"
-            note = f"verification confirmed; solver attempt 1/3 in {format_age(left)} (no reopen)"
-            log_activity(
-                "legacy solver retry reconciled from visible CAPTCHA; generation 1/3 armed",
-                pkg, CYAN,
-            )
-        else:
-            note = f"verification UI; {reason} retry provider in {format_age(left)} (no reopen)"
+        note = f"verification UI; {reason} retry provider in {format_age(left)} (no reopen)"
         rt_tab["note"] = note
         core.save()
         return "Captcha", note, True
@@ -13547,8 +13001,7 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
             return health.get("status", ""), "SAFEMODE-off " + str(health.get("note", "")), False
 
     trigger = int(cfg.get("alive_old_state_hard_seconds", 180) or 180)
-    # Legacy max-valid-age config is intentionally not used as a recovery veto
-    # in V4.81.71. Validate the timestamp and 270h backstop instead.
+    max_valid = int(cfg.get("alive_old_state_max_valid_seconds", 86400) or 86400)
     stale_limit = int(cfg.get("state_stale_seconds", 180) or 180)
     grace = int(cfg.get("post_open_grace_seconds", 360) or 360)
 
@@ -13673,29 +13126,64 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
     if state:
         age = state_age_seconds(state)
 
-        # V4.81.71: PHANTOM TIMESTAMP/AGE GUARD. Real stale states remain actionable
-        # through 270h; >270h, missing/zero timestamps, and implausible future ts
-        # are ignored as recovery evidence before anything destructive is queued.
-        phantom_reason = state_phantom_timestamp_reason(state)
-        if phantom_reason:
+        # V3.79: PHANTOM AGE GUARD (mirror of the hatcher path).
+        # A missing `ts` field makes age compute to an impossible value like 277h.
+        # Never drive a kill+open off that — ignore it and trust the live package
+        # check instead. Checked BEFORE grace/trigger so a garbage age can't force
+        # a rejoin under any branch. This is the exact guard the market path was
+        # missing while the hatcher had it.
+        if max_valid > 0 and age > max_valid:
             return ("Ingame" if alive else "Stale"), \
-                   f"phantom state ignored: {phantom_reason} ({format_age(age)})", False
+                   f"invalid old state ignored {format_age(age)}", False
 
         # fresh -> healthy, skip
         if age <= stale_limit and state_is_clean(state):
             clear_disconnect_ui_incident(rt_tab)
-            _clear_peer_auth_safe_route_attempt(rt_tab)
             return ("Ingame" if alive else "Loading"), "ok", False
 
         # old state but still loading (inside our grace window) -> wait
         if in_grace:
             return "Loading", f"loading grace {format_age(now() - last_open)}", True
 
-        # V4.81.67: auth holds are target-local. A sibling's face-lock/529/CAPTCHA
-        # must never downgrade or suppress recovery for this package. Retire any
-        # legacy peer-safe-route marker, then classify this target normally.
+        # old past trigger -> hard recovery, except a peer auth incident may
+        # downgrade an ALIVE sibling to a safe route-only generation. Always
+        # classify THIS package with the direct moderation API first; otherwise
+        # one face-locked clone could hide a second face-locked clone forever.
         if age >= trigger:
-            _clear_peer_auth_safe_route_attempt(rt_tab)
+            if alive and _is_noka_clone_package(pkg):
+                peer_pkg, peer_reason = active_noka_auth_incident(cfg, rt, exclude_pkg=pkg)
+                if peer_pkg:
+                    own_blocked, own_note = direct_moderation_guard_before_open(
+                        tab, rt_tab, cfg, f"peer-auth classify before {mode} old-state recovery"
+                    )
+                    if own_blocked:
+                        core.cancel(pkg)
+                        core.save()
+                        return "Manual", own_note or rt_tab.get("note") or "auth/moderation hold", True
+
+                    interval = max(30, int(cfg.get("noka_peer_auth_safe_route_retry_seconds", 45) or 45))
+                    last_peer_route = int(rt_tab.get("peer_auth_safe_route_last", 0) or 0)
+                    if last_peer_route > 0 and now() - last_peer_route < interval:
+                        left = max(1, interval - (now() - last_peer_route))
+                        rt_tab["note"] = f"peer auth {short_pkg(peer_pkg)}; safe route cooldown {left}s"
+                        core.save()
+                        return "Waiting", rt_tab["note"], True
+
+                    meta = {
+                        "peer_auth_safe_route_only": True,
+                        "no_hard_fallback": True,
+                        "bypass_recheck": True,
+                    }
+                    added, _ = core.queue_route_retry(
+                        tab, target, f"peer auth {short_pkg(peer_pkg)}; safe ALIVE route", metadata=meta
+                    )
+                    rt_tab["peer_auth_safe_route_last"] = now()
+                    rt_tab["note"] = (
+                        f"peer auth {short_pkg(peer_pkg)}; safe route queued"
+                        if added else f"peer auth {short_pkg(peer_pkg)}; safe route already queued"
+                    )
+                    core.save()
+                    return ("Queued" if added else "Waiting"), rt_tab["note"], True
             added, _ = core.queue_alive_old_state_recovery(
                 tab,
                 target,
@@ -13713,9 +13201,40 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
     if alive:
         if in_grace:
             return "Loading", "no state grace", True
-        # V4.81.67: sibling auth state is informational only. Recover this target
-        # from its own process/state/API/UI evidence and retire any legacy marker.
-        _clear_peer_auth_safe_route_attempt(rt_tab)
+        if _is_noka_clone_package(pkg):
+            peer_pkg, peer_reason = active_noka_auth_incident(cfg, rt, exclude_pkg=pkg)
+            if peer_pkg:
+                own_blocked, own_note = direct_moderation_guard_before_open(
+                    tab, rt_tab, cfg, f"peer-auth classify before {mode} no-state recovery"
+                )
+                if own_blocked:
+                    core.cancel(pkg)
+                    core.save()
+                    return "Manual", own_note or rt_tab.get("note") or "auth/moderation hold", True
+
+                interval = max(30, int(cfg.get("noka_peer_auth_safe_route_retry_seconds", 45) or 45))
+                last_peer_route = int(rt_tab.get("peer_auth_safe_route_last", 0) or 0)
+                if last_peer_route > 0 and now() - last_peer_route < interval:
+                    left = max(1, interval - (now() - last_peer_route))
+                    rt_tab["note"] = f"peer auth {short_pkg(peer_pkg)}; safe route cooldown {left}s"
+                    core.save()
+                    return "Waiting", rt_tab["note"], True
+
+                meta = {
+                    "peer_auth_safe_route_only": True,
+                    "no_hard_fallback": True,
+                    "bypass_recheck": True,
+                }
+                added, _ = core.queue_route_retry(
+                    tab, target, f"peer auth {short_pkg(peer_pkg)}; safe ALIVE no-state route", metadata=meta
+                )
+                rt_tab["peer_auth_safe_route_last"] = now()
+                rt_tab["note"] = (
+                    f"peer auth {short_pkg(peer_pkg)}; safe route queued"
+                    if added else f"peer auth {short_pkg(peer_pkg)}; safe route already queued"
+                )
+                core.save()
+                return ("Queued" if added else "Waiting"), rt_tab["note"], True
         added, _ = core.queue_alive_no_state_recovery(
             tab,
             target,
@@ -14058,9 +13577,7 @@ def roblox_cookie_not_approved_api_detection(cookie, expected_user_id=None, cfg=
 
 
 
-def direct_moderation_guard_before_open(
-    tab, rt_tab, cfg, reason="queued open", allow_existing_auth_recheck=False
-):
+def direct_moderation_guard_before_open(tab, rt_tab, cfg, reason="queued open"):
     """Run the direct Roblox Not Approved moderation check before ANY open intent.
 
     This guard is deliberately independent from the CAPTCHA solver and from the
@@ -14076,25 +13593,8 @@ def direct_moderation_guard_before_open(
     if not pkg:
         return False, "direct moderation guard no package"
 
-    existing_auth_hold = bool(
-        manual_login_blocked(rt_tab, cfg, pkg) and _runtime_auth_hint(rt_tab)
-    )
-    if existing_auth_hold:
-        manual_reason = str(rt_tab.get("manual_login_reason", "") or "").lower()
-        never_probe_terms = (
-            "account_banned", "banned", "terminated", "api user moderated",
-            "parental", "daily limit",
-        )
-        may_recheck = bool(
-            allow_existing_auth_recheck
-            and not any(term in manual_reason for term in never_probe_terms)
-        )
-        if not may_recheck:
-            return True, str(rt_tab.get("note") or "existing auth/moderation hold")
-        # V4.81.74: this is a non-destructive route that was already earned by
-        # an independent Roblox clean-session probe. Re-check direct moderation
-        # freshly instead of letting the persisted Face Lock/CAPTCHA flag veto
-        # the route before Roblox can refresh the old Redfinger screen.
+    if manual_login_blocked(rt_tab, cfg, pkg) and _runtime_auth_hint(rt_tab):
+        return True, str(rt_tab.get("note") or "existing auth/moderation hold")
 
     cookie, cookie_source, cookie_note = solver_cookie_for_package(pkg, cfg)
     cookie = str(cookie or "").strip()
@@ -14579,12 +14079,12 @@ def hatcher_visible_home_watch_active(rt_tab, cfg):
     return now() - last_open <= watch
 
 
-def android_disconnect_ui_detail(pkg, cfg, force=False):
+def android_disconnect_ui_detail(pkg, cfg):
     """High-confidence package-scoped native Roblox disconnect detection."""
     if not cfg.get("android_disconnect_ui_detection_enabled", True):
         return None
 
-    texts, _ = android_ui_text_for_package_or_rect(pkg, cfg, force=bool(force))
+    texts, _ = android_ui_text_for_package_or_rect(pkg, cfg, force=False)
     if not texts:
         return None
 
@@ -15975,9 +15475,6 @@ def wait_until_fresh_after_open(
                 tab, cfg, rt, rt_tab,
                 probe_token=opened_at,
                 reason="wait-after-open no fresh state",
-                unconditional_provider=bool(
-                    cfg.get("solver_stuck_loading_unconditional_provider", True)
-                ),
             )
             if not started and (
                 "already checked this rejoin" in probe_note
@@ -16215,8 +15712,6 @@ def wait_until_fresh_after_open(
             clear_manual_login_block(rt_tab)
             clear_captcha_ui_runtime(rt_tab)
             clear_disconnect_ui_incident(rt_tab)
-            if pending_target == "hatcher":
-                clear_hatcher_alive_loading_guard(rt_tab, "fresh clean state")
             rt_tab["solver_busy_retry_pending"] = False
             rt_tab["solver_busy_retry_at"] = 0
             rt_tab["solver_retry_reason"] = ""
@@ -16243,40 +15738,6 @@ def wait_until_fresh_after_open(
                 core.save()
                 return False, "stop"
             time.sleep(1)
-
-    # The normal five-minute wait ends exactly at the rescue threshold, so the
-    # loop above may exit before its next tick can launch the one-shot check.
-    # Perform that boundary check here, then release the single-flight lock
-    # while the provider works in the background.
-    final_status, _final_status_note = package_alive_status(pkg, cfg)
-    final_fresh, _final_state, _final_err = state_fresh_after_open(
-        tab, cfg, opened_at
-    )
-    stuck_after = max(
-        300,
-        int(cfg.get("solver_stuck_loading_probe_after_seconds", 300) or 300),
-    )
-    if (
-        allow_solver_probe
-        and cfg.get("solver_stuck_loading_probe_enabled", True)
-        and final_status == "ALIVE"
-        and not final_fresh
-        and now() - int(opened_at or start) >= stuck_after
-    ):
-        started, _probe_note = start_challenge_probe_job(
-            tab,
-            cfg,
-            rt,
-            rt_tab,
-            probe_token=opened_at,
-            reason="five-minute no-fresh boundary; hidden CAPTCHA rescue",
-            unconditional_provider=True,
-        )
-        if started:
-            core.save()
-            return False, "solver pending"
-        if solver_job_completion_state(pkg):
-            return False, "solver result"
 
     return False, "fresh timeout"
 
@@ -16327,7 +15788,11 @@ def solver_preflight_before_open(open_queue, item, tab, rt_tab, pkg, target, cfg
     trust_until = int(rt_tab.get("solver_no_captcha_trust_until", 0) or 0)
     trusted_rejoins = int(rt_tab.get("solver_no_captcha_trusted_rejoins", 0) or 0)
     max_trusted = max(1, int(cfg.get("solver_no_captcha_max_trusted_rejoins", 3) or 3))
-    if trust_until > now() and trusted_rejoins < max_trusted:
+    if (
+        not item.get("combined_stuck_recovery")
+        and trust_until > now()
+        and trusted_rejoins < max_trusted
+    ):
         rt_tab["solver_no_captcha_trusted_rejoins"] = trusted_rejoins + 1
         rt_tab["note"] = (
             f"NO_CAPTCHA trusted "
@@ -16382,6 +15847,7 @@ def solver_preflight_before_open(open_queue, item, tab, rt_tab, pkg, target, cfg
         open_generation=generation,
         target_override=target,
         core=core,
+        challenge_confirmed=bool(item.get("combined_stuck_recovery")),
     )
     if started:
         item["solver_preflight_waiting"] = True
@@ -16476,48 +15942,15 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
     reason = item.get("reason", "queued open")
     mode = str(item.get("mode", "hard") or "hard").lower()
 
-    # A solver may clear the Roblox challenge outside Redfinger. Give that
-    # server-side result a few seconds to propagate before restarting only the
-    # affected target. Requeueing keeps the dashboard responsive to siblings.
-    not_before = int(item.get("not_before", 0) or 0)
-    if not_before > now():
-        open_queue.append(item)
-        rt_tab["note"] = (
-            "CAPTCHA_SUCCESS; target rejoin in "
-            + format_age(not_before - now())
-        )
-        core.save()
-        return True
-
     item_mode = str(item.get("mode", "hard") or "hard").lower()
-    is_hard = item_mode not in (
-        "soft", "route", "switch", "reuse_task",
-        "dead_shell_route", "dead-shell-route",
-    )
-
-    # V4.81.67 migration: peer-auth safe routes were a cross-package workaround.
-    # They are obsolete now. Drop a persisted generation and let the next watchdog
-    # tick reclassify this target from its own state instead of resetting load grace.
-    if item.get("peer_auth_safe_route_only"):
-        _clear_peer_auth_safe_route_attempt(rt_tab)
-        rt_tab["note"] = "legacy peer-auth route retired; target will reclassify"
-        log_activity("legacy peer-auth safe route retired; target-local recheck next", pkg, DIM)
-        core.save()
-        return True
+    is_hard = item_mode not in ("soft", "route", "switch", "reuse_task")
 
     # V4.81.59: MODERATION FIRST. This is deliberately before Option 6's
     # legacy API bypass, solver/provider work, staggering, PID guards, and the
     # Android route/open itself. Strong direct Not Approved proof must stop the
     # generation before ANY rejoin intent.
     moderation_blocked, moderation_note = direct_moderation_guard_before_open(
-        tab,
-        rt_tab,
-        cfg,
-        f"before open: {reason}",
-        allow_existing_auth_recheck=bool(
-            item.get("external_face_unlock_route")
-            or item.get("provider_flagged_safe_route")
-        ),
+        tab, rt_tab, cfg, f"before open: {reason}"
     )
     if moderation_blocked:
         removed = core.cancel(pkg)
@@ -16604,55 +16037,27 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
             core.save()
             return True
 
-    # V4.81.75: a DEAD exact package can still have a surviving black
-    # App Cloner task/window. A cold hard-start intent in that state can disturb
-    # sibling floating tasks. Convert only automatic Noka recoveries to one
-    # task-reuse route; explicit manual force actions remain untouched.
+    # V4.81.54: if another Noka clone is in CAPTCHA/529/face-lock/banned state,
+    # never execute a destructive hard action against an ALIVE sibling. App Cloner
+    # can collapse sibling floating tasks even when exact-PID signaling is correct.
     if (
         is_hard
-        and process_status == "DEAD"
+        and process_status == "ALIVE"
         and _is_noka_clone_package(pkg)
-        and not item.get("manual_option6_force_override")
-        and "manual force" not in str(reason or "").lower()
-        and "force restart" not in str(reason or "").lower()
+        and cfg.get("noka_peer_auth_hard_suppression_enabled", True)
     ):
-        shell_state, shell_note = noka_dead_task_shell_status(
-            pkg, cfg, process_status=process_status
-        )
-        if shell_state is None:
-            core.requeue_front(item)
-            rt_tab["note"] = "dead-shell safety check inconclusive; open deferred"
+        peer_pkg, peer_reason = active_noka_auth_incident(cfg, rt, exclude_pkg=pkg)
+        if peer_pkg:
+            # Drop this speculative ALIVE hard item instead of requeueing it at
+            # the front forever; the dashboard may rediscover it after auth clears.
+            # This keeps confirmed DEAD crash recovery for other packages unblocked.
+            rt_tab["note"] = f"peer auth hold {short_pkg(peer_pkg)}; hard open suppressed"
             log_activity(
-                "DEAD Noka shell check inconclusive; hard start deferred "
-                "(no PID stop/open): " + cut(shell_note, 80),
-                pkg,
-                YELLOW,
+                f"hard recovery suppressed; peer {short_pkg(peer_pkg)} auth incident ({cut(peer_reason, 55)})",
+                pkg, YELLOW,
             )
             core.save()
             return True
-
-        if shell_state is True:
-            peer_snapshot, peer_errors = _sibling_pid_snapshot(pkg, cfg)
-            item["mode"] = "dead_shell_route"
-            item["no_hard_fallback"] = True
-            item["dead_noka_shell_route_only"] = True
-            item["dead_shell_route_peer_snapshot"] = peer_snapshot
-            item["dead_shell_route_peer_snapshot_errors"] = peer_errors
-            item["dead_shell_route_note"] = str(shell_note or "")
-            mode = "dead_shell_route"
-            item_mode = mode
-            is_hard = False
-            rt_tab["note"] = "black/dead task shell; route-only recovery"
-            log_activity(
-                "DEAD Noka task shell detected; hard_force downgraded to one "
-                "task-reuse route (no PID stop / no hard fallback): "
-                + cut(shell_note, 75),
-                pkg,
-                CYAN,
-            )
-
-    # V4.81.67: no sibling/peer auth veto here. Auth/moderation safety is checked
-    # only against THIS target below, immediately before any destructive PID stop.
 
     # V4.81.28: a bubble-only item is a speculative fast-track. Revalidate the
     # Android activity immediately before execution; if the shell materialized,
@@ -16734,10 +16139,6 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
             core.save()
             return True
 
-    if is_hard and process_status == "ALIVE":
-        _clear_peer_auth_safe_route_attempt(rt_tab)
-        log_activity("target-local hard preflight; sibling auth ignored", pkg, DIM)
-
     if not item.get("bypass_api_precheck"):
         api_blocked, api_note = api_precheck_before_rejoin(
             tab,
@@ -16787,16 +16188,9 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
                 core.save()
                 return True
 
-            solver_generation_reopen = bool(item.get("solver_generation_reopen"))
-            visible_auth = None if solver_generation_reopen else android_login_challenge_ui_detail(
+            visible_auth = android_login_challenge_ui_detail(
                 pkg, cfg, force=True, auth_hint=_runtime_auth_hint(rt_tab)
             )
-            if solver_generation_reopen:
-                log_activity(
-                    "solver-generation reopen: stale CAPTCHA/529 visual veto skipped; "
-                    "moderation + Account Locked guards remain active",
-                    pkg, DIM,
-                )
             if visible_auth:
                 detail = str(
                     visible_auth.get("text")
@@ -16820,7 +16214,7 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
                 core.save()
                 return True
 
-            if _runtime_auth_hint(rt_tab) and not solver_generation_reopen:
+            if _runtime_auth_hint(rt_tab):
                 visual_join = visual_join_error_detail(pkg, cfg, force=True, bypass_confirm=True)
                 if visual_join:
                     rt_tab["note"] = "visual Join Error after auth/face-lock; hard recovery blocked"
@@ -17052,6 +16446,35 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
     opening_screen(tab, target, cfg, 1, max(1, len(open_queue) + 1), mode=display_mode)
     rt_tab["note"] = f"opening -> {target}"
     core.save()
+
+    combined_stuck = bool(
+        item.get("combined_stuck_recovery")
+        and target == "hatcher"
+        and str(mode or "").lower() not in ("soft", "route", "switch", "reuse_task")
+    )
+    if combined_stuck and item.get("combined_stuck_refresh_private_link"):
+        refresh_ok, refreshed_route, refresh_note, refresh_block = (
+            refresh_hatcher_private_route_for_combined_stuck(tab, cfg, rt_tab)
+        )
+        item["combined_stuck_ps_refresh_done"] = True
+        item["combined_stuck_ps_refresh_ok"] = bool(refresh_ok)
+        item["combined_stuck_ps_refresh_note"] = str(refresh_note or "")
+        if refreshed_route:
+            item["combined_stuck_ps_route_refreshed"] = True
+        rt_tab["combined_stuck_ps_refresh_ok"] = bool(refresh_ok)
+        rt_tab["combined_stuck_ps_refresh_note"] = str(refresh_note or "")
+        if refresh_block:
+            rt_tab["note"] = "combined recovery blocked before PID-stop: " + cut(refresh_note, 80)
+            core.save()
+            log_activity(rt_tab["note"], pkg, RED)
+            return False, rt_tab["note"]
+        log_activity(
+            "combined stuck PS " + ("ok: " if refresh_ok else "fallback: ") + cut(refresh_note, 85),
+            pkg,
+            GREEN if refresh_ok else YELLOW,
+        )
+        core.save()
+
     log_activity(f"opening -> {target} ({display_mode})", pkg)
     ok, msg = core.open(
         tab,
@@ -17060,36 +16483,11 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
         reason,
         force=item.get("force", False),
         mode=mode,
+        force_clear_cache=bool(
+            combined_stuck and item.get("combined_stuck_clear_cache")
+        ),
     )
     opened_at = int(rt_tab.get("last_open", now()))
-
-    if item.get("dead_noka_shell_route_only") and ok:
-        peer_snapshot = item.get("dead_shell_route_peer_snapshot")
-        if isinstance(peer_snapshot, dict) and peer_snapshot:
-            time.sleep(1.0)
-            peer_ok, peer_note = _verify_sibling_pid_snapshot(
-                peer_snapshot, cfg, pkg
-            )
-            if not peer_ok:
-                rt_tab["dead_shell_route_sibling_loss"] = True
-                rt_tab["dead_shell_route_sibling_loss_note"] = str(peer_note or "")
-                rt_tab["dead_shell_route_sibling_loss_at"] = now()
-                rt_tab["note"] = "shell route peer loss detected; generation stopped"
-                log_activity(
-                    "DEAD-SHELL ROUTE SIBLING LOSS; no further auto action "
-                    "this generation: " + cut(peer_note, 100),
-                    pkg,
-                    RED,
-                )
-            else:
-                rt_tab["dead_shell_route_sibling_loss"] = False
-
-    if item.get("peer_auth_safe_route_only"):
-        _mark_peer_auth_safe_route_attempt(
-            rt_tab,
-            item.get("peer_auth_peer_pkg"),
-            ok,
-        )
 
     if ok and item.get("manual_option6"):
         rt_tab["last_option6_restart_at"] = int(opened_at or now())
@@ -17112,38 +16510,6 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
     core.save()
 
     if ok:
-        # V4.81.78: arm the hidden-CAPTCHA watchdog only from a real successful
-        # Hatcher open. NOMO uptime, synthetic startup grace, and an old Lua
-        # timestamp are never allowed to create or replace this token.
-        if target == "hatcher":
-            rt_tab["solver_stuck_open_token"] = int(opened_at or now())
-            rt_tab["solver_stuck_open_target"] = "hatcher"
-            rt_tab["solver_stuck_open_armed_at"] = now()
-            rt_tab["solver_stuck_open_mode"] = str(
-                rt_tab.get("last_open_mode", mode) or mode
-            )
-            rt_tab["solver_stuck_open_reason"] = str(reason or "")
-            log_activity(
-                "five-minute hidden-CAPTCHA watchdog armed from open ok",
-                pkg,
-                CYAN,
-            )
-            core.save()
-
-        if item.get("solver_generation_reopen"):
-            attempts = int(item.get("solver_generation_attempt", 0) or 0)
-            result_label = str(item.get("solver_result", "solver generation") or "solver generation")
-            reset_solver_challenge_generation(rt_tab, "target reopened")
-            clear_captcha_ui_runtime(rt_tab)
-            rt_tab["solver_challenge_last_reopen_at"] = int(opened_at or now())
-            rt_tab["solver_challenge_last_reopen_result"] = result_label
-            rt_tab["note"] = f"solver target reopened after attempt {attempts}; fresh guard armed"
-            log_activity(
-                f"solver target reopen complete after attempt {attempts}; new session will use fresh CAPTCHA guard",
-                pkg, GREEN,
-            )
-            core.save()
-
         if item.get("bubble_only_recovery") and target == "hatcher":
             opened_at, bubble_second_note = hatcher_bubble_second_private_intent(
                 tab, rt_tab, cfg, rt, target, reason, opened_at, core
@@ -17421,51 +16787,6 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                 core.save()
                 return True
             alive_for_retry = retry_process_status == "ALIVE"
-
-            # V4.81.76: ALIVE Hatcher Noka + no fresh state is not enough proof
-            # for a destructive retry. Roblox can legitimately remain in a
-            # server queue/loading screen beyond the normal fresh-state timeout.
-            if (
-                target == "hatcher"
-                and alive_for_retry
-                and _is_noka_clone_package(pkg)
-                and cfg.get("hatcher_alive_loading_guard_enabled", True)
-                and fresh_msg == "fresh timeout"
-                and not item.get("disconnect_recovery")
-                and not item.get("solver_recovery")
-                and not item.get("manual_booster_route")
-                and not item.get("manual_booster_hard_route")
-            ):
-                strong_home = android_roblox_home_ui_detail(
-                    pkg, cfg, force=True, required=True
-                )
-                strong_disconnect = android_disconnect_ui_detail(
-                    pkg, cfg, force=True
-                )
-                strong_auth = android_login_challenge_ui_detail(
-                    pkg, cfg, force=True, auth_hint=_runtime_auth_hint(rt_tab)
-                )
-                if not strong_home and not strong_disconnect and not strong_auth:
-                    left = start_hatcher_alive_loading_guard(
-                        rt_tab,
-                        cfg,
-                        opened_at=opened_at,
-                        reason="alive no fresh state after Hatcher open",
-                    )
-                    rt_tab["note"] = (
-                        "alive loading/server queue protected; "
-                        f"no hard retry for {format_age(left)}"
-                    )
-                    log_activity(
-                        "ALIVE Hatcher join produced no fresh state, but no strong "
-                        "failure UI is visible; protecting slow/server-queue load "
-                        f"for {format_age(left)} (no PID stop / no hard retry)",
-                        pkg,
-                        CYAN,
-                    )
-                    core.save()
-                    return True
-
             join_fail_count = int(rt_tab.get("homepage_join_fail_count", 0) or 0) + 1
             rt_tab["homepage_join_fail_count"] = join_fail_count
             failures_before_hard = max(
@@ -17661,13 +16982,6 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                     "market_alive_noka_route_only": bool(
                         item.get("market_alive_noka_route_only")
                     ),
-                    "dead_noka_shell_route_only": bool(
-                        item.get("dead_noka_shell_route_only")
-                    ),
-                    "hatcher_alive_loading_route_only": bool(
-                        item.get("hatcher_alive_loading_route_only")
-                    ),
-                    "no_hard_fallback": bool(item.get("no_hard_fallback")),
                 }
                 retry_reason = f"join fail {join_fail_count}/{failures_before_hard}; route retry after {fresh_msg}"
                 added, _ = core.queue_route_retry(
@@ -21928,9 +21242,8 @@ def start_hatcher_reporter(main_cfg=None):
                 old_open_age = (now() - last_open_for_old) if last_open_for_old > 0 else 999999
                 in_old_open_grace = old_open_age < old_after_open_grace
 
-                phantom_state_reason = state_phantom_timestamp_reason(state) if state else ""
-                if alive and old_enabled and phantom_state_reason:
-                    note = f"phantom state ignored: {phantom_state_reason} ({format_age(age)})"
+                if alive and old_enabled and age > old_max:
+                    note = f"invalid old state ignored {age}s"
                     status = "Online"
                 elif alive and old_enabled and age >= old_sec and in_old_open_grace:
                     left = max(1, old_after_open_grace - old_open_age)
@@ -22774,34 +22087,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                         hcfg, pkg, detected_user, tab=tab, source="state"
                     )
 
-            # V4.81.78: evaluate the open-token watchdog before old-state,
-            # bubble-only, kick, or other Hatcher recovery branches. This is
-            # deliberately independent of visual Loading detection and of the
-            # loading-guard flag. When it starts, it owns only this package's
-            # current incident until the provider result is consumed.
-            solver_watch_active = False
-            solver_watch_note = ""
-            if raw_alive:
-                watch_started, solver_watch_note = (
-                    hatcher_alive_loading_maybe_solver_rescue(
-                        core,
-                        tab,
-                        rt_tab,
-                        cfg,
-                        process_status=process_status,
-                        state=state,
-                    )
-                )
-                solver_watch_active = bool(
-                    watch_started or solver_job_running(pkg)
-                )
-                if solver_watch_active:
-                    status = "Solving"
-                    note = solver_job_note(pkg)
-
-            if solver_watch_active:
-                pass
-            elif not tab.get("server_link") or str(tab.get("server_link")).startswith("YOUR_"):
+            if not tab.get("server_link") or str(tab.get("server_link")).startswith("YOUR_"):
                 status = "No server"
                 note = "server_link missing"
             elif state:
@@ -22819,7 +22105,6 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                 if health.get("clean_fresh"):
                     clear_manual_login_block(rt_tab)
                     clear_captcha_ui_runtime(rt_tab)
-                    clear_hatcher_alive_loading_guard(rt_tab, "fresh Hatcher health")
 
                 problem_code, problem_note = hatcher_teleport_problem(
                     tab, state, hcfg, cfg
@@ -22868,21 +22153,13 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                 in_startup_observe = bool(
                     alive and startup_observe_until > now()
                 )
-                alive_loading_guard = bool(
-                    alive and hatcher_alive_loading_guard_active(rt_tab)
-                )
-                alive_loading_left = (
-                    hatcher_alive_loading_hold_left(rt_tab)
-                    if alive_loading_guard else 0
-                )
 
                 bubble_rescue_handled = False
                 if (
                     not problem_code
                     and alive
                     and old_enabled
-                    and recovery_age >= old_sec
-                    and not state_has_phantom_timestamp(state)
+                    and old_sec <= recovery_age <= old_max
                     and not challenge_active
                 ):
                     bubble_only, bubble_note = hatcher_bubble_only_recovery_candidate(
@@ -22902,52 +22179,15 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                     pass
                 elif bubble_rescue_handled:
                     pass
-                elif alive_loading_guard and not challenge_active:
-                    rescue_started, rescue_note = (
-                        hatcher_alive_loading_maybe_solver_rescue(
-                            core, tab, rt_tab, cfg,
-                            process_status=process_status,
-                            state=state,
-                        )
-                    )
-                    if rescue_started or solver_job_running(pkg):
-                        status = "Solving"
-                        note = solver_job_note(pkg)
-                    elif alive_loading_left > 0:
-                        status = "Loading"
-                        note = (
-                            "alive loading/server queue hold "
-                            + format_age(alive_loading_left)
-                            + "; "
-                            + rescue_note
-                        )
-                    else:
-                        route_added, route_note = hatcher_alive_loading_maybe_route_retry(
-                            core, tab, rt_tab, cfg
-                        )
-                        if route_added or core.has(pkg):
-                            status = "Queued"
-                            note = route_note
-                        else:
-                            status = "Loading"
-                            note = (
-                                "alive loading persists; "
-                                + str(route_note)
-                                + "; automatic hard recovery blocked"
-                            )
                 elif in_startup_observe and recovery_age >= old_sec:
                     status = "Loading"
                     note = (
                         "startup loading grace "
                         + format_age(max(1, startup_observe_until - now()))
                     )
-                elif alive and old_enabled and state_has_phantom_timestamp(state):
+                elif alive and old_enabled and recovery_age > old_max:
                     status = "Online"
-                    note = (
-                        "phantom state ignored: "
-                        + state_phantom_timestamp_reason(state)
-                        + f" ({format_age(recovery_age)})"
-                    )
+                    note = f"invalid old state ignored {age}s"
                 elif alive and old_enabled and recovery_age >= old_sec and in_old_open_grace:
                     status = "Loading"
                     note = f"old-state open grace {max(1, old_after_open_grace - old_open_age)}s"
@@ -22995,7 +22235,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                             # FIX V3.78: use `or 180` instead of `or 120` to avoid 0->120 falsy fallback
                             # that made 277h state appear fresh
                             if (recovery_age >= int(cfg.get("hatcher_alive_old_state_hard_force_seconds", 180) or 180)
-                                    and not state_has_phantom_timestamp(state)
+                                    and recovery_age <= int(cfg.get("hatcher_alive_old_state_max_valid_seconds", 86400) or 86400)
                                     and cfg.get("rejoin_if_crash", True)):
                                 added, hard_note, _ = core.queue_hatcher_old_state_hard(
                                     tab,
@@ -23043,47 +22283,9 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                     )
 
                     challenge_active = str(health.get("bad") or "") in {"ui_challenge", "challenge"}
-                    alive_loading_guard = hatcher_alive_loading_guard_active(rt_tab)
-                    alive_loading_left = (
-                        hatcher_alive_loading_hold_left(rt_tab)
-                        if alive_loading_guard else 0
-                    )
                     if challenge_active:
                         status = "Captcha"
                         note = "verification UI detected; solver owns package (no reopen)"
-                    elif alive_loading_guard:
-                        rescue_started, rescue_note = (
-                            hatcher_alive_loading_maybe_solver_rescue(
-                                core, tab, rt_tab, cfg,
-                                process_status=process_status,
-                                state=state,
-                            )
-                        )
-                        if rescue_started or solver_job_running(pkg):
-                            status = "Solving"
-                            note = solver_job_note(pkg)
-                        elif alive_loading_left > 0:
-                            status = "Loading"
-                            note = (
-                                "alive loading/server queue hold "
-                                + format_age(alive_loading_left)
-                                + "; "
-                                + rescue_note
-                            )
-                        else:
-                            route_added, route_note = hatcher_alive_loading_maybe_route_retry(
-                                core, tab, rt_tab, cfg
-                            )
-                            if route_added or core.has(pkg):
-                                status = "Queued"
-                                note = route_note
-                            else:
-                                status = "Loading"
-                                note = (
-                                    "alive loading persists; "
-                                    + str(route_note)
-                                    + "; automatic hard recovery blocked"
-                                )
                     elif rt_tab.get("last_open") and in_post_open_grace(rt_tab, cfg):
                         status = "Loading"
                         note = f"waiting for {expected_state_name(tab)}"
@@ -23121,7 +22323,6 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                 else:
                     rt_tab["hatcher_no_state_since"] = 0
                     rt_tab["hatcher_startup_observe_until"] = 0
-                    clear_hatcher_alive_loading_guard(rt_tab, "package no longer alive")
                     status = "Offline"
 
             # Clear a previous incident as soon as the counter reports a clean
@@ -23188,13 +22389,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
             # gets its normal turn; its queued generation performs one solver check before opening.
 
             due_refresh, refresh_left = periodic_hard_refresh_due(rt_tab, cfg)
-            if (
-                due_refresh
-                and captcha_action is None
-                and not manual_login_blocked(rt_tab, cfg, pkg)
-                and not (alive and hatcher_alive_loading_guard_active(rt_tab))
-                and core.idle_for(pkg)
-            ):
+            if due_refresh and captcha_action is None and not manual_login_blocked(rt_tab, cfg, pkg) and core.idle_for(pkg):
                 added, _ = core.queue_hard_retry(tab, "hatcher", "periodic hard refresh")
                 if added:
                     mark_periodic_hard_refresh(rt_tab)
@@ -23247,7 +22442,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
         hatcher_rejoin_status_screen(rows, hcfg, cfg, session_start, loops, last_msg)
         _old_on, _old_sec, _old_max, _old_cd = hatcher_alive_old_state_hard_settings(hcfg, cfg)
         print(col(
-            f"  Hatcher: old state >= {format_age(_old_sec)} => exact-PID restart affected tab only; broken/missing ts ignored.",
+            f"  Hatcher: old state {format_age(_old_sec)}..{format_age(_old_max)} => exact-PID restart affected tab only; above max ignored.",
             GREEN,
         ))
 
@@ -28583,630 +27778,6 @@ task.spawn(function()
 end)
 '''
 
-
-# ============================================================
-# EXOTIC MASTER CONFIG MERGER (V4.81.78)
-# ============================================================
-
-_EXOTIC_MASTER_BRACED_UUID_RE = re.compile(
-    r"^\{[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\}$"
-)
-_EXOTIC_MASTER_PLAIN_UUID_RE = re.compile(
-    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
-)
-_EXOTIC_MASTER_MISSING = object()
-
-_EXOTIC_MASTER_SUFFIX_TO_MASTER = {
-    "file2": "file2.json",
-    "filesession": "filesession.json",
-    "gag2": "gag2.json",
-}
-
-
-def _exotic_master_path_text(path):
-    return ".".join(str(part) for part in (path or ()) if str(part))
-
-
-def _exotic_master_uuid_declared_path(path):
-    """True for fields whose own name explicitly declares UUID identity.
-
-    This deliberately does NOT classify generic UUID-shaped values such as
-    web_api_key. The field name must itself contain 'uuid'.
-    """
-    if not path:
-        return False
-    leaf = str(path[-1] or "").strip().lower()
-    return "uuid" in leaf
-
-
-def _exotic_master_is_braced_pet_uuid(value):
-    return isinstance(value, str) and bool(
-        _EXOTIC_MASTER_BRACED_UUID_RE.fullmatch(value.strip())
-    )
-
-
-def _exotic_master_is_plain_uuid(value):
-    return isinstance(value, str) and bool(
-        _EXOTIC_MASTER_PLAIN_UUID_RE.fullmatch(value.strip())
-    )
-
-
-def _exotic_master_node_contains_pet_ref(value, path=()):
-    """Detect pet identity references without treating every UUID-looking value as pet data."""
-    if _exotic_master_uuid_declared_path(path):
-        if isinstance(value, (str, list, dict)):
-            # Empty *_uuid arrays/strings are still account-local identity slots.
-            return True
-
-    if _exotic_master_is_braced_pet_uuid(value):
-        return True
-
-    if isinstance(value, list):
-        return any(
-            _exotic_master_node_contains_pet_ref(item, path)
-            for item in value
-        )
-
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if _exotic_master_node_contains_pet_ref(item, tuple(path) + (str(key),)):
-                return True
-
-    return False
-
-
-def _exotic_master_mark(stats, bucket, path):
-    if not isinstance(stats, dict):
-        return
-    values = stats.setdefault(bucket, set())
-    if isinstance(values, set):
-        values.add(_exotic_master_path_text(path) or "<root>")
-
-
-def _exotic_master_merge(master, current=_EXOTIC_MASTER_MISSING, path=(), stats=None):
-    """Overlay master settings onto current while preserving account-local pet UUID refs.
-
-    Rules:
-      - Current object is the base, so target-only/unknown fields survive.
-      - Curly-braced UUID references are never replaced/removed.
-      - Any field explicitly named *uuid* is account-local and is never replaced.
-      - If master introduces a pet UUID where the target has no value, that master
-        reference is omitted instead of leaking a different account's pet.
-      - Normal settings recursively follow the master.
-    """
-    current_exists = current is not _EXOTIC_MASTER_MISSING
-
-    # Explicit UUID slots are account-local even when currently blank.
-    if _exotic_master_uuid_declared_path(path) and isinstance(
-        master if master is not _EXOTIC_MASTER_MISSING else current,
-        (str, list, dict),
-    ):
-        if current_exists:
-            _exotic_master_mark(stats, "preserved_paths", path)
-            return copy.deepcopy(current)
-        _exotic_master_mark(stats, "blocked_master_pet_paths", path)
-        return _EXOTIC_MASTER_MISSING
-
-    # A scalar pet UUID in either side is account identity, not a portable setting.
-    if _exotic_master_is_braced_pet_uuid(master) or (
-        current_exists and _exotic_master_is_braced_pet_uuid(current)
-    ):
-        if current_exists:
-            _exotic_master_mark(stats, "preserved_paths", path)
-            return copy.deepcopy(current)
-        _exotic_master_mark(stats, "blocked_master_pet_paths", path)
-        return _EXOTIC_MASTER_MISSING
-
-    # Lists are atomic selections. If either list contains a pet reference, keep
-    # the target list exactly; do not splice another account's pets into it.
-    if isinstance(master, list):
-        current_list = current if current_exists and isinstance(current, list) else _EXOTIC_MASTER_MISSING
-        master_has_pet = _exotic_master_node_contains_pet_ref(master, path)
-        current_has_pet = (
-            current_list is not _EXOTIC_MASTER_MISSING
-            and _exotic_master_node_contains_pet_ref(current_list, path)
-        )
-        if master_has_pet or current_has_pet:
-            if current_list is not _EXOTIC_MASTER_MISSING:
-                _exotic_master_mark(stats, "preserved_paths", path)
-                return copy.deepcopy(current_list)
-            _exotic_master_mark(stats, "blocked_master_pet_paths", path)
-            return _EXOTIC_MASTER_MISSING
-        return copy.deepcopy(master)
-
-    # Dicts merge recursively. This allows normal settings inside the same object
-    # as UUID slots to update without overwriting the UUID children.
-    if isinstance(master, dict):
-        if current_exists and isinstance(current, dict):
-            result = copy.deepcopy(current)
-            current_dict = current
-        elif current_exists and _exotic_master_node_contains_pet_ref(current, path):
-            # Ref-bearing target changed type: fail safe and keep it.
-            _exotic_master_mark(stats, "preserved_paths", path)
-            return copy.deepcopy(current)
-        else:
-            result = {}
-            current_dict = {}
-
-        for key, master_value in master.items():
-            child_path = tuple(path) + (str(key),)
-            child_current = (
-                current_dict[key]
-                if isinstance(current_dict, dict) and key in current_dict
-                else _EXOTIC_MASTER_MISSING
-            )
-            merged = _exotic_master_merge(
-                master_value,
-                child_current,
-                child_path,
-                stats,
-            )
-            if merged is _EXOTIC_MASTER_MISSING:
-                # If target had this key, result already contains its local value.
-                # If target did not, omit master-only pet identity.
-                continue
-            result[key] = merged
-        return result
-
-    # If current is a pet-ref-bearing list/dict but master changes type, preserve.
-    if current_exists and isinstance(current, (list, dict)):
-        if _exotic_master_node_contains_pet_ref(current, path):
-            _exotic_master_mark(stats, "preserved_paths", path)
-            return copy.deepcopy(current)
-
-    # Normal scalar setting: master wins.
-    return copy.deepcopy(master)
-
-
-def _exotic_master_read_json_from_zip(zf, name, required=False):
-    try:
-        raw = zf.read(name)
-    except KeyError:
-        if required:
-            raise ValueError(f"missing {name}")
-        return None
-
-    try:
-        payload = json.loads(raw.decode("utf-8-sig"))
-    except Exception as exc:
-        raise ValueError(f"{name}: invalid JSON ({exc})")
-
-    if not isinstance(payload, dict):
-        raise ValueError(f"{name}: root must be a JSON object")
-    return payload
-
-
-def _exotic_master_normalize_uid_list(value):
-    out = []
-    seen = set()
-    for item in value if isinstance(value, list) else []:
-        uid = str(item or "").strip()
-        if not uid.isdigit() or uid in seen:
-            continue
-        seen.add(uid)
-        out.append(uid)
-    return out
-
-
-def load_exotic_master_zip(zip_path):
-    """Read/validate the V9.10 master ZIP without extracting arbitrary entries."""
-    zip_path = Path(zip_path)
-    if not zip_path.is_file():
-        raise ValueError(f"master ZIP not found: {zip_path}")
-
-    try:
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            groups = _exotic_master_read_json_from_zip(zf, "groups.json", required=False) or {}
-            hatching = _exotic_master_normalize_uid_list(groups.get("hatching"))
-            market = _exotic_master_normalize_uid_list(groups.get("market"))
-            overlap = sorted(set(hatching) & set(market))
-            if overlap:
-                raise ValueError(
-                    "groups.json has UID(s) in both Hatching and Market: "
-                    + ", ".join(overlap[:8])
-                )
-
-            masters = {}
-            # V9.10 File 1 variants.
-            for name in (
-                "file1_default.json",
-                "file1_hatching.json",
-                "file1_market.json",
-                "file2.json",
-                "filesession.json",
-                "gag2.json",
-            ):
-                payload = _exotic_master_read_json_from_zip(zf, name, required=False)
-                if payload is not None:
-                    masters[name] = payload
-
-            # V9.9/raw fallback: file1.json acts as default only.
-            if "file1_default.json" not in masters:
-                legacy = _exotic_master_read_json_from_zip(
-                    zf, "file1.json", required=False
-                )
-                if legacy is not None:
-                    masters["file1_default.json"] = legacy
-
-    except zipfile.BadZipFile:
-        raise ValueError("exotic_master.zip is not a valid ZIP")
-
-    if not masters:
-        raise ValueError("master ZIP has no supported Exotic JSON templates")
-
-    # If group-specific File 1 is missing, fall back to default rather than
-    # copying the opposite group's gift settings.
-    if "file1_hatching.json" not in masters and "file1_default.json" in masters:
-        masters["file1_hatching.json"] = copy.deepcopy(masters["file1_default.json"])
-    if "file1_market.json" not in masters and "file1_default.json" in masters:
-        masters["file1_market.json"] = copy.deepcopy(masters["file1_default.json"])
-
-    return {
-        "path": str(zip_path),
-        "masters": masters,
-        "hatching": hatching,
-        "market": market,
-        "all": _exotic_master_normalize_uid_list(groups.get("all")),
-        "ungrouped": _exotic_master_normalize_uid_list(groups.get("ungrouped")),
-        "schema_version": int(groups.get("schemaVersion", 0) or 0),
-    }
-
-
-def _exotic_master_target_records():
-    """Find existing per-UID Exotic configs across known Executor workspaces."""
-    records = []
-    seen = set()
-    pattern = re.compile(
-        r"^(?P<uid>\d+)(?P<suffix>file1|file2|filesession|gag2)\.json$",
-        re.I,
-    )
-    for root_index, root in enumerate(_exotic_workspace_roots(), 1):
-        root = Path(root)
-        folder = root / EXOTIC_MASTER_WORKSPACE_FOLDER
-        if not folder.is_dir():
-            continue
-        try:
-            candidates = sorted(folder.glob("*.json"), key=lambda p: p.name.lower())
-        except Exception:
-            candidates = []
-        for path in candidates:
-            match = pattern.fullmatch(path.name)
-            if not match:
-                continue
-            key = str(path)
-            if key in seen:
-                continue
-            seen.add(key)
-            records.append({
-                "path": path,
-                "workspace_root": root,
-                "root_index": root_index,
-                "uid": match.group("uid"),
-                "suffix": match.group("suffix").lower(),
-            })
-    return records
-
-
-def _exotic_master_file1_name_for_uid(uid, master):
-    uid = str(uid or "")
-    if uid in set(master.get("hatching") or []):
-        return "file1_hatching.json", "Hatching"
-    if uid in set(master.get("market") or []):
-        return "file1_market.json", "Market"
-    return "file1_default.json", "Default"
-
-
-def _exotic_master_build_plan(master):
-    records = _exotic_master_target_records()
-    masters = master.get("masters") or {}
-    plan = []
-    skipped = []
-
-    for record in records:
-        path = record["path"]
-        suffix = record["suffix"]
-        uid = record["uid"]
-
-        if suffix == "file1":
-            master_name, group = _exotic_master_file1_name_for_uid(uid, master)
-        else:
-            master_name = _EXOTIC_MASTER_SUFFIX_TO_MASTER.get(suffix, "")
-            group = "Shared"
-
-        if not master_name or master_name not in masters:
-            skipped.append((path, f"master {master_name or suffix} not included"))
-            continue
-
-        try:
-            raw = path.read_bytes()
-            current = json.loads(raw.decode("utf-8-sig"))
-        except Exception as exc:
-            skipped.append((path, f"current JSON invalid: {exc}"))
-            continue
-
-        if not isinstance(current, dict):
-            skipped.append((path, "current root is not an object"))
-            continue
-
-        stats = {}
-        merged = _exotic_master_merge(
-            masters[master_name],
-            current,
-            (),
-            stats,
-        )
-        if merged is _EXOTIC_MASTER_MISSING or not isinstance(merged, dict):
-            skipped.append((path, "merge produced invalid root"))
-            continue
-
-        preserved = sorted(stats.get("preserved_paths") or [])
-        blocked = sorted(stats.get("blocked_master_pet_paths") or [])
-        plan.append({
-            **record,
-            "master_name": master_name,
-            "group": group,
-            "raw": raw,
-            "current": current,
-            "merged": merged,
-            "changed": merged != current,
-            "preserved_paths": preserved,
-            "blocked_master_pet_paths": blocked,
-        })
-
-    return plan, skipped
-
-
-def _exotic_master_backup_plan(zip_path, plan):
-    changed = [item for item in plan if item.get("changed")]
-    if not changed:
-        return None
-
-    EXOTIC_MASTER_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup = EXOTIC_MASTER_BACKUP_DIR / f"exotic_master_backup_{stamp}.zip"
-    tmp = backup.with_suffix(".zip.tmp")
-
-    manifest = {
-        "created_at": datetime.now().astimezone().isoformat(),
-        "nomo_version": __version__,
-        "master_zip": str(zip_path),
-        "files": [],
-    }
-
-    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
-        for index, item in enumerate(changed, 1):
-            arc = f"originals/{index:03d}_{item['path'].name}"
-            zf.writestr(arc, item["raw"])
-            manifest["files"].append({
-                "archive_name": arc,
-                "original_path": str(item["path"]),
-                "uid": item["uid"],
-                "suffix": item["suffix"],
-                "master_name": item["master_name"],
-                "group": item["group"],
-            })
-        zf.writestr(
-            "manifest.json",
-            json.dumps(manifest, ensure_ascii=False, indent=2),
-        )
-
-    os.replace(str(tmp), str(backup))
-    return backup
-
-
-def _exotic_master_atomic_pretty_json(path, payload):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".nomo_master_tmp")
-    encoded = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
-    tmp.write_text(encoded, encoding="utf-8")
-
-    # Validate the exact temp bytes before replacing the live config.
-    verify = json.loads(tmp.read_text(encoding="utf-8"))
-    if verify != payload:
-        raise ValueError("temp JSON verification mismatch")
-
-    os.replace(str(tmp), str(path))
-
-    live = json.loads(path.read_text(encoding="utf-8"))
-    if live != payload:
-        raise ValueError("post-write JSON verification mismatch")
-
-
-def _exotic_master_restore_raw(path, raw):
-    path = Path(path)
-    tmp = path.with_name(path.name + ".nomo_master_restore")
-    tmp.write_bytes(raw)
-    os.replace(str(tmp), str(path))
-
-
-def _exotic_master_find_default_zip():
-    candidates = [
-        EXOTIC_MASTER_DEFAULT_ZIP,
-        Path("/sdcard/exotic_master.zip"),
-        EXOTIC_MASTER_DOWNLOAD_ZIP,
-        Path("/sdcard/Download/exotic_master.zip"),
-        BASE_DIR / "exotic_master.zip",
-    ]
-    seen = set()
-    for path in candidates:
-        key = str(path)
-        if key in seen:
-            continue
-        seen.add(key)
-        try:
-            if path.is_file():
-                return path
-        except Exception:
-            continue
-    return EXOTIC_MASTER_DEFAULT_ZIP
-
-
-def apply_exotic_master_menu(cfg):
-    """Manual, preview-first application of one group-aware Exotic master ZIP."""
-    clear()
-    banner("APPLY EXOTIC MASTER CONFIG", cfg)
-    print(col("Master settings overwrite normal settings.", BOLD))
-    print(col("Existing per-UID pet UUID references stay account-local.", GREEN))
-    print(col("No Roblox package/process is stopped or reopened by this tool.", DIM))
-    print("")
-
-    zip_path = _exotic_master_find_default_zip()
-    if not zip_path.is_file():
-        print(col(f"Default ZIP not found: {zip_path}", YELLOW))
-        drain_stdin()
-        raw = clean_terminal_input(
-            input(f"ZIP path [ENTER={EXOTIC_MASTER_DEFAULT_ZIP}]: ")
-        )
-        zip_path = Path(raw) if raw else EXOTIC_MASTER_DEFAULT_ZIP
-
-    try:
-        master = load_exotic_master_zip(zip_path)
-    except Exception as exc:
-        print(col(f"Master ZIP error: {exc}", RED))
-        pause()
-        return False
-
-    plan, skipped = _exotic_master_build_plan(master)
-    changed = [item for item in plan if item.get("changed")]
-    unchanged = [item for item in plan if not item.get("changed")]
-    preserved_paths = sum(len(item.get("preserved_paths") or []) for item in plan)
-    blocked_paths = sum(len(item.get("blocked_master_pet_paths") or []) for item in plan)
-
-    uid_set = sorted({item["uid"] for item in plan}, key=lambda x: int(x))
-    suffix_counts = {}
-    group_counts = {}
-    for item in plan:
-        suffix_counts[item["suffix"]] = suffix_counts.get(item["suffix"], 0) + 1
-        group_counts[item["group"]] = group_counts.get(item["group"], 0) + 1
-
-    print(f"ZIP      : {zip_path}")
-    print(f"Schema   : {master.get('schema_version') or '-'}")
-    print(
-        "Groups   : "
-        f"Hatching {len(master.get('hatching') or [])} | "
-        f"Market {len(master.get('market') or [])}"
-    )
-    print(
-        "Targets  : "
-        f"{len(plan)} file(s) / {len(uid_set)} UID(s) | "
-        f"change {len(changed)} | same {len(unchanged)} | skip {len(skipped)}"
-    )
-    print(
-        "Files    : "
-        + " | ".join(
-            f"{name} {suffix_counts.get(name, 0)}"
-            for name in ("file1", "file2", "filesession", "gag2")
-        )
-    )
-    print(
-        "Pet refs : "
-        f"{preserved_paths} current path(s) preserved | "
-        f"{blocked_paths} master-only path(s) blocked"
-    )
-    print(
-        "Routing  : "
-        + " | ".join(
-            f"{name} {group_counts.get(name, 0)}"
-            for name in ("Hatching", "Market", "Default", "Shared")
-        )
-    )
-
-    if skipped:
-        print("")
-        print(col("Skipped:", YELLOW))
-        for path, reason in skipped[:10]:
-            print(col(f"  {path.name}: {cut(reason, 100)}", DIM))
-        if len(skipped) > 10:
-            print(col(f"  ... +{len(skipped) - 10} more", DIM))
-
-    if not plan:
-        print("")
-        print(col(
-            "No existing <UID>file1/file2/filesession/gag2 JSON files were found "
-            "under known Workspace/exotichub99 folders.",
-            RED,
-        ))
-        pause()
-        return False
-
-    if not changed:
-        print("")
-        print(col("Everything already matches this master. Nothing to write.", GREEN))
-        pause()
-        return True
-
-    print("")
-    print(col("Examples:", BOLD))
-    for item in changed[:8]:
-        print(
-            f"  {item['uid']} {item['suffix']} -> {item['group']} "
-            f"| preserve {len(item.get('preserved_paths') or [])} pet path(s)"
-        )
-    if len(changed) > 8:
-        print(col(f"  ... +{len(changed) - 8} more changed files", DIM))
-
-    drain_stdin()
-    confirm = clean_terminal_input(
-        input(f"\nApply {len(changed)} changed file(s)? [y/N]: ")
-    ).lower()
-    if confirm not in {"y", "yes"}:
-        print(col("Cancelled. No files changed.", YELLOW))
-        pause()
-        return False
-
-    try:
-        backup = _exotic_master_backup_plan(zip_path, plan)
-    except Exception as exc:
-        print(col(f"Backup failed; nothing written: {exc}", RED))
-        pause()
-        return False
-
-    written = []
-    try:
-        for item in changed:
-            _exotic_master_atomic_pretty_json(item["path"], item["merged"])
-            written.append(item)
-    except Exception as exc:
-        rollback_errors = []
-        for item in changed:
-            try:
-                _exotic_master_restore_raw(item["path"], item["raw"])
-            except Exception as restore_exc:
-                rollback_errors.append(
-                    f"{item['path'].name}: {restore_exc}"
-                )
-        print(col(f"Apply failed: {exc}", RED))
-        if rollback_errors:
-            print(col("Rollback had errors; use the backup ZIP:", RED))
-            for note in rollback_errors[:8]:
-                print(col("  " + cut(note, 110), DIM))
-        else:
-            print(col("All changed files were rolled back.", GREEN))
-        if backup:
-            print(f"Backup: {backup}")
-        pause()
-        return False
-
-    print("")
-    print(col(
-        f"Applied Exotic master to {len(written)} file(s) across {len(uid_set)} UID(s).",
-        GREEN,
-    ))
-    print(col(
-        f"Pet UUID protection: {preserved_paths} current path(s) preserved; "
-        f"{blocked_paths} master-only path(s) blocked.",
-        GREEN,
-    ))
-    if backup:
-        print(f"Backup: {backup}")
-    print(col("No Roblox process/rejoin action was performed.", DIM))
-    pause()
-    return True
-
-
 # ============================================================
 # EXOTIC HUB SHARED KEY MANAGER
 # ============================================================
@@ -34101,6 +32672,120 @@ def private_server_cookie_preflight(pkg, cfg, cache):
     return cookie, username, user_id, "OK", note
 
 
+def refresh_hatcher_private_route_for_combined_stuck(tab, cfg, rt_tab=None):
+    """Refresh only this package's owned Hatcher private-server join code.
+
+    Returns (ok, route, note, hard_block). `hard_block` is reserved for strong
+    ownership/place/auth evidence where using the saved route would be unsafe.
+    Transient metadata/network failures keep the saved route usable.
+    """
+    pkg = str((tab or {}).get("package") or "").strip()
+    if not pkg:
+        return False, "", "missing package", False
+
+    try:
+        hcfg = load_hatcher_config()
+    except Exception as exc:
+        return False, "", "hatcher config unavailable: " + cut(exc, 90), False
+
+    prof = None
+    for candidate in hatcher_profiles(hcfg):
+        if str(candidate.get("package") or "").strip() == pkg:
+            prof = candidate
+            break
+    if prof is None:
+        return False, "", "no hatcher profile for package", False
+
+    server_id = str(prof.get("private_server_id") or "").strip()
+    if not server_id:
+        return False, "", "saved private server has no server id; cannot rotate join code", False
+
+    cache = load_cookie_cache()
+    cookie, username, user_id, status, note = private_server_cookie_preflight(pkg, cfg, cache)
+    if not cookie:
+        status_u = str(status or "").upper()
+        hard_block = status_u in {"COOKIE INVALID", "COOKIE CHALLENGE", "USER MISMATCH"}
+        return False, "", f"private-server auth preflight {status}: {note}", hard_block
+
+    fresh = fetch_private_server_metadata(cookie, server_id)
+    if not fresh:
+        return False, "", "private-server metadata unavailable; saved route retained", False
+
+    fresh_owner = str((fresh or {}).get("owner_id") or "").strip()
+    current_user_id = str(user_id or "").strip()
+    if fresh_owner and current_user_id and fresh_owner != current_user_id:
+        return (
+            False,
+            "",
+            f"private-server owner mismatch server={fresh_owner} package={current_user_id}",
+            True,
+        )
+
+    expected_place = str(
+        hcfg.get("expected_place_id")
+        or prof.get("private_server_place_id")
+        or "126884695634066"
+    ).strip()
+    fresh_root_place = str((fresh or {}).get("root_place_id") or "").strip()
+    if fresh_root_place and expected_place and fresh_root_place != expected_place:
+        return (
+            False,
+            "",
+            f"private-server place mismatch root={fresh_root_place} expected={expected_place}",
+            True,
+        )
+
+    refreshed, refresh_err = refresh_private_server_join_code(
+        cookie, server_id, friends_allowed=True
+    )
+    if not refreshed:
+        return False, "", "join-code refresh failed: " + cut(refresh_err, 100), False
+
+    merged = _merge_private_server_item({
+        "id": server_id,
+        "link_code": str(prof.get("private_server_link_code") or ""),
+        "access_code": str(prof.get("private_server_access_code") or ""),
+        "browser_link": str(prof.get("private_server_browser_link") or ""),
+        "name": str(prof.get("hatcher_name") or "NOMO Hatcher"),
+        "active": True,
+    }, fresh, prefer_extra=True)
+    merged = _merge_private_server_item(merged, refreshed, prefer_extra=True)
+    route = build_private_server_link(expected_place, merged, cfg)
+    if not route:
+        return False, "", "Roblox refreshed metadata but returned no usable join code", False
+
+    old_code = str(prof.get("private_server_link_code") or "").strip()
+    new_code = str(merged.get("link_code") or "").strip()
+    prof["private_server_link_code"] = new_code
+    prof["private_server_access_code"] = str(merged.get("access_code") or "")
+    prof["private_server_browser_link"] = str(merged.get("browser_link") or "")
+    prof["private_server_place_id"] = expected_place
+    prof["private_server_owner_id"] = fresh_owner or current_user_id
+    prof["private_server_synced_at"] = now()
+    prof["server_link"] = route
+    save_hatcher_config(hcfg)
+
+    # The queue keeps a tab snapshot, so update that exact object too. This makes
+    # the current generation use the freshly rotated route without waiting for a
+    # reload, while the hatcher profile persistence covers later generations.
+    tab["private_server_id"] = server_id
+    tab["private_server_link_code"] = new_code
+    tab["private_server_access_code"] = str(merged.get("access_code") or "")
+    tab["private_server_browser_link"] = str(merged.get("browser_link") or "")
+    tab["private_server_place_id"] = expected_place
+    tab["server_link"] = route
+    tab["restock_link"] = route
+
+    changed_code = bool(new_code and new_code != old_code)
+    if rt_tab is not None:
+        rt_tab["combined_stuck_ps_refresh_at"] = now()
+        rt_tab["combined_stuck_ps_refresh_ok"] = True
+        rt_tab["combined_stuck_ps_code_changed"] = changed_code
+        rt_tab["combined_stuck_ps_user"] = str(username or "")
+
+    return True, route, ("new private-server join code saved" if changed_code else "private-server join code refreshed") , False
+
+
 def auto_fetch_private_servers(
     cfg, selected_packages=None, pause_at_end=True, *,
     sync_market_access=True, automatic=False, place_id_override=None
@@ -34695,380 +33380,11 @@ def auto_fetch_private_servers(
 
 
 # ============================================================
-# V4.81.74 BACKGROUND EXTERNAL FACE-LOCK RELEASE PROBE
-# ============================================================
-
-_FACE_UNLOCK_JOBS = {}
-_FACE_UNLOCK_LOCK = threading.RLock()
-
-
-def _face_unlock_reason_active(rt_tab):
-    if not isinstance(rt_tab, dict):
-        return False
-    reason = str(rt_tab.get("manual_login_reason", "") or "").strip().lower()
-    return bool(
-        reason == "face_lock"
-        or bool(rt_tab.get("face_lock_detected"))
-    )
-
-
-def _face_unlock_probe_worker(package, cfg_snapshot):
-    result = {
-        "state": "unknown",
-        "detail": "probe not run",
-        "cookie_source": "",
-        "cookie_note": "",
-    }
-    try:
-        cookie, source, note = solver_cookie_for_package(package, cfg_snapshot)
-        cookie = str(cookie or "").strip()
-        result["cookie_source"] = str(source or "")
-        result["cookie_note"] = cut(str(note or ""), 120)
-        if not cookie:
-            result["state"] = "unknown"
-            result["detail"] = "no package cookie"
-        else:
-            blocked, detail = roblox_cookie_detection(cookie, cfg_snapshot)
-            result["detail"] = cut(str(detail or ""), 220)
-            if blocked is False:
-                # roblox_cookie_detection(False) means: authenticated endpoint
-                # succeeded, no strong moderation proof, and /home stayed usable.
-                result["state"] = "clear"
-            elif blocked is True:
-                result["state"] = "challenge"
-            else:
-                low = str(detail or "").lower()
-                if "invalid" in low or "expired" in low:
-                    result["state"] = "invalid"
-                elif any(x in low for x in (
-                    "moderated", "account locked", "face lock",
-                    "/not-approved", "banned", "terminated",
-                )):
-                    result["state"] = "restricted"
-                else:
-                    result["state"] = "unknown"
-    except Exception as exc:
-        result["state"] = "unknown"
-        result["detail"] = "unlock probe error: " + cut(str(exc), 120)
-
-    with _FACE_UNLOCK_LOCK:
-        job = _FACE_UNLOCK_JOBS.get(str(package or ""))
-        if job:
-            job["result"] = result
-            job["done"] = True
-            job["finished_at"] = now()
-
-
-def maybe_start_face_unlock_probe(tab, cfg, rt_tab, reason="face lock"):
-    """Start a bounded non-blocking Roblox-side release check for one held clone."""
-    if not cfg.get("face_lock_external_unlock_probe_enabled", True):
-        return False, "external unlock probe disabled"
-    if not _face_unlock_reason_active(rt_tab):
-        return False, "not a face-lock hold"
-
-    pkg = str((tab or {}).get("package", "") or "").strip()
-    if not pkg:
-        return False, "no package"
-
-    interval = max(
-        120,
-        int(cfg.get("face_lock_external_unlock_probe_seconds", 300) or 300),
-    )
-    last = int(rt_tab.get("face_unlock_probe_last_started_at", 0) or 0)
-
-    with _FACE_UNLOCK_LOCK:
-        existing = _FACE_UNLOCK_JOBS.get(pkg)
-        if existing and not existing.get("done"):
-            rt_tab["face_unlock_probe_note"] = "account locked; checking external unlock"
-            return False, "unlock probe already running"
-        if existing and existing.get("done"):
-            # Let the main-thread poller consume the completed result first.
-            return False, "unlock probe result pending"
-        if last > 0 and now() - last < interval:
-            left = max(1, interval - (now() - last))
-            return False, f"unlock probe cooldown {format_age(left)}"
-
-        job = {
-            "package": pkg,
-            "tab": dict(tab or {}),
-            "target": str(rt_tab.get("target") or ("hatcher" if (tab or {}).get("server_link") else "market")),
-            "reason": cut(str(reason or "face lock"), 180),
-            "started_at": now(),
-            "done": False,
-            "result": None,
-        }
-        _FACE_UNLOCK_JOBS[pkg] = job
-
-    rt_tab["face_unlock_probe_last_started_at"] = int(job["started_at"])
-    rt_tab["face_unlock_probe_note"] = "account locked; checking external unlock"
-
-    thread = threading.Thread(
-        target=_face_unlock_probe_worker,
-        args=(pkg, dict(cfg or {})),
-        name=f"nomo-face-unlock-{pkg}",
-        daemon=True,
-    )
-    thread.start()
-    return True, "external unlock probe started"
-
-
-def _queue_verified_auth_safe_route(
-    core, tab, target, rt_tab, reason, metadata_key
-):
-    """Queue one route-only refresh after independent Roblox clean-session proof."""
-    pkg = str((tab or {}).get("package", "") or "").strip()
-    if not pkg:
-        return False, "missing package"
-
-    meta = {
-        str(metadata_key): True,
-        "verified_auth_route_probe": True,
-        "no_hard_fallback": True,
-        # The independent probe already did the generic API/web check. Skip the
-        # older precheck because it intentionally preserves persisted auth hints.
-        # The moderation-first gate is NOT skipped and runs freshly at execution.
-        "bypass_api_precheck": True,
-        "solver_preflight_done": True,
-        "skip_solver_once": True,
-        # Do not immediately hit the same provider again during this refresh.
-        # Normal monitoring can detect a genuinely new/current challenge later.
-        "skip_solver_probe": True,
-    }
-    return core.queue_route_retry(
-        tab,
-        target,
-        reason,
-        metadata=meta,
-        bypass_manual=True,
-    )
-
-
-def poll_face_unlock_probe_jobs(cfg, rt, open_queue, core=None):
-    if core is None:
-        core = RejoinCore(open_queue, cfg, rt)
-
-    completed = []
-    with _FACE_UNLOCK_LOCK:
-        for pkg, job in list(_FACE_UNLOCK_JOBS.items()):
-            if job.get("done"):
-                completed.append((pkg, dict(job)))
-                del _FACE_UNLOCK_JOBS[pkg]
-
-    if not completed:
-        return False
-
-    changed = False
-    for pkg, job in completed:
-        rt_tab = get_runtime_tab(rt, pkg)
-        result = job.get("result") if isinstance(job.get("result"), dict) else {}
-        state = str(result.get("state") or "unknown")
-        detail = str(result.get("detail") or "")
-
-        rt_tab["face_unlock_probe_last_finished_at"] = now()
-        rt_tab["face_unlock_probe_last_state"] = state
-        rt_tab["face_unlock_probe_last_detail"] = cut(detail, 220)
-
-        # The hold may have healed while the network job was in flight.
-        if not _face_unlock_reason_active(rt_tab):
-            rt_tab["face_unlock_probe_note"] = ""
-            changed = True
-            continue
-
-        if state == "clear":
-            cooldown = max(
-                300,
-                int(cfg.get("face_lock_external_unlock_route_cooldown_seconds", 600) or 600),
-            )
-            last_route = int(rt_tab.get("face_unlock_route_last_at", 0) or 0)
-            if last_route > 0 and now() - last_route < cooldown:
-                left = max(1, cooldown - (now() - last_route))
-                rt_tab["face_unlock_probe_note"] = (
-                    f"Roblox unlock detected; route cooldown {format_age(left)}"
-                )
-                changed = True
-                continue
-
-            tab = dict(job.get("tab") or {"package": pkg})
-            target = str(
-                job.get("target")
-                or rt_tab.get("target")
-                or ("hatcher" if tab.get("server_link") else "market")
-            )
-            added, qnote = _queue_verified_auth_safe_route(
-                core,
-                tab,
-                target,
-                rt_tab,
-                "external Face Lock release detected; safe route refresh",
-                "external_face_unlock_route",
-            )
-            if added:
-                rt_tab["face_unlock_route_last_at"] = now()
-                rt_tab["face_unlock_probe_note"] = "external unlock detected; safe route queued"
-                rt_tab["note"] = rt_tab["face_unlock_probe_note"]
-                log_activity(
-                    "Roblox account now clean after Face Lock; safe target route queued "
-                    "(no PID stop, hold kept until fresh state)",
-                    pkg,
-                    GREEN,
-                )
-            else:
-                rt_tab["face_unlock_probe_note"] = (
-                    "external unlock detected; " + cut(str(qnote or "route pending"), 70)
-                )
-            changed = True
-            continue
-
-        if state == "restricted":
-            rt_tab["face_unlock_probe_note"] = "account still restricted; Face Lock hold kept"
-        elif state == "invalid":
-            rt_tab["face_unlock_probe_note"] = "account unlocked check: Roblox cookie invalid/expired"
-        elif state == "challenge":
-            rt_tab["face_unlock_probe_note"] = "account still requires verification"
-        else:
-            rt_tab["face_unlock_probe_note"] = "external unlock check inconclusive; hold kept"
-        changed = True
-
-    if changed:
-        core.save()
-    return changed
-
-
-# ============================================================
 # V3.82 BACKGROUND CAPTCHA SOLVER JOBS
 # ============================================================
 
 _SOLVER_JOBS = {}
 _SOLVER_LOCK = threading.RLock()
-
-
-def solver_challenge_attempt_limit(cfg):
-    # V4.81.69 keeps the V4.81.68 fixed safety contract. Three provider attempts belong to one
-    # confirmed on-screen challenge generation, then that target is reopened.
-    return 3
-
-
-def solver_challenge_generation_active(rt_tab):
-    return bool(isinstance(rt_tab, dict) and rt_tab.get("solver_challenge_generation_active"))
-
-
-def begin_solver_challenge_generation(rt_tab, pkg, reason=""):
-    if not isinstance(rt_tab, dict):
-        return ""
-    if not solver_challenge_generation_active(rt_tab):
-        token = f"{int(now())}:{time.time_ns()}:{str(pkg or '')}"
-        rt_tab["solver_challenge_generation_active"] = True
-        rt_tab["solver_challenge_generation"] = token
-        rt_tab["solver_challenge_attempts"] = 0
-        rt_tab["solver_challenge_guard_done"] = True
-        rt_tab["solver_challenge_started_at"] = now()
-        rt_tab["solver_challenge_reason"] = cut(str(reason or "visible captcha"), 180)
-        rt_tab["solver_challenge_reopen_pending"] = False
-        rt_tab["solver_challenge_last_result"] = ""
-    return str(rt_tab.get("solver_challenge_generation", "") or "")
-
-
-def reset_solver_challenge_generation(rt_tab, reason=""):
-    if not isinstance(rt_tab, dict):
-        return False
-    changed = bool(rt_tab.get("solver_challenge_generation_active") or rt_tab.get("solver_challenge_attempts"))
-    last_token = str(rt_tab.get("solver_challenge_generation", "") or "")
-    rt_tab["solver_challenge_generation_active"] = False
-    rt_tab["solver_challenge_generation"] = ""
-    rt_tab["solver_challenge_attempts"] = 0
-    rt_tab["solver_challenge_guard_done"] = False
-    rt_tab["solver_challenge_started_at"] = 0
-    rt_tab["solver_challenge_reason"] = ""
-    rt_tab["solver_challenge_reopen_pending"] = False
-    rt_tab["solver_challenge_last_reset_at"] = now()
-    rt_tab["solver_challenge_last_reset_reason"] = str(reason or "reopen")
-    if last_token:
-        rt_tab["solver_challenge_last_generation"] = last_token
-    return changed
-
-
-def _solver_challenge_clear_transient_hold(pkg, rt_tab):
-    """Clear only CAPTCHA/solver transient holds before a solver-owned reopen.
-
-    Never erase a real face-lock/account-lock/ban/moderation hold here. The direct
-    moderation gate still runs again at execution time as the final authority.
-    """
-    reason = str((rt_tab or {}).get("manual_login_reason", "") or "").lower()
-    hold_reason = str(get_hold_reason(pkg) or "").lower() if pkg else ""
-    strong_terms = (
-        "face_lock", "face lock", "account locked", "account_banned",
-        "banned", "terminated", "moderated", "parental",
-    )
-    strong = any(x in reason for x in strong_terms)
-    hold_strong = any(x in hold_reason for x in strong_terms)
-    if not strong and not hold_strong and (
-        "captcha" in reason or "challenge" in reason or "solver" in reason or not reason
-    ):
-        clear_manual_login_block(rt_tab)
-    if pkg and not strong and not hold_strong:
-        clear_hold(pkg)
-
-
-def solver_package_cookie_auth_state(pkg, cfg):
-    """Return True=authenticated, False=definitely invalid/expired, None=ambiguous.
-
-    Provider-side 'cookie flagged' wording is not authoritative. Roblox's own
-    authenticated endpoint/precheck decides whether NOMO may call it invalid.
-    """
-    cookie, _source, note = solver_cookie_for_package(pkg, cfg)
-    cookie = str(cookie or "").strip()
-    if not cookie:
-        return None, "no package cookie: " + cut(str(note or ""), 80)
-    try:
-        info = get_roblox_user_info(cookie) or {}
-    except Exception as exc:
-        return None, "cookie API unavailable: " + cut(str(exc), 80)
-    if info.get("valid") is True:
-        return True, "cookie/API authenticated"
-    status = str(info.get("status", "") or "").lower()
-    if "invalid/expired" in status or "http 401" in status:
-        return False, str(info.get("status") or "invalid/expired")
-    # HTTP 403 / challenge is not proof of an expired .ROBLOSECURITY cookie.
-    return None, str(info.get("status") or "cookie auth ambiguous")
-
-
-def queue_solver_generation_reopen(core, tab, target, rt_tab, cfg, result_label, safety=False):
-    pkg = str((tab or {}).get("package", "") or "")
-    if not pkg:
-        return False, "solver generation reopen: missing package"
-    if rt_tab.get("solver_challenge_reopen_pending"):
-        return False, "solver generation reopen already pending"
-
-    attempts = int(rt_tab.get("solver_challenge_attempts", 0) or 0)
-    token = str(rt_tab.get("solver_challenge_generation", "") or "")
-    _solver_challenge_clear_transient_hold(pkg, rt_tab)
-    clear_captcha_ui_runtime(rt_tab)
-    clear_solver_runtime_block(rt_tab)
-    core.cancel(pkg)
-
-    rt_tab["solver_challenge_reopen_pending"] = True
-    rt_tab["solver_challenge_last_result"] = str(result_label or "")
-    rt_tab["solver_challenge_reopen_queued_at"] = now()
-    rt_tab["solver_challenge_reopen_safety"] = bool(safety)
-    metadata = {
-        "solver_generation_reopen": True,
-        "solver_generation_safety_reopen": bool(safety),
-        "solver_generation_token": token,
-        "solver_generation_attempt": attempts,
-        # This exception is intentionally narrower than Option 6: it skips only
-        # the stale visible CAPTCHA/529 veto. Moderation/account-lock guards remain.
-        "auth_result_recovery": True,
-        # Generic API challenge precheck would intentionally hold a still-live
-        # CAPTCHA session and prevent the solver-owned reopen. Skip only that
-        # generic gate; direct moderation/API Account Locked still runs first.
-        "bypass_api_precheck": True,
-    }
-    added, note = core.queue_solver_result_recovery(
-        tab, target, str(result_label or "SOLVER_GENERATION"), metadata
-    )
-    if not added:
-        rt_tab["solver_challenge_reopen_pending"] = False
-    return added, note
 
 
 def solver_job_running(package):
@@ -35179,23 +33495,6 @@ def solver_response_http_status(data):
     return 0
 
 
-def solver_response_cookie_flagged(data):
-    """Provider-side cookie-flag wording; never proof that Roblox auth is dead."""
-    text = solver_response_text_blob(data)
-    return bool(
-        "cookie is flagged" in text
-        or "cookie flagged" in text
-        or "flagged cookie" in text
-        or "re-login to your account and get a new cookie" in text
-        or "relogin to your account and get a new cookie" in text
-        or (
-            "verification passed" in text
-            and "roblox returned an error" in text
-            and "cookie" in text
-        )
-    )
-
-
 def solver_response_provider_unavailable(data):
     if not isinstance(data, dict):
         return False
@@ -35238,7 +33537,6 @@ def solver_response_retry_later(data):
     return (
         solver_response_provider_cooldown(data)
         or solver_response_provider_unavailable(data)
-        or solver_response_cookie_flagged(data)
         or "cookie flagged refresh denied" in text
         or "cache flagged refresh denied" in text
         or "flagged refresh" in text
@@ -35247,6 +33545,81 @@ def solver_response_retry_later(data):
         or "provider cooldown" in text
         or "temporarily" in text
     )
+
+
+def solver_response_claims_cookie_invalid_or_flagged(data):
+    """True only for provider wording that claims this cookie/cache is bad.
+
+    Rate-limit / maintenance errors by themselves are deliberately excluded.
+    """
+    status = str(solver_response_status(data) or "").upper()
+    text = solver_response_text_blob(data)
+    if status in {"INVALID_COOKIES", "INVALID_COOKIE", "UNAUTHORIZED", "AUTH_FAILED"}:
+        return True
+    markers = (
+        "cookie flagged",
+        "cache flagged",
+        "flagged refresh",
+        "invalid cookie",
+        "invalid cookies",
+        "cookie invalid",
+        "cookie expired",
+        "expired cookie",
+        "authentication failed",
+        "auth failed",
+    )
+    return any(marker in text for marker in markers)
+
+
+def verify_roblox_auth_after_provider_cookie_claim(pkg, cfg):
+    """Independently verify a provider INVALID/FLAGGED claim with Roblox.
+
+    Returns (classification, detail) where classification is valid, invalid,
+    restricted, challenge, or unknown. Provider text is never treated as proof.
+    """
+    cookie, source, cookie_note = solver_cookie_for_package(pkg, cfg)
+    if not cookie:
+        return "unknown", "live package cookie unavailable: " + cut(cookie_note, 90)
+
+    base = check_cookie_challenge(cookie)
+    if base == "invalid":
+        return "invalid", f"Roblox authenticated-user endpoint rejected {source} cookie"
+    if base == "challenge":
+        return "challenge", f"Roblox authenticated-user endpoint returned a challenge ({source})"
+    if base != "valid":
+        return "unknown", f"Roblox auth verification unavailable ({base}; {source})"
+
+    # Base auth is valid. Re-run NOMO's restriction-aware Roblox check so a
+    # still-authenticated locked/banned account never becomes destructive just
+    # because the provider made a bad cookie claim.
+    api_hit, api_detail = roblox_cookie_detection(cookie, cfg)
+    detail = str(api_detail or "")
+    detail_low = detail.lower()
+    restriction_markers = (
+        "/not-approved",
+        "moderated/locked",
+        "user moderated",
+        "account locked",
+        "account is locked",
+        "account terminated",
+        "account banned",
+        "face lock",
+        "restriction",
+        "punishment",
+    )
+    if api_hit is True:
+        return "challenge", detail or "Roblox reports challenge"
+    if api_hit is False:
+        return "valid", detail or f"Roblox auth valid ({source})"
+    if "invalid/expired" in detail_low:
+        return "invalid", detail
+    if any(marker in detail_low for marker in restriction_markers):
+        return "restricted", detail
+
+    # /v1/users/authenticated was explicitly 200 even if the secondary route
+    # check was inconclusive. The destructive boundary still runs the existing
+    # package-local moderation/UI gates before PID-stop.
+    return "valid", detail or f"Roblox base auth valid ({source})"
 
 
 def apply_solver_retry_later(pkg, rt_tab, cfg, reason="PROVIDER_RETRY", retry_seconds=None):
@@ -35307,17 +33680,8 @@ def _solver_probe_worker(package, tab, cookie, cfg_snapshot, place_id):
             details.append(ui_detail)
             locally_detected = locally_detected or (ui_hit is True)
 
-        unconditional_stuck_probe = bool(
-            cfg_snapshot.get("solver_stuck_loading_unconditional_provider", False)
-        )
-        provider_probe = bool(
-            cfg_snapshot.get("solver_provider_probe_on_no_state", True)
-            or unconditional_stuck_probe
-        )
-        if (
-            cfg_snapshot.get("solver_provider_challenge_only", True)
-            and not unconditional_stuck_probe
-        ):
+        provider_probe = bool(cfg_snapshot.get("solver_provider_probe_on_no_state", True))
+        if cfg_snapshot.get("solver_provider_challenge_only", True):
             provider_probe = False
         should_call_provider = locally_detected or provider_probe
 
@@ -35398,25 +33762,14 @@ def reserve_solver_provider_submit(rt_tab, cfg, submitted_at=None, status="SUBMI
     return submitted
 
 
-def start_challenge_probe_job(
-    tab,
-    cfg,
-    rt,
-    rt_tab,
-    probe_token=0,
-    reason="wait-after-open no fresh state",
-    unconditional_provider=False,
-):
+def start_challenge_probe_job(tab, cfg, rt, rt_tab, probe_token=0, reason="wait-after-open no fresh state"):
     """Start one background provider check for one actual open generation.
 
     V3.84 deliberately does not periodically scan every stale package. The token
     is normally rt_tab.last_open, so the same rejoin can submit at most once.
     """
     pkg = str((tab or {}).get("package", "") or "")
-    if not pkg or (
-        not cfg.get("login_challenge_detection_enabled", True)
-        and not unconditional_provider
-    ):
+    if not pkg or not cfg.get("login_challenge_detection_enabled", True):
         return False, "challenge probe disabled"
 
     token = int(probe_token or 0)
@@ -35451,7 +33804,6 @@ def start_challenge_probe_job(
         "target": str(rt_tab.get("target", "") or ("hatcher" if (tab or {}).get("server_link") else "market")),
         "reason": str(reason or "wait-after-open no fresh state"),
         "phase": "probe",
-        "stuck_loading_probe": bool(unconditional_provider),
         "probe_token": token,
         "started_at": now(),
         "timeout": timeout,
@@ -35471,9 +33823,6 @@ def start_challenge_probe_job(
     log_activity(f"checking login/captcha once: {cut(job['reason'], 65)}", pkg, CYAN)
 
     cfg_snapshot = dict(cfg)
-    cfg_snapshot["solver_stuck_loading_unconditional_provider"] = bool(
-        unconditional_provider
-    )
     thread = threading.Thread(
         target=_solver_probe_worker,
         args=(pkg, dict(tab or {}), cookie, cfg_snapshot, place_id),
@@ -35633,14 +33982,6 @@ def start_solver_job(tab, cfg, rt, rt_tab, reason, force=False, phase="solve", o
         "cookie_source": cookie_source,
         "response": None,
     }
-    if str(phase or "solve") == "solve" and challenge_confirmed:
-        generation = begin_solver_challenge_generation(rt_tab, pkg, reason)
-        attempt = int(rt_tab.get("solver_challenge_attempts", 0) or 0) + 1
-        rt_tab["solver_challenge_attempts"] = attempt
-        rt_tab["solver_challenge_last_attempt_at"] = now()
-        job["challenge_generation"] = generation
-        job["challenge_attempt"] = attempt
-        job["challenge_guard_done"] = bool(rt_tab.get("solver_challenge_guard_done"))
     with _SOLVER_LOCK:
         _SOLVER_JOBS[pkg] = job
 
@@ -35660,10 +34001,7 @@ def start_solver_job(tab, cfg, rt, rt_tab, reason, force=False, phase="solve", o
     generation_note = (
         f" gen={str(job.get('open_generation', ''))[-8:]}"
         if job["phase"] == "preopen"
-        else (
-            f" attempt={int(job.get('challenge_attempt', 0) or 0)}/3"
-            if job.get("challenge_generation") else ""
-        )
+        else ""
     )
     log_activity(
         f"{prefix}{generation_note}: {cut(job['reason'], 60)} | cookie={cookie_source}",
@@ -35692,34 +34030,18 @@ def _solver_error_text(response):
 
 
 def handle_detected_solver_challenge(tab, cfg, rt, rt_tab, reason, core=None):
-    """Start attempt #1 for a freshly confirmed target-local CAPTCHA generation."""
+    """Start/describe a solver job, or isolate the package if unavailable."""
     pkg = str((tab or {}).get("package", "") or "")
-    begin_solver_challenge_generation(rt_tab, pkg, reason)
-
-    started, note = start_solver_job(
-        tab, cfg, rt, rt_tab, reason, core=core, challenge_confirmed=True
-    )
+    started, note = start_solver_job(tab, cfg, rt, rt_tab, reason, core=core, challenge_confirmed=True)
     if started:
-        attempt = int(rt_tab.get("solver_challenge_attempts", 0) or 0)
-        rt_tab["note"] = f"solver attempt {attempt}/3" if attempt else note
+        rt_tab["note"] = note
         if core is not None:
             core.save()
         else:
             save_runtime(rt)
-        return "Solving", rt_tab["note"]
+        return "Solving", note
 
-    note_low = str(note or "").lower()
-    if any(x in note_low for x in ("cooldown", "retry in", "provider cooldown")):
-        retry_seconds = max(600, int(cfg.get("solver_failure_retry_seconds", 600) or 600))
-        apply_solver_retry_later(pkg, rt_tab, cfg, "CAPTCHA_GENERATION", retry_seconds)
-        rt_tab["note"] = f"CAPTCHA confirmed; solver attempt 1/3 deferred: {cut(note, 65)}"
-        if core is not None:
-            core.save()
-        else:
-            save_runtime(rt)
-        return "Captcha", rt_tab["note"]
-
-    # Missing solver credentials/cookie is still a real manual intervention case.
+    # Disabled, missing credentials/cookie, or cooldown after a failed attempt.
     retry_seconds = max(600, int(cfg.get("solver_failure_retry_seconds", 600) or 600))
     mark_manual_login_block(
         rt_tab,
@@ -35792,17 +34114,6 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
             or bool(job.get("ok"))
         )
 
-        # The open lock was released when this five-minute background check
-        # started. Keep a Hatcher target inside V4.81.76's non-destructive guard
-        # unless CAPTCHA_SUCCESS below explicitly earns its one target restart.
-        if job.get("stuck_loading_probe") and target == "hatcher":
-            start_hatcher_alive_loading_guard(
-                rt_tab,
-                cfg,
-                opened_at=int(rt_tab.get("last_open", 0) or 0),
-                reason="five-minute hidden-CAPTCHA check completed",
-            )
-
         # V4.14: pre-open jobs do not create a second queue entry. They unlock
         # the original generation exactly once, so CAPTCHA_SUCCESS and
         # NO_CAPTCHA both lead to one Roblox launch—not open -> solve -> reopen.
@@ -35845,7 +34156,73 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
             rt_tab["solver_state"] = "failed"
             rt_tab["solver_last_error"] = err
 
-            if solver_response_retry_later(response):
+            if (
+                queued_item is not None
+                and queued_item.get("combined_stuck_recovery")
+                and solver_response_claims_cookie_invalid_or_flagged(response)
+            ):
+                auth_class, auth_detail = verify_roblox_auth_after_provider_cookie_claim(pkg, cfg)
+                rt_tab["combined_stuck_provider_claim"] = cut(err, 140)
+                rt_tab["combined_stuck_roblox_auth_class"] = auth_class
+                rt_tab["combined_stuck_roblox_auth_detail"] = cut(auth_detail, 180)
+
+                if auth_class == "valid":
+                    clear_hold(pkg)
+                    clear_manual_login_block(rt_tab)
+                    rt_tab["solver_busy_retry_pending"] = False
+                    rt_tab["solver_busy_retry_at"] = 0
+                    rt_tab["solver_retry_reason"] = ""
+                    rt_tab["note"] = "provider invalid/flagged ignored; Roblox auth valid; combined recovery"
+                    queued_item["solver_preflight_waiting"] = False
+                    queued_item["solver_preflight_done"] = True
+                    queued_item["solver_result"] = "PROVIDER_COOKIE_CLAIM_IGNORED_ROBLOX_VALID"
+                    queued_item["skip_solver_once"] = True
+                    queued_item["skip_solver_probe"] = True
+                    log_activity(
+                        "solver invalid/flagged claim ignored; Roblox auth valid; "
+                        "combined PS+cache recovery continues",
+                        pkg,
+                        YELLOW,
+                    )
+                elif auth_class in {"invalid", "restricted"}:
+                    core.remove_generation(pkg, generation)
+                    retry_seconds = max(600, int(cfg.get("manual_auth_retry_seconds", 3600) or 3600))
+                    hold_reason = "account restricted/moderated" if auth_class == "restricted" else "invalid package cookie"
+                    mark_manual_login_block(
+                        rt_tab,
+                        hold_reason,
+                        auth_detail or err,
+                        "Roblox confirmed " + hold_reason,
+                        None,
+                        retry_seconds,
+                    )
+                    set_hold(pkg, "Roblox confirmed " + hold_reason, retry_seconds)
+                    rt_tab["note"] = "Roblox confirmed auth problem; combined recovery blocked"
+                    log_activity(
+                        "provider claim independently confirmed by Roblox; no PID-stop: " + cut(auth_detail, 85),
+                        pkg,
+                        RED,
+                    )
+                else:
+                    # A real Roblox challenge or an unavailable verification is
+                    # not clean-auth proof. Do not trust the provider enough to
+                    # mark the cookie bad, but also do not PID-stop the clone.
+                    core.remove_generation(pkg, generation)
+                    retry_seconds = max(600, int(cfg.get("solver_min_resubmit_seconds", 600) or 600))
+                    retry_reason = "ROBLOX_CHALLENGE" if auth_class == "challenge" else "AUTH_VERIFY_UNKNOWN"
+                    retry_after = apply_solver_retry_later(pkg, rt_tab, cfg, retry_reason, retry_seconds)
+                    rt_tab["note"] = (
+                        "Roblox challenge; combined recovery deferred (no PID-stop)"
+                        if auth_class == "challenge"
+                        else "Roblox auth verification unavailable; combined recovery deferred"
+                    )
+                    log_activity(
+                        f"provider cookie claim untrusted; {auth_class}; recovery deferred "
+                        f"{format_age(retry_after)}: {cut(auth_detail, 75)}",
+                        pkg,
+                        YELLOW,
+                    )
+            elif solver_response_retry_later(response):
                 rt_tab["solver_busy_retry_pending"] = False
                 rt_tab["solver_busy_retry_at"] = 0
                 rt_tab["solver_retry_reason"] = ""
@@ -35911,156 +34288,6 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
                     pkg,
                     YELLOW,
                 )
-            changed = True
-            continue
-
-        # V4.81.68: challenge-confirmed jobs are governed by the three-try
-        # generation, not by the old "UI must disappear first" logic. This client
-        # leaves Start Puzzle visible until the target package is reopened.
-        challenge_generation = str(job.get("challenge_generation", "") or "")
-        challenge_attempt = int(job.get("challenge_attempt", 0) or 0)
-        current_generation = str(rt_tab.get("solver_challenge_generation", "") or "")
-        challenge_job = bool(
-            challenge_generation
-            and solver_challenge_generation_active(rt_tab)
-            and challenge_generation == current_generation
-        )
-
-        if challenge_job and (no_captcha_result or solved_result):
-            result_label = "NO_CAPTCHA" if no_captcha_result else "CAPTCHA_SUCCESS"
-            detail = _solver_probe_detail(response)
-            _solver_challenge_clear_transient_hold(pkg, rt_tab)
-            clear_solver_runtime_block(rt_tab)
-            rt_tab["solver_state"] = "success" if solved_result else "clear"
-            rt_tab["solver_last_success"] = now()
-            rt_tab["solver_last_error"] = ""
-            rt_tab["solver_last_probe"] = detail
-            rt_tab["solver_challenge_last_result"] = result_label
-            added, _ = queue_solver_generation_reopen(
-                core, tab, target, rt_tab, cfg, result_label, safety=False
-            )
-            rt_tab["note"] = (
-                f"{result_label}; exact target reopen queued"
-                if added else f"{result_label}; target reopen already pending"
-            )
-            log_activity(
-                f"solver {result_label} attempt {challenge_attempt}/3; exact target PID reopen "
-                "(old CAPTCHA UI intentionally not rechecked)",
-                pkg, GREEN,
-            )
-            changed = True
-            continue
-
-        if challenge_job:
-            err = _solver_error_text(response)
-            rt_tab["solver_state"] = "failed"
-            rt_tab["solver_last_error"] = err
-            rt_tab["solver_challenge_last_result"] = status_code or "FAILED"
-
-            invalid_label = status_code in {"INVALID_COOKIES", "INVALID_COOKIE", "UNAUTHORIZED", "AUTH_FAILED"}
-            provider_cookie_flagged = solver_response_cookie_flagged(response)
-            cookie_auth, cookie_auth_note = solver_package_cookie_auth_state(pkg, cfg)
-
-            if provider_cookie_flagged and cookie_auth is True:
-                # The provider's wording is not authority. Ask Roblox's full
-                # auth/moderation/web-route chain. If Roblox says the session is
-                # clean, verification likely succeeded but this Redfinger task
-                # is stale: route it once without any PID stop.
-                probe_cookie, _probe_source, _probe_note = solver_cookie_for_package(pkg, cfg)
-                session_blocked, session_detail = (
-                    roblox_cookie_detection(probe_cookie, cfg)
-                    if probe_cookie else (None, "no package cookie")
-                )
-                if session_blocked is False:
-                    reset_solver_challenge_generation(rt_tab, "provider flagged but Roblox clean")
-                    clear_solver_runtime_block(rt_tab)
-                    added, qnote = _queue_verified_auth_safe_route(
-                        core,
-                        tab,
-                        target,
-                        rt_tab,
-                        "solver verification passed; provider cookie-flagged but Roblox clean",
-                        "provider_flagged_safe_route",
-                    )
-                    rt_tab["note"] = (
-                        "provider cookie-flagged; Roblox clean; safe route queued"
-                        if added
-                        else "provider cookie-flagged; Roblox clean; " + cut(str(qnote), 60)
-                    )
-                    log_activity(
-                        "provider reported cookie flagged after verification, but Roblox "
-                        "auth/moderation/home is clean; safe route refresh only (no PID stop)",
-                        pkg,
-                        GREEN,
-                    )
-                    changed = True
-                    continue
-                log_activity(
-                    "provider reported cookie flagged; Roblox clean-session proof was not "
-                    "available, so cookie is NOT marked invalid: " + cut(str(session_detail), 75),
-                    pkg,
-                    YELLOW,
-                )
-
-            if invalid_label and cookie_auth is False:
-                reset_solver_challenge_generation(rt_tab, "cookie invalid")
-                clear_solver_runtime_block(rt_tab)
-                retry_seconds = max(600, int(cfg.get("manual_auth_retry_seconds", 3600) or 3600))
-                mark_manual_login_block(
-                    rt_tab, "invalid package cookie", err,
-                    "INVALID_COOKIES - refresh account cookie", None, retry_seconds,
-                )
-                set_hold(pkg, "solver + Roblox API confirmed invalid/expired package cookie", retry_seconds)
-                log_activity(
-                    f"solver invalid-cookie result confirmed by Roblox API; retry in {format_age(retry_seconds)}",
-                    pkg, RED,
-                )
-                changed = True
-                continue
-
-            if invalid_label and cookie_auth is True:
-                log_activity(
-                    f"provider said {status_code}, but cookie/API still authenticates; treating as solver failure",
-                    pkg, YELLOW,
-                )
-            elif solver_response_http_status(response) == 403 and cookie_auth is True:
-                log_activity(
-                    "solver/challenge HTTP 403; cookie/API still valid, cookie retained",
-                    pkg, YELLOW,
-                )
-
-            limit = solver_challenge_attempt_limit(cfg)
-            attempts = max(challenge_attempt, int(rt_tab.get("solver_challenge_attempts", 0) or 0))
-            if attempts >= limit:
-                clear_solver_runtime_block(rt_tab)
-                added, _ = queue_solver_generation_reopen(
-                    core, tab, target, rt_tab, cfg, f"SOLVER_FAILED_{attempts}", safety=True
-                )
-                rt_tab["note"] = (
-                    f"solver failed {attempts}/{limit}; exact target safety reopen queued"
-                    if added else f"solver failed {attempts}/{limit}; target safety reopen pending"
-                )
-                log_activity(
-                    f"solver failed {attempts}/{limit}; exact target PID safety reopen "
-                    "(A/B/C/D peers untouched)",
-                    pkg, YELLOW,
-                )
-                changed = True
-                continue
-
-            retry_seconds = max(600, int(cfg.get("solver_failure_retry_seconds", 600) or 600))
-            retry_after = apply_solver_retry_later(
-                pkg, rt_tab, cfg, "CAPTCHA_GENERATION", retry_seconds
-            )
-            rt_tab["note"] = (
-                f"solver failed {attempts}/{limit}; attempt {attempts + 1}/{limit} "
-                f"after {format_age(retry_after)} (old UI guard skipped)"
-            )
-            log_activity(
-                f"solver attempt {attempts}/{limit} failed: {cut(err, 75)}; "
-                f"retry #{attempts + 1} in {format_age(retry_after)} without CAPTCHA rescan",
-                pkg, YELLOW,
-            )
             changed = True
             continue
 
@@ -36155,43 +34382,6 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
             # Remove only stale/duplicate queue entries for this package. Never
             # disturb another clone's queued recovery.
             core.cancel(pkg)
-
-            # V4.81.78: this provider request was made only because an actual
-            # open stayed ALIVE/no-fresh for five minutes. CAPTCHA_SUCCESS is
-            # external to Redfinger, so the frozen client must be restarted.
-            # NO_CAPTCHA was handled above and never reaches this branch.
-            if solved_result and job.get("stuck_loading_probe"):
-                if target == "hatcher":
-                    clear_hatcher_alive_loading_guard(
-                        rt_tab,
-                        "CAPTCHA_SUCCESS exact target recovery",
-                    )
-                solver_metadata = solver_result_recovery_metadata(
-                    result_label,
-                    {
-                        "stuck_loading_solver_recovery": True,
-                        "not_before": now() + 5,
-                    },
-                )
-                added, _ = core.queue_solver_result_recovery(
-                    tab,
-                    target,
-                    result_label,
-                    solver_metadata,
-                )
-                rt_tab["note"] = (
-                    "CAPTCHA_SUCCESS; exact target rejoin queued"
-                    if added
-                    else "CAPTCHA_SUCCESS; exact target rejoin already pending"
-                )
-                log_activity(
-                    "hidden CAPTCHA solved externally; exact target PID rejoin "
-                    "queued after 5s (siblings untouched)",
-                    pkg,
-                    GREEN,
-                )
-                changed = True
-                continue
 
             # This is a post-open provider result. Never PID-stop Noka here. If a
             # solved CAPTCHA leaves the 529/auth wrapper visible, deliver one safe
@@ -37683,9 +35873,8 @@ def solver_menu(cfg):
         if provider == "blocksolve":
             print("   BlockSolve contract: POST /join | X-API-Key | {cookie, placeId} | auto=challenge-only")
         print(f"3. Default place ID: {cfg.get('solver_place_id', '126884695634066')}")
-        print(f"4. Timeout / min provider interval / stuck-load delay: {cfg.get('solver_timeout_seconds', 180)}s / {cfg.get('solver_min_resubmit_seconds', 600)}s / {cfg.get('solver_probe_after_seconds', 300)}s")
-        print(f"   One provider check per stuck rejoin: {cfg.get('solver_probe_once_per_open', True)}")
-        print(f"   Pre-open provider check: {cfg.get('solver_preflight_every_open', False)}")
+        print(f"4. Timeout / min provider interval / probe delay: {cfg.get('solver_timeout_seconds', 180)}s / {cfg.get('solver_min_resubmit_seconds', 600)}s / {cfg.get('solver_probe_after_seconds', 180)}s")
+        print(f"   Once per actual rejoin: {cfg.get('solver_probe_once_per_open', True)}")
         print(f"   Cookie precheck required: {cfg.get('solver_require_cookie_precheck', True)}")
         print("5. Test solver with a package (fresh package DB cookie)")
         print("6. Test solver with a sample cookie (paste manually)")
@@ -37735,12 +35924,11 @@ def solver_menu(cfg):
             try:
                 timeout = int(input(f"Request timeout seconds [{cfg.get('solver_timeout_seconds', 180)}]: ").strip() or cfg.get("solver_timeout_seconds", 180))
                 cooldown = int(input(f"Minimum provider interval seconds [{cfg.get('solver_min_resubmit_seconds', 600)}]: ").strip() or cfg.get("solver_min_resubmit_seconds", 600))
-                probe = int(input(f"Stuck-loading solver delay seconds [{cfg.get('solver_probe_after_seconds', 300)}]: ").strip() or cfg.get("solver_probe_after_seconds", 300))
+                probe = int(input(f"Post-rejoin no-fresh probe delay seconds [{cfg.get('solver_probe_after_seconds', 180)}]: ").strip() or cfg.get("solver_probe_after_seconds", 180))
                 cfg["solver_timeout_seconds"] = max(15, timeout)
                 cfg["solver_min_resubmit_seconds"] = max(600, cooldown)
                 cfg["solver_retry_cooldown_seconds"] = max(600, cooldown)
-                cfg["solver_probe_after_seconds"] = max(300, probe)
-                cfg["solver_stuck_loading_probe_after_seconds"] = max(300, probe)
+                cfg["solver_probe_after_seconds"] = max(10, probe)
                 save_config(cfg)
                 print(col("Solver timing saved.", GREEN))
             except Exception:
@@ -45182,7 +43370,7 @@ def main():
             normalize_active_mode_flags(cfg)
 
         elif choice == "17":
-            apply_exotic_master_menu(cfg)
+            workspace_zip_tools_menu(cfg)
             cfg = load_config()
             normalize_active_mode_flags(cfg)
 
