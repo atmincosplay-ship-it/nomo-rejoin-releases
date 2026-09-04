@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
-# V4.81.77 — FIVE-MINUTE HIDDEN-CAPTCHA RESCUE
+# V4.81.78 — OPEN-TOKEN CAPTCHA WATCHDOG
+# - Every successful Hatcher ``open ok`` arms a package-scoped watchdog from
+#   that exact open timestamp. It is independent of NOMO uptime, Lua state age,
+#   the Loading-screen detector, and the older loading-guard flag.
+# - At five minutes with the exact target still ALIVE and no fresh post-open Lua
+#   state, the watchdog submits the provider once for that open token. It runs
+#   before bubble-only/old-state recovery and cancels only that package's queued
+#   recovery, preventing an older branch from reopening the clone and resetting
+#   the five-minute timer before the provider gets its turn.
 # - Removes the provider submission immediately before every normal rejoin. A
 #   healthy rejoin that becomes fresh within five minutes uses no solver credit.
 # - An ALIVE Noka Hatcher join that is still not fresh five minutes after its
@@ -1368,7 +1376,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.77"
+__version__ = "V4.81.78"
 MAX_VALID_STALE_STATE_SECONDS = 270 * 60 * 60  # V4.81.71: below the historical ~277h phantom sample
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
@@ -2153,7 +2161,7 @@ DEFAULT_CONFIG = {
     # contains a path is used exactly as entered. Automatic jobs start only after
     # a real challenge is detected and run outside the dashboard/main loop.
     "solver_enabled": False,
-    # Retained for compatibility; V4.81.77 disables the pre-open provider gate.
+    # Retained for compatibility; V4.81.78 disables the pre-open provider gate.
     "solver_once_per_rejoin": True,
     "solver_preflight_every_open": False,
     "solver_no_captcha_trust_seconds": 3600,
@@ -2186,7 +2194,7 @@ DEFAULT_CONFIG = {
     # package has produced no state for solver_probe_after_seconds, allow the
     # configured provider to make the authoritative check once for that open.
     "solver_provider_probe_on_no_state": True,
-    # V4.81.77: the provider is the fallback detector after five minutes of an
+    # V4.81.78: the provider is the fallback detector after five minutes of an
     # actual Hatcher open. It runs once even if local/API CAPTCHA evidence is
     # absent because Roblox can cover the challenge with its loading card.
     "solver_stuck_loading_probe_enabled": True,
@@ -3554,7 +3562,7 @@ def apply_update_migrations(cfg):
     # exact-target-PID recovery path only for a confirmed solver generation.
     set_cfg("solver_rejoin_on_success", False)
     set_cfg("solver_rejoin_on_no_captcha", False)
-    # V4.81.77: do not spend a provider request before a normal open. The one
+    # V4.81.78: do not spend a provider request before a normal open. The one
     # unconditional provider request belongs only to a five-minute stuck load.
     if cfg.get("solver_once_per_rejoin") is not True:
         set_cfg("solver_once_per_rejoin", True)
@@ -12122,18 +12130,38 @@ def hatcher_alive_loading_maybe_route_retry(core, tab, rt_tab, cfg):
     return False, str(note or "route retry already queued")
 
 
-def hatcher_alive_loading_maybe_solver_rescue(core, tab, rt_tab, cfg):
-    """Submit one unconditional provider check after five minutes of this open."""
-    if not hatcher_alive_loading_guard_active(rt_tab):
-        return False, "loading guard inactive"
+def hatcher_alive_loading_maybe_solver_rescue(
+    core, tab, rt_tab, cfg, process_status="", state=None
+):
+    """Run the package-local five-minute watchdog for an actual successful open.
+
+    V4.81.77 reached this helper only through the loading-guard branch. The
+    older bubble-only branch is evaluated first, so it could queue another open,
+    replace ``last_open``, and starve the provider check indefinitely. V4.81.78
+    keys the check to a token armed directly by ``open ok`` and lets the live
+    Hatcher loop call it before any stale/bubble recovery decision.
+    """
     if not cfg.get("solver_stuck_loading_probe_enabled", True):
         return False, "stuck-loading solver rescue disabled"
     if not cfg.get("solver_enabled", False):
         return False, "solver disabled"
 
-    opened_at = int(rt_tab.get("last_open", 0) or 0)
+    opened_at = int(rt_tab.get("solver_stuck_open_token", 0) or 0)
     if opened_at <= 0:
-        return False, "stuck-loading rescue has no open token"
+        return False, "stuck-loading rescue not armed by open ok"
+
+    if str(process_status or "").upper() != "ALIVE":
+        return False, "target is not confirmed ALIVE"
+
+    fresh, _fresh_state, _fresh_err = state_fresh_after_open(
+        tab, cfg, opened_at
+    )
+    if fresh:
+        rt_tab["solver_stuck_open_completed_at"] = now()
+        rt_tab["solver_stuck_open_token"] = 0
+        rt_tab["solver_stuck_open_target"] = ""
+        return False, "fresh state completed open watchdog"
+
     probe_after = max(
         300,
         int(cfg.get("solver_stuck_loading_probe_after_seconds", 300) or 300),
@@ -12152,6 +12180,17 @@ def hatcher_alive_loading_maybe_solver_rescue(core, tab, rt_tab, cfg):
         unconditional_provider=True,
     )
     if started:
+        # The solver now owns only this package's incident. Remove a queued
+        # bubble/old-state retry for the same target so it cannot race the
+        # provider or replace the token. Sibling queue entries are untouched.
+        removed = core.cancel(str((tab or {}).get("package", "") or ""))
+        if removed:
+            log_activity(
+                "five-minute solver watchdog cancelled target-only queued "
+                "recovery; sibling queues untouched",
+                str((tab or {}).get("package", "") or ""),
+                CYAN,
+            )
         rt_tab["note"] = str(note or "checking hidden captcha")
         core.save()
     return started, str(note or "hidden CAPTCHA rescue checked")
@@ -17073,6 +17112,24 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
     core.save()
 
     if ok:
+        # V4.81.78: arm the hidden-CAPTCHA watchdog only from a real successful
+        # Hatcher open. NOMO uptime, synthetic startup grace, and an old Lua
+        # timestamp are never allowed to create or replace this token.
+        if target == "hatcher":
+            rt_tab["solver_stuck_open_token"] = int(opened_at or now())
+            rt_tab["solver_stuck_open_target"] = "hatcher"
+            rt_tab["solver_stuck_open_armed_at"] = now()
+            rt_tab["solver_stuck_open_mode"] = str(
+                rt_tab.get("last_open_mode", mode) or mode
+            )
+            rt_tab["solver_stuck_open_reason"] = str(reason or "")
+            log_activity(
+                "five-minute hidden-CAPTCHA watchdog armed from open ok",
+                pkg,
+                CYAN,
+            )
+            core.save()
+
         if item.get("solver_generation_reopen"):
             attempts = int(item.get("solver_generation_attempt", 0) or 0)
             result_label = str(item.get("solver_result", "solver generation") or "solver generation")
@@ -22717,7 +22774,34 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                         hcfg, pkg, detected_user, tab=tab, source="state"
                     )
 
-            if not tab.get("server_link") or str(tab.get("server_link")).startswith("YOUR_"):
+            # V4.81.78: evaluate the open-token watchdog before old-state,
+            # bubble-only, kick, or other Hatcher recovery branches. This is
+            # deliberately independent of visual Loading detection and of the
+            # loading-guard flag. When it starts, it owns only this package's
+            # current incident until the provider result is consumed.
+            solver_watch_active = False
+            solver_watch_note = ""
+            if raw_alive:
+                watch_started, solver_watch_note = (
+                    hatcher_alive_loading_maybe_solver_rescue(
+                        core,
+                        tab,
+                        rt_tab,
+                        cfg,
+                        process_status=process_status,
+                        state=state,
+                    )
+                )
+                solver_watch_active = bool(
+                    watch_started or solver_job_running(pkg)
+                )
+                if solver_watch_active:
+                    status = "Solving"
+                    note = solver_job_note(pkg)
+
+            if solver_watch_active:
+                pass
+            elif not tab.get("server_link") or str(tab.get("server_link")).startswith("YOUR_"):
                 status = "No server"
                 note = "server_link missing"
             elif state:
@@ -22821,7 +22905,9 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                 elif alive_loading_guard and not challenge_active:
                     rescue_started, rescue_note = (
                         hatcher_alive_loading_maybe_solver_rescue(
-                            core, tab, rt_tab, cfg
+                            core, tab, rt_tab, cfg,
+                            process_status=process_status,
+                            state=state,
                         )
                     )
                     if rescue_started or solver_job_running(pkg):
@@ -22968,7 +23054,9 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                     elif alive_loading_guard:
                         rescue_started, rescue_note = (
                             hatcher_alive_loading_maybe_solver_rescue(
-                                core, tab, rt_tab, cfg
+                                core, tab, rt_tab, cfg,
+                                process_status=process_status,
+                                state=state,
                             )
                         )
                         if rescue_started or solver_job_running(pkg):
@@ -28497,7 +28585,7 @@ end)
 
 
 # ============================================================
-# EXOTIC MASTER CONFIG MERGER (V4.81.77)
+# EXOTIC MASTER CONFIG MERGER (V4.81.78)
 # ============================================================
 
 _EXOTIC_MASTER_BRACED_UUID_RE = re.compile(
@@ -36068,7 +36156,7 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
             # disturb another clone's queued recovery.
             core.cancel(pkg)
 
-            # V4.81.77: this provider request was made only because an actual
+            # V4.81.78: this provider request was made only because an actual
             # open stayed ALIVE/no-fresh for five minutes. CAPTCHA_SUCCESS is
             # external to Redfinger, so the frozen client must be restarted.
             # NO_CAPTCHA was handled above and never reaches this branch.
