@@ -1,5 +1,26 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.70 — NONBLOCKING MARKET CACHE RECOVERY QUEUE
+# - Market combined-stuck recovery no longer monopolizes the single-flight queue while waiting minutes for a
+#   fresh post-open heartbeat. After exact-target PID stop -> forced Clear Cache -> Market open, verification is
+#   package-local/backgrounded and the queue immediately continues to the next clone.
+# - Existing post-open grace + Market incident cooldown still prevent rapid PID/cache loops. A fresh clean Market
+#   state resets the incident normally; a clone that remains stuck can recover again after the package cooldown.
+# - Pending legacy Market hard items from older runtime.json generations (market alive old/no-state or the old
+#   homepage/no-state hard retry) are upgraded at execution time into the combined Market Clear Cache generation,
+#   unless they belong to manual/solver/auth/disconnect/AutoExec/Exotic recovery.
+# - This preserves the package-only exact-PID rule, peer-auth safety, and all Face Lock/Account Locked protections.
+#
+# V4.81.69 — DISCONNECT OUTRANKS VISUAL FACE-LOCK FALSE POSITIVES
+# - A current package-scoped Roblox kick/disconnect popup (267/288/524/etc.) now outranks screenshot-only
+#   Face Lock/CAPTCHA heuristics. The visual Account-Locked detector is skipped while that strong disconnect is
+#   visible, so a normal gray Disconnected modal cannot become a false FACE LOCK HOLD.
+# - If an earlier screenshot-only Face Lock hold is still latched for that same package, a current non-529
+#   disconnect clears only that visual-origin hold and its peer-auth suppression. Direct Account Locked text,
+#   moderation API source=5/status=2, bans, and real 529/verification evidence remain authoritative.
+# - The queued HARD boundary performs the same precedence check before the strong-auth discard and again before
+#   visual auth checks, so an Error 267 kick can reach its exact-PID recovery instead of being discarded as auth.
+#
 # V4.81.68 — MARKET PEER-AUTH QUEUE FIX
 # - Market 5m stuck recoveries no longer downgrade an ALIVE stuck clone into a sticky peer-auth route-only
 #   generation while another Noka clone is running solver/auth protection. That route-only metadata blocked the
@@ -1275,7 +1296,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.68"
+__version__ = "V4.81.70"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -12731,6 +12752,24 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
             rt_tab["android_disconnect_candidate_at"] = 0
             rt_tab["android_disconnect_candidate_count"] = 0
 
+    # V4.81.69: a current high-confidence kick/disconnect is not an auth screen.
+    # Suppress screenshot-only Face Lock/CAPTCHA heuristics for that package and
+    # self-heal only a previously latched *visual-origin* Face Lock. Strong
+    # Account-Locked text/API evidence is checked below and may still override.
+    non_auth_disconnect = None
+    if raw_alive and state_disconnect_ui(state):
+        code = str((state or {}).get("disconnect_code", "") or "").strip()
+        if code != "529":
+            non_auth_disconnect = {
+                "code": code,
+                "text": str((state or {}).get("disconnect_text", "") or ""),
+                "reason": str((state or {}).get("disconnect_reason", "") or "state_disconnect"),
+            }
+            clear_visual_face_lock_confirmation(pkg)
+            clear_visual_captcha_confirmation(pkg)
+            if clear_visual_face_lock_for_disconnect(rt_tab, pkg, non_auth_disconnect):
+                log_activity("disconnect UI cleared false visual face-lock hold", pkg, GREEN)
+
     # V4.29: both visual blockers are checked only before a clean/fresh game
     # heartbeat newer than the current open generation exists. This produces no
     # screenshot/uiautomator overhead during normal Online sessions.
@@ -12768,7 +12807,11 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
         }
 
     text_face = account_ui if account_ui and account_ui.get("kind") == "face_lock" else None
-    face_lock = text_face or (visual_face_lock_detail(pkg, cfg, force=False) if face_lock_scan_eligible else None)
+    face_lock = text_face or (
+        visual_face_lock_detail(pkg, cfg, force=False)
+        if face_lock_scan_eligible and not non_auth_disconnect
+        else None
+    )
     if face_lock:
         first_hit = not bool(rt_tab.get("face_lock_detected"))
         detail = str(face_lock.get("text", "") or "account locked")
@@ -12819,7 +12862,7 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
         clear_visual_captcha_confirmation(pkg)
     captcha_ui = android_login_challenge_ui_detail(
         pkg, cfg, force=False, auth_hint=_runtime_auth_hint(rt_tab)
-    ) if captcha_scan_eligible else None
+    ) if captcha_scan_eligible and not non_auth_disconnect else None
     if captcha_ui:
         detail = ",".join(captcha_ui.get("hits", []) or []) or "verification UI"
         rt_tab["captcha_ui_visible"] = True
@@ -13354,6 +13397,8 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
                 rt_tab["market_combined_stuck_last"] = 0
                 rt_tab["market_combined_stuck_last_age"] = 0
                 rt_tab["market_combined_stuck_last_reason"] = ""
+                rt_tab["market_background_fresh_opened_at"] = 0
+                rt_tab["market_background_fresh_until"] = 0
             return ("Ingame" if alive else "Loading"), "ok", False
 
         # old state but still loading (inside our grace window) -> wait
@@ -14408,6 +14453,61 @@ def android_disconnect_ui_detail(pkg, cfg):
 
 
 
+def current_non_auth_disconnect_ui_detail(pkg, cfg, force=False):
+    """Return a current strong disconnect that is not the 529 auth wrapper.
+
+    A normal Roblox kick/disconnect modal (267/288/524/etc.) is an in-session
+    failure. It must outrank screenshot-only CAPTCHA/Face-Lock heuristics, while
+    exact Account-Locked text/API evidence is still checked separately.
+    """
+    if force:
+        try:
+            capture_android_ui_snapshot(cfg, force=True)
+        except Exception:
+            pass
+    detail = android_disconnect_ui_detail(str(pkg or ""), cfg)
+    if not detail:
+        return None
+    code = str(detail.get("code", "") or "").strip()
+    if code == "529":
+        return None
+    return detail
+
+
+def _visual_face_lock_runtime_only(rt_tab):
+    """True only for a Face Lock latch created by the screenshot heuristic."""
+    if not isinstance(rt_tab, dict):
+        return False
+    detail = " ".join(str(rt_tab.get(k, "") or "") for k in (
+        "face_lock_detail", "manual_login_detail",
+    )).lower()
+    return bool(
+        "visual panel=" in detail
+        or "android_package_scoped_visual_face_lock" in detail
+    )
+
+
+def clear_visual_face_lock_for_disconnect(rt_tab, pkg, disconnect_detail=None):
+    """Remove only a screenshot-origin Face Lock when a real disconnect is visible."""
+    if not _visual_face_lock_runtime_only(rt_tab):
+        return False
+    if str(rt_tab.get("manual_login_reason", "") or "").strip().lower() == "face_lock":
+        clear_manual_login_block(rt_tab)
+    else:
+        clear_face_lock_runtime(rt_tab)
+    try:
+        clear_hold(pkg)
+    except Exception:
+        pass
+    try:
+        clear_visual_face_lock_confirmation(pkg)
+    except Exception:
+        pass
+    code = str((disconnect_detail or {}).get("code", "") or "").strip()
+    rt_tab["note"] = "disconnect UI overrides false visual face-lock" + (f" ({code})" if code else "")
+    return True
+
+
 _LOADING_VISUAL_FRAME_CACHE = {
     "ts": 0,
     "frame": None,
@@ -15072,6 +15172,14 @@ def active_noka_auth_incident(cfg, rt, exclude_pkg=""):
         rt_tab = get_runtime_tab(rt, pkg)
         reason = _auth_incident_runtime_reason(rt_tab, cfg)
         if reason:
+            # V4.81.69: do not let a screenshot-only false Face Lock on a real
+            # kick popup suppress every ALIVE sibling. Exact/API auth holds are
+            # deliberately untouched by this self-heal.
+            if _visual_face_lock_runtime_only(rt_tab):
+                disconnect_detail = current_non_auth_disconnect_ui_detail(pkg, cfg, force=False)
+                if disconnect_detail and clear_visual_face_lock_for_disconnect(rt_tab, pkg, disconnect_detail):
+                    log_activity("peer-auth false visual face-lock cleared by disconnect UI", pkg, GREEN)
+                    continue
             return pkg, reason
         if solver_job_running(pkg):
             return pkg, "solver/auth job running"
@@ -16241,6 +16349,17 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
         core.save()
         return True
 
+    # V4.81.69: before a persisted auth hint can discard this HARD item, check
+    # whether it was created by the screenshot Face-Lock heuristic while the
+    # package is actually showing a strong non-529 kick/disconnect popup.
+    queue_non_auth_disconnect = None
+    if is_hard and _runtime_auth_hint(rt_tab) and _visual_face_lock_runtime_only(rt_tab):
+        queue_non_auth_disconnect = current_non_auth_disconnect_ui_detail(pkg, cfg, force=True)
+        if queue_non_auth_disconnect and clear_visual_face_lock_for_disconnect(
+            rt_tab, pkg, queue_non_auth_disconnect
+        ):
+            log_activity("queued recovery: disconnect cleared false visual face-lock before auth gate", pkg, GREEN)
+
     # V4.81.56: strong auth evidence outranks bypass_manual/recovery_must_open_once.
     # An old hard item that predates Account Locked/529 must die here, before
     # API checks, staggering, solver preflight, or any PID signal. The only
@@ -16465,8 +16584,24 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
                 core.save()
                 return True
 
-            visible_auth = android_login_challenge_ui_detail(
-                pkg, cfg, force=True, auth_hint=_runtime_auth_hint(rt_tab)
+            # V4.81.69: reuse the exact same accessibility snapshot. A current
+            # 267/288/524/etc. popup blocks screenshot-only auth promotion, but
+            # the explicit Account-Locked text check above still wins.
+            current_disconnect = queue_non_auth_disconnect or current_non_auth_disconnect_ui_detail(
+                pkg, cfg, force=False
+            )
+            if current_disconnect:
+                clear_visual_face_lock_confirmation(pkg)
+                clear_visual_captcha_confirmation(pkg)
+                if clear_visual_face_lock_for_disconnect(rt_tab, pkg, current_disconnect):
+                    log_activity("pre-open disconnect cleared false visual face-lock", pkg, GREEN)
+
+            visible_auth = (
+                android_login_challenge_ui_detail(
+                    pkg, cfg, force=True, auth_hint=_runtime_auth_hint(rt_tab)
+                )
+                if not current_disconnect
+                else None
             )
             if visible_auth:
                 detail = str(
@@ -16491,7 +16626,7 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
                 core.save()
                 return True
 
-            if _runtime_auth_hint(rt_tab):
+            if _runtime_auth_hint(rt_tab) and not current_disconnect:
                 visual_join = visual_join_error_detail(pkg, cfg, force=True, bypass_confirm=True)
                 if visual_join:
                     rt_tab["note"] = "visual Join Error after auth/face-lock; hard recovery blocked"
@@ -16506,9 +16641,17 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
             # normal monitoring (two confirmations). At the destructive boundary,
             # a raw candidate only defers this hard open; it does not create a
             # persistent hold until the normal detector confirms it.
-            face_snap = capture_visual_face_lock_snapshot(cfg, force=True)
+            face_snap = (
+                capture_visual_face_lock_snapshot(cfg, force=True)
+                if not current_disconnect
+                else {"raw_candidates": {}}
+            )
             raw_face = bool((face_snap.get("raw_candidates") or {}).get(pkg, False))
-            confirmed_face = visual_face_lock_detail(pkg, cfg, force=False, bypass_confirm=False)
+            confirmed_face = (
+                visual_face_lock_detail(pkg, cfg, force=False, bypass_confirm=False)
+                if not current_disconnect
+                else None
+            )
             if confirmed_face:
                 retry_seconds = max(600, int(cfg.get("manual_auth_retry_seconds", 3600) or 3600))
                 detail = str(confirmed_face.get("text") or "account locked")
@@ -16724,6 +16867,59 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
     rt_tab["note"] = f"opening -> {target}"
     core.save()
 
+    # V4.81.70: runtime.json can survive an update with a Market hard item that
+    # was queued before the combined Clear-Cache metadata existed (or was produced
+    # by the old synchronous homepage/no-state fallback). Upgrade only automatic
+    # Market session-stuck generations here; never convert manual/auth/solver/
+    # disconnect/AutoExec/Exotic actions into cache recovery.
+    if (
+        target == "market"
+        and str(mode or "").lower() not in ("soft", "route", "switch", "reuse_task")
+        and cfg.get("market_combined_stuck_recovery_enabled", True)
+        and not item.get("combined_stuck_recovery")
+        and not any(
+            item.get(k)
+            for k in (
+                "manual_option6",
+                "manual_booster_route",
+                "manual_booster_hard_route",
+                "manual_auth_open",
+                "solver_recovery",
+                "auth_result_recovery",
+                "disconnect_recovery",
+                "market_runtime_recovery",
+                "market_alive_noka_route_only",
+                "exotic_recovery",
+                "exotic_alive_noka_route_only",
+            )
+        )
+    ):
+        _legacy_reason = str(reason or "").lower()
+        if any(
+            token in _legacy_reason
+            for token in (
+                "market alive old state",
+                "market alive no-state",
+                "market alive no state",
+                "homepage/no-state hard retry",
+                "market 5m stuck",
+                "market valid-ts stale",
+            )
+        ):
+            item.update(
+                market_combined_stuck_metadata(
+                    cfg,
+                    int(item.get("market_stuck_age", 0) or 0),
+                    reason,
+                )
+            )
+            item["market_legacy_stuck_upgrade"] = True
+            log_activity(
+                "legacy Market stuck queue upgraded -> forced Clear Cache recovery",
+                pkg,
+                CYAN,
+            )
+
     combined_stuck = bool(
         item.get("combined_stuck_recovery")
         and target in ("hatcher", "market")
@@ -16828,6 +17024,37 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
             core.save()
             log_activity(
                 f"fresh verification backgrounded for {format_age(background_timeout)}; watchdog continues",
+                pkg,
+                CYAN,
+            )
+            return True
+
+        # V4.81.70: the automatic Market combined Clear-Cache generation must
+        # not monopolize the global queue while waiting for fresh state.
+        background_market_wait = bool(
+            target == "market"
+            and combined_stuck
+            and not item.get("manual_option6")
+            and not item.get("manual_booster_route")
+            and not item.get("manual_booster_hard_route")
+            and not item.get("solver_recovery")
+            and not item.get("auth_result_recovery")
+            and not item.get("disconnect_recovery")
+            and not item.get("manual_auth_open")
+            and not item.get("market_runtime_recovery")
+            and not item.get("exotic_recovery")
+        )
+        if background_market_wait:
+            rt_tab["market_background_fresh_opened_at"] = int(opened_at or now())
+            rt_tab["market_background_fresh_until"] = int(opened_at or now()) + max(
+                300,
+                int(cfg.get("market_combined_stuck_recovery_seconds", 300) or 300),
+            )
+            rt_tab["note"] = "opened; Market fresh check backgrounded"
+            core.finish(rt_tab, verified=False, note="Market background fresh wait")
+            core.save()
+            log_activity(
+                "Market fresh verification backgrounded for 5m; queue continues",
                 pkg,
                 CYAN,
             )
