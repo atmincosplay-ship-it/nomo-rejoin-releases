@@ -1,5 +1,25 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.73 — NUMERIC MODERATION RESTRICTION IS NOT FACE-LOCK PROOF
+# - Roblox moderation restriction source=5 + moderationStatus=2 is no longer sufficient by itself to create
+#   FACE LOCK HOLD. Multiple normal accounts can expose that numeric restriction shape, so treating it as
+#   Account Locked caused pool-wide false face-locks.
+# - The numeric restriction remains diagnostic/advisory. It becomes Face Lock only when the same API payload
+#   contains explicit Account Locked / suspicious-activity / unlock-account wording.
+# - Exact package-scoped Account Locked UI text remains authoritative.
+# - Old V4.81.58-.72 API-numeric Face Lock latches self-clear unless actual explicit lock wording is retained.
+# - Activity now names the authoritative source when Face Lock is created.
+#
+# V4.81.72 — LEGACY/GENERIC FACE-LOCK LATCH SELF-HEAL
+# - V4.81.71 only cleared Face Lock runtime entries that still contained the original visual-panel marker.
+#   Older runtime.json entries can retain only generic face_lock / face_lock_detected fields, so they still
+#   suppressed every sibling even when no clone currently has Account Locked.
+# - A persisted Face Lock is now authoritative only when runtime retains strong Account Locked text or a direct
+#   Roblox moderation/API face_lock result. Bare/generic/visual-only legacy Face Lock latches self-clear.
+# - Peer-auth suppression also ignores generic Face Lock state unless that strong evidence exists.
+# - The final destructive boundary still performs the direct moderation API + exact Account Locked UI checks,
+#   so a real lock is re-established before any PID stop.
+#
 # V4.81.71 — VISUAL FACE-LOCK IS ADVISORY, NEVER AUTHORITATIVE
 # - Screenshot-only Face Lock candidates no longer create manual holds, peer-auth suppression, or hard-open deferrals.
 # - Only exact package-scoped Account Locked text or Roblox moderation/API proof may create a real Face Lock hold.
@@ -1303,7 +1323,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.71"
+__version__ = "V4.81.73"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -12714,7 +12734,7 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
         rt_tab, pkg, "stale visual Face Lock cleared; exact text/API required"
     ):
         log_activity(
-            "stale visual-only face-lock latch cleared; recovery allowed",
+            "stale generic/visual face-lock latch cleared; recovery allowed",
             pkg,
             GREEN,
         )
@@ -12839,6 +12859,7 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
         detail = str(text_face.get("text", "") or "account locked")
         rt_tab["face_lock_detected"] = True
         rt_tab["face_lock_detail"] = detail
+        rt_tab["face_lock_evidence_source"] = "exact_account_locked_ui"
         rt_tab["face_lock_last_seen_at"] = now()
         if not int(rt_tab.get("face_lock_detected_at", 0) or 0):
             rt_tab["face_lock_detected_at"] = now()
@@ -12855,7 +12876,7 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
             if first_hit:
                 set_hold(pkg, "face_lock", retry_seconds)
                 log_activity(
-                    f"FACE LOCK exact text detected; package held, retry in {format_age(retry_seconds)}",
+                    f"FACE LOCK source=exact_account_locked_ui; package held, retry in {format_age(retry_seconds)}",
                     pkg,
                     RED,
                 )
@@ -13892,7 +13913,25 @@ def roblox_cookie_not_approved_api_detection(cookie, expected_user_id=None, cfg=
             restriction_duration = restriction.get("durationSeconds")
 
             if restriction_source == 5 and restriction_status == 2:
-                bits = ["api account locked / face lock", "restriction source=5 status=2"]
+                # V4.81.73: this numeric shape is NOT Face Lock proof by itself.
+                # It was originally promoted from one captured Account Locked
+                # example, but live testing showed normal accounts can expose the
+                # same source/status pair. Require explicit lock wording somewhere
+                # in the authenticated payload before creating a hold.
+                try:
+                    restriction_payload_text = json.dumps(data, ensure_ascii=False).lower()
+                except Exception:
+                    restriction_payload_text = str(data).lower()
+                explicit_lock_terms = (
+                    "account locked",
+                    "unlock your account",
+                    "suspicious activity",
+                    "confirming that you're a human",
+                    "confirming that you are a human",
+                )
+                explicit_lock = any(term in restriction_payload_text for term in explicit_lock_terms)
+
+                bits = ["moderation api restriction source=5 status=2"]
                 if restriction_start:
                     bits.append("start=" + restriction_start)
                 if restriction_end:
@@ -13901,7 +13940,13 @@ def roblox_cookie_not_approved_api_detection(cookie, expected_user_id=None, cfg=
                     bits.append("end=none")
                 if restriction_duration not in (None, ""):
                     bits.append("durationSeconds=" + str(restriction_duration))
-                return True, "; ".join(bits), data
+
+                if explicit_lock:
+                    bits.insert(0, "moderation api explicit account locked")
+                    return True, "; ".join(bits), data
+
+                bits.insert(0, "moderation api numeric restriction advisory")
+                return None, "; ".join(bits), data
 
             return None, (
                 "moderation api unknown restriction "
@@ -14001,21 +14046,20 @@ def direct_moderation_guard_before_open(tab, rt_tab, cfg, reason="queued open"):
         return False, detail
 
     retry_seconds = max(600, int(cfg.get("manual_auth_retry_seconds", 3600) or 3600))
-    restriction = payload.get("restriction") if isinstance(payload, dict) else None
-    is_face_lock = "account locked" in detail_l or "face lock" in detail_l
-    if isinstance(restriction, dict):
-        try:
-            is_face_lock = is_face_lock or (
-                int(restriction.get("source")) == 5
-                and int(restriction.get("moderationStatus")) == 2
-            )
-        except Exception:
-            pass
+    # V4.81.73: only explicit lock wording can make this Face Lock. Do not
+    # re-promote source=5/status=2 numerics here after the API classifier.
+    is_face_lock = bool(
+        "explicit account locked" in detail_l
+        or "account locked" in detail_l
+        or "unlock your account" in detail_l
+        or "suspicious activity" in detail_l
+    )
 
     if is_face_lock:
         rt_tab["moderation_guard_last_status"] = "face_lock"
         rt_tab["face_lock_detected"] = True
-        rt_tab["face_lock_detail"] = detail or "api account locked / face lock"
+        rt_tab["face_lock_detail"] = detail or "api explicit account locked"
+        rt_tab["face_lock_evidence_source"] = "api_explicit_lock_text"
         rt_tab["face_lock_last_seen_at"] = now()
         if not int(rt_tab.get("face_lock_detected_at", 0) or 0):
             rt_tab["face_lock_detected_at"] = now()
@@ -14030,7 +14074,7 @@ def direct_moderation_guard_before_open(tab, rt_tab, cfg, reason="queued open"):
         set_hold(pkg, "face_lock", retry_seconds)
         rt_tab["note"] = "FACE LOCK HOLD - direct moderation API"
         log_activity(
-            f"{reason}; direct moderation API = FACE LOCK; open blocked before route/PID/solver",
+            f"{reason}; direct moderation API explicit lock text = FACE LOCK; open blocked before route/PID/solver",
             pkg,
             RED,
         )
@@ -14519,34 +14563,81 @@ def current_non_auth_disconnect_ui_detail(pkg, cfg, force=False):
     return detail
 
 
-def _visual_face_lock_runtime_only(rt_tab):
-    """True only for a Face Lock latch created solely by screenshot geometry."""
+def _authoritative_face_lock_runtime(rt_tab):
+    """True only when persisted runtime retains explicit Face Lock evidence.
+
+    V4.81.73 deliberately does NOT trust moderation_guard_last_status=face_lock
+    by itself because older builds wrote that status from source=5/status=2
+    numerics. Require an explicit evidence source or exact lock wording.
+    """
     if not isinstance(rt_tab, dict):
         return False
+
+    source = str(rt_tab.get("face_lock_evidence_source", "") or "").strip().lower()
+    if source in ("exact_account_locked_ui", "api_explicit_lock_text"):
+        return True
+
+    detail = " ".join(str(rt_tab.get(k, "") or "") for k in (
+        "face_lock_detail",
+        "manual_login_detail",
+        "moderation_guard_last_detail",
+        "note",
+    )).lower()
+
+    # Exclude the legacy numeric-only API phrase first.
+    numeric_only = (
+        "restriction source=5 status=2" in detail
+        and not any(term in detail for term in (
+            "suspicious activity",
+            "unlock your account",
+            "confirming that you're a human",
+            "confirming that you are a human",
+        ))
+    )
+    if numeric_only:
+        return False
+
+    exact_ui_like = (
+        "account locked" in detail
+        and any(term in detail for term in (
+            "suspicious activity",
+            "unlock your account",
+            "confirming that you're a human",
+            "confirming that you are a human",
+            "continue",
+        ))
+    )
+    api_explicit = "moderation api explicit account locked" in detail
+    return bool(exact_ui_like or api_explicit)
+
+def _visual_face_lock_runtime_only(rt_tab):
+    """True for any persisted Face Lock state lacking authoritative proof.
+
+    Name kept for compatibility with the V4.81.69/.71 self-heal call sites.
+    V4.81.72 intentionally includes generic legacy `face_lock` latches whose
+    original visual marker was lost from runtime.json.
+    """
+    if not isinstance(rt_tab, dict):
+        return False
+
+    reason = str(rt_tab.get("manual_login_reason", "") or "").strip().lower()
     detail = " ".join(str(rt_tab.get(k, "") or "") for k in (
         "face_lock_detail", "manual_login_detail",
     )).lower()
-    visual = bool(
-        "visual panel=" in detail
+
+    has_face_state = bool(
+        rt_tab.get("face_lock_detected")
+        or reason in ("face_lock", "face lock")
+        or str(rt_tab.get("moderation_guard_last_status", "") or "").strip().lower() == "face_lock"
+        or "face_lock" in detail
+        or "face lock" in detail
+        or "visual panel=" in detail
         or "android_package_scoped_visual_face_lock" in detail
     )
-    if not visual:
+    if not has_face_state:
         return False
-    # Never erase stronger exact/API evidence even if an old visual string is
-    # still present somewhere in runtime metadata.
-    if str(rt_tab.get("moderation_guard_last_status", "") or "").lower() == "face_lock":
-        return False
-    if any(term in detail for term in (
-        "api account locked",
-        "restriction source=5",
-        "suspicious activity",
-        "unlock your account",
-        "confirming that you're a human",
-        "confirming that you are a human",
-    )):
-        return False
-    return True
 
+    return not _authoritative_face_lock_runtime(rt_tab)
 
 def clear_visual_face_lock_false_positive(rt_tab, pkg, why="visual Face Lock is advisory only"):
     """Clear only a persisted screenshot-origin Face Lock latch/hold."""
@@ -14569,9 +14660,12 @@ def clear_visual_face_lock_false_positive(rt_tab, pkg, why="visual Face Lock is 
         clear_visual_face_lock_confirmation(pkg)
     except Exception:
         pass
+    if str(rt_tab.get("moderation_guard_last_status", "") or "").strip().lower() == "face_lock":
+        rt_tab["moderation_guard_last_status"] = "unknown"
+    rt_tab["face_lock_evidence_source"] = ""
     rt_tab["visual_face_lock_candidate_detail"] = old_detail
     rt_tab["visual_face_lock_candidate_cleared_at"] = now()
-    rt_tab["note"] = str(why or "visual Face Lock ignored")
+    rt_tab["note"] = str(why or "non-authoritative Face Lock ignored")
     return True
 
 
@@ -15231,16 +15325,24 @@ def _auth_incident_runtime_reason(rt_tab, cfg):
     if not isinstance(rt_tab, dict):
         return ""
     recent = max(120, int(cfg.get("noka_peer_auth_recent_seconds", 900) or 900))
-    reason = " ".join(str(rt_tab.get(k, "") or "") for k in (
-        "manual_login_reason", "manual_login_detail", "captcha_ui_detail", "face_lock_detail",
-    )).lower()
-    if bool(rt_tab.get("face_lock_detected")):
+
+    # V4.81.72: Face Lock only blocks siblings when strong persisted evidence
+    # remains. Generic/visual-only legacy Face Lock state is self-healed by the
+    # caller and is never pool-wide auth evidence.
+    authoritative_face = _authoritative_face_lock_runtime(rt_tab)
+    if authoritative_face:
         return "face lock"
+
+    reason = " ".join(str(rt_tab.get(k, "") or "") for k in (
+        "manual_login_reason", "manual_login_detail", "captcha_ui_detail",
+    )).lower()
+
     if any(term in reason for term in (
-        "account locked", "face_lock", "face lock", "529", "captcha", "verification",
+        "529", "captcha", "verification",
         "account_banned", "account banned", "terminated", "moderated",
     )):
         return cut(reason, 70)
+
     if bool(rt_tab.get("captcha_ui_visible")):
         seen = int(rt_tab.get("captcha_ui_last_seen_at", 0) or 0)
         if seen <= 0 or now() - seen <= recent:
@@ -15263,7 +15365,7 @@ def active_noka_auth_incident(cfg, rt, exclude_pkg=""):
             rt_tab, pkg, "visual Face Lock peer blocker cleared; exact text/API required"
         ):
             log_activity(
-                "peer-auth visual-only face-lock cleared; siblings may recover",
+                "peer-auth generic/visual face-lock cleared; siblings may recover",
                 pkg,
                 GREEN,
             )
@@ -16663,13 +16765,14 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
                     return True
                 rt_tab["face_lock_detected"] = True
                 rt_tab["face_lock_detail"] = detail
+                rt_tab["face_lock_evidence_source"] = "exact_account_locked_ui"
                 rt_tab["face_lock_last_seen_at"] = now()
                 if not int(rt_tab.get("face_lock_detected_at", 0) or 0):
                     rt_tab["face_lock_detected_at"] = now()
                 mark_manual_login_block(rt_tab, "face_lock", detail, "account locked; hard recovery blocked", int(rt_tab.get("face_lock_detected_at", now()) or now()), retry_seconds)
                 set_hold(pkg, "face_lock", retry_seconds)
                 rt_tab["note"] = "account locked; hard recovery blocked"
-                log_activity("Account Locked text blocked queued hard recovery before PID stop", pkg, RED)
+                log_activity("FACE LOCK source=exact_account_locked_ui blocked queued hard recovery before PID stop", pkg, RED)
                 core.save()
                 return True
 
