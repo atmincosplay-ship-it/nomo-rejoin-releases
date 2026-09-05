@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.67 — MARKET 5M STUCK CACHE RECOVERY + VALID-TS MARKET AGE
+# - Market now gets the package-scoped equivalent of the proven Hatcher stuck repair. When the actual Market
+#   Roblox session has a clean-but-stale valid timestamp for >=5m, or stays ALIVE with no state for >=5m, NOMO
+#   runs one solver/auth safety preflight, exact-target PID stop, forced Android Clear Cache, then reopens the
+#   normal Market route. Market never regenerates a private-server link because Trade World does not use one.
+# - Market no longer discards a real 24h/146h/etc. state merely because it crosses the historical 24h ceiling.
+#   A plausible Unix `ts` is authoritative; only the missing/broken `ts=0` -> `999999s` (~277h) sentinel remains
+#   invalid and cannot drive a destructive recovery.
+# - The Market combined-stuck generation has no automatic route/hard fallback chain after its one cache repair.
+#   If it still cannot produce fresh state, a package-local cooldown prevents rapid cache/PID loops; a clean fresh
+#   heartbeat resets the incident so a later independent 5m stall can recover normally.
+# - Existing face-lock/Account Locked/moderation/CAPTCHA gates remain authoritative. Market AutoExec script-only
+#   failures still use the existing loader self-heal path and are NOT converted into Android PID/cache recovery.
+#
 # V4.81.66 — VALID-TS STALE RECOVERY + NONBLOCKING HATCHER FRESH WAIT
 # - Hatcher no longer treats every state older than 24h as invalid. A real Unix `ts` is now authoritative: any
 #   clean stale state at/after the 5-minute recovery threshold remains eligible even at 24h/146h/etc. The historic
@@ -1251,7 +1265,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.66"
+__version__ = "V4.81.67"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -2101,6 +2115,12 @@ DEFAULT_CONFIG = {
     "min_seconds_between_reopen": 60,
 
     "alive_old_state_hard_seconds": 180,
+    # V4.81.67: actual Trade World/Market session stuck recovery. This is
+    # intentionally separate from Market AutoExec loader self-heal.
+    "market_combined_stuck_recovery_enabled": True,
+    "market_combined_stuck_recovery_seconds": 300,
+    "market_combined_stuck_clear_cache": True,
+    "market_combined_stuck_cooldown_seconds": 900,
     # V3.79: how long a clone that is ALIVE at hatcher startup may sit without a
     # readable state file before the table stops showing "waiting" and surfaces
     # an actionable "check Lua/username" note. Short so it never looks stuck.
@@ -2119,12 +2139,9 @@ DEFAULT_CONFIG = {
     # account actually logged in. Makes the manual "get username" step optional.
     "auto_resolve_usernames_enabled": True,
     "username_resolve_interval_seconds": 600,
-    # V3.79: MARKET phantom-age ceiling (mirror of the hatcher's
-    # hatcher_alive_old_state_max_valid_seconds). A missing `ts` in the state
-    # file makes age compute to an impossible value (e.g. 277h). Any age above
-    # this is treated as invalid and IGNORED — never drives a kill+open. This is
-    # the guard the market path was missing while the hatcher path had it, which
-    # is why one instance ran 11h and another rejoin-looped on the same 277h age.
+    # Legacy max-age ceiling for shared non-combined paths. V4.81.67 Market
+    # uses timestamp validity instead: real old ts is recoverable; ts=0/999999s
+    # sentinel is ignored. Keep this key for compatibility with other paths.
     "alive_old_state_max_valid_seconds": 86400,
 
     "open_all_on_start": True,
@@ -3347,6 +3364,16 @@ def apply_update_migrations(cfg):
         set_cfg("stale_reopen_after_seconds", 60)
     if _int_cfg(cfg.get("force_rejoin_if_stale_seconds"), 999999) > 180:
         set_cfg("force_rejoin_if_stale_seconds", 180)
+
+    # V4.81.67: Market's real session-stuck path is 5m and package-local.
+    if "market_combined_stuck_recovery_enabled" not in cfg:
+        set_cfg("market_combined_stuck_recovery_enabled", True)
+    if _int_cfg(cfg.get("market_combined_stuck_recovery_seconds"), 0) < 300:
+        set_cfg("market_combined_stuck_recovery_seconds", 300)
+    if "market_combined_stuck_clear_cache" not in cfg:
+        set_cfg("market_combined_stuck_clear_cache", True)
+    if _int_cfg(cfg.get("market_combined_stuck_cooldown_seconds"), 0) < 300:
+        set_cfg("market_combined_stuck_cooldown_seconds", 900)
 
     # V3.60: safer Redfinger defaults. Some Roblox clones can take 2+ minutes
     # to load into the game, so do NOT hard-rejoin too early. V3.58/3.59 used
@@ -12452,7 +12479,7 @@ def state_age_seconds(state):
         return 999999
 
 
-def hatcher_state_timestamp_valid(state):
+def state_timestamp_valid(state):
     """Return True only for a real state-writer Unix timestamp.
 
     The Lua writer uses >=1600000000 as its minimum plausible epoch. Missing or
@@ -12469,6 +12496,11 @@ def hatcher_state_timestamp_valid(state):
         return False
     # Reject obviously future/corrupt epochs without punishing normal clock skew.
     return ts <= now() + 86400
+
+
+def hatcher_state_timestamp_valid(state):
+    """Compatibility alias for older Hatcher call sites."""
+    return state_timestamp_valid(state)
 
 
 def mark_hatcher_background_fresh_wait(rt_tab, opened_at, cfg, reason="", mode=""):
@@ -13086,6 +13118,46 @@ def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, he
     )
     return status, note, True
 
+def market_combined_stuck_enabled(cfg, mode="market", target="market"):
+    return bool(
+        str(mode or "").lower() == "market"
+        and str(target or "").lower() == "market"
+        and cfg.get("market_combined_stuck_recovery_enabled", True)
+    )
+
+
+def market_combined_stuck_metadata(cfg, age_or_seconds=0, reason=""):
+    enabled = bool(cfg.get("market_combined_stuck_recovery_enabled", True))
+    return {
+        "combined_stuck_recovery": enabled,
+        "market_combined_stuck_recovery": enabled,
+        "combined_stuck_refresh_private_link": False,
+        "combined_stuck_clear_cache": bool(
+            enabled and cfg.get("market_combined_stuck_clear_cache", True)
+        ),
+        # The cache repair itself is the single recovery attempt. Do not append
+        # the legacy route -> hard fallback chain if fresh state is still late.
+        "no_hard_fallback": True,
+        "market_stuck_age": int(age_or_seconds or 0),
+        "market_stuck_reason": str(reason or "market stuck"),
+    }
+
+
+def market_combined_stuck_cooldown_left(rt_tab, cfg):
+    try:
+        last = int(rt_tab.get("market_combined_stuck_last", 0) or 0)
+    except Exception:
+        last = 0
+    if last <= 0:
+        return 0
+    try:
+        cooldown = int(cfg.get("market_combined_stuck_cooldown_seconds", 900) or 900)
+    except Exception:
+        cooldown = 900
+    cooldown = max(300, cooldown)
+    return max(0, cooldown - max(0, now() - last))
+
+
 def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=None, mode="market", core=None):
     """SHARED rejoin engine for both Market and Hatcher."""
     if core is None:
@@ -13120,6 +13192,12 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
     max_valid = int(cfg.get("alive_old_state_max_valid_seconds", 86400) or 86400)
     stale_limit = int(cfg.get("state_stale_seconds", 180) or 180)
     grace = int(cfg.get("post_open_grace_seconds", 360) or 360)
+    market_combined = market_combined_stuck_enabled(cfg, mode, target)
+    if market_combined:
+        trigger = max(300, int(cfg.get("market_combined_stuck_recovery_seconds", 300) or 300))
+        # A configured global post-open grace must not postpone the requested
+        # Market 5m stuck decision beyond the Market-specific threshold.
+        grace = min(grace, trigger)
 
     # --- join/login challenge: solve current live challenge in-place ---
     if bad == "account_banned":
@@ -13242,19 +13320,30 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
     if state:
         age = state_age_seconds(state)
 
-        # V3.79: PHANTOM AGE GUARD (mirror of the hatcher path).
-        # A missing `ts` field makes age compute to an impossible value like 277h.
-        # Never drive a kill+open off that — ignore it and trust the live package
-        # check instead. Checked BEFORE grace/trigger so a garbage age can't force
-        # a rejoin under any branch. This is the exact guard the market path was
-        # missing while the hatcher had it.
-        if max_valid > 0 and age > max_valid:
+        # V4.81.67: Market mirrors the Hatcher valid-ts rule. A real Unix
+        # timestamp remains authoritative even at 24h/146h/etc.; only the old
+        # missing/broken-ts sentinel is invalid. Other shared modes keep the
+        # historical max-age guard.
+        if market_combined:
+            if age >= trigger and not state_timestamp_valid(state):
+                rt_tab["market_no_state_since"] = 0
+                return ("Ingame" if alive else "Stale"), \
+                       "invalid state timestamp ignored", False
+        elif max_valid > 0 and age > max_valid:
             return ("Ingame" if alive else "Stale"), \
                    f"invalid old state ignored {format_age(age)}", False
+
+        if market_combined:
+            rt_tab["market_last_state_seen_at"] = now()
+            rt_tab["market_no_state_since"] = 0
 
         # fresh -> healthy, skip
         if age <= stale_limit and state_is_clean(state):
             clear_disconnect_ui_incident(rt_tab)
+            if market_combined:
+                rt_tab["market_combined_stuck_last"] = 0
+                rt_tab["market_combined_stuck_last_age"] = 0
+                rt_tab["market_combined_stuck_last_reason"] = ""
             return ("Ingame" if alive else "Loading"), "ok", False
 
         # old state but still loading (inside our grace window) -> wait
@@ -13300,12 +13389,23 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
                     )
                     core.save()
                     return ("Queued" if added else "Waiting"), rt_tab["note"], True
+            recovery_meta = None
+            if market_combined:
+                cooldown_left = market_combined_stuck_cooldown_left(rt_tab, cfg)
+                if cooldown_left > 0:
+                    return "Waiting", f"Market stuck recovery cooldown {format_age(cooldown_left)}", True
+                recovery_meta = market_combined_stuck_metadata(
+                    cfg, age, f"market valid-ts stale {format_age(age)}"
+                )
             added, _ = core.queue_alive_old_state_recovery(
                 tab,
                 target,
                 f"{mode} alive old state {format_age(age)}",
+                metadata=recovery_meta,
             )
             if added:
+                if market_combined:
+                    return "Queued", f"Market 5m stuck -> cache recovery ({format_age(age)})", True
                 return "Queued", f"old {format_age(age)} kill+open", True
             status, note = core.queue_display(pkg, "Queued", "already queued")
             return status, note, True
@@ -13315,7 +13415,24 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
 
     # --- no state at all ---
     if alive:
-        if in_grace:
+        if market_combined:
+            try:
+                no_state_since = int(rt_tab.get("market_no_state_since", 0) or 0)
+            except Exception:
+                no_state_since = 0
+            if no_state_since <= 0:
+                # Prefer the latest known local proof that this package had a
+                # state/open. This avoids instant recovery when state only just
+                # disappeared, while a freshly opened stuck clone still reaches
+                # the decision at the requested 5m mark.
+                last_seen = int(rt_tab.get("market_last_state_seen_at", 0) or 0)
+                baseline = max(int(last_open or 0), last_seen)
+                no_state_since = baseline if baseline > 0 else now()
+                rt_tab["market_no_state_since"] = no_state_since
+            no_state_for = max(0, now() - no_state_since)
+            if no_state_for < trigger:
+                return "Loading", f"Market no-state {format_age(no_state_for)}/{format_age(trigger)}", True
+        elif in_grace:
             return "Loading", "no state grace", True
         if _is_noka_clone_package(pkg):
             peer_pkg, peer_reason = active_noka_auth_incident(cfg, rt, exclude_pkg=pkg)
@@ -13351,12 +13468,24 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
                 )
                 core.save()
                 return ("Queued" if added else "Waiting"), rt_tab["note"], True
+        recovery_meta = None
+        if market_combined:
+            cooldown_left = market_combined_stuck_cooldown_left(rt_tab, cfg)
+            if cooldown_left > 0:
+                return "Waiting", f"Market stuck recovery cooldown {format_age(cooldown_left)}", True
+            recovery_meta = market_combined_stuck_metadata(
+                cfg, max(trigger, int(now() - int(rt_tab.get("market_no_state_since", now()) or now()))),
+                "market no-state 5m",
+            )
         added, _ = core.queue_alive_no_state_recovery(
             tab,
             target,
             f"{mode} alive no-state hard",
+            metadata=recovery_meta,
         )
         if added:
+            if market_combined:
+                return "Queued", "Market 5m no-state -> cache recovery", True
             return "Queued", "no-state kill+open", True
         status, note = core.queue_display(pkg, "Queued", "already queued")
         return status, note, True
@@ -16565,10 +16694,10 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
 
     combined_stuck = bool(
         item.get("combined_stuck_recovery")
-        and target == "hatcher"
+        and target in ("hatcher", "market")
         and str(mode or "").lower() not in ("soft", "route", "switch", "reuse_task")
     )
-    if combined_stuck and item.get("combined_stuck_refresh_private_link"):
+    if combined_stuck and target == "hatcher" and item.get("combined_stuck_refresh_private_link"):
         refresh_ok, refreshed_route, refresh_note, refresh_block = (
             refresh_hatcher_private_route_for_combined_stuck(tab, cfg, rt_tab)
         )
@@ -16618,6 +16747,13 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
         rt_tab["hatcher_alive_old_state_hard_reason"] = str(
             item.get("hatcher_old_state_reason", reason) or reason
         )
+    if ok and item.get("market_combined_stuck_recovery"):
+        rt_tab["market_combined_stuck_last"] = now()
+        rt_tab["market_combined_stuck_last_age"] = int(item.get("market_stuck_age", 0) or 0)
+        rt_tab["market_combined_stuck_last_reason"] = str(
+            item.get("market_stuck_reason", reason) or reason
+        )
+        rt_tab["market_no_state_since"] = 0
     # Record pool-wide hard-open time for the stagger gate.
     if is_hard and ok:
         rt["_last_pool_hard_open"] = now()
@@ -34374,9 +34510,13 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
                     queued_item["solver_result"] = "PROVIDER_COOKIE_CLAIM_IGNORED_ROBLOX_VALID"
                     queued_item["skip_solver_once"] = True
                     queued_item["skip_solver_probe"] = True
+                    combined_desc = (
+                        "combined PS+cache recovery continues"
+                        if str((queued_item or {}).get("target") or "") == "hatcher"
+                        else "combined cache recovery continues"
+                    )
                     log_activity(
-                        "solver invalid/flagged claim ignored; Roblox auth valid; "
-                        "combined PS+cache recovery continues",
+                        "solver invalid/flagged claim ignored; Roblox auth valid; " + combined_desc,
                         pkg,
                         YELLOW,
                     )
