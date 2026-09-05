@@ -1,5 +1,25 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.75 — RESTORE BACKGROUND STUCK CAPTCHA SOLVER
+# - V4.81.66/.70 moved Hatcher/Market fresh verification out of wait_until_fresh_after_open() so the
+#   dashboard would no longer freeze for minutes. That also accidentally bypassed the old ~3m
+#   post-open CAPTCHA provider probe that lived inside the synchronous wait loop.
+# - Restore that probe as a package-local background watchdog: an ALIVE clone with no clean fresh state
+#   for solver_probe_after_seconds (default 180s) gets one direct provider check for that stuck incident.
+# - This background solver probe is NON-DESTRUCTIVE: no PID stop, no cache clear, no route/open.
+# - A confirmed Face Lock on one peer does NOT suppress another package's solver-only probe. Peer-auth
+#   protection still blocks destructive sibling hard recovery while its safety condition applies.
+# - The background probe explicitly calls the provider even when Roblox base auth is valid, matching
+#   Manual Solver Test behavior; this catches invisible join CAPTCHAs that UI/Lua cannot see.
+# - One probe per stuck incident/open generation + existing >=10m provider submit cooldown prevents spam.
+# - A clean fresh heartbeat resets the package-local stuck-probe incident.
+#
+# V4.81.74 — CURRENT DISCONNECT ONLY + STRICT OPTION-16 UI ISOLATION
+# - Hours-old disconnect/267 fields in stale state.json are no longer treated as CURRENT kick popups.
+# - Android auth/disconnect text uses the exact saved Option-16 rectangle as the authoritative clone boundary.
+# - Shared/App-Cloner package-name text is no longer unioned across clone cells when a saved rectangle exists.
+# - Adds Recovery Tools option 9 to persist one user-confirmed Face Lock package across transient HTTP/kick/loading UI.
+#
 # V4.81.73 — NUMERIC MODERATION RESTRICTION IS NOT FACE-LOCK PROOF
 # - Roblox moderation restriction source=5 + moderationStatus=2 is no longer sufficient by itself to create
 #   FACE LOCK HOLD. Multiple normal accounts can expose that numeric restriction shape, so treating it as
@@ -1323,7 +1343,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.73"
+__version__ = "V4.81.75"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -11878,12 +11898,13 @@ def _counter_version_tuple(state):
 def state_disconnect_ui(state):
     """True only for a CURRENT, high-confidence disconnect observation.
 
-    Counter <=2.4 could latch GuiService/Rejoin text forever while continuing to
-    write fresh heartbeats. Those legacy flags are ignored unless Python itself
-    confirmed the native popup for this exact package.
+    V4.81.74: an hours-old state.json cannot represent current UI. Stale files
+    may preserve the last 267/288 values from before the executor stopped.
     """
     if not state:
         return False
+
+    # Injected by Python from a CURRENT package/Option-16 UI observation.
     if bool(state.get("_android_disconnect_confirmed")):
         return True
 
@@ -11901,11 +11922,6 @@ def state_disconnect_ui(state):
     if not disconnected and not has_strong_text:
         return False
 
-    # Counter v2.5+ actively clears a vanished prompt, so its current boolean is safe.
-    if _counter_version_tuple(state) >= (2, 5):
-        return True
-
-    # Transitional support for any counter that writes a real observation epoch.
     try:
         seen = int(state.get("disconnect_observed_ts", 0) or 0)
     except Exception:
@@ -11913,7 +11929,18 @@ def state_disconnect_ui(state):
     if seen > 0 and abs(now() - seen) <= 45:
         return True
 
-    # Legacy v2.4 and older: do not trust sticky state without Android confirmation.
+    # Even Counter v2.5+ is only authoritative while its state heartbeat is
+    # recent. Never promote a 1h/14h-old saved kick into a current popup.
+    try:
+        age = int(state_age_seconds(state))
+    except Exception:
+        age = 999999
+    if age > 90:
+        return False
+
+    if _counter_version_tuple(state) >= (2, 5):
+        return True
+
     return False
 
 
@@ -13296,6 +13323,15 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
     if busy_action is not None:
         return busy_action
 
+    # V4.81.75: restore the old 3m post-open CAPTCHA probe after Market fresh
+    # verification became backgrounded. This is solver-only and is deliberately
+    # evaluated before any peer-auth/destructive recovery gate.
+    stuck_solver = maybe_start_background_stuck_solver_probe(
+        tab, target, cfg, rt, rt_tab, health, core
+    )
+    if stuck_solver is not None:
+        return stuck_solver[0], stuck_solver[1], True
+
     if not cfg.get("rejoin_if_crash", True):
         if not cfg.get("alive_old_state_rejoin_in_safe_mode", True):
             return health.get("status", ""), "SAFEMODE-off " + str(health.get("note", "")), False
@@ -14337,19 +14373,16 @@ def android_ui_text_for_package(pkg, cfg, force=False):
 
 
 def android_ui_text_for_package_or_rect(pkg, cfg, force=False):
-    """Package text with a saved-rectangle fallback for App Cloner package aliasing.
+    """Return clone-isolated Android text.
 
-    The fallback never consumes unscoped global text: only accessibility nodes whose
-    center point is physically inside this package's exact Option 16 rectangle are
-    added. This is the same isolation rule used by the Home detector.
+    V4.81.74: when Option 16 has a valid saved rectangle, that rectangle is the
+    authoritative clone boundary. App Cloner/uiautomator can report sibling or
+    shared Roblox package names, so package-name text must not be unioned with
+    another cell's modal.
     """
     pkg = str(pkg or "")
     snapshot = capture_android_ui_snapshot(cfg, force=force)
     by_pkg = snapshot.get("by_pkg", {}) if isinstance(snapshot, dict) else {}
-    values = []
-    for node_pkg, node_values in (by_pkg or {}).items():
-        if node_pkg == pkg or node_pkg.startswith(pkg + ":"):
-            values.extend(node_values if isinstance(node_values, list) else [str(node_values)])
 
     rect = _loading_visual_rect_for_package(pkg, cfg)
     if rect and isinstance(snapshot, dict):
@@ -14358,12 +14391,13 @@ def android_ui_text_for_package_or_rect(pkg, cfg, force=False):
         except Exception:
             rx1 = ry1 = rx2 = ry2 = 0
         if rx2 > rx1 and ry2 > ry1:
+            rect_values = []
             for node in snapshot.get("text_nodes", []) or []:
                 if not isinstance(node, dict):
                     continue
                 bounds = node.get("bounds")
-                text = str(node.get("text", "") or "").strip()
-                if not text or not isinstance(bounds, (list, tuple)) or len(bounds) != 4:
+                node_text = str(node.get("text", "") or "").strip()
+                if not node_text or not isinstance(bounds, (list, tuple)) or len(bounds) != 4:
                     continue
                 try:
                     x1, y1, x2, y2 = (int(v) for v in bounds)
@@ -14372,8 +14406,16 @@ def android_ui_text_for_package_or_rect(pkg, cfg, force=False):
                 cx = (x1 + x2) / 2.0
                 cy = (y1 + y2) / 2.0
                 if rx1 <= cx <= rx2 and ry1 <= cy <= ry2:
-                    values.append(text)
+                    rect_values.append(node_text)
 
+            # Valid saved rectangle => never fall back to alias-prone package
+            # text for this sensitive auth/disconnect classification.
+            return list(dict.fromkeys(rect_values)), str(snapshot.get("error", "") or "")
+
+    values = []
+    for node_pkg, node_values in (by_pkg or {}).items():
+        if node_pkg == pkg or node_pkg.startswith(pkg + ":"):
+            values.extend(node_values if isinstance(node_values, list) else [str(node_values)])
     values = list(dict.fromkeys(str(v or "").strip() for v in values if str(v or "").strip()))
     return values, str(snapshot.get("error", "") or "")
 
@@ -14574,7 +14616,7 @@ def _authoritative_face_lock_runtime(rt_tab):
         return False
 
     source = str(rt_tab.get("face_lock_evidence_source", "") or "").strip().lower()
-    if source in ("exact_account_locked_ui", "api_explicit_lock_text"):
+    if source in ("exact_account_locked_ui", "api_explicit_lock_text", "manual_confirmed"):
         return True
 
     detail = " ".join(str(rt_tab.get(k, "") or "") for k in (
@@ -22054,6 +22096,9 @@ def start_hatcher_reporter(main_cfg=None):
                     note = "periodic hard queued"
 
             status, note = core.queue_display(pkg, status, note)
+            if background_solver_active and solver_job_running(pkg):
+                status = "Solving"
+                note = solver_job_note(pkg)
             if manual_login_blocked(rt_tab, cfg, pkg) and not core.has(pkg):
                 status = "Manual"
                 note = rt_tab.get("manual_login_reason") or rt_tab.get("note") or "needs manual login"
@@ -22800,6 +22845,17 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
             background_fresh = hatcher_background_fresh_wait_status(
                 tab, rt_tab, state, cfg
             )
+
+            # V4.81.75: nonblocking replacement for the solver probe that used
+            # to live inside wait_until_fresh_after_open(). A peer Face Lock does
+            # not suppress this package-local provider check.
+            stuck_solver = maybe_start_background_stuck_solver_probe(
+                tab, "hatcher", cfg, rt, rt_tab, health, core
+            )
+            background_solver_active = bool(
+                stuck_solver is not None or solver_job_running(pkg)
+            )
+
             note = health.get("note") or "ok"
             pets = "-"
             eggs = "-"
@@ -22825,7 +22881,10 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                 # A current kick/disconnect OR verification challenge owns this cycle.
                 # Never stamp/queue old-state recovery while the solver is supposed
                 # to operate on the currently-open package in-place.
-                challenge_active = str(health.get("bad") or "") in {"ui_challenge", "challenge"}
+                challenge_active = (
+                    str(health.get("bad") or "") in {"ui_challenge", "challenge"}
+                    or background_solver_active
+                )
                 recovery_age = 0 if (alive and (state_disconnect_ui(state) or challenge_active)) else age
 
                 ready_at = int((prof or {}).get("ready_pet_count", 200))
@@ -23053,10 +23112,17 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                         if last_no_state_hard > 0 else 0
                     )
 
-                    challenge_active = str(health.get("bad") or "") in {"ui_challenge", "challenge"}
+                    challenge_active = (
+                        str(health.get("bad") or "") in {"ui_challenge", "challenge"}
+                        or background_solver_active
+                    )
                     if challenge_active:
-                        status = "Captcha"
-                        note = "verification UI detected; solver owns package (no reopen)"
+                        status = "Solving" if background_solver_active else "Captcha"
+                        note = (
+                            (stuck_solver[1] if stuck_solver is not None else solver_job_note(pkg))
+                            if background_solver_active
+                            else "verification UI detected; solver owns package (no reopen)"
+                        )
                     elif rt_tab.get("last_open") and in_post_open_grace(rt_tab, cfg):
                         status = "Loading"
                         note = f"waiting for {expected_state_name(tab)}"
@@ -34604,6 +34670,168 @@ def start_challenge_probe_job(tab, cfg, rt, rt_tab, probe_token=0, reason="wait-
     return True, solver_job_note(pkg)
 
 
+
+def maybe_start_background_stuck_solver_probe(
+    tab,
+    target,
+    cfg,
+    rt,
+    rt_tab,
+    health,
+    core=None,
+):
+    """Restore the old post-open no-fresh solver probe without blocking the UI.
+
+    V4.81.75: Hatcher/Market background fresh verification replaced the old
+    synchronous wait loop, but that loop also owned the automatic CAPTCHA probe.
+    This is the nonblocking replacement.
+
+    Important safety rules:
+      * package-local only; peer Face Lock does not suppress this solver-only work
+      * never PID-stops, clears cache, routes, or opens Roblox
+      * one direct provider submission per stuck incident/open generation
+      * provider's existing >=10m package cooldown still applies
+      * own authoritative Face Lock / ban / current disconnect is not probed
+    """
+    if core is None:
+        core = RejoinCore([], cfg, rt)
+
+    pkg = str((tab or {}).get("package") or "")
+    if not pkg:
+        return None
+
+    if not cfg.get("solver_enabled", False):
+        return None
+
+    alive = bool((health or {}).get("alive"))
+    clean_fresh = bool((health or {}).get("clean_fresh"))
+    bad = str((health or {}).get("bad") or "").strip().lower()
+
+    if clean_fresh:
+        # A healthy heartbeat closes the incident. Keep provider cooldown/history,
+        # but allow a later unrelated stuck incident to receive one new probe.
+        rt_tab["solver_background_stuck_since"] = 0
+        rt_tab["solver_background_stuck_probe_token"] = 0
+        rt_tab["solver_background_stuck_probe_started_at"] = 0
+        rt_tab["solver_background_stuck_last_note"] = ""
+        return None
+
+    if not alive:
+        rt_tab["solver_background_stuck_since"] = 0
+        return None
+
+    # Existing dedicated handlers own these states. In particular, C being a real
+    # Face Lock must hold C, but it must not prevent A/B/D from reaching this helper.
+    if bad in {
+        "face_lock",
+        "account_banned",
+        "disconnect",
+        "process_unknown",
+        "roblox_home",
+        "ui_challenge",
+        "challenge",
+    }:
+        return None
+
+    # Strong persisted auth proof on THIS package wins. Do not use peer auth here.
+    try:
+        if _authoritative_face_lock_runtime(rt_tab):
+            return None
+    except Exception:
+        pass
+
+    # Derive the current stuck incident from the package's own open/background
+    # generation. If NOMO did not open it this session, start a local observation
+    # timer now rather than blindly probing every ancient state immediately.
+    candidates = []
+    for key in (
+        "hatcher_background_fresh_opened_at",
+        "market_background_fresh_opened_at",
+        "last_open",
+    ):
+        try:
+            value = int(rt_tab.get(key, 0) or 0)
+        except Exception:
+            value = 0
+        if value > 0:
+            candidates.append(value)
+
+    try:
+        observed_since = int(rt_tab.get("solver_background_stuck_since", 0) or 0)
+    except Exception:
+        observed_since = 0
+
+    latest_open = max(candidates) if candidates else 0
+    if observed_since <= 0 or (latest_open > 0 and latest_open > observed_since):
+        observed_since = latest_open if latest_open > 0 else now()
+        rt_tab["solver_background_stuck_since"] = observed_since
+
+    elapsed = max(0, now() - observed_since)
+    probe_after = max(10, int(cfg.get("solver_probe_after_seconds", 180) or 180))
+    if elapsed < probe_after:
+        return None
+
+    # The token changes when a new open or a new post-clean stuck incident starts.
+    token = int(observed_since or latest_open or now())
+
+    # Reuse the historical solver_probe_token too, so a legacy synchronous probe
+    # and this restored background path can never both submit for the same open.
+    try:
+        previous_bg = int(rt_tab.get("solver_background_stuck_probe_token", 0) or 0)
+    except Exception:
+        previous_bg = 0
+    try:
+        previous_legacy = int(rt_tab.get("solver_probe_token", 0) or 0)
+    except Exception:
+        previous_legacy = 0
+
+    if previous_bg == token or previous_legacy == token:
+        if solver_job_running(pkg):
+            return "Solving", solver_job_note(pkg)
+        return None
+
+    if solver_job_running(pkg):
+        return "Solving", solver_job_note(pkg)
+
+    # Direct provider path on purpose. Manual Solver Test proved that invisible
+    # join CAPTCHAs can exist while Roblox's normal auth API still says VALID.
+    # challenge_confirmed=True bypasses the "API valid => provider not sent"
+    # challenge-only optimization for this one stuck incident.
+    started, note = start_solver_job(
+        tab,
+        cfg,
+        rt,
+        rt_tab,
+        reason=f"background stuck/no-fresh {format_age(elapsed)}",
+        force=False,
+        phase="probe",
+        target_override=str(target or rt_tab.get("target") or "hatcher"),
+        core=core,
+        challenge_confirmed=True,
+    )
+
+    if started:
+        rt_tab["solver_background_stuck_probe_token"] = token
+        rt_tab["solver_probe_token"] = token
+        rt_tab["solver_background_stuck_probe_started_at"] = now()
+        rt_tab["solver_background_stuck_last_note"] = str(note or "")
+        rt_tab["note"] = str(note or "solver running")
+        core.save()
+        log_activity(
+            f"stuck loading {format_age(elapsed)} -> solver provider started "
+            "(package-only; no reopen)",
+            pkg,
+            CYAN,
+        )
+        return "Solving", str(note or "solver running")
+
+    # Provider cooldown / configuration failure does not mark the incident as
+    # consumed. The normal dashboard may retry later, while start_solver_job()
+    # continues to enforce the hard provider cooldown.
+    rt_tab["solver_background_stuck_last_note"] = str(note or "")
+    return None
+
+
 def maybe_start_blocked_join_probe(tab, cfg, rt, rt_tab, state, alive, open_queue=None, mode="hatcher"):
     """Compatibility stub.
 
@@ -36544,6 +36772,37 @@ def resume_face_locked_package(cfg):
     print(col(("Restart started: " if ok else "Restart failed: ") + str(note), GREEN if ok else RED))
     pause()
 
+
+def mark_face_locked_package_confirmed(cfg):
+    """Persist an explicit user-confirmed Face Lock for one package."""
+    selected = choose_packages_common(
+        cfg, "MARK CONFIRMED FACE-LOCK PACKAGE", multi=False,
+        installed_only=False, include_discovered=True,
+    )
+    if not selected:
+        return
+    pkg = selected[0]
+    rt = load_runtime()
+    rt_tab = get_runtime_tab(rt, pkg)
+    retry_seconds = max(600, int(cfg.get("manual_auth_retry_seconds", 3600) or 3600))
+    detected_at = now()
+    detail = "manual confirmed Account Locked / Face Lock"
+    rt_tab["face_lock_detected"] = True
+    rt_tab["face_lock_detected_at"] = detected_at
+    rt_tab["face_lock_last_seen_at"] = detected_at
+    rt_tab["face_lock_detail"] = detail
+    rt_tab["face_lock_evidence_source"] = "manual_confirmed"
+    mark_manual_login_block(
+        rt_tab, "face_lock", detail, "FACE LOCK HOLD (manual confirmed)",
+        detected_at, retry_seconds,
+    )
+    set_hold(pkg, "face_lock", retry_seconds)
+    rt_tab["note"] = "FACE LOCK HOLD (manual confirmed)"
+    save_runtime(rt)
+    print(col(f"Confirmed Face Lock saved for {pkg}.", RED))
+    print(col("Transient HTTP/kick/loading screens will not overwrite this hold.", DIM))
+    pause()
+
 def recovery_menu(cfg):
     while True:
         clear()
@@ -36556,6 +36815,7 @@ def recovery_menu(cfg):
         print("6. Test login/CAPTCHA detection for one package")
         print("7. Test face-lock visual detection for one package")
         print("8. Clear/resume one face-locked package")
+        print("9. Mark one package as CONFIRMED Face Lock")
         print("0. Back")
         drain_stdin()
         ch = input("\nChoose: ").strip()
@@ -36631,6 +36891,8 @@ def recovery_menu(cfg):
             test_face_lock_detection_menu(cfg)
         elif ch == "8":
             resume_face_locked_package(cfg)
+        elif ch == "9":
+            mark_face_locked_package_confirmed(cfg)
         else:
             print("Invalid choice.")
             time.sleep(1)
