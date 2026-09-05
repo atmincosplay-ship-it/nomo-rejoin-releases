@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.71 — VISUAL FACE-LOCK IS ADVISORY, NEVER AUTHORITATIVE
+# - Screenshot-only Face Lock candidates no longer create manual holds, peer-auth suppression, or hard-open deferrals.
+# - Only exact package-scoped Account Locked text or Roblox moderation/API proof may create a real Face Lock hold.
+# - Existing V4.81.69/V4.81.70 visual-only Face Lock latches are automatically cleared package-locally.
+# - Grow Offline/hourglass/loading overlays can therefore no longer freeze the entire Hatcher/Market recovery pool.
+# - Real Account Locked / moderation / 529 / CAPTCHA protections remain unchanged.
+#
 # V4.81.70 — NONBLOCKING MARKET CACHE RECOVERY QUEUE
 # - Market combined-stuck recovery no longer monopolizes the single-flight queue while waiting minutes for a
 #   fresh post-open heartbeat. After exact-target PID stop -> forced Clear Cache -> Market open, verification is
@@ -1296,7 +1303,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.70"
+__version__ = "V4.81.71"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -12701,6 +12708,17 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
     if clear_obsolete_age_access_hold(rt_tab, pkg):
         log_activity("obsolete V4.81.61 age/access hold cleared", pkg, GREEN)
 
+    # V4.81.71 migration/self-heal: older builds could persist a screenshot-only
+    # Face Lock in runtime.json and then suppress the whole pool for hours.
+    if clear_visual_face_lock_false_positive(
+        rt_tab, pkg, "stale visual Face Lock cleared; exact text/API required"
+    ):
+        log_activity(
+            "stale visual-only face-lock latch cleared; recovery allowed",
+            pkg,
+            GREEN,
+        )
+
     if process_status is None:
         if raw_alive is None:
             process_status, process_note = package_alive_status(pkg, cfg)
@@ -12807,14 +12825,18 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
         }
 
     text_face = account_ui if account_ui and account_ui.get("kind") == "face_lock" else None
-    face_lock = text_face or (
+    visual_face = (
         visual_face_lock_detail(pkg, cfg, force=False)
         if face_lock_scan_eligible and not non_auth_disconnect
         else None
     )
-    if face_lock:
+
+    # V4.81.71: exact Account Locked text is authoritative. Screenshot geometry
+    # alone is only a diagnostic candidate because normal loading/hourglass
+    # overlays have repeatedly matched the old detector.
+    if text_face:
         first_hit = not bool(rt_tab.get("face_lock_detected"))
-        detail = str(face_lock.get("text", "") or "account locked")
+        detail = str(text_face.get("text", "") or "account locked")
         rt_tab["face_lock_detected"] = True
         rt_tab["face_lock_detail"] = detail
         rt_tab["face_lock_last_seen_at"] = now()
@@ -12833,7 +12855,7 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
             if first_hit:
                 set_hold(pkg, "face_lock", retry_seconds)
                 log_activity(
-                    f"FACE LOCK detected; package held, retry in {format_age(retry_seconds)}",
+                    f"FACE LOCK exact text detected; package held, retry in {format_age(retry_seconds)}",
                     pkg,
                     RED,
                 )
@@ -12845,8 +12867,24 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
             "age": state_age_seconds(state) if state else "-",
             "status": "Face Lock", "note": "account locked; manual verification",
             "bad": "face_lock", "visible_window": True,
-            "face_lock_detail": face_lock,
+            "face_lock_detail": text_face,
         }
+
+    if visual_face:
+        rt_tab["visual_face_lock_candidate_detail"] = str(
+            visual_face.get("text")
+            or visual_face.get("reason")
+            or "visual candidate"
+        )
+        rt_tab["visual_face_lock_candidate_last_seen_at"] = now()
+        last_log = int(rt_tab.get("visual_face_lock_candidate_last_log", 0) or 0)
+        if last_log <= 0 or now() - last_log >= 60:
+            rt_tab["visual_face_lock_candidate_last_log"] = now()
+            log_activity(
+                "visual Face Lock candidate ignored; exact text/API proof required",
+                pkg,
+                YELLOW,
+            )
 
     # V4.81.62: age/access banner is informational in this client and must not
     # create a hold or suppress normal join/recovery.
@@ -13915,6 +13953,13 @@ def direct_moderation_guard_before_open(tab, rt_tab, cfg, reason="queued open"):
     if not pkg:
         return False, "direct moderation guard no package"
 
+    # V4.81.71: clear only old screenshot-origin Face Lock before the
+    # authoritative Roblox moderation API gets a chance to classify the package.
+    if clear_visual_face_lock_false_positive(
+        rt_tab, pkg, "visual Face Lock cleared before moderation API"
+    ):
+        log_activity("visual-only face-lock cleared before moderation API", pkg, GREEN)
+
     if manual_login_blocked(rt_tab, cfg, pkg) and _runtime_auth_hint(rt_tab):
         return True, str(rt_tab.get("note") or "existing auth/moderation hold")
 
@@ -14475,16 +14520,59 @@ def current_non_auth_disconnect_ui_detail(pkg, cfg, force=False):
 
 
 def _visual_face_lock_runtime_only(rt_tab):
-    """True only for a Face Lock latch created by the screenshot heuristic."""
+    """True only for a Face Lock latch created solely by screenshot geometry."""
     if not isinstance(rt_tab, dict):
         return False
     detail = " ".join(str(rt_tab.get(k, "") or "") for k in (
         "face_lock_detail", "manual_login_detail",
     )).lower()
-    return bool(
+    visual = bool(
         "visual panel=" in detail
         or "android_package_scoped_visual_face_lock" in detail
     )
+    if not visual:
+        return False
+    # Never erase stronger exact/API evidence even if an old visual string is
+    # still present somewhere in runtime metadata.
+    if str(rt_tab.get("moderation_guard_last_status", "") or "").lower() == "face_lock":
+        return False
+    if any(term in detail for term in (
+        "api account locked",
+        "restriction source=5",
+        "suspicious activity",
+        "unlock your account",
+        "confirming that you're a human",
+        "confirming that you are a human",
+    )):
+        return False
+    return True
+
+
+def clear_visual_face_lock_false_positive(rt_tab, pkg, why="visual Face Lock is advisory only"):
+    """Clear only a persisted screenshot-origin Face Lock latch/hold."""
+    if not _visual_face_lock_runtime_only(rt_tab):
+        return False
+    old_detail = str(
+        rt_tab.get("face_lock_detail")
+        or rt_tab.get("manual_login_detail")
+        or ""
+    )
+    if str(rt_tab.get("manual_login_reason", "") or "").strip().lower() == "face_lock":
+        clear_manual_login_block(rt_tab)
+    else:
+        clear_face_lock_runtime(rt_tab)
+    try:
+        clear_hold(pkg)
+    except Exception:
+        pass
+    try:
+        clear_visual_face_lock_confirmation(pkg)
+    except Exception:
+        pass
+    rt_tab["visual_face_lock_candidate_detail"] = old_detail
+    rt_tab["visual_face_lock_candidate_cleared_at"] = now()
+    rt_tab["note"] = str(why or "visual Face Lock ignored")
+    return True
 
 
 def clear_visual_face_lock_for_disconnect(rt_tab, pkg, disconnect_detail=None):
@@ -15170,16 +15258,17 @@ def active_noka_auth_incident(cfg, rt, exclude_pkg=""):
         if not pkg or pkg == exclude_pkg or not _is_noka_clone_package(pkg):
             continue
         rt_tab = get_runtime_tab(rt, pkg)
+        # V4.81.71: visual-only Face Lock is never pool-wide auth evidence.
+        if clear_visual_face_lock_false_positive(
+            rt_tab, pkg, "visual Face Lock peer blocker cleared; exact text/API required"
+        ):
+            log_activity(
+                "peer-auth visual-only face-lock cleared; siblings may recover",
+                pkg,
+                GREEN,
+            )
         reason = _auth_incident_runtime_reason(rt_tab, cfg)
         if reason:
-            # V4.81.69: do not let a screenshot-only false Face Lock on a real
-            # kick popup suppress every ALIVE sibling. Exact/API auth holds are
-            # deliberately untouched by this self-heal.
-            if _visual_face_lock_runtime_only(rt_tab):
-                disconnect_detail = current_non_auth_disconnect_ui_detail(pkg, cfg, force=False)
-                if disconnect_detail and clear_visual_face_lock_for_disconnect(rt_tab, pkg, disconnect_detail):
-                    log_activity("peer-auth false visual face-lock cleared by disconnect UI", pkg, GREEN)
-                    continue
             return pkg, reason
         if solver_job_running(pkg):
             return pkg, "solver/auth job running"
@@ -16637,10 +16726,9 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
                     core.save()
                     return True
 
-            # The Account-Locked visual detector is deliberately stricter during
-            # normal monitoring (two confirmations). At the destructive boundary,
-            # a raw candidate only defers this hard open; it does not create a
-            # persistent hold until the normal detector confirms it.
+            # V4.81.71: direct moderation API + exact Account Locked text have
+            # already run above. A screenshot/color candidate alone cannot block
+            # or defer the exact-target hard recovery.
             face_snap = (
                 capture_visual_face_lock_snapshot(cfg, force=True)
                 if not current_disconnect
@@ -16652,28 +16740,17 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
                 if not current_disconnect
                 else None
             )
-            if confirmed_face:
-                retry_seconds = max(600, int(cfg.get("manual_auth_retry_seconds", 3600) or 3600))
-                detail = str(confirmed_face.get("text") or "account locked")
-                rt_tab["face_lock_detected"] = True
-                rt_tab["face_lock_detail"] = detail
-                rt_tab["face_lock_last_seen_at"] = now()
-                if not int(rt_tab.get("face_lock_detected_at", 0) or 0):
-                    rt_tab["face_lock_detected_at"] = now()
-                mark_manual_login_block(
-                    rt_tab, "face_lock", detail, "account locked; hard recovery blocked",
-                    int(rt_tab.get("face_lock_detected_at", now()) or now()), retry_seconds,
+            if confirmed_face or raw_face:
+                candidate = confirmed_face or {}
+                rt_tab["visual_face_lock_candidate_detail"] = str(
+                    candidate.get("text") or "raw visual candidate"
                 )
-                set_hold(pkg, "face_lock", retry_seconds)
-                rt_tab["note"] = "account locked; hard recovery blocked"
-                log_activity("Account Locked blocked queued hard recovery before PID stop", pkg, RED)
-                core.save()
-                return True
-            if raw_face:
-                rt_tab["note"] = "possible Account Locked UI; hard recovery deferred for confirmation"
-                log_activity("possible Account Locked UI; destructive recovery deferred", pkg, YELLOW)
-                core.save()
-                return True
+                rt_tab["visual_face_lock_candidate_last_seen_at"] = now()
+                log_activity(
+                    "visual Face Lock candidate ignored at hard boundary; text/API clear",
+                    pkg,
+                    YELLOW,
+                )
 
     preflight_state, preflight_item = core.solver_preflight_before_open(
         item, tab, rt_tab, pkg, target
