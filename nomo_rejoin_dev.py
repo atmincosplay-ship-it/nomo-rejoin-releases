@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.68 — MARKET PEER-AUTH QUEUE FIX
+# - Market 5m stuck recoveries no longer downgrade an ALIVE stuck clone into a sticky peer-auth route-only
+#   generation while another Noka clone is running solver/auth protection. That route-only metadata blocked the
+#   later exact-PID + Clear Cache upgrade and could leave a genuinely stuck Market clone sitting on Next forever.
+# - During any peer auth/solver safety window, the Market combined-stuck path now simply waits package-locally.
+#   Once the peer blocker clears, the same >=5m stale/no-state clone queues its normal exact-target PID stop, forced
+#   Clear Cache, and Market reopen. Confirmed face-lock/Account Locked protection is not weakened.
+# - On upgrade from V4.81.67, any still-pending peer-auth safe-route item for that stuck Market package is removed
+#   before waiting, so old runtime queue metadata cannot keep suppressing the cache recovery after restart.
+#
 # V4.81.67 — MARKET 5M STUCK CACHE RECOVERY + VALID-TS MARKET AGE
 # - Market now gets the package-scoped equivalent of the proven Hatcher stuck repair. When the actual Market
 #   Roblox session has a clean-but-stale valid timestamp for >=5m, or stays ALIVE with no state for >=5m, NOMO
@@ -1265,7 +1275,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.67"
+__version__ = "V4.81.68"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -13366,6 +13376,18 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
                         core.save()
                         return "Manual", own_note or rt_tab.get("note") or "auth/moderation hold", True
 
+                    if market_combined:
+                        # V4.81.68: do not turn a real Market 5m cache recovery
+                        # into a sticky route-only generation while peer auth/solver
+                        # protection is active. Wait, then take the cache-recovery turn.
+                        pending = _queue_latest_for_package(open_queue, pkg)
+                        if pending and pending.get("peer_auth_safe_route_only"):
+                            core.cancel(pkg)
+                        rt_tab["peer_auth_safe_route_last"] = 0
+                        rt_tab["note"] = f"peer auth {short_pkg(peer_pkg)}; Market cache recovery waiting"
+                        core.save()
+                        return "Waiting", rt_tab["note"], True
+
                     interval = max(30, int(cfg.get("noka_peer_auth_safe_route_retry_seconds", 45) or 45))
                     last_peer_route = int(rt_tab.get("peer_auth_safe_route_last", 0) or 0)
                     if last_peer_route > 0 and now() - last_peer_route < interval:
@@ -13444,6 +13466,16 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
                     core.cancel(pkg)
                     core.save()
                     return "Manual", own_note or rt_tab.get("note") or "auth/moderation hold", True
+
+                if market_combined:
+                    # V4.81.68: same rule for Market ALIVE/no-state incidents.
+                    pending = _queue_latest_for_package(open_queue, pkg)
+                    if pending and pending.get("peer_auth_safe_route_only"):
+                        core.cancel(pkg)
+                    rt_tab["peer_auth_safe_route_last"] = 0
+                    rt_tab["note"] = f"peer auth {short_pkg(peer_pkg)}; Market cache recovery waiting"
+                    core.save()
+                    return "Waiting", rt_tab["note"], True
 
                 interval = max(30, int(cfg.get("noka_peer_auth_safe_route_retry_seconds", 45) or 45))
                 last_peer_route = int(rt_tab.get("peer_auth_safe_route_last", 0) or 0)
