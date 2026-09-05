@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.76 — RESTORE AUTH FACE-LOCK + EXO GROUP IMPORT GUARD
+# - Restore Roblox's authenticated moderation restriction source=5 + moderationStatus=2 as package-local
+#   authoritative Face Lock evidence. Later testing isolated the major false-lock cascade to stale/cross-clone
+#   UI evidence; disabling this authenticated signature caused a genuinely locked clone to be treated as Kicked.
+# - The direct moderation guard still runs before ANY route/PID/solver/open intent, so a confirmed Face Lock
+#   cannot be restarted as a kick and cannot disturb healthy sibling App Cloner tasks.
+# - Face Lock evidence source is recorded as api_restriction_5_2 for diagnostics.
+# - Option 17 Workspace ZIP import now recognizes EXO master groups.json and prints Hatching/Market/Ungrouped counts.
+# - If hatchingAuto=true produced the exact complement all-market (e.g. 139 total - 28 market = 111 hatching),
+#   NOMO flags it as AUTO-COMPLEMENT and requires an explicit unsafe-import confirmation instead of silently
+#   installing a bad group map.
+# - NOMO does not guess which UIDs belong to the real Hatching group.
+#
 # V4.81.75 — RESTORE BACKGROUND STUCK CAPTCHA SOLVER
 # - V4.81.66/.70 moved Hatcher/Market fresh verification out of wait_until_fresh_after_open() so the
 #   dashboard would no longer freeze for minutes. That also accidentally bypassed the old ~3m
@@ -1343,7 +1356,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.75"
+__version__ = "V4.81.76"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -13949,25 +13962,15 @@ def roblox_cookie_not_approved_api_detection(cookie, expected_user_id=None, cfg=
             restriction_duration = restriction.get("durationSeconds")
 
             if restriction_source == 5 and restriction_status == 2:
-                # V4.81.73: this numeric shape is NOT Face Lock proof by itself.
-                # It was originally promoted from one captured Account Locked
-                # example, but live testing showed normal accounts can expose the
-                # same source/status pair. Require explicit lock wording somewhere
-                # in the authenticated payload before creating a hold.
-                try:
-                    restriction_payload_text = json.dumps(data, ensure_ascii=False).lower()
-                except Exception:
-                    restriction_payload_text = str(data).lower()
-                explicit_lock_terms = (
-                    "account locked",
-                    "unlock your account",
-                    "suspicious activity",
-                    "confirming that you're a human",
-                    "confirming that you are a human",
-                )
-                explicit_lock = any(term in restriction_payload_text for term in explicit_lock_terms)
-
-                bits = ["moderation api restriction source=5 status=2"]
+                # V4.81.76: restore the authenticated restriction signature as
+                # authoritative Face Lock evidence. This request is made with the
+                # selected package's own fresh .ROBLOSECURITY cookie, so it is
+                # package-local and independent from screenshot/App-Cloner UI
+                # aliasing that caused the earlier pool-wide false detections.
+                bits = [
+                    "api face lock",
+                    "restriction source=5 status=2",
+                ]
                 if restriction_start:
                     bits.append("start=" + restriction_start)
                 if restriction_end:
@@ -13976,13 +13979,7 @@ def roblox_cookie_not_approved_api_detection(cookie, expected_user_id=None, cfg=
                     bits.append("end=none")
                 if restriction_duration not in (None, ""):
                     bits.append("durationSeconds=" + str(restriction_duration))
-
-                if explicit_lock:
-                    bits.insert(0, "moderation api explicit account locked")
-                    return True, "; ".join(bits), data
-
-                bits.insert(0, "moderation api numeric restriction advisory")
-                return None, "; ".join(bits), data
+                return True, "; ".join(bits), data
 
             return None, (
                 "moderation api unknown restriction "
@@ -14082,10 +14079,12 @@ def direct_moderation_guard_before_open(tab, rt_tab, cfg, reason="queued open"):
         return False, detail
 
     retry_seconds = max(600, int(cfg.get("manual_auth_retry_seconds", 3600) or 3600))
-    # V4.81.73: only explicit lock wording can make this Face Lock. Do not
-    # re-promote source=5/status=2 numerics here after the API classifier.
+    # V4.81.76: the authenticated source=5/status=2 signature is again
+    # authoritative Face Lock evidence for this exact package.
     is_face_lock = bool(
-        "explicit account locked" in detail_l
+        "api face lock" in detail_l
+        or "restriction source=5 status=2" in detail_l
+        or "explicit account locked" in detail_l
         or "account locked" in detail_l
         or "unlock your account" in detail_l
         or "suspicious activity" in detail_l
@@ -14094,8 +14093,12 @@ def direct_moderation_guard_before_open(tab, rt_tab, cfg, reason="queued open"):
     if is_face_lock:
         rt_tab["moderation_guard_last_status"] = "face_lock"
         rt_tab["face_lock_detected"] = True
-        rt_tab["face_lock_detail"] = detail or "api explicit account locked"
-        rt_tab["face_lock_evidence_source"] = "api_explicit_lock_text"
+        rt_tab["face_lock_detail"] = detail or "api face lock"
+        rt_tab["face_lock_evidence_source"] = (
+            "api_restriction_5_2"
+            if "restriction source=5 status=2" in detail_l
+            else "api_explicit_lock_text"
+        )
         rt_tab["face_lock_last_seen_at"] = now()
         if not int(rt_tab.get("face_lock_detected_at", 0) or 0):
             rt_tab["face_lock_detected_at"] = now()
@@ -14110,7 +14113,7 @@ def direct_moderation_guard_before_open(tab, rt_tab, cfg, reason="queued open"):
         set_hold(pkg, "face_lock", retry_seconds)
         rt_tab["note"] = "FACE LOCK HOLD - direct moderation API"
         log_activity(
-            f"{reason}; direct moderation API explicit lock text = FACE LOCK; open blocked before route/PID/solver",
+            f"{reason}; direct moderation API = FACE LOCK; open blocked before route/PID/solver",
             pkg,
             RED,
         )
@@ -14616,7 +14619,12 @@ def _authoritative_face_lock_runtime(rt_tab):
         return False
 
     source = str(rt_tab.get("face_lock_evidence_source", "") or "").strip().lower()
-    if source in ("exact_account_locked_ui", "api_explicit_lock_text", "manual_confirmed"):
+    if source in (
+        "exact_account_locked_ui",
+        "api_explicit_lock_text",
+        "api_restriction_5_2",
+        "manual_confirmed",
+    ):
         return True
 
     detail = " ".join(str(rt_tab.get(k, "") or "") for k in (
@@ -14629,6 +14637,7 @@ def _authoritative_face_lock_runtime(rt_tab):
     # Exclude the legacy numeric-only API phrase first.
     numeric_only = (
         "restriction source=5 status=2" in detail
+        and source != "api_restriction_5_2"
         and not any(term in detail for term in (
             "suspicious activity",
             "unlock your account",
@@ -25775,6 +25784,83 @@ def _workspace_zip_members(zip_path):
     return items
 
 
+
+def inspect_exo_master_groups_in_zip(zip_path):
+    """Inspect EXO master groups.json without modifying the archive.
+
+    Returns None when this is not an EXO master-style ZIP.
+    """
+    zip_path = Path(zip_path).expanduser()
+    try:
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            group_info = None
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                relative = _workspace_zip_relative_path(info.filename)
+                if relative is None:
+                    continue
+                if str(relative).replace("\\", "/").lower() == "groups.json":
+                    group_info = info
+                    break
+            if group_info is None:
+                return None
+            try:
+                data = json.loads(archive.read(group_info).decode("utf-8"))
+            except Exception:
+                return {
+                    "valid": False,
+                    "error": "groups.json is not valid JSON",
+                }
+    except Exception as exc:
+        return {
+            "valid": False,
+            "error": f"could not inspect groups.json: {exc}",
+        }
+
+    if not isinstance(data, dict):
+        return {
+            "valid": False,
+            "error": "groups.json root is not an object",
+        }
+
+    def uid_set(key):
+        value = data.get(key, [])
+        if not isinstance(value, list):
+            return set()
+        return {str(x).strip() for x in value if str(x).strip()}
+
+    hatching = uid_set("hatching")
+    market = uid_set("market")
+    ungrouped = uid_set("ungrouped")
+    all_uids = uid_set("all")
+    hatching_auto = bool(data.get("hatchingAuto", False))
+    market_auto = bool(data.get("marketAuto", False))
+
+    auto_complement = bool(
+        hatching_auto
+        and all_uids
+        and hatching == (all_uids - market)
+        and not (hatching & market)
+    )
+
+    overlap = hatching & market
+    missing_from_all = (hatching | market | ungrouped) - all_uids if all_uids else set()
+
+    return {
+        "valid": True,
+        "hatching": len(hatching),
+        "market": len(market),
+        "ungrouped": len(ungrouped),
+        "all": len(all_uids),
+        "hatchingAuto": hatching_auto,
+        "marketAuto": market_auto,
+        "auto_complement": auto_complement,
+        "overlap": len(overlap),
+        "missing_from_all": len(missing_from_all),
+    }
+
+
 def import_workspace_zip_to_delta(zip_path, *, make_backup=True):
     """Import a supported config/workspace ZIP into Delta's global Workspace."""
     zip_path = Path(zip_path).expanduser()
@@ -25915,7 +26001,63 @@ def workspace_zip_tools_menu(cfg):
                 DIM,
             ))
 
-            if not _setup_yes_no("Import now?", default=True):
+            exo_groups = inspect_exo_master_groups_in_zip(zip_path)
+            unsafe_auto_complement = False
+            if exo_groups is not None:
+                print("")
+                print(col("EXO master groups.json detected:", CYAN))
+                if not exo_groups.get("valid"):
+                    print(col(
+                        "  INVALID: " + str(exo_groups.get("error") or "unknown error"),
+                        RED,
+                    ))
+                    unsafe_auto_complement = True
+                else:
+                    print(
+                        f"  Hatching : {exo_groups.get('hatching', 0)}"
+                        f"  (auto={exo_groups.get('hatchingAuto', False)})"
+                    )
+                    print(
+                        f"  Market   : {exo_groups.get('market', 0)}"
+                        f"  (auto={exo_groups.get('marketAuto', False)})"
+                    )
+                    print(f"  Ungrouped: {exo_groups.get('ungrouped', 0)}")
+                    print(f"  All UIDs : {exo_groups.get('all', 0)}")
+                    if exo_groups.get("overlap"):
+                        print(col(
+                            f"  ERROR: {exo_groups['overlap']} UID(s) are in both Hatching and Market.",
+                            RED,
+                        ))
+                        unsafe_auto_complement = True
+                    if exo_groups.get("auto_complement"):
+                        unsafe_auto_complement = True
+                        print(col(
+                            "  WARNING: Hatching is exactly ALL - MARKET.",
+                            RED,
+                        ))
+                        print(col(
+                            "  hatchingAuto=true auto-classified every non-Market UID as Hatching.",
+                            RED,
+                        ))
+                        print(col(
+                            "  NOMO cannot know which UIDs are your real Hatching accounts.",
+                            YELLOW,
+                        ))
+
+            if unsafe_auto_complement:
+                print("")
+                print(col(
+                    "Unsafe EXO group map detected. Import is BLOCKED by default.",
+                    RED,
+                ))
+                if not _setup_yes_no(
+                    "Import this EXO ZIP anyway? (unsafe)",
+                    default=False,
+                ):
+                    print(col("Import cancelled; fix groups.json first.", YELLOW))
+                    pause()
+                    continue
+            elif not _setup_yes_no("Import now?", default=True):
                 print(col("Import cancelled.", YELLOW))
                 pause()
                 continue
