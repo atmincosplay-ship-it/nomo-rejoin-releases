@@ -1,5 +1,24 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.80 — REAL EXOTIC MASTER INSTALLER
+# - FIX: Option 17 was still prompting for /Download/config.zip and treating exotic_master.zip
+#   as a generic Workspace ZIP. exotic_master.zip is a template bundle, not a ready Workspace tree.
+# - Option 17 -> 1 now auto-finds the newest exotic_master*.zip in /storage/emulated/0/Download
+#   (with /sdcard/Download and /storage/emulated/0 fallback) and installs it to the selected
+#   packages' CURRENT executor Workspace(s).
+# - Each selected package's live Roblox UID is resolved from its own cookie/API (cached UID fallback).
+# - groups.json decides the sender config:
+#       Hatching UID -> file1_hatching.json (Divine -> Market targets)
+#       Market UID   -> file1_market.json   (Trash -> Hatching targets)
+#       Other UID    -> file1_default.json
+# - Master shared templates are expanded per UID:
+#       file2.json       -> <UID>file2.json
+#       filesession.json -> <UID>filesession.json
+#       gag2.json        -> <UID>gag2.json (when present)
+#   under Workspace/exotichub99/.
+# - Existing per-UID files are backed up before overwrite.
+# - Generic Workspace ZIP import is preserved as Option 17 -> 2.
+#
 # V4.81.79 — OPTION 17 USES CURRENT EXECUTOR WORKSPACE
 # - FIX: Workspace ZIP Tools were still hardcoded to /Delta/Workspace even when
 #   the selected package was configured for Arceus X Global, Arceus per-clone,
@@ -1391,7 +1410,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.79"
+__version__ = "V4.81.80"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1414,6 +1433,7 @@ DELTA_KEY_AUTH_URL_FILE = Path("/storage/emulated/0/Download/delta_auth_url.txt"
 DELTA_KEY_CAPTURED_FILE = Path("/storage/emulated/0/Download/delta_key_captured.txt")
 DELTA_KEY_DEFAULT_LICENSE_FILE = DELTA_GLOBAL_ROOT / "Internals" / "Cache" / "license"
 DELTA_WORKSPACE_DEFAULT_IMPORT_ZIP = Path("/storage/emulated/0/Download/config.zip")
+EXOTIC_MASTER_DEFAULT_IMPORT_ZIP = Path("/storage/emulated/0/Download/exotic_master.zip")
 DELTA_WORKSPACE_EXPORT_DIR = BASE_DIR / "workspace_exports"
 DELTA_WORKSPACE_BACKUP_DIR = BASE_DIR / "workspace_backups"
 
@@ -26473,19 +26493,368 @@ def export_workspace_root_zip(root, label="current"):
     return True, f"Exported {len(files)} files from {root}.", output, len(files)
 
 
+
+def _find_latest_exotic_master_zip():
+    """Return newest exotic_master*.zip from normal Android download locations."""
+    candidates = []
+    seen = set()
+    for folder in (
+        Path("/storage/emulated/0/Download"),
+        Path("/sdcard/Download"),
+        Path("/storage/emulated/0"),
+    ):
+        try:
+            for path in folder.glob("exotic_master*.zip"):
+                key = str(path)
+                if key in seen or not path.is_file():
+                    continue
+                seen.add(key)
+                try:
+                    stamp = float(path.stat().st_mtime)
+                except Exception:
+                    stamp = 0.0
+                candidates.append((stamp, path))
+        except Exception:
+            continue
+
+    if not candidates:
+        return EXOTIC_MASTER_DEFAULT_IMPORT_ZIP
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def _read_exotic_master_manifest(zip_path):
+    """Validate/read the small Exotic Master template bundle."""
+    zip_path = Path(zip_path).expanduser()
+    if not zip_path.exists() or not zip_path.is_file():
+        return False, f"EXO master ZIP not found: {zip_path}", None
+
+    try:
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            by_base = {}
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                base = Path(str(info.filename).replace("\\", "/")).name.lower()
+                if base:
+                    by_base[base] = info
+
+            required = (
+                "groups.json",
+                "file1_default.json",
+                "file1_hatching.json",
+                "file1_market.json",
+            )
+            missing = [name for name in required if name not in by_base]
+            if missing:
+                return False, (
+                    "Not an Exotic Master ZIP; missing: " + ", ".join(missing)
+                ), None
+
+            parsed = {}
+            for name in (
+                "groups.json",
+                "file1_default.json",
+                "file1_hatching.json",
+                "file1_market.json",
+                "file2.json",
+                "filesession.json",
+                "gag2.json",
+            ):
+                info = by_base.get(name)
+                if info is None:
+                    continue
+                raw = archive.read(info)
+                try:
+                    parsed[name] = json.loads(
+                        raw.decode("utf-8-sig")
+                    )
+                except Exception as exc:
+                    return False, f"{name} is invalid JSON: {exc}", None
+
+    except zipfile.BadZipFile:
+        return False, "Invalid/damaged Exotic Master ZIP.", None
+    except Exception as exc:
+        return False, f"Could not read Exotic Master ZIP: {exc}", None
+
+    groups = parsed.get("groups.json")
+    if not isinstance(groups, dict):
+        return False, "groups.json root is not an object.", None
+
+    def uid_set(key):
+        value = groups.get(key, [])
+        if not isinstance(value, list):
+            return set()
+        return {str(v).strip() for v in value if str(v).strip()}
+
+    hatching = uid_set("hatching")
+    market = uid_set("market")
+    ungrouped = uid_set("ungrouped")
+    all_uids = uid_set("all")
+    overlap = hatching & market
+    if overlap:
+        return False, (
+            f"groups.json has {len(overlap)} UID(s) in both Hatching and Market."
+        ), None
+
+    auto_complement = bool(
+        groups.get("hatchingAuto")
+        and all_uids
+        and hatching == (all_uids - market)
+    )
+    if auto_complement:
+        return False, (
+            "Unsafe old groups.json: hatchingAuto=true and Hatching == ALL - MARKET. "
+            "Re-export with GAG Workspace V9.11+."
+        ), None
+
+    return True, "ok", {
+        "zip_path": zip_path,
+        "parsed": parsed,
+        "hatching": hatching,
+        "market": market,
+        "ungrouped": ungrouped,
+        "all": all_uids,
+    }
+
+
+def _tabs_by_package_for_workspace(cfg):
+    tabs = {}
+    try:
+        for tab in autoexec_tabs(cfg):
+            if not isinstance(tab, dict):
+                continue
+            pkg = str(tab.get("package") or "")
+            if pkg:
+                tabs[pkg] = tab
+    except Exception:
+        pass
+    for tab in cfg.get("tabs", []) or []:
+        if not isinstance(tab, dict):
+            continue
+        pkg = str(tab.get("package") or "")
+        if pkg and pkg not in tabs:
+            tabs[pkg] = tab
+    return tabs
+
+
+def _resolve_package_uid_for_exotic(pkg):
+    """Resolve exact live Roblox UID; cached identity is fallback only."""
+    pkg = str(pkg or "").strip()
+    cache = load_cookie_cache()
+    ent = cache.get(pkg) if isinstance(cache, dict) else {}
+    if not isinstance(ent, dict):
+        ent = {}
+
+    # Fresh package cookie/API is authoritative.
+    try:
+        cookie = str(get_cookie_from_package(pkg) or "").strip()
+    except Exception:
+        cookie = ""
+    if cookie:
+        try:
+            username, user_id = get_username_from_cookie(cookie, timeout=8)
+            if username and str(user_id or "").isdigit():
+                updates = {
+                    "cookie": cookie,
+                    "updated": now(),
+                    "username": str(username),
+                    "user_id": str(user_id),
+                }
+                try:
+                    _cookie_cache_update_entry(pkg, updates)
+                except Exception:
+                    pass
+                return {
+                    "ok": True,
+                    "pkg": pkg,
+                    "username": str(username),
+                    "uid": str(user_id),
+                    "source": "live_cookie_api",
+                }
+        except Exception:
+            pass
+
+    # Cache fallback is useful when Roblox API is temporarily unreachable.
+    uid = str(ent.get("user_id") or ent.get("userID") or "").strip()
+    username = str(ent.get("username") or "").strip()
+    if uid.isdigit():
+        return {
+            "ok": True,
+            "pkg": pkg,
+            "username": username or pkg,
+            "uid": uid,
+            "source": "cookie_cache",
+        }
+
+    # Cached cookie can still recover an identity if user_id wasn't stored.
+    cached_cookie = str(ent.get("cookie") or "").strip()
+    if cached_cookie:
+        try:
+            username2, user_id2 = get_username_from_cookie(cached_cookie, timeout=8)
+            if username2 and str(user_id2 or "").isdigit():
+                return {
+                    "ok": True,
+                    "pkg": pkg,
+                    "username": str(username2),
+                    "uid": str(user_id2),
+                    "source": "cached_cookie_api",
+                }
+        except Exception:
+            pass
+
+    return {
+        "ok": False,
+        "pkg": pkg,
+        "username": username or pkg,
+        "uid": "",
+        "source": "unresolved",
+    }
+
+
+def _exotic_master_variant_for_uid(manifest, uid):
+    uid = str(uid or "")
+    if uid in manifest["hatching"]:
+        return "hatching", "file1_hatching.json"
+    if uid in manifest["market"]:
+        return "market", "file1_market.json"
+    return "default", "file1_default.json"
+
+
+def _exotic_master_install_plan(cfg, selected, manifest):
+    tabs = _tabs_by_package_for_workspace(cfg)
+    plan = []
+    unresolved = []
+
+    for pkg in selected:
+        tab = tabs.get(pkg)
+        if not tab:
+            unresolved.append((pkg, "package config missing"))
+            continue
+        root = _executor_workspace_root_for_tab(tab)
+        if root is None:
+            unresolved.append((pkg, "current executor Workspace unresolved"))
+            continue
+
+        ident = _resolve_package_uid_for_exotic(pkg)
+        if not ident.get("ok"):
+            unresolved.append((pkg, "Roblox UID unresolved"))
+            continue
+
+        variant, file1_name = _exotic_master_variant_for_uid(
+            manifest, ident["uid"]
+        )
+        plan.append({
+            "pkg": pkg,
+            "username": ident["username"],
+            "uid": ident["uid"],
+            "identity_source": ident["source"],
+            "root": Path(root),
+            "exo_dir": Path(root) / "exotichub99",
+            "variant": variant,
+            "file1_name": file1_name,
+        })
+
+    return plan, unresolved
+
+
+def install_exotic_master_plan(manifest, plan):
+    """Expand master templates into each selected package's UID files."""
+    parsed = manifest["parsed"]
+    if not plan:
+        return False, "Nothing to install.", []
+
+    # Build all unique target writes first.
+    writes = {}
+    for item in plan:
+        uid = str(item["uid"])
+        exo_dir = Path(item["exo_dir"])
+
+        file1_obj = parsed.get(item["file1_name"])
+        if not isinstance(file1_obj, dict):
+            return False, f"{item['file1_name']} missing/invalid.", []
+
+        writes[str(exo_dir / f"{uid}file1.json")] = (
+            exo_dir / f"{uid}file1.json",
+            json.dumps(file1_obj, indent=2, ensure_ascii=False).encode("utf-8"),
+        )
+
+        for master_name, suffix in (
+            ("file2.json", "file2.json"),
+            ("filesession.json", "filesession.json"),
+            ("gag2.json", "gag2.json"),
+        ):
+            obj = parsed.get(master_name)
+            if obj is None:
+                continue
+            writes[str(exo_dir / f"{uid}{suffix}")] = (
+                exo_dir / f"{uid}{suffix}",
+                json.dumps(obj, indent=2, ensure_ascii=False).encode("utf-8"),
+            )
+
+    # One backup ZIP containing original files, with destination-root labels.
+    existing = [target for target, _content in writes.values() if target.is_file()]
+    backups = []
+    if existing:
+        DELTA_WORKSPACE_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = (
+            DELTA_WORKSPACE_BACKUP_DIR
+            / f"exotic_master_overwrite_backup_{stamp}.zip"
+        )
+        with zipfile.ZipFile(
+            backup_path, "w",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=9,
+        ) as backup:
+            for index, target in enumerate(existing, start=1):
+                backup.write(
+                    target,
+                    arcname=f"{index:03d}_{target.name}",
+                )
+        backups.append(backup_path)
+
+    written = 0
+    for target, content in writes.values():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(target.name + ".nomo_exotic_tmp")
+        try:
+            with open(tmp, "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                try:
+                    os.fsync(handle.fileno())
+                except Exception:
+                    pass
+            os.replace(str(tmp), str(target))
+            written += 1
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
+
+    return True, (
+        f"EXO master installed: {written} per-UID file(s) for "
+        f"{len(plan)} selected package(s)."
+    ), backups
+
+
 def workspace_zip_tools_menu(cfg):
     while True:
         clear()
         banner("WORKSPACE ZIP / EXO CONFIG TOOLS", cfg)
         print(col(
-            "Uses each selected package's CURRENT executor Workspace (Option 20).",
+            "Current executor Workspace comes from Option 20.",
             DIM,
         ))
         print("")
-        print("1. Import config/workspace ZIP -> current executor Workspace(s)")
-        print("2. Export current executor Workspace(s) -> timestamped ZIP")
-        print("3. Show current executor Workspace paths")
-        print("4. Show supported ZIP layouts")
+        print("1. Install exotic_master.zip from Download -> current executor")
+        print("2. Import generic config/workspace ZIP -> current executor Workspace(s)")
+        print("3. Export current executor Workspace(s) -> timestamped ZIP")
+        print("4. Show current executor Workspace paths")
+        print("5. Show supported ZIP layouts")
         print("0. Back")
         drain_stdin()
         choice = clean_terminal_input(input("\nChoose: "))
@@ -26494,9 +26863,116 @@ def workspace_zip_tools_menu(cfg):
             return
 
         if choice == "1":
+            selected = choose_packages_common(
+                cfg,
+                "EXOTIC MASTER INSTALL: SELECT PACKAGES",
+                multi=True,
+                include_discovered=False,
+                configured_only=True,
+            )
+            if not selected:
+                continue
+
+            auto_zip = _find_latest_exotic_master_zip()
+            print("")
+            print(col(f"Auto source: {auto_zip}", CYAN))
+            raw = clean_terminal_input(input(
+                "EXO master ZIP path [ENTER=auto source above]: "
+            ))
+            zip_path = Path(raw) if raw else auto_zip
+
+            ok, note, manifest = _read_exotic_master_manifest(zip_path)
+            if not ok:
+                print(col(note, RED))
+                pause()
+                continue
+
+            print("")
+            print(col("EXOTIC MASTER:", BOLD))
+            print(f"  File      : {zip_path}")
+            print(f"  Hatching  : {len(manifest['hatching'])}")
+            print(f"  Market    : {len(manifest['market'])}")
+            print(f"  Default   : {len(manifest['ungrouped'])}")
+            print(f"  All UIDs  : {len(manifest['all'])}")
+            if not manifest["hatching"]:
+                print(col(
+                    "  WARNING: Hatching group is EMPTY. Hatcher UIDs will receive DEFAULT "
+                    "unless explicitly listed in groups.json.",
+                    YELLOW,
+                ))
+            if not manifest["market"]:
+                print(col(
+                    "  WARNING: Market group is EMPTY. Market UIDs will receive DEFAULT "
+                    "unless explicitly listed in groups.json.",
+                    YELLOW,
+                ))
+
+            plan, unresolved = _exotic_master_install_plan(
+                cfg, selected, manifest
+            )
+
+            print("")
+            print(col("PACKAGE INSTALL PLAN:", BOLD))
+            if plan:
+                for item in plan:
+                    print(
+                        f"  {short_pkg(item['pkg'])}  "
+                        f"{item['username']}  UID={item['uid']}  "
+                        f"-> {item['variant'].upper()}"
+                    )
+                    print(
+                        f"      {item['exo_dir']}  "
+                        f"[identity={item['identity_source']}]"
+                    )
+            if unresolved:
+                print("")
+                print(col("UNRESOLVED / SKIPPED:", RED))
+                for pkg, why in unresolved:
+                    print(f"  {short_pkg(pkg)} -> {why}")
+
+            if not plan:
+                print(col("No selected package can be installed.", RED))
+                pause()
+                continue
+
+            # Show any UID not present in master.all explicitly.
+            unknown_master = [
+                item for item in plan
+                if manifest["all"] and item["uid"] not in manifest["all"]
+            ]
+            if unknown_master:
+                print("")
+                print(col(
+                    "WARNING: selected UID(s) absent from groups.json ALL; "
+                    "they will receive DEFAULT:",
+                    YELLOW,
+                ))
+                for item in unknown_master:
+                    print(f"  {item['username']} ({item['uid']})")
+
+            if not _setup_yes_no("Install EXO master now?", default=True):
+                print(col("Install cancelled.", YELLOW))
+                pause()
+                continue
+
+            ok, note, backups = install_exotic_master_plan(
+                manifest, plan
+            )
+            print(col(note, GREEN if ok else RED))
+            for backup in backups or []:
+                print(f"Backup: {backup}")
+            if ok:
+                print(col(
+                    "Installed files are under current Workspace/exotichub99/<UID>*.json",
+                    DIM,
+                ))
+            pause()
+            continue
+
+        if choice == "2":
             destinations = _current_executor_workspace_roots_for_selection(
                 cfg,
-                "WORKSPACE ZIP IMPORT: SELECT PACKAGES",
+                "GENERIC WORKSPACE ZIP IMPORT: SELECT PACKAGES",
             )
             if not destinations:
                 print(col("No current executor Workspace resolved.", RED))
@@ -26504,7 +26980,7 @@ def workspace_zip_tools_menu(cfg):
                 continue
 
             raw = clean_terminal_input(input(
-                f"ZIP path [ENTER={DELTA_WORKSPACE_DEFAULT_IMPORT_ZIP}]: "
+                f"Generic ZIP path [ENTER={DELTA_WORKSPACE_DEFAULT_IMPORT_ZIP}]: "
             ))
             zip_path = Path(raw) if raw else DELTA_WORKSPACE_DEFAULT_IMPORT_ZIP
 
@@ -26537,68 +27013,8 @@ def workspace_zip_tools_menu(cfg):
                     f"<- {pkg_text}  overwrite={existing}"
                 )
             print(f"Total overwrite : {total_existing}")
-            print(col(
-                "Overwritten files are backed up separately for each destination.",
-                DIM,
-            ))
 
-            exo_groups = inspect_exo_master_groups_in_zip(zip_path)
-            unsafe_auto_complement = False
-            if exo_groups is not None:
-                print("")
-                print(col("EXO master groups.json detected:", CYAN))
-                if not exo_groups.get("valid"):
-                    print(col(
-                        "  INVALID: " + str(exo_groups.get("error") or "unknown error"),
-                        RED,
-                    ))
-                    unsafe_auto_complement = True
-                else:
-                    print(
-                        f"  Hatching : {exo_groups.get('hatching', 0)}"
-                        f"  (auto={exo_groups.get('hatchingAuto', False)})"
-                    )
-                    print(
-                        f"  Market   : {exo_groups.get('market', 0)}"
-                        f"  (auto={exo_groups.get('marketAuto', False)})"
-                    )
-                    print(f"  Ungrouped: {exo_groups.get('ungrouped', 0)}")
-                    print(f"  All UIDs : {exo_groups.get('all', 0)}")
-                    if exo_groups.get("overlap"):
-                        print(col(
-                            f"  ERROR: {exo_groups['overlap']} UID(s) are in both Hatching and Market.",
-                            RED,
-                        ))
-                        unsafe_auto_complement = True
-                    if exo_groups.get("auto_complement"):
-                        unsafe_auto_complement = True
-                        print(col(
-                            "  WARNING: Hatching is exactly ALL - MARKET.",
-                            RED,
-                        ))
-                        print(col(
-                            "  hatchingAuto=true auto-classified every non-Market UID as Hatching.",
-                            RED,
-                        ))
-                        print(col(
-                            "  NOMO cannot know which UIDs are your real Hatching accounts.",
-                            YELLOW,
-                        ))
-
-            if unsafe_auto_complement:
-                print("")
-                print(col(
-                    "Unsafe EXO group map detected. Import is BLOCKED by default.",
-                    RED,
-                ))
-                if not _setup_yes_no(
-                    "Import this EXO ZIP anyway? (unsafe)",
-                    default=False,
-                ):
-                    print(col("Import cancelled; fix groups.json first.", YELLOW))
-                    pause()
-                    continue
-            elif not _setup_yes_no("Import now?", default=True):
+            if not _setup_yes_no("Import generic Workspace ZIP now?", default=True):
                 print(col("Import cancelled.", YELLOW))
                 pause()
                 continue
@@ -26614,7 +27030,7 @@ def workspace_zip_tools_menu(cfg):
             pause()
             continue
 
-        if choice == "2":
+        if choice == "3":
             destinations = _current_executor_workspace_roots_for_selection(
                 cfg,
                 "WORKSPACE EXPORT: SELECT PACKAGES",
@@ -26645,7 +27061,7 @@ def workspace_zip_tools_menu(cfg):
             pause()
             continue
 
-        if choice == "3":
+        if choice == "4":
             destinations = _current_executor_workspace_roots_for_selection(
                 cfg,
                 "SHOW WORKSPACE PATHS: SELECT PACKAGES",
@@ -26664,17 +27080,23 @@ def workspace_zip_tools_menu(cfg):
             pause()
             continue
 
-        if choice == "4":
+        if choice == "5":
             print("")
-            print("Supported input layouts:")
-            print("  Arceus X/Workspace/HolyV2/...")
-            print("  Delta/Workspace/HolyV2/...")
-            print("  Workspace/HolyV2/...")
-            print("  HolyV2/...  (already flat)")
+            print("EXO Master input:")
+            print("  /storage/emulated/0/Download/exotic_master.zip")
+            print("  newest exotic_master*.zip is auto-detected")
             print("")
-            print("Destination is NOT forced to Delta.")
-            print("Option 17 resolves the current Workspace from selected package(s).")
-            print("Use Option 20 if a package points at the wrong executor path.")
+            print("EXO Master destination:")
+            print("  <current Workspace>/exotichub99/<UID>file1.json")
+            print("  <current Workspace>/exotichub99/<UID>file2.json")
+            print("  <current Workspace>/exotichub99/<UID>filesession.json")
+            print("  <current Workspace>/exotichub99/<UID>gag2.json (if provided)")
+            print("")
+            print("Generic Workspace ZIP layouts:")
+            print("  Arceus X/Workspace/...")
+            print("  Delta/Workspace/...")
+            print("  Workspace/...")
+            print("  flat Workspace-relative files")
             pause()
             continue
 
