@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.81 — FACE LOCK / BAN IS PACKAGE-LOCAL, NEVER PEER BLOCKER
+# - FIX: active_noka_auth_incident() still returned authoritative Face Lock/Banned runtime state
+#   as a pool-wide auth incident. If nokaC was Face Locked, A/B/D ALIVE App Cloner shells could
+#   have their exact-target hard recovery suppressed forever with:
+#       hard recovery suppressed; peer nokaC auth incident (face lock)
+# - Authoritative Face Lock and account ban/moderation now hold ONLY that exact package.
+# - Healthy/stuck/closed sibling clones continue normal Hatcher/Market recovery and reopen.
+# - Peer-wide short safety suppression remains only for active transient challenge work:
+#   current CAPTCHA/529/verification UI and a running solver/auth job.
+# - The selected package still performs its own direct moderation/API + exact Account Locked check
+#   before any PID stop/open, so removing peer Face Lock suppression does not weaken target safety.
+#
 # V4.81.80 — REAL EXOTIC MASTER INSTALLER
 # - FIX: Option 17 was still prompting for /Download/config.zip and treating exotic_master.zip
 #   as a generic Workspace ZIP. exotic_master.zip is a template bundle, not a ready Workspace tree.
@@ -1410,7 +1422,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.80"
+__version__ = "V4.81.81"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -15710,24 +15722,43 @@ def visual_join_error_detail(pkg, cfg, force=False, bypass_confirm=False):
 
 
 def _auth_incident_runtime_reason(rt_tab, cfg):
+    """Return only TRANSIENT auth work that may briefly protect sibling hard actions.
+
+    V4.81.81: Face Lock / banned / moderated state is package-local and must NEVER
+    suppress another package's recovery. The target package still has its own
+    direct moderation/API and exact Account Locked guard before any PID stop/open.
+    """
     if not isinstance(rt_tab, dict):
         return ""
+
     recent = max(120, int(cfg.get("noka_peer_auth_recent_seconds", 900) or 900))
 
-    # V4.81.72: Face Lock only blocks siblings when strong persisted evidence
-    # remains. Generic/visual-only legacy Face Lock state is self-healed by the
-    # caller and is never pool-wide auth evidence.
-    authoritative_face = _authoritative_face_lock_runtime(rt_tab)
-    if authoritative_face:
-        return "face lock"
-
     reason = " ".join(str(rt_tab.get(k, "") or "") for k in (
-        "manual_login_reason", "manual_login_detail", "captcha_ui_detail",
+        "manual_login_reason",
+        "manual_login_detail",
+        "captcha_ui_detail",
     )).lower()
 
+    # Explicit package-local terminal holds are intentionally NOT peer blockers.
+    local_hold_reason = str(rt_tab.get("manual_login_reason", "") or "").strip().lower()
+    if local_hold_reason in (
+        "face_lock",
+        "face lock",
+        "account_banned",
+        "account banned",
+        "banned",
+        "moderated",
+    ):
+        return ""
+
+    if _authoritative_face_lock_runtime(rt_tab):
+        return ""
+
+    # Only active/transient verification challenges remain pool safety hints.
     if any(term in reason for term in (
-        "529", "captcha", "verification",
-        "account_banned", "account banned", "terminated", "moderated",
+        "529",
+        "captcha",
+        "verification",
     )):
         return cut(reason, 70)
 
@@ -15735,11 +15766,15 @@ def _auth_incident_runtime_reason(rt_tab, cfg):
         seen = int(rt_tab.get("captcha_ui_last_seen_at", 0) or 0)
         if seen <= 0 or now() - seen <= recent:
             return "verification UI"
+
     return ""
 
 
 def active_noka_auth_incident(cfg, rt, exclude_pkg=""):
-    """Return (package, reason) for any active Noka auth blocker in this pool."""
+    """Return only a transient Noka CAPTCHA/529/solver peer safety blocker.
+
+    Face Lock and banned/moderated holds are package-local in V4.81.81.
+    """
     if not cfg.get("noka_peer_auth_hard_suppression_enabled", True):
         return "", ""
     exclude_pkg = str(exclude_pkg or "")
@@ -15753,7 +15788,7 @@ def active_noka_auth_incident(cfg, rt, exclude_pkg=""):
             rt_tab, pkg, "visual Face Lock peer blocker cleared; exact text/API required"
         ):
             log_activity(
-                "peer-auth generic/visual face-lock cleared; siblings may recover",
+                "peer-auth generic/visual face-lock cleared (package-local hold policy)",
                 pkg,
                 GREEN,
             )
@@ -17012,9 +17047,9 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
             core.save()
             return True
 
-    # V4.81.54: if another Noka clone is in CAPTCHA/529/face-lock/banned state,
-    # never execute a destructive hard action against an ALIVE sibling. App Cloner
-    # can collapse sibling floating tasks even when exact-PID signaling is correct.
+    # V4.81.81: only an ACTIVE transient CAPTCHA/529/solver job may briefly
+    # protect sibling ALIVE hard actions. Face Lock/Ban is package-local and never
+    # suppresses another clone. App Cloner safety remains for transient auth work.
     if (
         is_hard
         and process_status == "ALIVE"
