@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.82 — MARKET AUTH HOLD MUST CANCEL ITS OWN RECOVERY QUEUE
+# - FIX: proactive moderation could classify a Market package as FACE LOCK, but
+#   apply_rejoin_action() had no explicit bad=='face_lock' branch. The same package
+#   could therefore immediately queue market alive-old-state hard_force anyway.
+# - A package-local Face Lock now cancels only that package's queued recovery and
+#   returns Face Lock immediately. No PID/cache/open intent survives for that clone.
+# - Market FIFO cosmetics no longer overwrite Face Lock/Banned/Manual status with
+#   Waiting/Next when an old queue item existed.
+# - This removes dead queue slots in front of healthy stuck Market clones, so B/C/D
+#   can reach the existing solver -> Clear Cache -> exact-PID Market recovery faster.
+# - No change to the one-at-a-time exact-PID safety model or 5m Market stuck threshold.
+#
 # V4.81.81 — FACE LOCK / BAN IS PACKAGE-LOCAL, NEVER PEER BLOCKER
 # - FIX: active_noka_auth_incident() still returned authoritative Face Lock/Banned runtime state
 #   as a pool-wide auth incident. If nokaC was Face Locked, A/B/D ALIVE App Cloner shells could
@@ -1422,7 +1434,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.81"
+__version__ = "V4.81.82"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -13491,14 +13503,47 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
         # Market 5m stuck decision beyond the Market-specific threshold.
         grace = min(grace, trigger)
 
-    # --- join/login challenge: solve current live challenge in-place ---
+    # --- package-local auth/moderation holds outrank EVERY recovery queue ---
+    if bad == "face_lock":
+        removed = core.cancel(pkg)
+        rt_tab["note"] = (
+            rt_tab.get("note")
+            or "FACE LOCK HOLD - package-local; recovery cancelled"
+        )
+        if removed:
+            log_activity(
+                f"Face Lock cancelled {removed} queued recovery item(s) for this package",
+                pkg,
+                RED,
+            )
+        core.save()
+        return "Face Lock", rt_tab["note"], True
+
     if bad == "account_banned":
         removed = core.cancel(pkg)
         rt_tab["note"] = rt_tab.get("note") or "ACCOUNT BANNED / TERMINATED - held"
         if removed:
-            core.save()
+            log_activity(
+                f"ban/moderation hold cancelled {removed} queued recovery item(s) for this package",
+                pkg,
+                RED,
+            )
+        core.save()
         return "Banned", rt_tab["note"], True
 
+    if bad == "manual" and manual_login_blocked(rt_tab, cfg, pkg):
+        removed = core.cancel(pkg)
+        rt_tab["note"] = rt_tab.get("note") or "manual auth hold; recovery cancelled"
+        if removed:
+            log_activity(
+                f"manual auth hold cancelled {removed} queued recovery item(s) for this package",
+                pkg,
+                YELLOW,
+            )
+        core.save()
+        return "Manual", rt_tab["note"], True
+
+    # --- join/login challenge: solve current live challenge in-place ---
     if bad == "challenge" or (state and state_login_challenge_detail(state)):
         if alive:
             removed = core.cancel(pkg)
@@ -18744,7 +18789,48 @@ def _nomo_start_market_rejoin_original(cfg):
             # once, but single-flight still processes only one. Show FIFO position
             # instead of making both look actively reopening.
             qpos = core.position(pkg)
-            if qpos > 0:
+            auth_terminal = str(health.get("bad") or "") in {
+                "face_lock",
+                "account_banned",
+                "manual",
+            } or manual_login_blocked(rt_tab, cfg, pkg)
+
+            # V4.81.82: auth/moderation status outranks FIFO cosmetics. A stale
+            # queue item must never turn FACE LOCK into Waiting/Next on screen.
+            if auth_terminal:
+                if qpos > 0:
+                    removed = core.cancel(pkg)
+                    if removed:
+                        log_activity(
+                            f"auth hold removed {removed} stale Market queue item(s)",
+                            pkg,
+                            RED,
+                        )
+                    qpos = 0
+
+                bad_now = str(health.get("bad") or "")
+                if bad_now == "face_lock":
+                    status = "Face Lock"
+                    note = (
+                        health.get("note")
+                        or rt_tab.get("note")
+                        or "account locked; package held"
+                    )
+                elif bad_now == "account_banned":
+                    status = "Banned"
+                    note = (
+                        health.get("note")
+                        or rt_tab.get("note")
+                        or "account banned/moderated; package held"
+                    )
+                else:
+                    status = "Manual"
+                    note = (
+                        rt_tab.get("manual_login_reason")
+                        or rt_tab.get("note")
+                        or "needs manual login"
+                    )
+            elif qpos > 0:
                 if qpos == 1:
                     status = "Next"
                     if "queued" not in str(note).lower():
@@ -18752,9 +18838,6 @@ def _nomo_start_market_rejoin_original(cfg):
                 else:
                     status = "Waiting"
                     note = f"queue #{qpos}; {note}".strip("; ")
-            elif manual_login_blocked(rt_tab, cfg, pkg):
-                status = "Manual"
-                note = rt_tab.get("manual_login_reason") or rt_tab.get("note") or "needs manual login"
 
             update_clone_session(rt_tab, status, cfg, state)
 
