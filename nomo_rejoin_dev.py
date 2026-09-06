@@ -1,5 +1,40 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.79 — OPTION 17 USES CURRENT EXECUTOR WORKSPACE
+# - FIX: Workspace ZIP Tools were still hardcoded to /Delta/Workspace even when
+#   the selected package was configured for Arceus X Global, Arceus per-clone,
+#   or a custom global executor path.
+# - Option 17 now resolves the Workspace from each selected package's CURRENT
+#   executor configuration/state path (same source of truth used by Option 20).
+# - Shared/global paths are automatically deduplicated; per-clone executor
+#   Workspaces are handled separately.
+# - Import writes the ZIP to every selected unique current Workspace and backs
+#   up overwritten files per destination first.
+# - Export creates one ZIP per selected unique current Workspace.
+# - Legacy import_workspace_zip_to_delta()/export_delta_workspace_zip() remain
+#   for compatibility, but the interactive Option 17 no longer forces Delta.
+#
+# V4.81.78 — RESTORE HIDDEN MAIN-MENU OPTIONS 16/17/18
+# - FIX: Main dispatch handlers for Options 16, 17, and 18 still existed, but their entries
+#   were accidentally missing from MAIN_MENU_ITEMS. read_menu_choice() therefore rejected
+#   those numbers before the handlers could run.
+# - Restore 16 Layout / detector tools.
+# - Restore 17 Workspace ZIP / EXO config tools.
+# - Restore 18 APK download / install tools.
+# - No Workspace ZIP, EXO groups, Face Lock, solver, PID, or recovery behavior is changed.
+#
+# V4.81.77 — PROACTIVE LOADING MODERATION API WATCH
+# - V4.81.76 restored authenticated Face Lock source=5/status=2, but the direct moderation API was still
+#   primarily reached at queued recovery/open boundaries. A genuinely locked/banned clone could therefore
+#   sit in Loading/HTTP-error state until the recovery timer expired.
+# - ALIVE + no clean/fresh post-open state now starts a NONBLOCKING package-local moderation API check
+#   immediately, then at a throttled interval (default 5m) while it remains unhealthy.
+# - A completed API Face Lock/Ban result updates the dashboard to Face Lock/Banned and holds only that package.
+# - Before a confirmed current non-529 disconnect is allowed to become Kicked, NOMO performs one throttled
+#   synchronous package-local moderation check. API Face Lock/Ban outranks the kick before any recovery queue.
+# - Existing direct moderation check before route/PID/solver/open remains the final destructive safety boundary.
+# - Healthy siblings are never stopped or held because another package is Face Locked/Banned.
+#
 # V4.81.76 — RESTORE AUTH FACE-LOCK + EXO GROUP IMPORT GUARD
 # - Restore Roblox's authenticated moderation restriction source=5 + moderationStatus=2 as package-local
 #   authoritative Face Lock evidence. Later testing isolated the major false-lock cascade to stale/cross-clone
@@ -1356,7 +1391,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.76"
+__version__ = "V4.81.79"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -6638,6 +6673,9 @@ MAIN_MENU_ITEMS = [
     ("12", "AutoExec manager"),
     ("13", "Redfinger setup wizard"),
     ("15", "Update NOMO"),
+    ("16", "Layout / detector tools"),
+    ("17", "Workspace ZIP / EXO config"),
+    ("18", "APK download / install"),
     ("19", "Delta key manager"),
     ("20", "Executor paths"),
     ("21", "Doctor"),
@@ -12843,6 +12881,45 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
                 "text": str((state or {}).get("disconnect_text", "") or ""),
                 "reason": str((state or {}).get("disconnect_reason", "") or "state_disconnect"),
             }
+
+            # V4.81.77: a real Face Lock/Ban may later surface as a generic
+            # HTTP/267/etc. client failure. Before we allow that screen to become
+            # Kicked, run the authenticated package-local moderation guard.
+            # Throttle this synchronous safety check so a persistent popup does
+            # not stall every dashboard cycle.
+            last_disconnect_mod = int(
+                rt_tab.get("disconnect_moderation_last_check", 0) or 0
+            )
+            if (
+                cfg.get("api_precheck_not_approved_enabled", True)
+                and now() - last_disconnect_mod >= 60
+            ):
+                rt_tab["disconnect_moderation_last_check"] = now()
+                moderation_blocked, moderation_note = direct_moderation_guard_before_open(
+                    tab,
+                    rt_tab,
+                    cfg,
+                    "disconnect classify before Kicked",
+                )
+                if moderation_blocked:
+                    kind = (
+                        "face_lock"
+                        if str(rt_tab.get("moderation_guard_last_status") or "") == "face_lock"
+                        else "account_banned"
+                    )
+                    return _moderation_health_result(
+                        tab,
+                        rt_tab,
+                        state,
+                        err,
+                        raw_alive,
+                        {
+                            "kind": kind,
+                            "status": "Face Lock" if kind == "face_lock" else "Banned",
+                            "note": moderation_note or rt_tab.get("note"),
+                        },
+                    )
+
             clear_visual_face_lock_confirmation(pkg)
             clear_visual_captcha_confirmation(pkg)
             if clear_visual_face_lock_for_disconnect(rt_tab, pkg, non_auth_disconnect):
@@ -12855,6 +12932,23 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
         state_is_clean_fresh(state, cfg)
         and not state_is_old_after_open(state, rt_tab)
     )
+
+    # V4.81.77: moderation API is no longer only a recovery/open-boundary check.
+    # While an ALIVE clone is unhealthy/loading, poll a package-local background
+    # Not Approved check without blocking the dashboard.
+    if raw_alive and not loading_online_proof:
+        loading_mod = poll_loading_moderation_job(pkg, rt_tab, cfg)
+        if loading_mod is not None:
+            return _moderation_health_result(
+                tab, rt_tab, state, err, raw_alive, loading_mod
+            )
+        if start_loading_moderation_job(tab, cfg, rt_tab):
+            log_activity(
+                "loading/no-fresh -> moderation API check started (package-only)",
+                pkg,
+                CYAN,
+            )
+
     face_lock_loading_only = bool(cfg.get("face_lock_visual_loading_only", True))
     face_lock_scan_eligible = bool(raw_alive) and (
         (not face_lock_loading_only) or (not loading_online_proof)
@@ -13009,6 +13103,11 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
         }
 
     if clean_fresh:
+        # A new healthy session closes the loading-moderation incident. A later
+        # independent loading incident may receive an immediate API check.
+        rt_tab["loading_moderation_last_started_at"] = 0
+        rt_tab["disconnect_moderation_last_check"] = 0
+
         # A genuinely healthy heartbeat starts a new disconnect-recovery cycle.
         # Do not let an old popup cooldown delay a later, unrelated Error 288.
         rt_tab["disconnect_ui_since"] = 0
@@ -14013,6 +14112,224 @@ def roblox_cookie_not_approved_api_detection(cookie, expected_user_id=None, cfg=
     except Exception as exc:
         return None, "moderation api unavailable: " + cut(exc, 80), {}
 
+
+
+
+_LOADING_MODERATION_LOCK = threading.Lock()
+_LOADING_MODERATION_JOBS = {}
+
+
+def _loading_moderation_worker(package, cfg_snapshot):
+    """Network-only worker. Runtime mutation stays on the dashboard thread."""
+    pkg = str(package or "")
+    result = {
+        "done": True,
+        "hit": None,
+        "detail": "",
+        "cookie_source": "",
+        "finished_at": now(),
+    }
+    try:
+        cookie, cookie_source, cookie_note = solver_cookie_for_package(pkg, cfg_snapshot)
+        cookie = str(cookie or "").strip()
+        result["cookie_source"] = str(cookie_source or "")
+        if not cookie:
+            result["detail"] = "loading moderation: no package cookie"
+        else:
+            expected_user_id = ""
+            try:
+                cache = load_cookie_cache()
+                ent = cache.get(pkg) if isinstance(cache, dict) else {}
+                if isinstance(ent, dict):
+                    expected_user_id = str(
+                        ent.get("user_id") or ent.get("userID") or ""
+                    ).strip()
+            except Exception:
+                expected_user_id = ""
+
+            if not expected_user_id:
+                try:
+                    info = get_roblox_user_info(cookie) or {}
+                    expected_user_id = str(
+                        info.get("userID") or info.get("id") or ""
+                    ).strip()
+                except Exception:
+                    expected_user_id = ""
+
+            hit, detail, _payload = roblox_cookie_not_approved_api_detection(
+                cookie, expected_user_id, cfg_snapshot
+            )
+            result["hit"] = hit
+            result["detail"] = str(detail or "")
+    except Exception as exc:
+        result["hit"] = None
+        result["detail"] = "loading moderation unavailable: " + cut(exc, 100)
+
+    result["finished_at"] = now()
+    with _LOADING_MODERATION_LOCK:
+        job = _LOADING_MODERATION_JOBS.get(pkg)
+        if job is not None:
+            job.update(result)
+
+
+def start_loading_moderation_job(tab, cfg, rt_tab):
+    """Start one nonblocking API moderation check for an unhealthy ALIVE clone."""
+    if not cfg.get("api_precheck_not_approved_enabled", True):
+        return False
+
+    pkg = str((tab or {}).get("package") or "")
+    if not pkg:
+        return False
+
+    interval = max(
+        60,
+        int(cfg.get("api_loading_moderation_interval_seconds", 300) or 300),
+    )
+    last_started = int(rt_tab.get("loading_moderation_last_started_at", 0) or 0)
+
+    with _LOADING_MODERATION_LOCK:
+        existing = _LOADING_MODERATION_JOBS.get(pkg)
+        if existing and not existing.get("done"):
+            return False
+        if existing and existing.get("done"):
+            # Let the dashboard consume the completed result first.
+            return False
+
+        if last_started > 0 and now() - last_started < interval:
+            return False
+
+        _LOADING_MODERATION_JOBS[pkg] = {
+            "done": False,
+            "hit": None,
+            "detail": "",
+            "started_at": now(),
+        }
+        rt_tab["loading_moderation_last_started_at"] = now()
+
+    thread = threading.Thread(
+        target=_loading_moderation_worker,
+        args=(pkg, dict(cfg or {})),
+        name="nomo-loading-moderation-" + short_pkg(pkg),
+        daemon=True,
+    )
+    thread.start()
+    return True
+
+
+def poll_loading_moderation_job(pkg, rt_tab, cfg):
+    """Consume a completed background moderation result on the main thread."""
+    pkg = str(pkg or "")
+    if not pkg:
+        return None
+
+    with _LOADING_MODERATION_LOCK:
+        job = _LOADING_MODERATION_JOBS.get(pkg)
+        if not job or not job.get("done"):
+            return None
+        result = dict(job)
+        del _LOADING_MODERATION_JOBS[pkg]
+
+    hit = result.get("hit")
+    detail = str(result.get("detail") or "")
+    detail_l = detail.lower()
+    rt_tab["moderation_guard_last_check"] = int(result.get("finished_at", now()) or now())
+    rt_tab["moderation_guard_cookie_source"] = str(result.get("cookie_source") or "")
+    rt_tab["moderation_guard_last_detail"] = cut(detail, 220)
+
+    if hit is not True:
+        rt_tab["moderation_guard_last_status"] = "unknown" if hit is None else "clear"
+        return None
+
+    retry_seconds = max(
+        600, int(cfg.get("manual_auth_retry_seconds", 3600) or 3600)
+    )
+    is_face_lock = bool(
+        "api face lock" in detail_l
+        or "restriction source=5 status=2" in detail_l
+        or "explicit account locked" in detail_l
+        or "account locked" in detail_l
+        or "unlock your account" in detail_l
+        or "suspicious activity" in detail_l
+    )
+
+    if is_face_lock:
+        rt_tab["moderation_guard_last_status"] = "face_lock"
+        rt_tab["face_lock_detected"] = True
+        rt_tab["face_lock_detail"] = detail or "api face lock"
+        rt_tab["face_lock_evidence_source"] = (
+            "api_restriction_5_2"
+            if "restriction source=5 status=2" in detail_l
+            else "api_explicit_lock_text"
+        )
+        rt_tab["face_lock_last_seen_at"] = now()
+        if not int(rt_tab.get("face_lock_detected_at", 0) or 0):
+            rt_tab["face_lock_detected_at"] = now()
+        mark_manual_login_block(
+            rt_tab,
+            "face_lock",
+            detail or "api account locked / face lock",
+            "FACE LOCK HOLD - loading moderation API",
+            int(rt_tab.get("face_lock_detected_at", now()) or now()),
+            retry_seconds,
+        )
+        set_hold(pkg, "face_lock", retry_seconds)
+        rt_tab["note"] = "FACE LOCK HOLD - loading moderation API"
+        log_activity(
+            "loading moderation API = FACE LOCK; package held (no recovery)",
+            pkg,
+            RED,
+        )
+        return {
+            "kind": "face_lock",
+            "status": "Face Lock",
+            "note": rt_tab["note"],
+        }
+
+    rt_tab["moderation_guard_last_status"] = "moderated"
+    mark_manual_login_block(
+        rt_tab,
+        "account_banned",
+        detail or "api user moderated/banned",
+        "ACCOUNT BANNED / MODERATED - loading API",
+        now(),
+        retry_seconds,
+    )
+    set_hold(pkg, "account_banned", retry_seconds)
+    rt_tab["note"] = "ACCOUNT BANNED / MODERATED - loading API"
+    log_activity(
+        "loading moderation API = restricted/banned; package held (no recovery)",
+        pkg,
+        RED,
+    )
+    return {
+        "kind": "account_banned",
+        "status": "Banned",
+        "note": rt_tab["note"],
+    }
+
+
+def _moderation_health_result(tab, rt_tab, state, err, raw_alive, result):
+    """Build a normal health row from a package-local API moderation hit."""
+    kind = str((result or {}).get("kind") or "account_banned")
+    status = str((result or {}).get("status") or (
+        "Face Lock" if kind == "face_lock" else "Banned"
+    ))
+    return {
+        "pkg": tab.get("package"),
+        "user": tab.get("user_name", tab.get("package")),
+        "alive": bool(raw_alive),
+        "state": state,
+        "state_err": err,
+        "fresh": False,
+        "clean_fresh": False,
+        "pets": int(state.get("pet_count", 0) or 0) if state else "-",
+        "eggs": int(state.get("egg_total", 0) or 0) if state else "-",
+        "age": state_age_seconds(state) if state else "-",
+        "status": status,
+        "note": str((result or {}).get("note") or rt_tab.get("note") or status),
+        "bad": kind,
+        "visible_window": True,
+    }
 
 
 def direct_moderation_guard_before_open(tab, rt_tab, cfg, reason="queued open"):
@@ -25954,15 +26271,221 @@ def export_delta_workspace_zip():
     return True, f"Exported {len(files)} files.", output, len(files)
 
 
+
+def _workspace_safe_slug(value):
+    value = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "")).strip("._-")
+    return value[:60] or "workspace"
+
+
+def _current_executor_workspace_roots_for_selection(cfg, title):
+    """Choose configured packages and resolve their current executor Workspaces.
+
+    Global/shared Workspace paths are deduplicated. Per-clone Arceus paths remain
+    independent roots, so an import can be applied to every selected clone.
+    """
+    selected = choose_packages_common(
+        cfg,
+        title,
+        multi=True,
+        include_discovered=False,
+        configured_only=True,
+    )
+    if not selected:
+        return []
+
+    tabs = {}
+    try:
+        for tab in autoexec_tabs(cfg):
+            pkg = str((tab or {}).get("package") or "")
+            if pkg:
+                tabs[pkg] = tab
+    except Exception:
+        pass
+    for tab in cfg.get("tabs", []) or []:
+        if not isinstance(tab, dict):
+            continue
+        pkg = str(tab.get("package") or "")
+        if pkg and pkg not in tabs:
+            tabs[pkg] = tab
+
+    roots_by_key = {}
+    unresolved = []
+    for pkg in selected:
+        tab = tabs.get(pkg)
+        if not tab:
+            unresolved.append((pkg, "package config missing"))
+            continue
+        root = _executor_workspace_root_for_tab(tab)
+        if root is None:
+            unresolved.append((pkg, "Workspace unresolved"))
+            continue
+
+        root = Path(root)
+        key = str(root)
+        ent = roots_by_key.setdefault(
+            key,
+            {
+                "root": root,
+                "packages": [],
+                "storage": str(
+                    tab.get("executor_storage")
+                    or cfg.get("executor_storage_mode")
+                    or "auto"
+                ),
+            },
+        )
+        ent["packages"].append(pkg)
+
+    if unresolved:
+        print("")
+        print(col("Unresolved package Workspace(s):", YELLOW))
+        for pkg, why in unresolved:
+            print(f"  {short_pkg(pkg)} -> {why}")
+        print(col("Use Option 20 to set/repair executor paths.", DIM))
+
+    return list(roots_by_key.values())
+
+
+def import_workspace_zip_to_roots(zip_path, roots, *, make_backup=True):
+    """Import supported Workspace ZIP members into one or more resolved roots."""
+    zip_path = Path(zip_path).expanduser()
+    roots = [Path(r) for r in roots if r is not None]
+
+    if not zip_path.exists() or not zip_path.is_file():
+        return False, f"ZIP not found: {zip_path}", []
+
+    # Deduplicate roots without resolving on-disk symlinks.
+    unique_roots = []
+    seen = set()
+    for root in roots:
+        key = str(root)
+        if key not in seen:
+            seen.add(key)
+            unique_roots.append(root)
+
+    if not unique_roots:
+        return False, "No current executor Workspace resolved.", []
+
+    try:
+        members = _workspace_zip_members(zip_path)
+    except zipfile.BadZipFile:
+        return False, "Invalid or damaged ZIP file.", []
+    except Exception as exc:
+        return False, f"Could not inspect ZIP: {exc}", []
+
+    if not members:
+        return False, (
+            "No workspace files found. Supported layouts: "
+            "Arceus X/Workspace/, Delta/Workspace/, Workspace/, or flat files."
+        ), []
+
+    backups = []
+    total_imported = 0
+    total_overwritten = 0
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    with zipfile.ZipFile(zip_path, "r") as archive:
+        for root_index, root in enumerate(unique_roots, start=1):
+            root.mkdir(parents=True, exist_ok=True)
+
+            overwritten = []
+            for _, relative in members:
+                target = root / relative
+                if target.exists() and target.is_file():
+                    overwritten.append(relative)
+
+            total_overwritten += len(overwritten)
+
+            if make_backup and overwritten:
+                DELTA_WORKSPACE_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+                label = _workspace_safe_slug(root)
+                backup_path = (
+                    DELTA_WORKSPACE_BACKUP_DIR
+                    / f"workspace_overwrite_backup_{stamp}_{root_index}_{label}.zip"
+                )
+                with zipfile.ZipFile(
+                    backup_path,
+                    "w",
+                    compression=zipfile.ZIP_DEFLATED,
+                    compresslevel=9,
+                ) as backup:
+                    for relative in overwritten:
+                        existing = root / relative
+                        if existing.exists() and existing.is_file():
+                            backup.write(
+                                existing,
+                                arcname=str(relative).replace("\\", "/"),
+                            )
+                backups.append(backup_path)
+
+            for info, relative in members:
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                temporary = target.with_name(target.name + ".nomo_import_tmp")
+                try:
+                    with archive.open(info, "r") as src, open(temporary, "wb") as dst:
+                        shutil.copyfileobj(src, dst, length=1024 * 1024)
+                    os.replace(str(temporary), str(target))
+                    total_imported += 1
+                finally:
+                    try:
+                        if temporary.exists():
+                            temporary.unlink()
+                    except Exception:
+                        pass
+
+    note = (
+        f"Imported {len(members)} ZIP file(s) into {len(unique_roots)} current "
+        f"Workspace(s); writes {total_imported}; overwritten {total_overwritten}"
+    )
+    return True, note, backups
+
+
+def export_workspace_root_zip(root, label="current"):
+    """Export one resolved current executor Workspace to an importable ZIP."""
+    root = Path(root)
+    if not root.exists():
+        return False, f"Workspace not found: {root}", None, 0
+
+    files = sorted(
+        path
+        for path in root.rglob("*")
+        if path.is_file() and not path.name.endswith(".nomo_import_tmp")
+    )
+    if not files:
+        return False, f"Workspace is empty: {root}", None, 0
+
+    DELTA_WORKSPACE_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    slug = _workspace_safe_slug(label)
+    output = DELTA_WORKSPACE_EXPORT_DIR / f"{slug}_workspace_{stamp}.zip"
+
+    with zipfile.ZipFile(
+        output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
+    ) as archive:
+        for path in files:
+            relative = path.relative_to(root)
+            archive.write(
+                path,
+                arcname=f"Workspace/{str(relative).replace(chr(92), '/')}",
+            )
+
+    return True, f"Exported {len(files)} files from {root}.", output, len(files)
+
+
 def workspace_zip_tools_menu(cfg):
     while True:
         clear()
-        banner("WORKSPACE ZIP TOOLS", cfg)
-        print(f"Delta Workspace: {DELTA_GLOBAL_WORKSPACE_DIR}")
+        banner("WORKSPACE ZIP / EXO CONFIG TOOLS", cfg)
+        print(col(
+            "Uses each selected package's CURRENT executor Workspace (Option 20).",
+            DIM,
+        ))
         print("")
-        print("1. Import config/workspace ZIP -> Delta Workspace")
-        print("2. Export Delta Workspace -> timestamped ZIP")
-        print("3. Show supported ZIP layouts")
+        print("1. Import config/workspace ZIP -> current executor Workspace(s)")
+        print("2. Export current executor Workspace(s) -> timestamped ZIP")
+        print("3. Show current executor Workspace paths")
+        print("4. Show supported ZIP layouts")
         print("0. Back")
         drain_stdin()
         choice = clean_terminal_input(input("\nChoose: "))
@@ -25971,6 +26494,15 @@ def workspace_zip_tools_menu(cfg):
             return
 
         if choice == "1":
+            destinations = _current_executor_workspace_roots_for_selection(
+                cfg,
+                "WORKSPACE ZIP IMPORT: SELECT PACKAGES",
+            )
+            if not destinations:
+                print(col("No current executor Workspace resolved.", RED))
+                pause()
+                continue
+
             raw = clean_terminal_input(input(
                 f"ZIP path [ENTER={DELTA_WORKSPACE_DEFAULT_IMPORT_ZIP}]: "
             ))
@@ -25988,16 +26520,25 @@ def workspace_zip_tools_menu(cfg):
                 pause()
                 continue
 
-            existing = sum(
-                1 for _, relative in members
-                if (DELTA_GLOBAL_WORKSPACE_DIR / relative).is_file()
-            )
             print("")
             print(f"Files detected : {len(members)}")
-            print(f"Will overwrite : {existing}")
-            print(f"Destination    : {DELTA_GLOBAL_WORKSPACE_DIR}")
+            print(col("Current destination Workspace(s):", BOLD))
+            total_existing = 0
+            for item in destinations:
+                root = Path(item["root"])
+                existing = sum(
+                    1 for _, relative in members
+                    if (root / relative).is_file()
+                )
+                total_existing += existing
+                pkg_text = ", ".join(short_pkg(p) for p in item["packages"])
+                print(
+                    f"  {root}  [{item['storage']}] "
+                    f"<- {pkg_text}  overwrite={existing}"
+                )
+            print(f"Total overwrite : {total_existing}")
             print(col(
-                "Overwritten files are backed up automatically before import.",
+                "Overwritten files are backed up separately for each destination.",
                 DIM,
             ))
 
@@ -26062,28 +26603,68 @@ def workspace_zip_tools_menu(cfg):
                 pause()
                 continue
 
-            ok, note, backup = import_workspace_zip_to_delta(
-                zip_path, make_backup=True
+            ok, note, backups = import_workspace_zip_to_roots(
+                zip_path,
+                [item["root"] for item in destinations],
+                make_backup=True,
             )
             print(col(note, GREEN if ok else RED))
-            if backup:
+            for backup in backups or []:
                 print(f"Backup: {backup}")
             pause()
             continue
 
         if choice == "2":
-            print(col("Building Delta Workspace export...", CYAN))
-            try:
-                ok, note, output, count = export_delta_workspace_zip()
-            except Exception as exc:
-                ok, note, output = False, f"Export failed: {exc}", None
-            print(col(note, GREEN if ok else RED))
-            if output:
-                print(f"ZIP: {output}")
+            destinations = _current_executor_workspace_roots_for_selection(
+                cfg,
+                "WORKSPACE EXPORT: SELECT PACKAGES",
+            )
+            if not destinations:
+                print(col("No current executor Workspace resolved.", RED))
+                pause()
+                continue
+
+            print("")
+            for index, item in enumerate(destinations, start=1):
+                root = Path(item["root"])
+                packages = item["packages"]
+                label = (
+                    short_pkg(packages[0])
+                    if len(packages) == 1
+                    else f"shared_{index}"
+                )
+                try:
+                    ok, note, output, count = export_workspace_root_zip(
+                        root, label=label
+                    )
+                except Exception as exc:
+                    ok, note, output = False, f"Export failed: {exc}", None
+                print(col(note, GREEN if ok else RED))
+                if output:
+                    print(f"ZIP: {output}")
             pause()
             continue
 
         if choice == "3":
+            destinations = _current_executor_workspace_roots_for_selection(
+                cfg,
+                "SHOW WORKSPACE PATHS: SELECT PACKAGES",
+            )
+            if not destinations:
+                print(col("No current executor Workspace resolved.", RED))
+                pause()
+                continue
+            print("")
+            print(col("Resolved current Workspace path(s):", BOLD))
+            for item in destinations:
+                pkg_text = ", ".join(short_pkg(p) for p in item["packages"])
+                print(f"  {pkg_text}")
+                print(f"    storage  : {item['storage']}")
+                print(f"    Workspace: {item['root']}")
+            pause()
+            continue
+
+        if choice == "4":
             print("")
             print("Supported input layouts:")
             print("  Arceus X/Workspace/HolyV2/...")
@@ -26091,13 +26672,15 @@ def workspace_zip_tools_menu(cfg):
             print("  Workspace/HolyV2/...")
             print("  HolyV2/...  (already flat)")
             print("")
-            print("All imported files land directly under:")
-            print(f"  {DELTA_GLOBAL_WORKSPACE_DIR}/")
+            print("Destination is NOT forced to Delta.")
+            print("Option 17 resolves the current Workspace from selected package(s).")
+            print("Use Option 20 if a package points at the wrong executor path.")
             pause()
             continue
 
         print(col("Invalid choice.", RED))
         time.sleep(1)
+
 
 
 def _delta_state_path_for_username(username):
