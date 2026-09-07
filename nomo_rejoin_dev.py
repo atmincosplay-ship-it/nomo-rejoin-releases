@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.83 — EXACT CAPTCHA OVERRIDES FRESH HEARTBEAT + AUTH IS PACKAGE-LOCAL
+# - FIX: a visible Roblox Security / "Verifying you're not a bot" challenge could be hidden by a
+#   clean/fresh Lua heartbeat. The dashboard could therefore show Ingame while the clone visibly
+#   sat on Start Puzzle.
+# - Exact package-scoped Option-16 accessibility text for CAPTCHA/529 is now checked even when the
+#   Lua heartbeat is fresh. Exact verification UI outranks Ingame.
+# - Screenshot/geometry CAPTCHA heuristics remain loading-only to avoid normal-game false positives.
+# - CAPTCHA/529/solver state is now package-local just like Face Lock/Ban: it never suppresses
+#   sibling recovery. A challenged D can be held/solved while A/B/C continue independently.
+# - When visible verification is detected but the provider does not start, Activity now prints the
+#   actual solver reason and applies a bounded retry time instead of repeating the generic
+#   "held in-place" line every dashboard cycle.
+# - No package is reopened simply because verification is visible.
+#
 # V4.81.82 — MARKET AUTH HOLD MUST CANCEL ITS OWN RECOVERY QUEUE
 # - FIX: proactive moderation could classify a Market package as FACE LOCK, but
 #   apply_rejoin_action() had no explicit bad=='face_lock' branch. The same package
@@ -1434,7 +1448,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.82"
+__version__ = "V4.81.83"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -13088,18 +13102,29 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
     # V4.81.62: age/access banner is informational in this client and must not
     # create a hold or suppress normal join/recovery.
 
-    # V4.29: visual CAPTCHA uses the same Loading-only gate and shared raw frame
-    # as face lock. Once the package has a clean post-open heartbeat, clear stale
-    # screenshot confirmations and perform no more visual/accessibility checks.
+    # V4.81.83: exact package-scoped verification text outranks even a clean
+    # heartbeat. A Security/Start Puzzle modal can coexist with a live Lua state.
+    exact_captcha_ui = (
+        android_exact_login_challenge_text_detail(pkg, cfg, force=False)
+        if raw_alive and not non_auth_disconnect
+        else None
+    )
+
+    # Screenshot/geometry CAPTCHA remains Loading-only. This preserves the
+    # false-positive protection we added for normal Grow Offline/hourglass UI.
     captcha_loading_only = bool(cfg.get("captcha_visual_loading_only", True))
     captcha_scan_eligible = bool(raw_alive) and (
         (not captcha_loading_only) or (not loading_online_proof)
     )
     if not captcha_scan_eligible:
         clear_visual_captcha_confirmation(pkg)
-    captcha_ui = android_login_challenge_ui_detail(
-        pkg, cfg, force=False, auth_hint=_runtime_auth_hint(rt_tab)
-    ) if captcha_scan_eligible and not non_auth_disconnect else None
+
+    captcha_ui = exact_captcha_ui
+    if captcha_ui is None and captcha_scan_eligible and not non_auth_disconnect:
+        captcha_ui = android_login_challenge_ui_detail(
+            pkg, cfg, force=False, auth_hint=_runtime_auth_hint(rt_tab)
+        )
+
     if captcha_ui:
         detail = ",".join(captcha_ui.get("hits", []) or []) or "verification UI"
         rt_tab["captcha_ui_visible"] = True
@@ -13111,7 +13136,12 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
             "pets": int(state.get("pet_count", 0) or 0) if state else "-",
             "eggs": int(state.get("egg_total", 0) or 0) if state else "-",
             "age": state_age_seconds(state) if state else "-",
-            "status": "Captcha", "note": "verification UI detected",
+            "status": "Captcha",
+            "note": (
+                "verification UI detected (exact text)"
+                if str((captcha_ui or {}).get("evidence_source") or "") == "exact_option16_text"
+                else "verification UI detected"
+            ),
             "bad": "ui_challenge", "visible_window": True,
             "ui_challenge_detail": captcha_ui,
         }
@@ -13403,11 +13433,28 @@ def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, he
     )
     status, note = core.handle_detected_solver_challenge(tab, rt_tab, detail)
     rt_tab["note"] = note
+
+    if status != "Solving":
+        # Provider disabled/cooldown/unavailable/cookie issue: keep THIS package
+        # in-place, but do not hammer the provider or hide the actual reason.
+        retry_seconds = max(
+            600,
+            int(cfg.get("solver_failure_retry_seconds", 600) or 600),
+        )
+        rt_tab["captcha_ui_retry_at"] = max(
+            int(rt_tab.get("captcha_ui_retry_at", 0) or 0),
+            now() + retry_seconds,
+        )
+
     core.save()
     log_activity(
         "verification UI; solver provider started in-place (no package reopen)"
         if status == "Solving"
-        else "verification UI held in-place; no package reopen",
+        else (
+            "verification UI solver not started: "
+            + cut(note or "unknown solver reason", 100)
+            + f"; package held {format_age(max(1, int(rt_tab.get('captcha_ui_retry_at', now()) or now()) - now()))}"
+        ),
         pkg,
         CYAN if status == "Solving" else YELLOW,
     )
@@ -15767,82 +15814,20 @@ def visual_join_error_detail(pkg, cfg, force=False, bypass_confirm=False):
 
 
 def _auth_incident_runtime_reason(rt_tab, cfg):
-    """Return only TRANSIENT auth work that may briefly protect sibling hard actions.
-
-    V4.81.81: Face Lock / banned / moderated state is package-local and must NEVER
-    suppress another package's recovery. The target package still has its own
-    direct moderation/API and exact Account Locked guard before any PID stop/open.
-    """
-    if not isinstance(rt_tab, dict):
-        return ""
-
-    recent = max(120, int(cfg.get("noka_peer_auth_recent_seconds", 900) or 900))
-
-    reason = " ".join(str(rt_tab.get(k, "") or "") for k in (
-        "manual_login_reason",
-        "manual_login_detail",
-        "captcha_ui_detail",
-    )).lower()
-
-    # Explicit package-local terminal holds are intentionally NOT peer blockers.
-    local_hold_reason = str(rt_tab.get("manual_login_reason", "") or "").strip().lower()
-    if local_hold_reason in (
-        "face_lock",
-        "face lock",
-        "account_banned",
-        "account banned",
-        "banned",
-        "moderated",
-    ):
-        return ""
-
-    if _authoritative_face_lock_runtime(rt_tab):
-        return ""
-
-    # Only active/transient verification challenges remain pool safety hints.
-    if any(term in reason for term in (
-        "529",
-        "captcha",
-        "verification",
-    )):
-        return cut(reason, 70)
-
-    if bool(rt_tab.get("captcha_ui_visible")):
-        seen = int(rt_tab.get("captcha_ui_last_seen_at", 0) or 0)
-        if seen <= 0 or now() - seen <= recent:
-            return "verification UI"
-
+    """V4.81.83: auth/challenge state is package-local, never a sibling blocker."""
     return ""
 
 
-def active_noka_auth_incident(cfg, rt, exclude_pkg=""):
-    """Return only a transient Noka CAPTCHA/529/solver peer safety blocker.
 
-    Face Lock and banned/moderated holds are package-local in V4.81.81.
+def active_noka_auth_incident(cfg, rt, exclude_pkg=""):
+    """Compatibility no-op: auth/CAPTCHA/solver holds are package-local.
+
+    Each target package is rechecked independently before destructive recovery.
+    A Face Lock, CAPTCHA, 529, ban, or running solver on one clone never blocks
+    another clone's queue.
     """
-    if not cfg.get("noka_peer_auth_hard_suppression_enabled", True):
-        return "", ""
-    exclude_pkg = str(exclude_pkg or "")
-    for tab in (cfg or {}).get("tabs", []):
-        pkg = str((tab or {}).get("package", "") or "")
-        if not pkg or pkg == exclude_pkg or not _is_noka_clone_package(pkg):
-            continue
-        rt_tab = get_runtime_tab(rt, pkg)
-        # V4.81.71: visual-only Face Lock is never pool-wide auth evidence.
-        if clear_visual_face_lock_false_positive(
-            rt_tab, pkg, "visual Face Lock peer blocker cleared; exact text/API required"
-        ):
-            log_activity(
-                "peer-auth generic/visual face-lock cleared (package-local hold policy)",
-                pkg,
-                GREEN,
-            )
-        reason = _auth_incident_runtime_reason(rt_tab, cfg)
-        if reason:
-            return pkg, reason
-        if solver_job_running(pkg):
-            return pkg, "solver/auth job running"
     return "", ""
+
 
 
 def join_error_529_auth_detail(
@@ -15912,6 +15897,80 @@ def join_error_529_auth_detail(
     }
 
 
+
+def android_exact_login_challenge_text_detail(pkg, cfg, force=False):
+    """High-confidence package-scoped CAPTCHA/529 from exact UI text only.
+
+    V4.81.83: this detector is allowed even when Lua state is clean/fresh.
+    It never uses screenshot geometry, unscoped global text, or color heuristics.
+    With an Option-16 rectangle, android_ui_text_for_package_or_rect() already
+    isolates nodes to that exact clone cell.
+    """
+    if not cfg.get("captcha_ui_override_enabled", True):
+        return None
+    if not cfg.get("login_challenge_ui_detection_enabled", True):
+        return None
+
+    texts, _ = android_ui_text_for_package_or_rect(
+        str(pkg or ""),
+        cfg,
+        force=force,
+    )
+    if not texts:
+        return None
+
+    auth_529 = join_error_529_auth_detail(texts, cfg)
+    if auth_529:
+        auth_529 = dict(auth_529)
+        auth_529["evidence_source"] = "exact_option16_text"
+        return auth_529
+
+    joined = "\n".join(
+        str(value)
+        for value in texts
+        if str(value or "").strip()
+    )
+    low = joined.lower()
+
+    strong_terms = [
+        "verifying you're not a bot",
+        "verifying you are not a bot",
+        "please solve this challenge so we know you are a real person",
+        "please solve this challenge",
+        "start puzzle",
+        "solve this puzzle",
+        "solve this challenge",
+        "complete the challenge",
+        "human verification",
+        "prove you are human",
+        "arkose",
+        "fun captcha",
+    ]
+    hits = [term for term in strong_terms if term in low]
+
+    if not hits and "verification" in low and "real person" in low:
+        hits = ["verification + real person"]
+
+    if (
+        not hits
+        and "not a bot" in low
+        and ("verification" in low or "security" in low)
+    ):
+        hits = ["not a bot"]
+
+    if not hits:
+        return None
+
+    return {
+        "title": "Roblox Verification",
+        "text": joined,
+        "reason": "android_package_scoped_exact_captcha_text",
+        "hits": hits[:5],
+        "evidence_source": "exact_option16_text",
+        "visual_only": False,
+    }
+
+
 def android_login_challenge_ui_detail(
     pkg,
     cfg,
@@ -15930,7 +15989,14 @@ def android_login_challenge_ui_detail(
     ):
         return None
 
-    # Keep the low-overhead visual CAPTCHA detector first.
+    # V4.81.83: exact Option-16 accessibility text is stronger than visual
+    # geometry and remains valid even with screenshot-only visual mode enabled.
+    exact = android_exact_login_challenge_text_detail(pkg, cfg, force=force)
+    if exact:
+        return exact
+
+    # Visual CAPTCHA remains a fallback and is still gated by the caller's
+    # Loading-only policy.
     visual = visual_captcha_detail(
         pkg,
         cfg,
@@ -15940,19 +16006,11 @@ def android_login_challenge_ui_detail(
     if visual:
         return visual
 
-    # Join Error 529 is a native package-scoped popup. Check it even when
-    # screenshot-only CAPTCHA mode is enabled.
     texts, _ = android_ui_text_for_package_or_rect(
         str(pkg or ""),
         cfg,
         force=force,
     )
-    auth_529 = join_error_529_auth_detail(
-        texts,
-        cfg,
-    )
-    if auth_529:
-        return auth_529
 
     # V4.81.54: exact text remains preferred. If App Cloner hides that text, a
     # strict Join Error visual may stand in for 529 only when this exact package
@@ -17092,9 +17150,9 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
             core.save()
             return True
 
-    # V4.81.81: only an ACTIVE transient CAPTCHA/529/solver job may briefly
-    # protect sibling ALIVE hard actions. Face Lock/Ban is package-local and never
-    # suppresses another clone. App Cloner safety remains for transient auth work.
+    # V4.81.83: all auth/challenge holds are package-local. The target clone
+    # is rechecked independently; another clone's Face Lock/CAPTCHA/solver cannot
+    # suppress this package's exact-target recovery.
     if (
         is_hard
         and process_status == "ALIVE"
