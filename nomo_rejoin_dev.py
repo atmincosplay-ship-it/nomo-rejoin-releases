@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.85 — OPTION 17 EXO GROUPING IS UID-BASED; REST = MARKET
+# - Corrects V4.81.84's experimental username-grouping idea. EXO config ownership
+#   is always Roblox UID-based: <UID>file1.json / <UID>file2.json / <UID>filesession.json.
+# - Option 17 now has a persistent UID Group Manager. It resolves each installed
+#   package's live Roblox username + UID only to help the user identify the account,
+#   then stores the classification by exact UID.
+# - Exact UID in Hatching -> file1_hatching.json.
+# - Every other selected UID -> file1_market.json (REST = MARKET).
+# - Local UID classification overrides old/bad master groups.json values. This lets
+#   the user repair an older master that had 111 Ungrouped without regenerating it.
+# - V4.81.84 username-grouping masters are rejected so they cannot silently apply
+#   the wrong ownership model.
+# - Install plan now shows grouping source plus pet/target counts, and performs a
+#   post-write read-back verification of every <UID>file1.json.
+#
 # V4.81.83 — EXACT CAPTCHA OVERRIDES FRESH HEARTBEAT + AUTH IS PACKAGE-LOCAL
 # - FIX: a visible Roblox Security / "Verifying you're not a bot" challenge could be hidden by a
 #   clean/fresh Lua heartbeat. The dashboard could therefore show Ingame while the clone visibly
@@ -1448,7 +1463,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.83"
+__version__ = "V4.81.85"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1474,6 +1489,7 @@ DELTA_WORKSPACE_DEFAULT_IMPORT_ZIP = Path("/storage/emulated/0/Download/config.z
 EXOTIC_MASTER_DEFAULT_IMPORT_ZIP = Path("/storage/emulated/0/Download/exotic_master.zip")
 DELTA_WORKSPACE_EXPORT_DIR = BASE_DIR / "workspace_exports"
 DELTA_WORKSPACE_BACKUP_DIR = BASE_DIR / "workspace_backups"
+EXO_UID_GROUPS_FILE = BASE_DIR / "exo_uid_groups.json"
 
 EXOTIC_KEY_STATE_FILE = BASE_DIR / "exotic_key_state.json"
 EXOTIC_KEY_SHARED_RELATIVE = Path("Nomo") / "exotic_key.json"
@@ -26767,6 +26783,15 @@ def _read_exotic_master_manifest(zip_path):
     market = uid_set("market")
     ungrouped = uid_set("ungrouped")
     all_uids = uid_set("all")
+
+    grouping_mode = str(groups.get("groupingMode") or "uid_lists").strip().lower()
+    if grouping_mode == "hatching_usernames_rest_market":
+        return False, (
+            "This master uses the discarded V4.81.84 username-grouping format. "
+            "EXO ownership is UID-based. Use a normal UID groups.json master; "
+            "Option 17 UID Group Manager can classify installed accounts."
+        ), None
+
     overlap = hatching & market
     if overlap:
         return False, (
@@ -26791,6 +26816,7 @@ def _read_exotic_master_manifest(zip_path):
         "market": market,
         "ungrouped": ungrouped,
         "all": all_uids,
+        "grouping_mode": "uid_lists",
     }
 
 
@@ -26888,20 +26914,84 @@ def _resolve_package_uid_for_exotic(pkg):
     }
 
 
-def _exotic_master_variant_for_uid(manifest, uid):
-    uid = str(uid or "")
-    if uid in manifest["hatching"]:
-        return "hatching", "file1_hatching.json"
-    if uid in manifest["market"]:
-        return "market", "file1_market.json"
-    return "default", "file1_default.json"
+
+def _normalize_exo_uid_set(values):
+    if not isinstance(values, (list, tuple, set)):
+        return set()
+    return {
+        str(value).strip()
+        for value in values
+        if str(value).strip().isdigit()
+    }
 
 
-def _exotic_master_install_plan(cfg, selected, manifest):
+def _load_exo_uid_groups():
+    data = load_json(EXO_UID_GROUPS_FILE, {})
+    if not isinstance(data, dict):
+        data = {}
+    hatching = _normalize_exo_uid_set(data.get("hatching", []))
+    market = _normalize_exo_uid_set(data.get("market", []))
+    overlap = hatching & market
+    if overlap:
+        # Fail deterministic: Hatching wins locally, remove overlap from Market.
+        market -= overlap
+    return {
+        "schemaVersion": 1,
+        "hatching": hatching,
+        "market": market,
+        "updatedAt": int(data.get("updatedAt", 0) or 0),
+    }
+
+
+def _save_exo_uid_groups(groups):
+    hatching = _normalize_exo_uid_set((groups or {}).get("hatching", []))
+    market = _normalize_exo_uid_set((groups or {}).get("market", []))
+    market -= hatching
+    payload = {
+        "schemaVersion": 1,
+        "hatching": sorted(hatching, key=lambda x: int(x)),
+        "market": sorted(market, key=lambda x: int(x)),
+        "updatedAt": now(),
+        "rule": "exact UID; Hatching explicit; REST = MARKET",
+    }
+    save_json(EXO_UID_GROUPS_FILE, payload)
+    return payload
+
+
+def _parse_number_selection(raw, maximum):
+    """Parse '1,3 5-7'. Returns None for invalid input."""
+    raw = str(raw or "").strip()
+    if not raw:
+        return set()
+    result = set()
+    for token in raw.replace(",", " ").split():
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            parts = token.split("-", 1)
+            if len(parts) != 2 or not all(part.strip().isdigit() for part in parts):
+                return None
+            a, b = int(parts[0]), int(parts[1])
+            if a > b:
+                a, b = b, a
+            if a < 1 or b > maximum:
+                return None
+            result.update(range(a, b + 1))
+        else:
+            if not token.isdigit():
+                return None
+            value = int(token)
+            if value < 1 or value > maximum:
+                return None
+            result.add(value)
+    return result
+
+
+def _resolve_exo_group_identities(cfg, selected):
     tabs = _tabs_by_package_for_workspace(cfg)
-    plan = []
+    rows = []
     unresolved = []
-
     for pkg in selected:
         tab = tabs.get(pkg)
         if not tab:
@@ -26911,27 +27001,193 @@ def _exotic_master_install_plan(cfg, selected, manifest):
         if root is None:
             unresolved.append((pkg, "current executor Workspace unresolved"))
             continue
-
         ident = _resolve_package_uid_for_exotic(pkg)
         if not ident.get("ok"):
             unresolved.append((pkg, "Roblox UID unresolved"))
             continue
-
-        variant, file1_name = _exotic_master_variant_for_uid(
-            manifest, ident["uid"]
-        )
-        plan.append({
+        rows.append({
             "pkg": pkg,
             "username": ident["username"],
             "uid": ident["uid"],
             "identity_source": ident["source"],
             "root": Path(root),
             "exo_dir": Path(root) / "exotichub99",
+        })
+    return rows, unresolved
+
+
+def configure_exo_uid_groups_menu(cfg):
+    selected = choose_packages_common(
+        cfg,
+        "EXO UID GROUPS: SELECT INSTALLED ACCOUNTS",
+        multi=True,
+        include_discovered=False,
+        configured_only=True,
+    )
+    if not selected:
+        return
+
+    rows, unresolved = _resolve_exo_group_identities(cfg, selected)
+    if unresolved:
+        print("")
+        print(col("UNRESOLVED / SKIPPED:", RED))
+        for pkg, why in unresolved:
+            print(f"  {short_pkg(pkg)} -> {why}")
+    if not rows:
+        print(col("No selected package UID could be resolved.", RED))
+        pause()
+        return
+
+    groups = _load_exo_uid_groups()
+    saved_hatching = set(groups["hatching"])
+
+    print("")
+    print(col("EXO UID GROUP MANAGER", BOLD))
+    print(col(
+        "Classification is stored by exact Roblox UID. Username is display-only.",
+        DIM,
+    ))
+    print(col(
+        "Choose HATCHING accounts below; every other selected UID becomes MARKET.",
+        CYAN,
+    ))
+    print("")
+    current_indices = []
+    for index, row in enumerate(rows, start=1):
+        is_hatching = row["uid"] in saved_hatching
+        if is_hatching:
+            current_indices.append(index)
+        label = "HATCHING" if is_hatching else "MARKET"
+        print(
+            f"{index:>2}. {short_pkg(row['pkg']):<8} "
+            f"{row['username']:<20} UID={row['uid']}  [{label}]"
+        )
+
+    current_text = ",".join(str(i) for i in current_indices) or "none"
+    print("")
+    print(f"Current Hatching numbers on this selection: {current_text}")
+    print("Examples: 1,3   or   1-3   |  0 = none  | ENTER = keep current")
+    raw = clean_terminal_input(input("Hatching numbers: "))
+
+    if not raw:
+        print(col("No group changes made.", YELLOW))
+        pause()
+        return
+
+    if raw.strip() == "0":
+        chosen = set()
+    else:
+        chosen = _parse_number_selection(raw, len(rows))
+        if chosen is None:
+            print(col("Invalid number selection.", RED))
+            pause()
+            return
+
+    hatching = set(groups["hatching"])
+    market = set(groups["market"])
+
+    selected_uids = {row["uid"] for row in rows}
+    hatching -= selected_uids
+    market -= selected_uids
+
+    for index, row in enumerate(rows, start=1):
+        uid = row["uid"]
+        if index in chosen:
+            hatching.add(uid)
+        else:
+            market.add(uid)
+
+    saved = _save_exo_uid_groups({
+        "hatching": hatching,
+        "market": market,
+    })
+
+    print("")
+    print(col("Saved exact UID groups:", GREEN))
+    for index, row in enumerate(rows, start=1):
+        group = "HATCHING" if row["uid"] in set(saved["hatching"]) else "MARKET"
+        print(f"  {row['username']}  UID={row['uid']} -> {group}")
+    print("")
+    print(col(
+        "Future Option 17 installs use these exact UIDs. "
+        "Unclassified UIDs default to MARKET.",
+        DIM,
+    ))
+    pause()
+
+
+def _exotic_master_variant_for_uid(manifest, uid, local_groups=None):
+    """Return (variant, template, source) using exact UID ownership only."""
+    uid = str(uid or "").strip()
+    local_groups = local_groups or {"hatching": set(), "market": set()}
+
+    if uid in set(local_groups.get("hatching", set())):
+        return "hatching", "file1_hatching.json", "local_uid"
+    if uid in set(local_groups.get("market", set())):
+        return "market", "file1_market.json", "local_uid"
+
+    if uid in manifest["hatching"]:
+        return "hatching", "file1_hatching.json", "master_uid"
+    if uid in manifest["market"]:
+        return "market", "file1_market.json", "master_uid"
+
+    # User rule: only Hatching is exceptional; everything else is Market.
+    return "market", "file1_market.json", "rest_market"
+
+
+
+def _exotic_master_install_plan(cfg, selected, manifest):
+    rows, unresolved = _resolve_exo_group_identities(cfg, selected)
+    local_groups = _load_exo_uid_groups()
+    parsed = manifest["parsed"]
+    plan = []
+
+    for row in rows:
+        variant, file1_name, group_source = _exotic_master_variant_for_uid(
+            manifest,
+            row["uid"],
+            local_groups,
+        )
+        file1_obj = parsed.get(file1_name)
+        gift = file1_obj.get("giftpets", {}) if isinstance(file1_obj, dict) else {}
+
+        pets = gift.get("allow_pet_list", {})
+        targets = gift.get("allow_player_targets", {})
+        pet_count = len(pets) if isinstance(pets, (dict, list)) else 0
+        target_count = len(targets) if isinstance(targets, (dict, list)) else 0
+
+        item = dict(row)
+        item.update({
             "variant": variant,
             "file1_name": file1_name,
+            "group_source": group_source,
+            "pet_count": pet_count,
+            "target_count": target_count,
         })
+        plan.append(item)
 
     return plan, unresolved
+
+
+def _verify_exotic_install_plan(manifest, plan):
+    """Read written <UID>file1.json back and compare full JSON to chosen master."""
+    parsed = manifest["parsed"]
+    results = []
+    for item in plan:
+        target = Path(item["exo_dir"]) / f"{item['uid']}file1.json"
+        expected = parsed.get(item["file1_name"])
+        ok = False
+        why = ""
+        try:
+            actual = json.loads(target.read_text(encoding="utf-8-sig"))
+            ok = actual == expected
+            if not ok:
+                why = "written JSON differs from selected master variant"
+        except Exception as exc:
+            why = f"read-back failed: {exc}"
+        results.append((item, ok, why))
+    return results
+
 
 
 def install_exotic_master_plan(manifest, plan):
@@ -27026,11 +27282,12 @@ def workspace_zip_tools_menu(cfg):
             DIM,
         ))
         print("")
-        print("1. Install exotic_master.zip from Download -> current executor")
-        print("2. Import generic config/workspace ZIP -> current executor Workspace(s)")
-        print("3. Export current executor Workspace(s) -> timestamped ZIP")
-        print("4. Show current executor Workspace paths")
-        print("5. Show supported ZIP layouts")
+        print("1. Install exotic_master.zip -> current executor (UID groups; REST=MARKET)")
+        print("2. Configure EXO UID groups from installed accounts")
+        print("3. Import generic config/workspace ZIP -> current executor Workspace(s)")
+        print("4. Export current executor Workspace(s) -> timestamped ZIP")
+        print("5. Show current executor Workspace paths")
+        print("6. Show supported ZIP layouts")
         print("0. Back")
         drain_stdin()
         choice = clean_terminal_input(input("\nChoose: "))
@@ -27066,22 +27323,16 @@ def workspace_zip_tools_menu(cfg):
             print("")
             print(col("EXOTIC MASTER:", BOLD))
             print(f"  File      : {zip_path}")
-            print(f"  Hatching  : {len(manifest['hatching'])}")
-            print(f"  Market    : {len(manifest['market'])}")
-            print(f"  Default   : {len(manifest['ungrouped'])}")
-            print(f"  All UIDs  : {len(manifest['all'])}")
-            if not manifest["hatching"]:
-                print(col(
-                    "  WARNING: Hatching group is EMPTY. Hatcher UIDs will receive DEFAULT "
-                    "unless explicitly listed in groups.json.",
-                    YELLOW,
-                ))
-            if not manifest["market"]:
-                print(col(
-                    "  WARNING: Market group is EMPTY. Market UIDs will receive DEFAULT "
-                    "unless explicitly listed in groups.json.",
-                    YELLOW,
-                ))
+            print(f"  Master Hatching UIDs : {len(manifest['hatching'])}")
+            print(f"  Master Market UIDs   : {len(manifest['market'])}")
+            print(f"  Old Ungrouped UIDs   : {len(manifest['ungrouped'])} (REST=MARKET now)")
+            local_groups = _load_exo_uid_groups()
+            print(f"  Local Hatching UIDs  : {len(local_groups['hatching'])}")
+            print(f"  Local Market UIDs    : {len(local_groups['market'])}")
+            print(col(
+                "  Rule: local exact UID > master exact UID > REST = MARKET",
+                CYAN,
+            ))
 
             plan, unresolved = _exotic_master_install_plan(
                 cfg, selected, manifest
@@ -27094,10 +27345,13 @@ def workspace_zip_tools_menu(cfg):
                     print(
                         f"  {short_pkg(item['pkg'])}  "
                         f"{item['username']}  UID={item['uid']}  "
-                        f"-> {item['variant'].upper()}"
+                        f"-> {item['variant'].upper()} "
+                        f"[group={item['group_source']}]"
                     )
                     print(
-                        f"      {item['exo_dir']}  "
+                        f"      pets={item['pet_count']}  "
+                        f"targets={item['target_count']}  "
+                        f"{item['exo_dir']}  "
                         f"[identity={item['identity_source']}]"
                     )
             if unresolved:
@@ -27111,20 +27365,19 @@ def workspace_zip_tools_menu(cfg):
                 pause()
                 continue
 
-            # Show any UID not present in master.all explicitly.
-            unknown_master = [
+            rest_market = [
                 item for item in plan
-                if manifest["all"] and item["uid"] not in manifest["all"]
+                if item.get("group_source") == "rest_market"
             ]
-            if unknown_master:
+            if rest_market:
                 print("")
                 print(col(
-                    "WARNING: selected UID(s) absent from groups.json ALL; "
-                    "they will receive DEFAULT:",
-                    YELLOW,
+                    f"{len(rest_market)} selected UID(s) are not explicitly grouped; "
+                    "REST = MARKET applies:",
+                    CYAN,
                 ))
-                for item in unknown_master:
-                    print(f"  {item['username']} ({item['uid']})")
+                for item in rest_market:
+                    print(f"  {item['username']} ({item['uid']}) -> MARKET")
 
             if not _setup_yes_no("Install EXO master now?", default=True):
                 print(col("Install cancelled.", YELLOW))
@@ -27142,10 +27395,29 @@ def workspace_zip_tools_menu(cfg):
                     "Installed files are under current Workspace/exotichub99/<UID>*.json",
                     DIM,
                 ))
+                verify = _verify_exotic_install_plan(manifest, plan)
+                failures = [entry for entry in verify if not entry[1]]
+                print("")
+                if not failures:
+                    print(col(
+                        f"Read-back verification: PASS ({len(verify)}/{len(verify)} file1 files match exactly)",
+                        GREEN,
+                    ))
+                else:
+                    print(col(
+                        f"Read-back verification: FAIL ({len(failures)} mismatch/error)",
+                        RED,
+                    ))
+                    for item, _ok, why in failures:
+                        print(f"  {item['username']} UID={item['uid']}: {why}")
             pause()
             continue
 
         if choice == "2":
+            configure_exo_uid_groups_menu(cfg)
+            continue
+
+        if choice == "3":
             destinations = _current_executor_workspace_roots_for_selection(
                 cfg,
                 "GENERIC WORKSPACE ZIP IMPORT: SELECT PACKAGES",
@@ -27206,7 +27478,7 @@ def workspace_zip_tools_menu(cfg):
             pause()
             continue
 
-        if choice == "3":
+        if choice == "6":
             destinations = _current_executor_workspace_roots_for_selection(
                 cfg,
                 "WORKSPACE EXPORT: SELECT PACKAGES",
