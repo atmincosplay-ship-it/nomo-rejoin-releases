@@ -14,6 +14,20 @@
 # - No recovery rule, PID policy, Home routing, shell wake, solver, or Option 17
 #   behavior is changed.
 #
+# V4.81.101 — MARKET CACHE FAILURE MUST ABORT REOPEN
+# - V4.81.98-.100 attempted forced Clear Cache before the peer-safe Market VIEW
+#   restart, but the helper could continue reopening even when cache_ok=False.
+# - That meant a clone could be reported/rejoined and placed into recovery cooldown
+#   without actually receiving the cache repair that the 5-minute stuck flow requires.
+# - Market cache+protocol recovery now FAILS CLOSED if forced Clear Cache fails:
+#     * no VIEW reopen,
+#     * no successful recovery stamp,
+#     * no long cooldown.
+# - A separate failed-attempt timestamp enforces the existing 5-minute retry cadence
+#   so a cache failure cannot spam every watchdog cycle.
+# - Fresh healthy Market state clears both successful-attempt and failed-attempt
+#   cooldown state.
+#
 # V4.81.100 — MARKET STRONG-HEAL RECHECK + 5M FAILED-RETRY
 # - V4.81.99 prevented weak fresh timestamps from cancelling Market recovery,
 #   but that also allowed an old queued recovery to restart a clone that had
@@ -1678,7 +1692,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.100"
+__version__ = "V4.81.101"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -5823,8 +5837,22 @@ def market_peer_safe_cache_protocol_restart(
         + ("ok: " if cache_ok else "FAILED: ")
         + cut(cache_note, 80),
         pkg,
-        GREEN if cache_ok else YELLOW,
+        GREEN if cache_ok else RED,
     )
+
+    if not cache_ok:
+        rt_tab["market_combined_stuck_failed_at"] = now()
+        rt_tab["market_combined_stuck_failed_reason"] = (
+            "forced cache failed: " + str(cache_note or "")
+        )
+        return False, (
+            "Market forced cache FAILED; reopen skipped: "
+            + cut(cache_note, 80)
+        )
+
+    # Cache repair really succeeded; clear any prior failed-attempt cooldown.
+    rt_tab["market_combined_stuck_failed_at"] = 0
+    rt_tab["market_combined_stuck_failed_reason"] = ""
 
     component, resolve_note = resolve_package_view_activity(pkg, link, cfg)
     if not component:
@@ -14209,15 +14237,20 @@ def market_combined_stuck_metadata(cfg, age_or_seconds=0, reason=""):
 
 def market_combined_stuck_cooldown_left(rt_tab, cfg):
     try:
-        last = int(rt_tab.get("market_combined_stuck_last", 0) or 0)
+        last_success = int(rt_tab.get("market_combined_stuck_last", 0) or 0)
     except Exception:
-        last = 0
+        last_success = 0
+    try:
+        last_failed = int(rt_tab.get("market_combined_stuck_failed_at", 0) or 0)
+    except Exception:
+        last_failed = 0
+
+    last = max(last_success, last_failed)
     if last <= 0:
         return 0
 
-    # V4.81.100: the old configured 15m value must not strand a clone that is
-    # still visibly/unambiguously unhealthy after a recovery attempt. Fresh clean
-    # Market state clears market_combined_stuck_last to zero elsewhere.
+    # V4.81.100/101: unsuccessful recovery/cache attempts retry after the shorter
+    # failed-retry interval. Fresh healthy Market state clears both timestamps.
     try:
         configured = int(
             cfg.get("market_combined_stuck_cooldown_seconds", 900) or 900
@@ -14231,7 +14264,11 @@ def market_combined_stuck_cooldown_left(rt_tab, cfg):
     except Exception:
         failed_retry = 300
 
-    effective = max(300, min(max(300, configured), max(300, failed_retry)))
+    if last_failed >= last_success and last_failed > 0:
+        effective = max(300, failed_retry)
+    else:
+        effective = max(300, min(max(300, configured), max(300, failed_retry)))
+
     return max(0, effective - max(0, now() - last))
 
 
@@ -14509,6 +14546,8 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
                 rt_tab["market_combined_stuck_last"] = 0
                 rt_tab["market_combined_stuck_last_age"] = 0
                 rt_tab["market_combined_stuck_last_reason"] = ""
+                rt_tab["market_combined_stuck_failed_at"] = 0
+                rt_tab["market_combined_stuck_failed_reason"] = ""
                 rt_tab["market_background_fresh_opened_at"] = 0
                 rt_tab["market_background_fresh_until"] = 0
             return ("Ingame" if alive else "Loading"), "ok", False
@@ -17971,6 +18010,8 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
             rt_tab["market_combined_stuck_last"] = 0
             rt_tab["market_combined_stuck_last_age"] = 0
             rt_tab["market_combined_stuck_last_reason"] = ""
+            rt_tab["market_combined_stuck_failed_at"] = 0
+            rt_tab["market_combined_stuck_failed_reason"] = ""
             rt_tab["market_background_fresh_opened_at"] = 0
             rt_tab["market_background_fresh_until"] = 0
             log_activity(
@@ -18678,6 +18719,12 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
         rt["_last_pool_hard_open"] = now()
     log_activity(f"open {'ok' if ok else 'FAILED'}: {msg}", pkg,
                  GREEN if ok else RED)
+    if (
+        not ok
+        and item.get("market_combined_stuck_recovery")
+        and "forced cache FAILED" in str(msg or "")
+    ):
+        rt_tab["note"] = "Market cache FAILED; retry in 5m"
     core.save()
 
     if ok:
