@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.90 — BUBBLE-ONLY LIVE-SIBLING PROTECTION
+# - Fixes the Hatcher path seen in the live screenshot:
+#     "bubble-only shell confirmed; target-only recovery queued".
+# - On Redfinger/App Cloner, exact target PID stop is sibling-safe, but creating
+#   a new floating target task with plain `am start` can still reshuffle/close a
+#   sibling floating clone. Bubble-only recovery is the path where this has been
+#   observed.
+# - Automatic bubble-only hard recovery is therefore HELD whenever any configured
+#   sibling clone is currently ALIVE.
+# - A PID-query error for any sibling also fails safe and holds the bubble recovery.
+# - Existing queued bubble-only items are rechecked at execution and dropped if
+#   live siblings are present, so a queue created before the update cannot kill/open.
+# - Normal DEAD-package recovery, ordinary non-bubble stale recovery, solver/auth,
+#   Option 17, and manual recovery paths are unchanged.
+#
 # V4.81.89 — PRE-WRITE RESPAWN GUARD
 # - V4.81.88 handled respawns during the post-write offline hold, but a clone
 #   could respawn immediately during initial offline preparation and cause an
@@ -1520,7 +1535,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.89"
+__version__ = "V4.81.90"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -5624,6 +5639,34 @@ def hatcher_bubble_only_recovery_candidate(pkg, cfg, *, process_status=None):
     return False, activity_note or "live ActivityRecord"
 
 
+
+def hatcher_bubble_only_live_sibling_guard(pkg, cfg):
+    """Return (held, note) for unsafe bubble-only auto recovery.
+
+    Bubble-shell recovery can require materializing a new App Cloner floating
+    task. On affected Redfinger builds that launch itself can disturb a sibling,
+    even though the PID stop touched only the exact target package.
+    """
+    if not cfg.get("bubble_only_live_sibling_protection_enabled", True):
+        return False, "peer protection disabled"
+
+    peers, errors = _sibling_pid_snapshot(pkg, cfg)
+    if errors:
+        return True, (
+            "sibling PID check unavailable; "
+            + " | ".join(errors)
+        )
+
+    if peers:
+        names = ", ".join(
+            short_pkg(peer)
+            for peer in sorted(peers.keys())
+        )
+        return True, f"live siblings: {names}"
+
+    return False, "no live sibling PIDs"
+
+
 def queue_hatcher_bubble_only_recovery(core, tab, rt_tab, cfg, reason):
     """Queue one package-local recovery for a confirmed bubble-only shell.
 
@@ -5636,6 +5679,26 @@ def queue_hatcher_bubble_only_recovery(core, tab, rt_tab, cfg, reason):
         return False, "no package"
     if solver_job_running(pkg):
         return False, "solver running"
+
+    peer_hold, peer_note = hatcher_bubble_only_live_sibling_guard(pkg, cfg)
+    if peer_hold:
+        note = "bubble-only held; " + str(peer_note or "live sibling protection")
+        rt_tab["note"] = note
+        rt_tab["bubble_only_peer_hold"] = True
+        rt_tab["bubble_only_peer_hold_note"] = str(peer_note or "")
+        rt_tab["bubble_only_peer_hold_at"] = now()
+
+        last_log = int(rt_tab.get("bubble_only_peer_hold_log_at", 0) or 0)
+        if now() - last_log >= 30:
+            log_activity(
+                "bubble-only auto recovery HELD; " + cut(peer_note, 90),
+                pkg,
+                YELLOW,
+            )
+            rt_tab["bubble_only_peer_hold_log_at"] = now()
+        return False, note
+
+    rt_tab["bubble_only_peer_hold"] = False
     manual_hold, manual_note = recovery_manual_hold_active(rt_tab, cfg, pkg)
     if manual_hold:
         return False, manual_note
@@ -17120,6 +17183,24 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
     item_mode = str(item.get("mode", "hard") or "hard").lower()
     is_hard = item_mode not in ("soft", "route", "switch", "reuse_task")
 
+    # V4.81.90: last-second App Cloner sibling guard for bubble-only recovery.
+    # Drop the queued action instead of requeueing it; the watchdog will keep
+    # displaying the package-local shell hold while peers remain alive.
+    if item.get("bubble_only_recovery"):
+        peer_hold, peer_note = hatcher_bubble_only_live_sibling_guard(pkg, cfg)
+        if peer_hold:
+            rt_tab["note"] = "bubble-only held; " + str(peer_note or "")
+            rt_tab["bubble_only_peer_hold"] = True
+            rt_tab["bubble_only_peer_hold_note"] = str(peer_note or "")
+            log_activity(
+                "queued bubble-only recovery CANCELLED; "
+                + cut(peer_note, 90),
+                pkg,
+                YELLOW,
+            )
+            core.save()
+            return True
+
     # V4.81.59: MODERATION FIRST. This is deliberately before Option 6's
     # legacy API bypass, solver/provider work, staggering, PID guards, and the
     # Android route/open itself. Strong direct Not Approved proof must stop the
@@ -23339,7 +23420,11 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                         f"startup bubble-only shell; old state {state_age}s",
                     )
                     rt_tab["note"] = qnote
-                    if added or core.has(pkg):
+                    if (
+                        added
+                        or core.has(pkg)
+                        or str(qnote or "").startswith("bubble-only held;")
+                    ):
                         continue
 
                 # NOMO may have been started while this clone was already in the
@@ -23553,8 +23638,16 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                             core, tab, rt_tab, cfg,
                             f"bubble-only shell; old state {recovery_age}s",
                         )
-                        if added or core.has(pkg):
-                            status = "Queued"
+                        if (
+                            added
+                            or core.has(pkg)
+                            or str(qnote or "").startswith("bubble-only held;")
+                        ):
+                            status = (
+                                "Queued"
+                                if (added or core.has(pkg))
+                                else "Shell"
+                            )
                             note = qnote
                             bubble_rescue_handled = True
 
