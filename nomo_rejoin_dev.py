@@ -1,5 +1,22 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.91 — EXO PET-TEAM PRESERVATION FAIL-CLOSED + IDENTITY VERIFICATION
+# - Fixes a dangerous Option 17 edge case: if the exact existing
+#   <UID>file1.json was missing/wrong Workspace, previous builds scrubbed the
+#   template's foreign pet UUIDs and could create a valid config with EMPTY teams.
+# - Option 17 now REQUIRES each selected UID's exact existing <UID>file1.json
+#   before stopping clones or modifying anything. Missing File1 = fail closed.
+# - The install plan shows the exact existing File1 path and a pet-team snapshot
+#   summary before confirmation.
+# - The installer stores the actual preserved identity snapshot in memory.
+# - Read-back verification now proves BOTH:
+#     1) all normal settings match the selected Hatching/Market master, and
+#     2) every preserved pet UUID/team field exactly matches the pre-write value.
+# - It also rejects any unexpected NON-EMPTY pet/team identity field that was not
+#   present in the target UID snapshot, preventing foreign template UUID leakage.
+# - File2/Session may still be created if missing; File1 may not, because File1 is
+#   the authoritative source of the account's pet teams.
+#
 # V4.81.90 — BUBBLE-ONLY LIVE-SIBLING PROTECTION
 # - Fixes the Hatcher path seen in the live screenshot:
 #     "bubble-only shell confirmed; target-only recovery queued".
@@ -1535,7 +1552,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.90"
+__version__ = "V4.81.91"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -27434,13 +27451,86 @@ def _exo_load_json_file(path):
         return None
 
 
+def _exo_get_path(root, path):
+    cur = root
+    for key in path:
+        if not isinstance(cur, dict) or key not in cur:
+            return False, None
+        cur = cur[key]
+    return True, cur
+
+
+def _exo_identity_value_nonempty(value):
+    if isinstance(value, (list, dict, tuple, set)):
+        return len(value) > 0
+    if isinstance(value, str):
+        return bool(value.strip())
+    return value not in (None, False, 0)
+
+
+def _exo_identity_summary(identity):
+    identity = identity or {}
+    nonempty_fields = 0
+    uuid_values = 0
+    team_fields = 0
+    nonempty_team_fields = 0
+
+    for path, value in identity.items():
+        key = str(path[-1] if path else "").lower()
+        if _exo_identity_value_nonempty(value):
+            nonempty_fields += 1
+        if "team" in key and isinstance(value, list):
+            team_fields += 1
+            if value:
+                nonempty_team_fields += 1
+        if isinstance(value, list):
+            uuid_values += sum(1 for item in value if _exo_is_uuid_string(item))
+        elif _exo_is_uuid_string(value):
+            uuid_values += 1
+
+    return {
+        "fields": len(identity),
+        "nonempty_fields": nonempty_fields,
+        "team_fields": team_fields,
+        "nonempty_team_fields": nonempty_team_fields,
+        "uuid_values": uuid_values,
+    }
+
+
+def _exo_preflight_existing_file1(plan):
+    """Require exact current per-UID File1 before any offline stop or write."""
+    failures = []
+    snapshots = []
+
+    for item in plan:
+        target = Path(item["exo_dir"]) / f"{item['uid']}file1.json"
+        existing = _exo_load_json_file(target)
+        if existing is None:
+            failures.append(
+                f"{item['username']} UID={item['uid']}: missing/unreadable exact "
+                f"existing File1: {target}"
+            )
+            continue
+
+        identity = _exo_collect_pet_identity(existing)
+        summary = _exo_identity_summary(identity)
+        item["_exo_preflight_file1"] = str(target)
+        item["_exo_preflight_identity_summary"] = summary
+
+        snapshots.append((item, target, summary))
+
+    return (not failures), failures, snapshots
+
+
 def _verify_exotic_install_plan(manifest, plan):
-    """Verify complete master settings outside preserved pet UUID/team identity."""
+    """Verify master settings AND exact preservation of target UID pet identity."""
     parsed = manifest["parsed"]
     results = []
 
     for item in plan:
         failures = []
+        snapshots = item.get("_exo_preserved_identity_snapshot", {}) or {}
+
         for master_name, suffix in (
             (item["file1_name"], "file1.json"),
             ("file2.json", "file2.json"),
@@ -27454,6 +27544,8 @@ def _verify_exotic_install_plan(manifest, plan):
             target = Path(item["exo_dir"]) / f"{item['uid']}{suffix}"
             try:
                 actual = json.loads(target.read_text(encoding="utf-8-sig"))
+
+                # 1) Every normal setting must equal the master.
                 if (
                     _exo_strip_pet_identity_for_compare(actual)
                     != _exo_strip_pet_identity_for_compare(expected)
@@ -27461,247 +27553,39 @@ def _verify_exotic_install_plan(manifest, plan):
                     failures.append(
                         f"{suffix}: non-pet-identity settings differ from master"
                     )
+
+                # 2) Every preserved target-UID pet/team identity field must
+                # exactly match its pre-write value.
+                preserved = snapshots.get(suffix, {}) or {}
+                for path, before_value in preserved.items():
+                    exists, after_value = _exo_get_path(actual, path)
+                    if not exists:
+                        failures.append(
+                            f"{suffix}: preserved identity missing: {'.'.join(path)}"
+                        )
+                        continue
+                    if after_value != before_value:
+                        failures.append(
+                            f"{suffix}: preserved identity changed: {'.'.join(path)}"
+                        )
+
+                # 3) No foreign/non-empty identity may appear from the template.
+                actual_identity = _exo_collect_pet_identity(actual)
+                for path, value in actual_identity.items():
+                    if path in preserved:
+                        continue
+                    if _exo_identity_value_nonempty(value):
+                        failures.append(
+                            f"{suffix}: unexpected non-empty identity: "
+                            f"{'.'.join(path)}"
+                        )
+
             except Exception as exc:
                 failures.append(f"{suffix}: read-back failed: {exc}")
 
         results.append((item, not failures, "; ".join(failures)))
 
     return results
-
-
-
-def _exo_stop_selected_for_offline_install(cfg, plan):
-    """Get all selected packages stably DEAD before reading/writing EXO files."""
-    stopped = []
-
-    print("")
-    print(col("OFFLINE EXO INSTALL PREP:", BOLD))
-    print(col(
-        "Stopping selected clone PIDs first so running EXO cannot keep/save stale config.",
-        CYAN,
-    ))
-
-    for item in plan:
-        pkg = str(item.get("pkg") or "").strip()
-        user = str(item.get("username") or pkg)
-        if not pkg:
-            return False, "install plan contains an empty package", stopped
-
-        status, status_note = package_alive_status(pkg, cfg, fresh=True)
-        if status == "UNKNOWN":
-            return False, (
-                f"{short_pkg(pkg)} {user}: PID state UNKNOWN; "
-                f"offline install aborted before write ({status_note})"
-            ), stopped
-
-        if status == "DEAD":
-            print(f"  {short_pkg(pkg)} {user}: already stopped")
-            continue
-
-        print(f"  {short_pkg(pkg)} {user}: exact PID stop...")
-        ok, stop_note = force_stop_package(pkg, cfg)
-        if not ok:
-            return False, (
-                f"{short_pkg(pkg)} {user}: exact PID stop failed; "
-                f"offline install aborted before write ({stop_note})"
-            ), stopped
-
-        final_status, final_note = package_alive_status(pkg, cfg, fresh=True)
-        if final_status == "UNKNOWN":
-            return False, (
-                f"{short_pkg(pkg)} {user}: PID state UNKNOWN after stop "
-                f"({final_note}); aborted before write"
-            ), stopped
-
-        if final_status == "DEAD":
-            stopped.append(pkg)
-            print(col(f"    stopped: {stop_note}", GREEN))
-        else:
-            # Do not abort yet. The bounded PRE-WRITE respawn guard below
-            # will exact-PID stop this selected package again.
-            print(col(
-                f"    immediate respawn detected after stop "
-                f"({final_status}: {final_note}); pre-write guard will handle it",
-                YELLOW,
-            ))
-
-    print("")
-    print(col(
-        "Pre-write offline hold: requiring all selected packages stably DEAD...",
-        DIM,
-    ))
-    stable_ok, stable_note, respawns = _exo_hold_stopped_with_respawn_guard(
-        cfg,
-        plan,
-        stable_seconds=2.0,
-        max_total_seconds=18.0,
-        max_respawns_per_package=3,
-        reapply_payload=False,
-    )
-    print(col(
-        f"Pre-write offline hold: {'PASS' if stable_ok else 'FAIL'} "
-        f"({stable_note})",
-        GREEN if stable_ok else RED,
-    ))
-
-    if not stable_ok:
-        return False, (
-            "offline install aborted before write because selected package(s) "
-            f"could not remain stopped: {stable_note}"
-        ), stopped
-
-    return True, (
-        f"Offline prep complete: {len(plan)} selected package(s) stably stopped."
-    ), stopped
-
-
-def _exo_atomic_write_bytes(target, content):
-    target = Path(target)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_name(target.name + ".nomo_exotic_tmp")
-    try:
-        with open(tmp, "wb") as handle:
-            handle.write(content)
-            handle.flush()
-            try:
-                os.fsync(handle.fileno())
-            except Exception:
-                pass
-        os.replace(str(tmp), str(target))
-    finally:
-        try:
-            if tmp.exists():
-                tmp.unlink()
-        except Exception:
-            pass
-
-
-def _exo_reapply_prepared_payloads(plan):
-    count = 0
-    for item in plan:
-        for payload in (item.get("_exo_prepared_payloads", {}) or {}).values():
-            target = payload.get("target")
-            content = payload.get("content")
-            if not target or not isinstance(content, (bytes, bytearray)):
-                continue
-            _exo_atomic_write_bytes(target, bytes(content))
-            count += 1
-    return count
-
-
-def _exo_hold_stopped_with_respawn_guard(
-    cfg,
-    plan,
-    stable_seconds=4.0,
-    max_total_seconds=18.0,
-    max_respawns_per_package=3,
-    reapply_payload=True,
-):
-    """Require a stable DEAD window; exact-PID stop/reapply on brief respawn."""
-    started = time.monotonic()
-    stable_since = time.monotonic()
-    respawns = {}
-
-    while True:
-        if time.monotonic() - started > float(max_total_seconds):
-            detail = ", ".join(
-                f"{short_pkg(pkg)}={count}"
-                for pkg, count in sorted(respawns.items())
-            ) or "none"
-            return False, (
-                "stable offline window not reached before timeout; "
-                f"respawns={detail}"
-            ), respawns
-
-        saw_respawn = False
-
-        for item in plan:
-            pkg = str(item.get("pkg") or "").strip()
-            user = str(item.get("username") or pkg)
-            status, note = package_alive_status(pkg, cfg, fresh=True)
-
-            if status == "UNKNOWN":
-                return False, (
-                    f"{short_pkg(pkg)} {user}: PID state UNKNOWN during offline hold "
-                    f"({note})"
-                ), respawns
-
-            if status == "DEAD":
-                continue
-
-            saw_respawn = True
-            count = int(respawns.get(pkg, 0) or 0) + 1
-            respawns[pkg] = count
-
-            print(col(
-                f"  Respawn detected: {short_pkg(pkg)} {user} "
-                f"(attempt {count}/{max_respawns_per_package})",
-                YELLOW,
-            ))
-
-            if count > int(max_respawns_per_package):
-                return False, (
-                    f"{short_pkg(pkg)} repeatedly respawned "
-                    f"({count} times); possible external relaunch loop"
-                ), respawns
-
-            ok, stop_note = force_stop_package(pkg, cfg)
-            if not ok:
-                return False, (
-                    f"{short_pkg(pkg)} respawn exact-PID stop failed: {stop_note}"
-                ), respawns
-
-            final_status, final_note = package_alive_status(pkg, cfg, fresh=True)
-            if final_status != "DEAD":
-                return False, (
-                    f"{short_pkg(pkg)} not confirmed DEAD after respawn stop "
-                    f"({final_status}: {final_note})"
-                ), respawns
-
-            if reapply_payload:
-                # POST-WRITE: the short-lived process may have written stale
-                # in-memory EXO state. Restore the immutable prepared payload.
-                written = _exo_reapply_prepared_payloads(plan)
-                print(col(
-                    f"    stopped again; re-applied {written} prepared EXO file(s)",
-                    GREEN,
-                ))
-            else:
-                # PRE-WRITE: nothing has been installed yet; just keep it dead.
-                print(col(
-                    "    stopped again; pre-write offline hold continues",
-                    GREEN,
-                ))
-
-        if saw_respawn:
-            stable_since = time.monotonic()
-            time.sleep(0.6)
-            continue
-
-        if time.monotonic() - stable_since >= float(stable_seconds):
-            detail = ", ".join(
-                f"{short_pkg(pkg)}={count}"
-                for pkg, count in sorted(respawns.items())
-            ) or "0"
-            return True, (
-                f"stable DEAD for {stable_seconds:.1f}s; respawns handled={detail}"
-            ), respawns
-
-        time.sleep(0.5)
-
-
-def _exo_verify_selected_still_stopped(cfg, plan):
-    failures = []
-    for item in plan:
-        pkg = str(item.get("pkg") or "").strip()
-        status, note = package_alive_status(pkg, cfg, fresh=True)
-        if status != "DEAD":
-            failures.append(
-                f"{short_pkg(pkg)}={status} ({note})"
-            )
-    if failures:
-        return False, " | ".join(failures)
-    return True, "all selected packages remain stopped"
 
 
 def install_exotic_master_plan(manifest, plan):
@@ -27716,6 +27600,13 @@ def install_exotic_master_plan(manifest, plan):
         uid = str(item["uid"])
         exo_dir = Path(item["exo_dir"])
         item["preserved_identity_paths"] = {}
+
+        exact_file1 = exo_dir / f"{uid}file1.json"
+        if _exo_load_json_file(exact_file1) is None:
+            return False, (
+                f"{item['username']} UID={uid}: exact existing File1 is missing/"
+                f"unreadable after offline prep: {exact_file1}; NOTHING WRITTEN"
+            ), []
 
         for master_name, suffix in (
             (item["file1_name"], "file1.json"),
@@ -27739,6 +27630,9 @@ def install_exotic_master_plan(manifest, plan):
             item["preserved_identity_paths"][suffix] = [
                 ".".join(path) for path in sorted(preserved.keys())
             ]
+            item.setdefault("_exo_preserved_identity_snapshot", {})[suffix] = (
+                copy.deepcopy(preserved)
+            )
 
             final_bytes = json.dumps(
                 final_obj,
@@ -27909,6 +27803,31 @@ def workspace_zip_tools_menu(cfg):
                 for item in rest_market:
                     print(f"  {item['username']} ({item['uid']}) -> MARKET")
 
+            preflight_ok, preflight_failures, preflight_rows = (
+                _exo_preflight_existing_file1(plan)
+            )
+            print("")
+            print(col("PET-TEAM SOURCE PREFLIGHT:", BOLD))
+            if not preflight_ok:
+                print(col(
+                    "FAIL — exact per-UID existing File1 is required; "
+                    "no clone will be stopped and no EXO file will be modified.",
+                    RED,
+                ))
+                for failure in preflight_failures:
+                    print(col("  " + failure, RED))
+                pause()
+                continue
+
+            for pf_item, pf_path, pf_summary in preflight_rows:
+                print(
+                    f"  {pf_item['username']} UID={pf_item['uid']} -> "
+                    f"teams {pf_summary['nonempty_team_fields']}/"
+                    f"{pf_summary['team_fields']} non-empty, "
+                    f"pet UUID values={pf_summary['uuid_values']}"
+                )
+                print(col(f"      source: {pf_path}", DIM))
+
             if not _setup_yes_no("Install EXO master now?", default=True):
                 print(col("Install cancelled.", YELLOW))
                 pause()
@@ -27981,7 +27900,8 @@ def workspace_zip_tools_menu(cfg):
                 print("")
                 if stopped_ok and not failures:
                     print(col(
-                        f"Read-back verification: PASS ({len(verify)}/{len(verify)} account config sets match master outside pet UUID/team identity)",
+                        f"Read-back verification: PASS ({len(verify)}/{len(verify)} "
+                        f"accounts: master settings match + preserved pet/team identity exact)",
                         GREEN,
                     ))
                     print(col(
