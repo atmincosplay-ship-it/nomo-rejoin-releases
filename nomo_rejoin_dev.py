@@ -1,5 +1,21 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.87 — OPTION 17 OFFLINE EXO INSTALL / LIVE-CONFIG WRITEBACK FIX
+# - Fixes a real failure mode where Option 17 wrote the correct master JSON and
+#   immediate read-back passed, but the already-running ExoticHub Lua still had
+#   its old config in memory (and could later save that stale config back).
+# - Before any EXO master write, Option 17 now stops ONLY the selected packages'
+#   verified exact PIDs, one package at a time, using the existing fail-closed
+#   sibling-safe PID stop. No am force-stop / killall / pkill.
+# - Pet UUID/team identity is read only AFTER the selected package is confirmed
+#   stopped, so the preserved account-specific team data is the stable on-disk state.
+# - If any selected package PID state is UNKNOWN or an exact stop fails, the whole
+#   install aborts BEFORE modifying EXO files.
+# - After install, NOMO waits for disk settle and verifies all selected packages
+#   are still stopped, then performs the existing master-vs-installed verification.
+# - Selected clones are intentionally left stopped. The next normal launch/rejoin
+#   starts EXO fresh so the new sellingpets/giftpets/etc. are actually loaded.
+#
 # V4.81.86 — EXO MASTER REPLACES SETTINGS BUT PRESERVES PET-IDENTITY/TEAM DATA
 # - Master settings overwrite the account config EXCEPT per-account pet UUID/team identity.
 # - Preserve team membership lists (team1..team7, custom/nested *_team lists).
@@ -1475,7 +1491,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.86"
+__version__ = "V4.81.87"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -27331,6 +27347,79 @@ def _verify_exotic_install_plan(manifest, plan):
     return results
 
 
+
+def _exo_stop_selected_for_offline_install(cfg, plan):
+    """Stop every selected clone by exact package PID before touching EXO config.
+
+    Returns (ok, note, stopped_packages). Any UNKNOWN/failure aborts the install
+    before files are modified.
+    """
+    stopped = []
+
+    print("")
+    print(col("OFFLINE EXO INSTALL PREP:", BOLD))
+    print(col(
+        "Stopping selected clone PIDs first so running EXO cannot keep/save stale config.",
+        CYAN,
+    ))
+
+    for item in plan:
+        pkg = str(item.get("pkg") or "").strip()
+        user = str(item.get("username") or pkg)
+        if not pkg:
+            return False, "install plan contains an empty package", stopped
+
+        status, status_note = package_alive_status(pkg, cfg, fresh=True)
+        if status == "UNKNOWN":
+            return False, (
+                f"{short_pkg(pkg)} {user}: PID state UNKNOWN; "
+                f"offline install aborted before write ({status_note})"
+            ), stopped
+
+        if status == "DEAD":
+            print(f"  {short_pkg(pkg)} {user}: already stopped")
+            continue
+
+        print(f"  {short_pkg(pkg)} {user}: exact PID stop...")
+        ok, stop_note = force_stop_package(pkg, cfg)
+        if not ok:
+            return False, (
+                f"{short_pkg(pkg)} {user}: exact PID stop failed; "
+                f"offline install aborted before write ({stop_note})"
+            ), stopped
+
+        final_status, final_note = package_alive_status(pkg, cfg, fresh=True)
+        if final_status != "DEAD":
+            return False, (
+                f"{short_pkg(pkg)} {user}: package not confirmed DEAD after stop "
+                f"({final_status}: {final_note}); aborted before write"
+            ), stopped
+
+        stopped.append(pkg)
+        print(col(f"    stopped: {stop_note}", GREEN))
+
+    # Small settle after the final process is gone. Any Lua config writer attached
+    # to the Roblox process is now dead before we read preserved team/UUID data.
+    time.sleep(1.5)
+    return True, (
+        f"Offline prep complete: {len(plan)} selected package(s) confirmed stopped."
+    ), stopped
+
+
+def _exo_verify_selected_still_stopped(cfg, plan):
+    failures = []
+    for item in plan:
+        pkg = str(item.get("pkg") or "").strip()
+        status, note = package_alive_status(pkg, cfg, fresh=True)
+        if status != "DEAD":
+            failures.append(
+                f"{short_pkg(pkg)}={status} ({note})"
+            )
+    if failures:
+        return False, " | ".join(failures)
+    return True, "all selected packages remain stopped"
+
+
 def install_exotic_master_plan(manifest, plan):
     """Install full master while preserving only each UID's pet UUID/team identity."""
     parsed = manifest["parsed"]
@@ -27438,7 +27527,7 @@ def workspace_zip_tools_menu(cfg):
             DIM,
         ))
         print("")
-        print("1. Install exotic_master.zip (replace settings; preserve pet UUID teams)")
+        print("1. Install exotic_master.zip OFFLINE (stop selected; preserve pet UUID teams)")
         print("2. Configure EXO UID groups from installed accounts")
         print("3. Import generic config/workspace ZIP -> current executor Workspace(s)")
         print("4. Export current executor Workspace(s) -> timestamped ZIP")
@@ -27493,6 +27582,10 @@ def workspace_zip_tools_menu(cfg):
                 "  Merge: MASTER wins; only existing pet UUID/team identity is preserved",
                 CYAN,
             ))
+            print(col(
+                "  Runtime: selected clones are exact-PID stopped BEFORE write and left stopped",
+                CYAN,
+            ))
 
             plan, unresolved = _exotic_master_install_plan(
                 cfg, selected, manifest
@@ -27544,6 +27637,18 @@ def workspace_zip_tools_menu(cfg):
                 pause()
                 continue
 
+            offline_ok, offline_note, stopped_packages = (
+                _exo_stop_selected_for_offline_install(cfg, plan)
+            )
+            print(col(offline_note, GREEN if offline_ok else RED))
+            if not offline_ok:
+                print(col(
+                    "No EXO config file was modified because offline prep failed.",
+                    YELLOW,
+                ))
+                pause()
+                continue
+
             ok, note, backups = install_exotic_master_plan(
                 manifest, plan
             )
@@ -27572,13 +27677,37 @@ def workspace_zip_tools_menu(cfg):
                             preview += f", +{len(paths)-8} more"
                         print(f"      {suffix}: {preview}")
 
+                # Keep the files quiet for a few seconds. If any selected clone
+                # somehow restarts, do not pretend the config is safely installed.
+                time.sleep(3.0)
+                stopped_ok, stopped_note = _exo_verify_selected_still_stopped(
+                    cfg, plan
+                )
+                print("")
+                print(col(
+                    f"Offline hold: {'PASS' if stopped_ok else 'FAIL'} "
+                    f"({stopped_note})",
+                    GREEN if stopped_ok else RED,
+                ))
+
                 verify = _verify_exotic_install_plan(manifest, plan)
                 failures = [entry for entry in verify if not entry[1]]
                 print("")
-                if not failures:
+                if stopped_ok and not failures:
                     print(col(
                         f"Read-back verification: PASS ({len(verify)}/{len(verify)} account config sets match master outside pet UUID/team identity)",
                         GREEN,
+                    ))
+                    print(col(
+                        "Selected clones are intentionally LEFT STOPPED. "
+                        "Start/rejoin them normally so EXO loads this config fresh.",
+                        CYAN,
+                    ))
+                elif not stopped_ok:
+                    print(col(
+                        "Read-back cannot certify a live reload because a selected "
+                        "package restarted during the offline hold.",
+                        RED,
                     ))
                 else:
                     print(col(
