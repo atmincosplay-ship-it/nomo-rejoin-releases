@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.97 — HATCHER STARTUP HANDOFF / REMOVE SILENT DUPLICATE PRE-SCAN
+# - Fixes Option 1 appearing frozen on STARTUP: CACHE CLEANUP after the summary
+#   already said all caches were cleared.
+# - The Hatcher starter previously performed a second Android/process/state scan
+#   over every profile before entering the normal watchdog loop. The watchdog then
+#   repeated the same work before drawing its first table.
+# - That duplicate pre-scan is removed by default. Closed/stale/Home/shell recovery
+#   is now owned by the first normal watchdog cycle only.
+# - Immediately after cache cleanup NOMO prints a visible handoff message.
+# - Hatcher also draws a lightweight STARTING screen using only saved state files
+#   before any Android/UI probes, so the terminal never looks dead during first scan.
+# - No recovery rule, PID policy, Home routing, shell wake, solver, or Option 17
+#   behavior is changed.
+#
 # V4.81.96 — ROBLOX HOME PROTOCOL-ACTIVITY NUDGE + VISUAL FRESH GUARD
 # - V4.81.95 correctly detected Roblox Home, but the peer-safe soft route could
 #   return "soft hop/open ok" while the same clone visibly remained on Home.
@@ -1621,7 +1635,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.96"
+__version__ = "V4.81.97"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -23821,90 +23835,54 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
     else:
         pass
 
-    # Startup: queue every package that truly needs an open, in profile order.
-    # Fresh packages are untouched. A running PID with a state already older than
-    # the configured hard threshold is not treated as healthy: it is queued for
-    # one exact-PID restart immediately. Closed packages are queued normally.
-    if cfg.get("open_all_on_start", True):
-        old_enabled, old_sec, old_max, _old_cd = hatcher_alive_old_state_hard_settings(hcfg, cfg)
-        for tab in tabs:
-            pkg = tab["package"]
-            process_status, process_note = package_alive_status(pkg, cfg, fresh=True)
-            raw_alive = process_status == "ALIVE"
-            state, _state_err = read_state(tab)
-            state_age = int((state or {}).get("age", 999999) or 999999) if state else None
-            fresh_state = bool(
-                state is not None
-                and state_is_clean(state)
-                and state_age <= int(cfg.get("state_stale_seconds", 180) or 180)
-            )
-            rt_tab = get_runtime_tab(rt, pkg)
-            rt_tab["target"] = "hatcher"
+    # V4.81.97: do not perform a second expensive Android/UI recovery scan here.
+    # The normal watchdog loop below owns all recovery decisions and will queue
+    # DEAD/stale/Home/shell packages on its first cycle.  Before that scan, draw a
+    # lightweight state-only screen so Option 1 never appears frozen after cache cleanup.
+    clear()
+    banner("HATCHER: STARTING WATCHDOG", cfg)
+    print(col(
+        "Cache cleanup finished. First live health scan is starting now.",
+        CYAN,
+    ))
+    print(col(
+        "No duplicate startup PID/UI scan; recovery begins in the normal watchdog loop.",
+        DIM,
+    ))
+    print("")
+    startup_rows = []
+    for tab in tabs:
+        pkg = str(tab.get("package") or "")
+        rt_tab = get_runtime_tab(rt, pkg)
+        rt_tab["target"] = "hatcher"
+        state, _err = read_state(tab)
+        username = str(tab.get("user_name") or short_pkg(pkg))
+        pets = "-"
+        eggs = "-"
+        age_text = "no state"
+        if state:
+            detected = _usable_detected_username(state.get("username"))
+            if detected:
+                username = detected
+            pets = str(int(state.get("pet_count", 0) or 0))
+            eggs = str(int(state.get("egg_total", 0) or 0))
+            age_value = int(state.get("age", 999999) or 999999)
+            age_text = format_age(age_value) if age_value < 999999 else "bad ts"
+        rt_tab["note"] = "startup live scan pending"
+        startup_rows.append((username, short_pkg(pkg), pets, eggs, age_text))
 
-            if fresh_state:
-                rt_tab["note"] = "start fresh state"
-                continue
-
-            if process_status == "UNKNOWN":
-                rt_tab["note"] = "start deferred: process check unavailable"
-                log_activity("startup process check unavailable; no reopen queued", pkg, YELLOW)
-                continue
-
-            if (
-                raw_alive
-                and state is not None
-                and old_enabled
-                and hatcher_state_timestamp_valid(state)
-                and state_age >= old_sec
-            ):
-                bubble_only, bubble_note = hatcher_bubble_only_recovery_candidate(
-                    pkg, cfg, process_status=process_status
-                )
-                if bubble_only:
-                    added, qnote = queue_hatcher_bubble_only_recovery(
-                        core, tab, rt_tab, cfg,
-                        f"startup bubble-only shell; old state {state_age}s",
-                    )
-                    rt_tab["note"] = qnote
-                    if (
-                        added
-                        or core.has(pkg)
-                        or str(qnote or "").startswith("bubble-only held;")
-                    ):
-                        continue
-
-                # NOMO may have been started while this clone was already in the
-                # Roblox loading screen. Its previous state file remains old until
-                # AutoExec reaches the game, so observe first instead of killing it.
-                startup_stale_grace = max(
-                    120,
-                    int(cfg.get("hatcher_startup_stale_grace_seconds", 240) or 240),
-                )
-                rt_tab["hatcher_startup_observe_until"] = now() + startup_stale_grace
-                rt_tab["last_open"] = now()
-                rt_tab["note"] = f"startup loading grace {startup_stale_grace}s"
-                log_activity(
-                    f"alive with old state; startup grace {format_age(startup_stale_grace)} (no stop)",
-                    pkg, CYAN,
-                )
-                continue
-
-            if raw_alive:
-                # Alive with no usable state yet: allow only the short startup
-                # grace. The normal loop then queues exact-PID no-state recovery.
-                startup_grace = int(cfg.get("hatcher_startup_grace_seconds", 75) or 75)
-                post_grace = int(cfg.get("post_open_grace_seconds", 360) or 360)
-                rt_tab["last_open"] = now() - max(0, post_grace - startup_grace)
-                rt_tab["hatcher_no_state_since"] = now()
-                rt_tab["note"] = f"start alive -> grace {startup_grace}s"
-                continue
-
-            core.queue_start_recovery(
-                tab,
-                "hatcher",
-                "hatcher start",
-            )
-        core.save()
+    for username, spkg, pets, eggs, age_text in startup_rows:
+        print(
+            f"  {spkg:<8} {cut(username, 18):<18} "
+            f"pet={pets:<4} egg={eggs:<4} state={age_text}"
+        )
+    print("")
+    print(col("Scanning live package/UI state...", YELLOW))
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass
+    core.save()
 
     while True:
         if stop_requested():
@@ -47163,6 +47141,16 @@ def main():
                 setup=False,
                 show_screen=True,
             )
+
+            print("")
+            print(col(
+                "Cache cleanup complete -> starting " + str(mode).upper() + " watchdog...",
+                CYAN,
+            ))
+            try:
+                sys.stdout.flush()
+            except Exception:
+                pass
 
             try:
                 start_active_rejoin_mode(cfg)
