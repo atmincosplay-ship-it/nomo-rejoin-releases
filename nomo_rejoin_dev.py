@@ -14,6 +14,16 @@
 # - No recovery rule, PID policy, Home routing, shell wake, solver, or Option 17
 #   behavior is changed.
 #
+# V4.81.98 — MARKET 5M CACHE RECOVERY MUST NOT BE SOFT-DOWNGRADED
+# - Fixes Market infinite Trade World loading regression introduced by the
+#   V4.81.93 global ALIVE-Noka sibling safety downgrade.
+# - Market combined-stuck items were queued with forced Clear Cache metadata,
+#   but execution converted them to soft task reuse whenever siblings were alive.
+# - Market combined-stuck recovery is now exempt from that generic downgrade.
+# - With live siblings it uses a dedicated peer-safe cache restart:
+#     exact target PID stop -> forced Clear Cache -> exact package VIEW component.
+# - The restart uses SINGLE_TOP only and never falls back to generic hard launch.
+#
 # V4.81.96 — ROBLOX HOME PROTOCOL-ACTIVITY NUDGE + VISUAL FRESH GUARD
 # - V4.81.95 correctly detected Roblox Home, but the peer-safe soft route could
 #   return "soft hop/open ok" while the same clone visibly remained on Home.
@@ -1635,7 +1645,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.97"
+__version__ = "V4.81.98"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -5719,6 +5729,143 @@ def open_roblox_protocol_activity_nudge(pkg, link, cfg, rt_tab=None):
                 rt_tab["home_protocol_peer_warning_at"] = now()
 
     return True, "protocol VIEW activity nudged"
+
+
+
+def market_peer_safe_cache_protocol_restart(
+    pkg,
+    link,
+    cfg,
+    rt_tab,
+    reason="market stuck",
+):
+    """Market 5m recovery: exact PID stop -> cache -> exact VIEW component."""
+    pkg = str(pkg or "").strip()
+    link = android_launch_roblox_link(link, cfg)
+    reason = str(reason or "market stuck")
+
+    if not pkg or not link:
+        return False, "missing package/link"
+
+    sibling_pids_before, sibling_pid_errors = _sibling_pid_snapshot(pkg, cfg)
+    if sibling_pid_errors:
+        return False, (
+            "Market peer-safe restart refused; sibling PID query unavailable: "
+            + " | ".join(sibling_pid_errors)
+        )
+
+    sibling_activity_before = {}
+    for peer in sorted(sibling_pids_before.keys()):
+        status, note = package_activity_status(peer, cfg)
+        sibling_activity_before[peer] = (status, note)
+
+    stopped, stop_note = force_stop_package(
+        pkg, cfg, tries=3, wait_after=0.8, settle=1.0
+    )
+    log_activity(
+        "Market cache restart stop check: " + cut(stop_note, 75),
+        pkg,
+        DIM,
+    )
+    if not stopped:
+        return False, "Market exact-PID stop failed: " + cut(stop_note, 70)
+
+    cache_ok, cache_note = clear_package_cache(
+        pkg,
+        cfg,
+        rt_tab=rt_tab,
+        reason=reason,
+        force=True,
+    )
+    rt_tab["market_peer_safe_cache_attempted_at"] = now()
+    rt_tab["market_peer_safe_cache_ok"] = bool(cache_ok)
+    rt_tab["market_peer_safe_cache_note"] = str(cache_note or "")
+    log_activity(
+        "Market forced cache "
+        + ("ok: " if cache_ok else "FAILED: ")
+        + cut(cache_note, 80),
+        pkg,
+        GREEN if cache_ok else YELLOW,
+    )
+
+    component, resolve_note = resolve_package_view_activity(pkg, link, cfg)
+    if not component:
+        rt_tab["market_peer_safe_protocol_failed_at"] = now()
+        rt_tab["market_peer_safe_protocol_failed_note"] = str(resolve_note or "")
+        return False, (
+            "Market VIEW resolve failed after cache: "
+            + cut(resolve_note, 75)
+        )
+
+    cmd = (
+        "am start -W "
+        "-f 0x20000000 "
+        "-n " + shlex.quote(component) + " "
+        "-a android.intent.action.VIEW "
+        "-d " + shlex.quote(link)
+    )
+
+    invalidate_android_observation_caches()
+    code, output = shell_timeout(cmd, cfg, capture=True, timeout=20)
+    invalidate_android_observation_caches()
+
+    if code != 0:
+        rt_tab["market_peer_safe_protocol_failed_at"] = now()
+        rt_tab["market_peer_safe_protocol_failed_note"] = cut(
+            output or f"exit {code}",
+            120,
+        )
+        return False, (
+            "Market exact VIEW start failed after cache: "
+            + cut(output or f"exit {code}", 80)
+        )
+
+    rt_tab["target"] = "market"
+    rt_tab["last_open"] = now()
+    rt_tab["last_open_mode"] = "market-cache-protocol"
+    rt_tab["market_peer_safe_protocol_component"] = component
+    rt_tab["market_peer_safe_protocol_opened_at"] = now()
+    rt_tab["market_peer_safe_protocol_result"] = cut(output or "started", 120)
+
+    if sibling_pids_before:
+        time.sleep(1.0)
+        peer_ok, peer_note = _verify_sibling_pid_snapshot(
+            sibling_pids_before, cfg, pkg
+        )
+        activity_losses = []
+        for peer, (before_status, _before_note) in sibling_activity_before.items():
+            if before_status != "ACTIVITY":
+                continue
+            after_status, after_note = package_activity_status(peer, cfg)
+            if after_status == "NO_ACTIVITY":
+                activity_losses.append(short_pkg(peer) + ": ActivityRecord lost")
+            elif after_status == "UNKNOWN":
+                activity_losses.append(
+                    short_pkg(peer)
+                    + ": activity check unknown ("
+                    + cut(after_note, 35)
+                    + ")"
+                )
+
+        if not peer_ok or activity_losses:
+            detail = "; ".join(
+                ([peer_note] if not peer_ok else []) + activity_losses
+            )
+            rt_tab["market_protocol_peer_warning"] = str(detail or "")
+            rt_tab["market_protocol_peer_warning_at"] = now()
+            log_activity(
+                "MARKET PROTOCOL RESTART peer warning; no sibling action: "
+                + cut(detail, 100),
+                pkg,
+                RED,
+            )
+        else:
+            rt_tab["market_protocol_peer_warning"] = ""
+
+    return True, (
+        "Market cache+protocol restart opened"
+        + ("" if cache_ok else " (cache helper reported warning)")
+    )
 
 
 def open_package_launcher(pkg, cfg):
@@ -14319,7 +14466,9 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
             )
             if added:
                 if market_combined:
-                    return "Queued", f"Market 5m stuck -> cache recovery ({format_age(age)})", True
+                    return "Queued", (
+                        f"Market 5m stuck -> cache restart ({format_age(age)})"
+                    ), True
                 return "Queued", f"old {format_age(age)} kill+open", True
             status, note = core.queue_display(pkg, "Queued", "already queued")
             return status, note, True
@@ -17704,6 +17853,11 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
         and _is_noka_clone_package(pkg)
         and cfg.get("noka_alive_auto_hard_peer_safe_soft_enabled", True)
         and automatic_hard_item_can_soft_downgrade(item)
+        and not (
+            target == "market"
+            and item.get("market_combined_stuck_recovery")
+            and item.get("combined_stuck_recovery")
+        )
     ):
         has_peer, peer_note, peer_query_ok = noka_live_sibling_detail(pkg, cfg)
 
@@ -17733,6 +17887,41 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
                 + "; no hard fallback",
                 pkg,
                 YELLOW,
+            )
+            core.save()
+
+    # V4.81.98: Market 5m combined-stuck recovery keeps its cache repair.
+    # With live peers, use exact stop+cache+exact VIEW component instead of
+    # generic hard package launch.
+    if (
+        is_hard
+        and process_status == "ALIVE"
+        and target == "market"
+        and item.get("market_combined_stuck_recovery")
+        and item.get("combined_stuck_recovery")
+        and _is_noka_clone_package(pkg)
+    ):
+        has_peer, peer_note, peer_query_ok = noka_live_sibling_detail(pkg, cfg)
+        if not peer_query_ok:
+            core.requeue_front(item)
+            rt_tab["note"] = "Market cache recovery deferred; sibling PID query unavailable"
+            log_activity(
+                "Market cache recovery deferred; peer safety query unavailable",
+                pkg,
+                YELLOW,
+            )
+            core.save()
+            return True
+        if has_peer:
+            item["market_peer_safe_cache_protocol"] = True
+            item["market_peer_safe_peer_note"] = str(peer_note or "")
+            item["no_hard_fallback"] = True
+            rt_tab["note"] = "Market stuck -> peer-safe cache restart"
+            log_activity(
+                "Market 5m stuck -> exact PID stop + Clear Cache + exact VIEW restart; "
+                + cut(peer_note, 85),
+                pkg,
+                CYAN,
             )
             core.save()
 
@@ -18153,7 +18342,9 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
         log_activity(f"open held by manual verification: {cut(manual_note, 70)}", pkg, YELLOW)
         return False, manual_note
     display_mode = str(mode or "hard")
-    if item.get("visible_home_protocol_nudge"):
+    if item.get("market_peer_safe_cache_protocol"):
+        display_mode = "market-cache-protocol"
+    elif item.get("visible_home_protocol_nudge"):
         display_mode = "home-protocol"
     elif item.get("bubble_only_soft_wake"):
         display_mode = "shell-soft-wake"
@@ -18248,7 +18439,22 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
 
     log_activity(f"opening -> {target} ({display_mode})", pkg)
 
-    if item.get("visible_home_protocol_nudge"):
+    if item.get("market_peer_safe_cache_protocol"):
+        link = core.target_link(tab, target, rt_tab)
+        if not link:
+            ok, msg = False, "Market cache protocol has no target link"
+        else:
+            ok, msg = market_peer_safe_cache_protocol_restart(
+                pkg,
+                link,
+                cfg,
+                rt_tab,
+                reason=reason,
+            )
+            if ok:
+                rt_tab["target"] = target
+                rt_tab["note"] = reason
+    elif item.get("visible_home_protocol_nudge"):
         link = core.target_link(tab, target, rt_tab)
         if not link:
             ok, msg = False, "protocol nudge has no target link"
