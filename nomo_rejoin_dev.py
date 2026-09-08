@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.92 — RESTORE OPTION 17 OFFLINE HELPERS / BUILD SYMBOL GUARD
+# - Fixes V4.81.91 Option 17 NameError:
+#     _exo_stop_selected_for_offline_install is not defined
+# - Restores the V4.81.90 offline helper block accidentally removed by V4.81.91.
+# - Keeps V4.81.91 exact File1 preflight + exact preserved-identity verification.
+# - Adds Option 17 runtime helper-symbol validation before showing the menu.
+# - Build now AST-validates critical Option 17 helpers are defined exactly once.
+#
 # V4.81.91 — EXO PET-TEAM PRESERVATION FAIL-CLOSED + IDENTITY VERIFICATION
 # - Fixes a dangerous Option 17 edge case: if the exact existing
 #   <UID>file1.json was missing/wrong Workspace, previous builds scrubbed the
@@ -1552,7 +1560,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.91"
+__version__ = "V4.81.92"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -27588,6 +27596,256 @@ def _verify_exotic_install_plan(manifest, plan):
     return results
 
 
+def _exo_stop_selected_for_offline_install(cfg, plan):
+    """Get all selected packages stably DEAD before reading/writing EXO files."""
+    stopped = []
+
+    print("")
+    print(col("OFFLINE EXO INSTALL PREP:", BOLD))
+    print(col(
+        "Stopping selected clone PIDs first so running EXO cannot keep/save stale config.",
+        CYAN,
+    ))
+
+    for item in plan:
+        pkg = str(item.get("pkg") or "").strip()
+        user = str(item.get("username") or pkg)
+        if not pkg:
+            return False, "install plan contains an empty package", stopped
+
+        status, status_note = package_alive_status(pkg, cfg, fresh=True)
+        if status == "UNKNOWN":
+            return False, (
+                f"{short_pkg(pkg)} {user}: PID state UNKNOWN; "
+                f"offline install aborted before write ({status_note})"
+            ), stopped
+
+        if status == "DEAD":
+            print(f"  {short_pkg(pkg)} {user}: already stopped")
+            continue
+
+        print(f"  {short_pkg(pkg)} {user}: exact PID stop...")
+        ok, stop_note = force_stop_package(pkg, cfg)
+        if not ok:
+            return False, (
+                f"{short_pkg(pkg)} {user}: exact PID stop failed; "
+                f"offline install aborted before write ({stop_note})"
+            ), stopped
+
+        final_status, final_note = package_alive_status(pkg, cfg, fresh=True)
+        if final_status == "UNKNOWN":
+            return False, (
+                f"{short_pkg(pkg)} {user}: PID state UNKNOWN after stop "
+                f"({final_note}); aborted before write"
+            ), stopped
+
+        if final_status == "DEAD":
+            stopped.append(pkg)
+            print(col(f"    stopped: {stop_note}", GREEN))
+        else:
+            # Do not abort yet. The bounded PRE-WRITE respawn guard below
+            # will exact-PID stop this selected package again.
+            print(col(
+                f"    immediate respawn detected after stop "
+                f"({final_status}: {final_note}); pre-write guard will handle it",
+                YELLOW,
+            ))
+
+    print("")
+    print(col(
+        "Pre-write offline hold: requiring all selected packages stably DEAD...",
+        DIM,
+    ))
+    stable_ok, stable_note, respawns = _exo_hold_stopped_with_respawn_guard(
+        cfg,
+        plan,
+        stable_seconds=2.0,
+        max_total_seconds=18.0,
+        max_respawns_per_package=3,
+        reapply_payload=False,
+    )
+    print(col(
+        f"Pre-write offline hold: {'PASS' if stable_ok else 'FAIL'} "
+        f"({stable_note})",
+        GREEN if stable_ok else RED,
+    ))
+
+    if not stable_ok:
+        return False, (
+            "offline install aborted before write because selected package(s) "
+            f"could not remain stopped: {stable_note}"
+        ), stopped
+
+    return True, (
+        f"Offline prep complete: {len(plan)} selected package(s) stably stopped."
+    ), stopped
+
+
+def _exo_atomic_write_bytes(target, content):
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + ".nomo_exotic_tmp")
+    try:
+        with open(tmp, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except Exception:
+                pass
+        os.replace(str(tmp), str(target))
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+
+
+def _exo_reapply_prepared_payloads(plan):
+    count = 0
+    for item in plan:
+        for payload in (item.get("_exo_prepared_payloads", {}) or {}).values():
+            target = payload.get("target")
+            content = payload.get("content")
+            if not target or not isinstance(content, (bytes, bytearray)):
+                continue
+            _exo_atomic_write_bytes(target, bytes(content))
+            count += 1
+    return count
+
+
+def _exo_hold_stopped_with_respawn_guard(
+    cfg,
+    plan,
+    stable_seconds=4.0,
+    max_total_seconds=18.0,
+    max_respawns_per_package=3,
+    reapply_payload=True,
+):
+    """Require a stable DEAD window; exact-PID stop/reapply on brief respawn."""
+    started = time.monotonic()
+    stable_since = time.monotonic()
+    respawns = {}
+
+    while True:
+        if time.monotonic() - started > float(max_total_seconds):
+            detail = ", ".join(
+                f"{short_pkg(pkg)}={count}"
+                for pkg, count in sorted(respawns.items())
+            ) or "none"
+            return False, (
+                "stable offline window not reached before timeout; "
+                f"respawns={detail}"
+            ), respawns
+
+        saw_respawn = False
+
+        for item in plan:
+            pkg = str(item.get("pkg") or "").strip()
+            user = str(item.get("username") or pkg)
+            status, note = package_alive_status(pkg, cfg, fresh=True)
+
+            if status == "UNKNOWN":
+                return False, (
+                    f"{short_pkg(pkg)} {user}: PID state UNKNOWN during offline hold "
+                    f"({note})"
+                ), respawns
+
+            if status == "DEAD":
+                continue
+
+            saw_respawn = True
+            count = int(respawns.get(pkg, 0) or 0) + 1
+            respawns[pkg] = count
+
+            print(col(
+                f"  Respawn detected: {short_pkg(pkg)} {user} "
+                f"(attempt {count}/{max_respawns_per_package})",
+                YELLOW,
+            ))
+
+            if count > int(max_respawns_per_package):
+                return False, (
+                    f"{short_pkg(pkg)} repeatedly respawned "
+                    f"({count} times); possible external relaunch loop"
+                ), respawns
+
+            ok, stop_note = force_stop_package(pkg, cfg)
+            if not ok:
+                return False, (
+                    f"{short_pkg(pkg)} respawn exact-PID stop failed: {stop_note}"
+                ), respawns
+
+            final_status, final_note = package_alive_status(pkg, cfg, fresh=True)
+            if final_status != "DEAD":
+                return False, (
+                    f"{short_pkg(pkg)} not confirmed DEAD after respawn stop "
+                    f"({final_status}: {final_note})"
+                ), respawns
+
+            if reapply_payload:
+                # POST-WRITE: the short-lived process may have written stale
+                # in-memory EXO state. Restore the immutable prepared payload.
+                written = _exo_reapply_prepared_payloads(plan)
+                print(col(
+                    f"    stopped again; re-applied {written} prepared EXO file(s)",
+                    GREEN,
+                ))
+            else:
+                # PRE-WRITE: nothing has been installed yet; just keep it dead.
+                print(col(
+                    "    stopped again; pre-write offline hold continues",
+                    GREEN,
+                ))
+
+        if saw_respawn:
+            stable_since = time.monotonic()
+            time.sleep(0.6)
+            continue
+
+        if time.monotonic() - stable_since >= float(stable_seconds):
+            detail = ", ".join(
+                f"{short_pkg(pkg)}={count}"
+                for pkg, count in sorted(respawns.items())
+            ) or "0"
+            return True, (
+                f"stable DEAD for {stable_seconds:.1f}s; respawns handled={detail}"
+            ), respawns
+
+        time.sleep(0.5)
+
+
+def _exo_verify_selected_still_stopped(cfg, plan):
+    failures = []
+    for item in plan:
+        pkg = str(item.get("pkg") or "").strip()
+        status, note = package_alive_status(pkg, cfg, fresh=True)
+        if status != "DEAD":
+            failures.append(
+                f"{short_pkg(pkg)}={status} ({note})"
+            )
+    if failures:
+        return False, " | ".join(failures)
+    return True, "all selected packages remain stopped"
+
+
+def _exo_option17_runtime_symbol_check():
+    required = (
+        "_exo_preflight_existing_file1",
+        "_exo_stop_selected_for_offline_install",
+        "_exo_atomic_write_bytes",
+        "_exo_reapply_prepared_payloads",
+        "_exo_hold_stopped_with_respawn_guard",
+        "_verify_exotic_install_plan",
+        "install_exotic_master_plan",
+    )
+    missing = [name for name in required if not callable(globals().get(name))]
+    if missing:
+        return False, "missing Option 17 helper(s): " + ", ".join(missing)
+    return True, "Option 17 helper symbols OK"
+
+
 def install_exotic_master_plan(manifest, plan):
     """Install full master while preserving only each UID's pet UUID/team identity."""
     parsed = manifest["parsed"]
@@ -27690,6 +27948,14 @@ def install_exotic_master_plan(manifest, plan):
 
 
 def workspace_zip_tools_menu(cfg):
+    symbols_ok, symbols_note = _exo_option17_runtime_symbol_check()
+    if not symbols_ok:
+        clear()
+        banner("WORKSPACE ZIP / EXO CONFIG TOOLS", cfg)
+        print(col("[OPTION 17 INTERNAL ERROR] " + symbols_note, RED))
+        pause()
+        return
+
     while True:
         clear()
         banner("WORKSPACE ZIP / EXO CONFIG TOOLS", cfg)
