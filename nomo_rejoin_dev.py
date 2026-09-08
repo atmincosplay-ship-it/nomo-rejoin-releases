@@ -14,6 +14,19 @@
 # - No recovery rule, PID policy, Home routing, shell wake, solver, or Option 17
 #   behavior is changed.
 #
+# V4.81.99 — MARKET 5M RECOVERY IS COMMITTED / NO FALSE HEALED CANCEL
+# - V4.81.98 correctly selected the Market peer-safe cache+VIEW restart, but an
+#   older last-second generic health recheck could still cancel it with:
+#       "open cancelled: healed while queued"
+# - That generic check only uses a fresh state.json age and can be false while
+#   the clone is visibly still stuck on the Trade World loading screen.
+# - Market combined-stuck recovery is now COMMITTED once the 5-minute threshold
+#   has queued it. Its metadata sets bypass_recheck=True, so a fresh timestamp
+#   alone cannot cancel the cache repair while the item sits in the queue.
+# - This does NOT bypass auth/moderation/CAPTCHA/Account-Lock gates; those still
+#   run immediately before any PID stop.
+# - Ordinary Hatcher/other ALIVE hard recoveries keep the generic healed recheck.
+#
 # V4.81.98 — MARKET 5M CACHE RECOVERY MUST NOT BE SOFT-DOWNGRADED
 # - Fixes Market infinite Trade World loading regression introduced by the
 #   V4.81.93 global ALIVE-Noka sibling safety downgrade.
@@ -1645,7 +1658,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.98"
+__version__ = "V4.81.99"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -14094,6 +14107,13 @@ def market_combined_stuck_metadata(cfg, age_or_seconds=0, reason=""):
         "combined_stuck_clear_cache": bool(
             enabled and cfg.get("market_combined_stuck_clear_cache", True)
         ),
+        # V4.81.99: once Market has crossed the 5-minute stuck threshold this
+        # recovery is committed. A generic fresh state.json timestamp is not
+        # enough to cancel it while queued; the visible Trade World loader can
+        # coexist with stale/old Lua writers.
+        "bypass_recheck": bool(enabled),
+        "always_recheck_health": False,
+        "market_stuck_committed": bool(enabled),
         # The cache repair itself is the single recovery attempt. Do not append
         # the legacy route -> hard fallback chain if fresh state is still late.
         "no_hard_fallback": True,
@@ -14467,7 +14487,7 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
             if added:
                 if market_combined:
                     return "Queued", (
-                        f"Market 5m stuck -> cache restart ({format_age(age)})"
+                        f"Market 5m stuck -> COMMITTED cache restart ({format_age(age)})"
                     ), True
                 return "Queued", f"old {format_age(age)} kill+open", True
             status, note = core.queue_display(pkg, "Queued", "already queued")
@@ -14558,7 +14578,7 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
         )
         if added:
             if market_combined:
-                return "Queued", "Market 5m no-state -> cache recovery", True
+                return "Queued", "Market 5m no-state -> COMMITTED cache restart", True
             return "Queued", "no-state kill+open", True
         status, note = core.queue_display(pkg, "Queued", "already queued")
         return status, note, True
@@ -17925,6 +17945,19 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
             )
             core.save()
 
+    if item.get("market_stuck_committed"):
+        last_commit_log = int(
+            rt_tab.get("market_stuck_committed_execution_log_at", 0) or 0
+        )
+        if now() - last_commit_log >= 10:
+            log_activity(
+                "Market 5m recovery COMMITTED; generic fresh-state healed-cancel bypassed",
+                pkg,
+                CYAN,
+            )
+            rt_tab["market_stuck_committed_execution_log_at"] = now()
+            core.save()
+
     # V4.81.83: all auth/challenge holds are package-local. The target clone
     # is rechecked independently; another clone's Face Lock/CAPTCHA/solver cannot
     # suppress this package's exact-target recovery.
@@ -17986,7 +18019,12 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
     # V3.79: LAST-SECOND HEALTH RECHECK
     # The clone may have recovered while it sat in the queue. Do not force-stop a
     # package that is alive AND writing fresh state right now.
-    if is_hard and cfg.get("recheck_before_hard_open", True) and not item.get("bypass_recheck"):
+    if (
+        is_hard
+        and cfg.get("recheck_before_hard_open", True)
+        and not item.get("bypass_recheck")
+        and not item.get("market_combined_stuck_recovery")
+    ):
         queued_at = int(item.get("queued_at", 0) or 0)
         min_age = (
             0
