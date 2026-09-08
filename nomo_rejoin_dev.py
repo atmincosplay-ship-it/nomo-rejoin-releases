@@ -14,6 +14,26 @@
 # - No recovery rule, PID policy, Home routing, shell wake, solver, or Option 17
 #   behavior is changed.
 #
+# V4.81.100 — MARKET STRONG-HEAL RECHECK + 5M FAILED-RETRY
+# - V4.81.99 prevented weak fresh timestamps from cancelling Market recovery,
+#   but that also allowed an old queued recovery to restart a clone that had
+#   genuinely become healthy before its queue turn.
+# - Market committed recovery now gets one STRONG health recheck immediately
+#   before destructive work. It cancels only when ALL are true:
+#     * target package is ALIVE,
+#     * state is clean + fresh,
+#     * place_id is Trade World (129954712878723),
+#     * current JobId is non-empty,
+#     * Market runtime marker is MARKET_RUNNING for that SAME JobId,
+#     * runtime marker age <= 120s (configurable).
+# - This is much stronger than V4.81.98's unsafe "fresh state timestamp only"
+#   heal test, so a loading-screen clone with a stale/ghost writer cannot cancel.
+# - A queued recovery for B/C that genuinely reached Market now self-cancels;
+#   A/D still stuck on the loader remain eligible.
+# - Failed Market stuck attempts no longer wait the historical 15m cooldown.
+#   Because a genuinely fresh healthy state already clears the incident, a still-
+#   unhealthy clone may retry after 5m by default.
+#
 # V4.81.99 — MARKET 5M RECOVERY IS COMMITTED / NO FALSE HEALED CANCEL
 # - V4.81.98 correctly selected the Market peer-safe cache+VIEW restart, but an
 #   older last-second generic health recheck could still cancel it with:
@@ -1658,7 +1678,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.99"
+__version__ = "V4.81.100"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -2516,6 +2536,11 @@ DEFAULT_CONFIG = {
     "market_combined_stuck_recovery_seconds": 300,
     "market_combined_stuck_clear_cache": True,
     "market_combined_stuck_cooldown_seconds": 900,
+    # V4.81.100: an unsuccessful cache restart may retry after 5m. A genuinely
+    # healthy fresh Market state clears the incident entirely, so this only
+    # matters while the clone remains unhealthy.
+    "market_combined_failed_retry_seconds": 300,
+    "market_strong_heal_runtime_max_age_seconds": 120,
     # V3.79: how long a clone that is ALIVE at hatcher startup may sit without a
     # readable state file before the table stops showing "waiting" and surfaces
     # an actionable "check Lua/username" note. Short so it never looks stuck.
@@ -14090,6 +14115,66 @@ def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, he
     )
     return status, note, True
 
+
+def market_strong_healthy_proof(tab, cfg):
+    """High-confidence proof that a queued Market recovery is obsolete.
+
+    A fresh state timestamp alone is NOT enough. Require both the current Trade
+    World state and the Market loader's current-job MARKET_RUNNING heartbeat.
+    """
+    pkg = str((tab or {}).get("package") or "")
+    user = str((tab or {}).get("user_name") or pkg)
+
+    process_status, process_note = package_alive_status(pkg, cfg, fresh=True)
+    if process_status != "ALIVE":
+        return False, f"process={process_status}: {cut(process_note, 55)}"
+
+    state, err = read_state(tab)
+    if not state:
+        return False, "no state"
+
+    if not state_timestamp_valid(state):
+        return False, "invalid state timestamp"
+
+    if not state_is_clean_fresh(state, cfg):
+        return False, f"state not clean/fresh age={format_age(state_age_seconds(state))}"
+
+    place_id = str(state.get("place_id") or "").strip()
+    if place_id != "129954712878723":
+        return False, f"place={place_id or '?'} not Trade World"
+
+    job_id = str(state.get("job_id") or "").strip()
+    if not job_id:
+        return False, "current Market JobId missing"
+
+    marker = market_runtime_for_username(user)
+    if not isinstance(marker, dict):
+        return False, "Market runtime marker missing"
+
+    stage = str(marker.get("stage") or "").strip().upper()
+    marker_job = str(marker.get("job_id") or marker.get("jobId") or "").strip()
+    try:
+        marker_age = int(marker.get("age", 999999) or 999999)
+    except Exception:
+        marker_age = 999999
+    max_age = max(
+        60,
+        int(cfg.get("market_strong_heal_runtime_max_age_seconds", 120) or 120),
+    )
+
+    if stage != "MARKET_RUNNING":
+        return False, f"runtime stage={stage or '?'}"
+    if marker_job != job_id:
+        return False, "runtime JobId does not match current state"
+    if marker_age > max_age:
+        return False, f"MARKET_RUNNING marker stale {format_age(marker_age)}"
+
+    return True, (
+        f"clean Trade World + MARKET_RUNNING same JobId "
+        f"(marker {format_age(marker_age)} old)"
+    )
+
+
 def market_combined_stuck_enabled(cfg, mode="market", target="market"):
     return bool(
         str(mode or "").lower() == "market"
@@ -14129,12 +14214,25 @@ def market_combined_stuck_cooldown_left(rt_tab, cfg):
         last = 0
     if last <= 0:
         return 0
+
+    # V4.81.100: the old configured 15m value must not strand a clone that is
+    # still visibly/unambiguously unhealthy after a recovery attempt. Fresh clean
+    # Market state clears market_combined_stuck_last to zero elsewhere.
     try:
-        cooldown = int(cfg.get("market_combined_stuck_cooldown_seconds", 900) or 900)
+        configured = int(
+            cfg.get("market_combined_stuck_cooldown_seconds", 900) or 900
+        )
     except Exception:
-        cooldown = 900
-    cooldown = max(300, cooldown)
-    return max(0, cooldown - max(0, now() - last))
+        configured = 900
+    try:
+        failed_retry = int(
+            cfg.get("market_combined_failed_retry_seconds", 300) or 300
+        )
+    except Exception:
+        failed_retry = 300
+
+    effective = max(300, min(max(300, configured), max(300, failed_retry)))
+    return max(0, effective - max(0, now() - last))
 
 
 def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=None, mode="market", core=None):
@@ -14474,7 +14572,7 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
             if market_combined:
                 cooldown_left = market_combined_stuck_cooldown_left(rt_tab, cfg)
                 if cooldown_left > 0:
-                    return "Waiting", f"Market stuck recovery cooldown {format_age(cooldown_left)}", True
+                    return "Waiting", f"Market failed-retry cooldown {format_age(cooldown_left)}", True
                 recovery_meta = market_combined_stuck_metadata(
                     cfg, age, f"market valid-ts stale {format_age(age)}"
                 )
@@ -14565,7 +14663,7 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
         if market_combined:
             cooldown_left = market_combined_stuck_cooldown_left(rt_tab, cfg)
             if cooldown_left > 0:
-                return "Waiting", f"Market stuck recovery cooldown {format_age(cooldown_left)}", True
+                return "Waiting", f"Market failed-retry cooldown {format_age(cooldown_left)}", True
             recovery_meta = market_combined_stuck_metadata(
                 cfg, max(trigger, int(now() - int(rt_tab.get("market_no_state_since", now()) or now()))),
                 "market no-state 5m",
@@ -17858,6 +17956,35 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
             core.save()
             return True
 
+    # V4.81.100: a Market item may have waited in FIFO after the original 5m
+    # stuck observation. Cancel it only on STRONG proof that this exact account is
+    # now genuinely running Market in the current JobId. Fresh ts alone is not proof.
+    if (
+        is_hard
+        and target == "market"
+        and item.get("market_combined_stuck_recovery")
+        and process_status == "ALIVE"
+    ):
+        strong_ok, strong_note = market_strong_healthy_proof(tab, cfg)
+        if strong_ok:
+            rt_tab["note"] = "Market healthy - queued recovery cancelled"
+            rt_tab["market_combined_stuck_last"] = 0
+            rt_tab["market_combined_stuck_last_age"] = 0
+            rt_tab["market_combined_stuck_last_reason"] = ""
+            rt_tab["market_background_fresh_opened_at"] = 0
+            rt_tab["market_background_fresh_until"] = 0
+            log_activity(
+                "Market queued recovery CANCELLED by strong healthy proof: "
+                + cut(strong_note, 95),
+                pkg,
+                GREEN,
+            )
+            core.save()
+            return True
+        else:
+            rt_tab["market_strong_heal_last_reject"] = str(strong_note or "")
+            rt_tab["market_strong_heal_last_reject_at"] = now()
+
     # V4.81.93: App Cloner safety now applies to EVERY automatic ALIVE Noka
     # hard generation, not only bubble/Option6/AutoExec special cases.
     #
@@ -18537,6 +18664,9 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
             item.get("hatcher_old_state_reason", reason) or reason
         )
     if ok and item.get("market_combined_stuck_recovery"):
+        # Attempt timestamp only. Fresh clean Market state clears it. If the
+        # restart remains unhealthy, V4.81.100 allows another attempt after the
+        # failed-retry interval instead of stranding it for 15m.
         rt_tab["market_combined_stuck_last"] = now()
         rt_tab["market_combined_stuck_last_age"] = int(item.get("market_stuck_age", 0) or 0)
         rt_tab["market_combined_stuck_last_reason"] = str(
