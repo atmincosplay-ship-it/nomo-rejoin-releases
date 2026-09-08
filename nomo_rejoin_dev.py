@@ -1,5 +1,21 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.94 — BUBBLE SHELL ACTIVE SOFT-WAKE (NO MORE PERMANENT HOLD)
+# - V4.81.90/.93 could leave stale bubble-only shells stuck forever:
+#     "bubble-only auto recovery HELD; live siblings ..."
+# - A stale (> normal old-state threshold) ALIVE Noka with NO ActivityRecord now
+#   actively receives a package-local SOFT deep-link wake when siblings are alive.
+# - Soft wake uses CLEAR_TOP|SINGLE_TOP task reuse flags and NEVER PID-stops the
+#   target or any sibling.
+# - Soft wake is marked no_hard_fallback, so failure cannot escalate into the
+#   hard target launch path that was proven able to disturb sibling floating tasks.
+# - If the shell stays stale/no-activity, NOMO may retry the soft wake every
+#   bubble_shell_soft_wake_retry_seconds (default 45s), one package at a time.
+# - If there are NO live siblings, the existing exact-PID hard shell recovery is
+#   still allowed because there is no sibling floating task to protect.
+# - Fresh/healthy minimized clones are not classified as stale shell recovery;
+#   the shell path still requires the existing old-state age threshold.
+#
 # V4.81.93 — ALIVE NOKA AUTO-HARD -> PEER-SAFE SOFT REUSE
 # - Live screenshot proved the ordinary Hatcher alive-old-state path could still:
 #     exact-PID stop target -> siblings verified intact -> hard am start target
@@ -1577,7 +1593,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.93"
+__version__ = "V4.81.94"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -5733,11 +5749,12 @@ def hatcher_bubble_only_live_sibling_guard(pkg, cfg):
 
 
 def queue_hatcher_bubble_only_recovery(core, tab, rt_tab, cfg, reason):
-    """Queue one package-local recovery for a confirmed bubble-only shell.
+    """Recover one stale Noka bubble shell without endangering live siblings.
 
-    Do not bypass manual/solver holds. This path exists only to bypass the stale
-    startup-observe / old-state cooldown gates after Android directly confirms
-    that the package has a process but no Roblox ActivityRecord.
+    With peers alive we must not use exact-PID hard stop + fresh App Cloner task
+    launch, because the target launch itself has been observed removing a sibling
+    floating task. Instead, actively send a soft package-local deep link and retry
+    it on a bounded cadence while the shell remains stale.
     """
     pkg = str((tab or {}).get("package", "") or "")
     if not pkg:
@@ -5745,29 +5762,77 @@ def queue_hatcher_bubble_only_recovery(core, tab, rt_tab, cfg, reason):
     if solver_job_running(pkg):
         return False, "solver running"
 
-    peer_hold, peer_note = hatcher_bubble_only_live_sibling_guard(pkg, cfg)
-    if peer_hold:
-        note = "bubble-only held; " + str(peer_note or "live sibling protection")
-        rt_tab["note"] = note
-        rt_tab["bubble_only_peer_hold"] = True
-        rt_tab["bubble_only_peer_hold_note"] = str(peer_note or "")
-        rt_tab["bubble_only_peer_hold_at"] = now()
-
-        last_log = int(rt_tab.get("bubble_only_peer_hold_log_at", 0) or 0)
-        if now() - last_log >= 30:
-            log_activity(
-                "bubble-only auto recovery HELD; " + cut(peer_note, 90),
-                pkg,
-                YELLOW,
-            )
-            rt_tab["bubble_only_peer_hold_log_at"] = now()
-        return False, note
-
-    rt_tab["bubble_only_peer_hold"] = False
     manual_hold, manual_note = recovery_manual_hold_active(rt_tab, cfg, pkg)
     if manual_hold:
         return False, manual_note
 
+    peer_hold, peer_note = hatcher_bubble_only_live_sibling_guard(pkg, cfg)
+
+    if peer_hold:
+        retry_seconds = max(
+            20,
+            int(cfg.get("bubble_shell_soft_wake_retry_seconds", 45) or 45),
+        )
+        last = int(rt_tab.get("bubble_shell_soft_wake_last", 0) or 0)
+        left = max(0, retry_seconds - max(0, now() - last))
+
+        rt_tab["bubble_only_peer_hold"] = False
+        rt_tab["bubble_shell_soft_wake_mode"] = True
+        rt_tab["bubble_shell_soft_wake_peer_note"] = str(peer_note or "")
+
+        if left > 0:
+            note = (
+                "shell soft-wake retry in "
+                + format_age(left)
+                + "; "
+                + cut(peer_note, 60)
+            )
+            rt_tab["note"] = note
+            return False, note
+
+        added, qnote = core.queue(
+            tab,
+            "hatcher",
+            str(reason or "bubble-only shell") + "; peer-safe soft wake",
+            force=True,
+            mode="soft",
+            front=True,
+            bypass_manual=False,
+            metadata={
+                "bypass_recheck": True,
+                "bubble_only_soft_wake": True,
+                "no_hard_fallback": True,
+                # A shell wake is itself the package-local recovery attempt.
+                # Provider probing may still happen later if a real challenge
+                # becomes visible/fresh, but this intent never becomes hard.
+                "bubble_shell_peer_note": str(peer_note or ""),
+            },
+        )
+
+        if added:
+            rt_tab["bubble_shell_soft_wake_last"] = now()
+            rt_tab["bubble_shell_soft_wake_count"] = (
+                int(rt_tab.get("bubble_shell_soft_wake_count", 0) or 0) + 1
+            )
+            rt_tab["hatcher_startup_observe_until"] = 0
+            rt_tab["note"] = "shell soft wake queued"
+            log_activity(
+                "bubble shell -> SOFT wake queued; "
+                + cut(peer_note, 80)
+                + "; no PID-stop/no hard fallback",
+                pkg,
+                CYAN,
+            )
+            core.save()
+            return True, "shell soft wake queued"
+
+        if core.has(pkg):
+            return False, "shell soft wake already queued"
+        return False, qnote or "shell soft wake blocked"
+
+    # No live siblings: the original target-only hard shell recovery is allowed.
+    rt_tab["bubble_shell_soft_wake_mode"] = False
+    rt_tab["bubble_only_peer_hold"] = False
     added, note = core.queue_exact_pid_recovery(
         tab,
         "hatcher",
@@ -5784,7 +5849,11 @@ def queue_hatcher_bubble_only_recovery(core, tab, rt_tab, cfg, reason):
     if added:
         rt_tab["hatcher_startup_observe_until"] = 0
         rt_tab["note"] = "bubble-only rescue queued"
-        log_activity("bubble-only shell confirmed; target-only recovery queued", pkg, YELLOW)
+        log_activity(
+            "bubble-only shell confirmed; no live siblings; target-only hard recovery queued",
+            pkg,
+            YELLOW,
+        )
         core.save()
         return True, "bubble-only rescue queued"
     if core.has(pkg):
@@ -17833,7 +17902,9 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
         log_activity(f"open held by manual verification: {cut(manual_note, 70)}", pkg, YELLOW)
         return False, manual_note
     display_mode = str(mode or "hard")
-    if item.get("peer_safe_alive_soft_downgrade"):
+    if item.get("bubble_only_soft_wake"):
+        display_mode = "shell-soft-wake"
+    elif item.get("peer_safe_alive_soft_downgrade"):
         display_mode = "peer-safe-soft"
     elif _alive_recovery_soft_allowed(reason, package_alive(pkg, cfg, fresh=True), cfg):
         display_mode = "alive-soft-first"
@@ -23755,13 +23826,13 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                         if (
                             added
                             or core.has(pkg)
-                            or str(qnote or "").startswith("bubble-only held;")
+                            or str(qnote or "").startswith("shell soft-wake retry")
+                            or str(qnote or "").startswith("shell soft wake")
                         ):
-                            status = (
-                                "Queued"
-                                if (added or core.has(pkg))
-                                else "Shell"
-                            )
+                            if added or core.has(pkg):
+                                status = "Waking"
+                            else:
+                                status = "Shell"
                             note = qnote
                             bubble_rescue_handled = True
 
@@ -23968,6 +24039,10 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
             # state again, even if it healed without NOMO opening the package.
             if state and state_is_clean(state):
                 clear_disconnect_ui_incident(rt_tab)
+                if health.get("clean_fresh"):
+                    rt_tab["bubble_shell_soft_wake_mode"] = False
+                    rt_tab["bubble_shell_soft_wake_count"] = 0
+                    rt_tab["bubble_shell_soft_wake_peer_note"] = ""
 
             # V3.53: direct Lua-detected disconnect/kick popup
             if state and alive and state_disconnect_ui(state) and cfg.get("rejoin_if_crash", True):
