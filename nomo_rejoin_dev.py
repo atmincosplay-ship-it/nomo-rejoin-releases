@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.89 — PRE-WRITE RESPAWN GUARD
+# - V4.81.88 handled respawns during the post-write offline hold, but a clone
+#   could respawn immediately during initial offline preparation and cause an
+#   abort before the respawn guard ran.
+# - Initial Option 17 offline prep now also tolerates brief exact-package respawns:
+#     * first exact-PID stop every selected package,
+#     * run a PRE-WRITE stable-DEAD guard,
+#     * exact-PID stop a respawned selected package again,
+#     * require 2 continuous seconds DEAD before reading/preserving pet identity.
+# - No payload is re-applied during PRE-WRITE because nothing has been written yet.
+# - POST-WRITE guard still re-applies the immutable prepared payload after any
+#   brief respawn and requires the existing 4-second stable-DEAD window.
+# - Both guards remain bounded to max 3 respawns/package and fail closed on
+#   UNKNOWN PID state or repeated relaunch loops.
+#
 # V4.81.88 — OPTION 17 RESPAWN GUARD / REAPPLY PAYLOAD
 # - V4.81.87 correctly detected when a selected clone came back ALIVE during
 #   the offline hold, but immediately failed the install.
@@ -1505,7 +1520,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.88"
+__version__ = "V4.81.89"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -27363,11 +27378,7 @@ def _verify_exotic_install_plan(manifest, plan):
 
 
 def _exo_stop_selected_for_offline_install(cfg, plan):
-    """Stop every selected clone by exact package PID before touching EXO config.
-
-    Returns (ok, note, stopped_packages). Any UNKNOWN/failure aborts the install
-    before files are modified.
-    """
+    """Get all selected packages stably DEAD before reading/writing EXO files."""
     stopped = []
 
     print("")
@@ -27403,22 +27414,52 @@ def _exo_stop_selected_for_offline_install(cfg, plan):
             ), stopped
 
         final_status, final_note = package_alive_status(pkg, cfg, fresh=True)
-        if final_status != "DEAD":
+        if final_status == "UNKNOWN":
             return False, (
-                f"{short_pkg(pkg)} {user}: package not confirmed DEAD after stop "
-                f"({final_status}: {final_note}); aborted before write"
+                f"{short_pkg(pkg)} {user}: PID state UNKNOWN after stop "
+                f"({final_note}); aborted before write"
             ), stopped
 
-        stopped.append(pkg)
-        print(col(f"    stopped: {stop_note}", GREEN))
+        if final_status == "DEAD":
+            stopped.append(pkg)
+            print(col(f"    stopped: {stop_note}", GREEN))
+        else:
+            # Do not abort yet. The bounded PRE-WRITE respawn guard below
+            # will exact-PID stop this selected package again.
+            print(col(
+                f"    immediate respawn detected after stop "
+                f"({final_status}: {final_note}); pre-write guard will handle it",
+                YELLOW,
+            ))
 
-    # Small settle after the final process is gone. Any Lua config writer attached
-    # to the Roblox process is now dead before we read preserved team/UUID data.
-    time.sleep(1.5)
+    print("")
+    print(col(
+        "Pre-write offline hold: requiring all selected packages stably DEAD...",
+        DIM,
+    ))
+    stable_ok, stable_note, respawns = _exo_hold_stopped_with_respawn_guard(
+        cfg,
+        plan,
+        stable_seconds=2.0,
+        max_total_seconds=18.0,
+        max_respawns_per_package=3,
+        reapply_payload=False,
+    )
+    print(col(
+        f"Pre-write offline hold: {'PASS' if stable_ok else 'FAIL'} "
+        f"({stable_note})",
+        GREEN if stable_ok else RED,
+    ))
+
+    if not stable_ok:
+        return False, (
+            "offline install aborted before write because selected package(s) "
+            f"could not remain stopped: {stable_note}"
+        ), stopped
+
     return True, (
-        f"Offline prep complete: {len(plan)} selected package(s) confirmed stopped."
+        f"Offline prep complete: {len(plan)} selected package(s) stably stopped."
     ), stopped
-
 
 
 def _exo_atomic_write_bytes(target, content):
@@ -27461,6 +27502,7 @@ def _exo_hold_stopped_with_respawn_guard(
     stable_seconds=4.0,
     max_total_seconds=18.0,
     max_respawns_per_package=3,
+    reapply_payload=True,
 ):
     """Require a stable DEAD window; exact-PID stop/reapply on brief respawn."""
     started = time.monotonic()
@@ -27523,13 +27565,20 @@ def _exo_hold_stopped_with_respawn_guard(
                     f"({final_status}: {final_note})"
                 ), respawns
 
-            # The process may have written stale in-memory EXO state during its
-            # short life. Re-apply the immutable payload prepared before respawn.
-            written = _exo_reapply_prepared_payloads(plan)
-            print(col(
-                f"    stopped again; re-applied {written} prepared EXO file(s)",
-                GREEN,
-            ))
+            if reapply_payload:
+                # POST-WRITE: the short-lived process may have written stale
+                # in-memory EXO state. Restore the immutable prepared payload.
+                written = _exo_reapply_prepared_payloads(plan)
+                print(col(
+                    f"    stopped again; re-applied {written} prepared EXO file(s)",
+                    GREEN,
+                ))
+            else:
+                # PRE-WRITE: nothing has been installed yet; just keep it dead.
+                print(col(
+                    "    stopped again; pre-write offline hold continues",
+                    GREEN,
+                ))
 
         if saw_respawn:
             stable_since = time.monotonic()
@@ -27819,7 +27868,14 @@ def workspace_zip_tools_menu(cfg):
                     DIM,
                 ))
                 stopped_ok, stopped_note, respawns = (
-                    _exo_hold_stopped_with_respawn_guard(cfg, plan)
+                    _exo_hold_stopped_with_respawn_guard(
+                        cfg,
+                        plan,
+                        stable_seconds=4.0,
+                        max_total_seconds=18.0,
+                        max_respawns_per_package=3,
+                        reapply_payload=True,
+                    )
                 )
                 print(col(
                     f"Offline hold: {'PASS' if stopped_ok else 'FAIL'} "
