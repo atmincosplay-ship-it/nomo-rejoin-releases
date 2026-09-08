@@ -14,6 +14,21 @@
 # - No recovery rule, PID policy, Home routing, shell wake, solver, or Option 17
 #   behavior is changed.
 #
+# V4.81.104 — HATCHER STALE TELEMETRY ALONE NEVER REJOINS AN ALIVE CLONE
+# - Real screenshots proved healthy ALIVE clones were being routed because their
+#   Lua/state timestamp became old:
+#       opening -> hatcher (peer-safe-soft)
+#       open ok: soft hop
+#   and that soft hop could leave the healthy clone on Roblox Home.
+# - Hatcher old-state age by itself is now OBSERVATION ONLY for an ALIVE package.
+# - An ALIVE Hatcher clone is touched only when there is stronger evidence:
+#     visible Roblox Home, no ActivityRecord/Shell, disconnect/kick,
+#     CAPTCHA/verification/auth/moderation, or another explicit package-local signal.
+# - ALIVE + live ActivityRecord + stale/old state => Stale telemetry only;
+#   no PID stop, no deep-link route, no soft/hard rejoin.
+# - Legacy queued hatcher_old_state_recovery items are revalidated at execution.
+# - DEAD package recovery is unchanged.
+#
 # V4.81.103 — SHELL = PID ALIVE / ACTIVITY LOST; ACTIVE PROTOCOL RESTORE
 # - Screenshot showed nokaA/nokaB as Shell while their floating windows vanished.
 #   Shell means package PID alive but Roblox ActivityRecord/task missing.
@@ -1717,7 +1732,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.103"
+__version__ = "V4.81.104"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -2791,6 +2806,8 @@ DEFAULT_CONFIG = {
     # This does NOT use generic popup text, so it avoids V3.70/V3.72 false rejoins.
     "hatcher_alive_old_state_hard_force_enabled": True,
     "hatcher_alive_old_state_hard_force_seconds": 300,
+    # V4.81.104: stale telemetry alone must never route/restart an ALIVE clone.
+    "hatcher_require_strong_evidence_for_alive_stale_recovery": True,
     "hatcher_alive_old_state_max_valid_seconds": 86400,
     "hatcher_alive_old_state_after_open_grace_seconds": 180,
     "hatcher_alive_old_state_hard_force_cooldown_seconds": 900,
@@ -12816,6 +12833,59 @@ def _queue_hatcher_alive_old_state_hard(open_queue, tab, rt_tab, hcfg, cfg, age_
     # than the historical 24h ceiling. State-bearing callers validate `ts`
     # explicitly; no-state callers pass a locally measured elapsed duration.
 
+    # V4.81.104: old telemetry age is not enough evidence to touch an ALIVE
+    # App Cloner task. This is the exact path that soft-hopped healthy clones
+    # onto Roblox Home.
+    if (
+        pkg
+        and cfg.get("hatcher_require_strong_evidence_for_alive_stale_recovery", True)
+    ):
+        process_status, process_note = package_alive_status(pkg, cfg, fresh=True)
+        if process_status == "ALIVE":
+            activity_status, activity_note = package_activity_status(pkg, cfg)
+
+            rt_tab["hatcher_alive_old_state_hard_last"] = 0
+            rt_tab["hatcher_alive_old_state_hard_age"] = 0
+            rt_tab["hatcher_alive_old_state_hard_reason"] = ""
+
+            if activity_status == "ACTIVITY":
+                rt_tab["hatcher_stale_telemetry_only"] = True
+                rt_tab["hatcher_stale_telemetry_only_at"] = now()
+                rt_tab["hatcher_stale_telemetry_note"] = (
+                    "live ActivityRecord; stale telemetry alone"
+                )
+                return (
+                    False,
+                    "telemetry stale only; live ActivityRecord; no auto rejoin",
+                    False,
+                )
+
+            if activity_status == "NO_ACTIVITY":
+                rt_tab["hatcher_stale_telemetry_only"] = False
+                return (
+                    False,
+                    "Shell/no ActivityRecord; shell recovery owns wake",
+                    False,
+                )
+
+            rt_tab["hatcher_stale_telemetry_only"] = True
+            rt_tab["hatcher_stale_telemetry_only_at"] = now()
+            rt_tab["hatcher_stale_telemetry_note"] = (
+                "activity query unavailable; fail-safe no rejoin"
+            )
+            return (
+                False,
+                "telemetry stale; activity check unavailable; no auto rejoin",
+                False,
+            )
+
+        if process_status == "UNKNOWN":
+            return (
+                False,
+                "telemetry stale; process check unavailable; no auto rejoin",
+                False,
+            )
+
     t = now()
     last = int(rt_tab.get("hatcher_alive_old_state_hard_last", 0) or 0)
     if last > 0 and (t - last) < cooldown_seconds:
@@ -18058,6 +18128,67 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
             core.save()
             return True
 
+    # V4.81.104: legacy Hatcher old-state queue items from older runtime.json
+    # must not soft-hop/restart a healthy ALIVE clone merely because telemetry
+    # aged out while the Android activity is still present.
+    if (
+        item.get("hatcher_old_state_recovery")
+        and target == "hatcher"
+        and process_status == "ALIVE"
+        and cfg.get("hatcher_require_strong_evidence_for_alive_stale_recovery", True)
+    ):
+        activity_status, activity_note = package_activity_status(pkg, cfg)
+
+        if activity_status == "ACTIVITY":
+            rt_tab["note"] = "telemetry stale only; live ActivityRecord; queued rejoin cancelled"
+            rt_tab["hatcher_alive_old_state_hard_last"] = 0
+            rt_tab["hatcher_alive_old_state_hard_age"] = 0
+            rt_tab["hatcher_alive_old_state_hard_reason"] = ""
+            rt_tab["hatcher_stale_telemetry_only"] = True
+            log_activity(
+                "Hatcher stale-only queued recovery CANCELLED; live ActivityRecord; no auto rejoin",
+                pkg,
+                GREEN,
+            )
+            core.save()
+            return True
+
+        if activity_status == "NO_ACTIVITY":
+            item["hatcher_old_state_recovery"] = False
+            item["bubble_only_soft_wake"] = True
+            item["bubble_only_protocol_wake"] = True
+            item["no_hard_fallback"] = True
+            item["bypass_recheck"] = True
+            item["always_recheck_health"] = False
+            item["mode"] = "soft"
+            item["combined_stuck_recovery"] = False
+            item["combined_stuck_clear_cache"] = False
+            item["combined_stuck_refresh_private_link"] = False
+            mode = "soft"
+            item_mode = "soft"
+            is_hard = False
+            rt_tab["note"] = "stale telemetry + no ActivityRecord -> shell protocol wake"
+            log_activity(
+                "legacy Hatcher old-state item converted -> shell protocol wake; "
+                "PID alive / ActivityRecord missing; no PID-stop/no hard fallback",
+                pkg,
+                CYAN,
+            )
+            core.save()
+
+        else:
+            rt_tab["note"] = (
+                "telemetry stale; ActivityRecord check unavailable; queued rejoin deferred"
+            )
+            core.requeue_front(item)
+            log_activity(
+                "Hatcher stale-only queued recovery deferred; ActivityRecord check unavailable",
+                pkg,
+                YELLOW,
+            )
+            core.save()
+            return True
+
     # V4.81.100: a Market item may have waited in FIFO after the original 5m
     # stuck observation. Cancel it only on STRONG proof that this exact account is
     # now genuinely running Market in the current JobId. Fresh ts alone is not proof.
@@ -19690,6 +19821,8 @@ def _nomo_start_market_rejoin_original(cfg):
                 if health.get("clean_fresh"):
                     clear_manual_login_block(rt_tab)
                     clear_captcha_ui_runtime(rt_tab)
+                    rt_tab["hatcher_stale_telemetry_only"] = False
+                    rt_tab["hatcher_stale_telemetry_note"] = ""
                     if str(health.get("bad") or "") != "roblox_home":
                         rt_tab["hatcher_visible_home_route_attempts"] = 0
                         rt_tab["hatcher_visible_home_route_last"] = 0
@@ -24692,6 +24825,12 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                     elif str(hard_note).startswith("invalid old state ignored"):
                         note = hard_note
                         status = "Online"
+                    elif (
+                        "telemetry stale" in str(hard_note).lower()
+                        or "shell/no activityrecord" in str(hard_note).lower()
+                    ):
+                        note = hard_note
+                        status = "Stale"
                     else:
                         note = hard_note
                         status = "Online"
@@ -24961,7 +25100,8 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
         hatcher_rejoin_status_screen(rows, hcfg, cfg, session_start, loops, last_msg)
         _old_on, _old_sec, _old_max, _old_cd = hatcher_alive_old_state_hard_settings(hcfg, cfg)
         print(col(
-            f"  Hatcher: valid-ts old state >= {format_age(_old_sec)} => package-only recovery; missing/bad ts sentinel ignored.",
+            "  Hatcher: stale telemetry alone NEVER rejoins an ALIVE clone; "
+            "Home/Shell/disconnect/auth/DEAD evidence owns recovery.",
             GREEN,
         ))
 
