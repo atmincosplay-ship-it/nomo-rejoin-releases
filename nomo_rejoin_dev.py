@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.86 — EXO MASTER REPLACES SETTINGS BUT PRESERVES PET-IDENTITY/TEAM DATA
+# - Master settings overwrite the account config EXCEPT per-account pet UUID/team identity.
+# - Preserve team membership lists (team1..team7, custom/nested *_team lists).
+# - Preserve pet UUID selection lists such as selected_pet_uuids and
+#   pet_level_selected_pets, plus direct *_uuid pet identity/state.
+# - Normal settings still come from the master: sellingpets, sell_pets, giftpets,
+#   toggles, delays, booleans, sizes, pet-name filters, etc.
+# - file1/file2/filesession/gag2 all use the same identity-safe overlay.
+# - Missing target file: scrub source-template pet UUID/team values instead of
+#   copying another account's pet IDs.
+# - Verification compares all NON-pet-identity settings against the selected master.
+#
 # V4.81.85 — OPTION 17 EXO GROUPING IS UID-BASED; REST = MARKET
 # - Corrects V4.81.84's experimental username-grouping idea. EXO config ownership
 #   is always Roblox UID-based: <UID>file1.json / <UID>file2.json / <UID>filesession.json.
@@ -1463,7 +1475,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.85"
+__version__ = "V4.81.86"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -27169,62 +27181,202 @@ def _exotic_master_install_plan(cfg, selected, manifest):
     return plan, unresolved
 
 
+
+_EXO_PET_UUID_RE = re.compile(
+    r"^\{?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\}?$"
+)
+
+
+def _exo_is_uuid_string(value):
+    return isinstance(value, str) and bool(_EXO_PET_UUID_RE.match(value.strip()))
+
+
+def _exo_pet_identity_container(path, value):
+    """Identify only account-specific pet membership / pet UUID values."""
+    key = str(path[-1] if path else "").strip().lower()
+
+    # Team membership lists are per-account. Keep even if empty.
+    if isinstance(value, list) and "team" in key:
+        return True
+
+    # Explicit pet UUID selection lists.
+    if isinstance(value, list) and (
+        "uuid" in key
+        or key in {"pet_level_selected_pets", "selected_pet_uuids"}
+    ):
+        return True
+
+    # Any list actually containing UUID values is account-specific.
+    if isinstance(value, list) and any(_exo_is_uuid_string(x) for x in value):
+        return True
+
+    # Direct pet identity/runtime UUID field. Never import another account's UUID.
+    if isinstance(value, str) and key.endswith("_uuid"):
+        return True
+
+    return False
+
+
+def _exo_collect_pet_identity(obj, path=()):
+    found = {}
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            child = path + (str(key),)
+            if _exo_pet_identity_container(child, value):
+                found[child] = copy.deepcopy(value)
+                continue
+            if isinstance(value, dict):
+                found.update(_exo_collect_pet_identity(value, child))
+    return found
+
+
+def _exo_set_path(root, path, value):
+    cur = root
+    for key in path[:-1]:
+        if not isinstance(cur, dict):
+            return False
+        if key not in cur or not isinstance(cur[key], dict):
+            cur[key] = {}
+        cur = cur[key]
+    if not isinstance(cur, dict) or not path:
+        return False
+    cur[path[-1]] = copy.deepcopy(value)
+    return True
+
+
+def _exo_scrub_master_pet_identity(obj):
+    """Clear source-account pet IDs/teams before overlaying target UID identity."""
+    result = copy.deepcopy(obj)
+
+    def walk(node, path=()):
+        if not isinstance(node, dict):
+            return
+        for key in list(node.keys()):
+            value = node[key]
+            child = path + (str(key),)
+            if _exo_pet_identity_container(child, value):
+                if isinstance(value, list):
+                    node[key] = []
+                elif isinstance(value, str):
+                    node[key] = ""
+                continue
+            if isinstance(value, dict):
+                walk(value, child)
+
+    walk(result)
+    return result
+
+
+def _exo_build_identity_safe_master(master_obj, existing_obj=None):
+    """Master wins everywhere except per-account pet UUID/team identity."""
+    result = _exo_scrub_master_pet_identity(master_obj)
+    preserved = {}
+
+    if isinstance(existing_obj, dict):
+        preserved = _exo_collect_pet_identity(existing_obj)
+        for path, value in preserved.items():
+            _exo_set_path(result, path, value)
+
+    return result, preserved
+
+
+def _exo_strip_pet_identity_for_compare(obj):
+    return _exo_scrub_master_pet_identity(obj)
+
+
+def _exo_load_json_file(path):
+    try:
+        path = Path(path)
+        if not path.is_file():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
 def _verify_exotic_install_plan(manifest, plan):
-    """Read written <UID>file1.json back and compare full JSON to chosen master."""
+    """Verify complete master settings outside preserved pet UUID/team identity."""
     parsed = manifest["parsed"]
     results = []
+
     for item in plan:
-        target = Path(item["exo_dir"]) / f"{item['uid']}file1.json"
-        expected = parsed.get(item["file1_name"])
-        ok = False
-        why = ""
-        try:
-            actual = json.loads(target.read_text(encoding="utf-8-sig"))
-            ok = actual == expected
-            if not ok:
-                why = "written JSON differs from selected master variant"
-        except Exception as exc:
-            why = f"read-back failed: {exc}"
-        results.append((item, ok, why))
-    return results
-
-
-
-def install_exotic_master_plan(manifest, plan):
-    """Expand master templates into each selected package's UID files."""
-    parsed = manifest["parsed"]
-    if not plan:
-        return False, "Nothing to install.", []
-
-    # Build all unique target writes first.
-    writes = {}
-    for item in plan:
-        uid = str(item["uid"])
-        exo_dir = Path(item["exo_dir"])
-
-        file1_obj = parsed.get(item["file1_name"])
-        if not isinstance(file1_obj, dict):
-            return False, f"{item['file1_name']} missing/invalid.", []
-
-        writes[str(exo_dir / f"{uid}file1.json")] = (
-            exo_dir / f"{uid}file1.json",
-            json.dumps(file1_obj, indent=2, ensure_ascii=False).encode("utf-8"),
-        )
-
+        failures = []
         for master_name, suffix in (
+            (item["file1_name"], "file1.json"),
             ("file2.json", "file2.json"),
             ("filesession.json", "filesession.json"),
             ("gag2.json", "gag2.json"),
         ):
-            obj = parsed.get(master_name)
-            if obj is None:
+            expected = parsed.get(master_name)
+            if not isinstance(expected, dict):
                 continue
-            writes[str(exo_dir / f"{uid}{suffix}")] = (
-                exo_dir / f"{uid}{suffix}",
-                json.dumps(obj, indent=2, ensure_ascii=False).encode("utf-8"),
+
+            target = Path(item["exo_dir"]) / f"{item['uid']}{suffix}"
+            try:
+                actual = json.loads(target.read_text(encoding="utf-8-sig"))
+                if (
+                    _exo_strip_pet_identity_for_compare(actual)
+                    != _exo_strip_pet_identity_for_compare(expected)
+                ):
+                    failures.append(
+                        f"{suffix}: non-pet-identity settings differ from master"
+                    )
+            except Exception as exc:
+                failures.append(f"{suffix}: read-back failed: {exc}")
+
+        results.append((item, not failures, "; ".join(failures)))
+
+    return results
+
+
+def install_exotic_master_plan(manifest, plan):
+    """Install full master while preserving only each UID's pet UUID/team identity."""
+    parsed = manifest["parsed"]
+    if not plan:
+        return False, "Nothing to install.", []
+
+    writes = {}
+
+    for item in plan:
+        uid = str(item["uid"])
+        exo_dir = Path(item["exo_dir"])
+        item["preserved_identity_paths"] = {}
+
+        for master_name, suffix in (
+            (item["file1_name"], "file1.json"),
+            ("file2.json", "file2.json"),
+            ("filesession.json", "filesession.json"),
+            ("gag2.json", "gag2.json"),
+        ):
+            master_obj = parsed.get(master_name)
+            if master_obj is None:
+                continue
+            if not isinstance(master_obj, dict):
+                return False, f"{master_name} missing/invalid.", []
+
+            target = exo_dir / f"{uid}{suffix}"
+            existing_obj = _exo_load_json_file(target)
+            final_obj, preserved = _exo_build_identity_safe_master(
+                master_obj,
+                existing_obj,
             )
 
-    # One backup ZIP containing original files, with destination-root labels.
+            item["preserved_identity_paths"][suffix] = [
+                ".".join(path) for path in sorted(preserved.keys())
+            ]
+
+            writes[str(target)] = (
+                target,
+                json.dumps(
+                    final_obj,
+                    indent=2,
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+            )
+
+    # Back up every file that is about to be replaced.
     existing = [target for target, _content in writes.values() if target.is_file()]
     backups = []
     if existing:
@@ -27240,10 +27392,7 @@ def install_exotic_master_plan(manifest, plan):
             compresslevel=9,
         ) as backup:
             for index, target in enumerate(existing, start=1):
-                backup.write(
-                    target,
-                    arcname=f"{index:03d}_{target.name}",
-                )
+                backup.write(target, arcname=f"{index:03d}_{target.name}")
         backups.append(backup_path)
 
     written = 0
@@ -27267,9 +27416,16 @@ def install_exotic_master_plan(manifest, plan):
             except Exception:
                 pass
 
+    preserved_total = sum(
+        len(paths)
+        for item in plan
+        for paths in item.get("preserved_identity_paths", {}).values()
+    )
+
     return True, (
         f"EXO master installed: {written} per-UID file(s) for "
-        f"{len(plan)} selected package(s)."
+        f"{len(plan)} selected package(s); "
+        f"preserved {preserved_total} pet UUID/team field(s)."
     ), backups
 
 
@@ -27282,7 +27438,7 @@ def workspace_zip_tools_menu(cfg):
             DIM,
         ))
         print("")
-        print("1. Install exotic_master.zip -> current executor (UID groups; REST=MARKET)")
+        print("1. Install exotic_master.zip (replace settings; preserve pet UUID teams)")
         print("2. Configure EXO UID groups from installed accounts")
         print("3. Import generic config/workspace ZIP -> current executor Workspace(s)")
         print("4. Export current executor Workspace(s) -> timestamped ZIP")
@@ -27331,6 +27487,10 @@ def workspace_zip_tools_menu(cfg):
             print(f"  Local Market UIDs    : {len(local_groups['market'])}")
             print(col(
                 "  Rule: local exact UID > master exact UID > REST = MARKET",
+                CYAN,
+            ))
+            print(col(
+                "  Merge: MASTER wins; only existing pet UUID/team identity is preserved",
                 CYAN,
             ))
 
@@ -27395,12 +27555,29 @@ def workspace_zip_tools_menu(cfg):
                     "Installed files are under current Workspace/exotichub99/<UID>*.json",
                     DIM,
                 ))
+                print("")
+                print(col("PRESERVED PET UUID / TEAM DATA:", BOLD))
+                for item in plan:
+                    by_file = item.get("preserved_identity_paths", {})
+                    total = sum(len(paths) for paths in by_file.values())
+                    print(
+                        f"  {item['username']} UID={item['uid']} -> "
+                        f"{total} preserved field(s)"
+                    )
+                    for suffix, paths in by_file.items():
+                        if not paths:
+                            continue
+                        preview = ", ".join(paths[:8])
+                        if len(paths) > 8:
+                            preview += f", +{len(paths)-8} more"
+                        print(f"      {suffix}: {preview}")
+
                 verify = _verify_exotic_install_plan(manifest, plan)
                 failures = [entry for entry in verify if not entry[1]]
                 print("")
                 if not failures:
                     print(col(
-                        f"Read-back verification: PASS ({len(verify)}/{len(verify)} file1 files match exactly)",
+                        f"Read-back verification: PASS ({len(verify)}/{len(verify)} account config sets match master outside pet UUID/team identity)",
                         GREEN,
                     ))
                 else:
