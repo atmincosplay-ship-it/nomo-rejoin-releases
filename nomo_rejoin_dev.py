@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.95 — VISIBLE ROBLOX HOME OUTRANKS STALE STATE / ACTIVE SOFT ROUTE
+# - Screenshot proved nokaC/nokaD could visibly sit on Roblox Home while Hatcher
+#   still displayed Online + old-state hard cooldown.
+# - Home detection no longer requires a Search accessibility label; package/
+#   Option16-scoped Home + >=3 navigation labels is sufficient.
+# - ALIVE stale/no-fresh Hatcher candidates are Home-probed even outside the old
+#   post-open watch window.
+# - Visible Home now outranks old-state/cooldown/bubble/stale routing.
+# - Pending hard recovery for that package is cancelled and only a SOFT Hatcher
+#   route is sent, using no_hard_fallback=True.
+#
 # V4.81.94 — BUBBLE SHELL ACTIVE SOFT-WAKE (NO MORE PERMANENT HOLD)
 # - V4.81.90/.93 could leave stale bubble-only shells stuck forever:
 #     "bubble-only auto recovery HELD; live siblings ..."
@@ -1593,7 +1604,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.94"
+__version__ = "V4.81.95"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -13465,10 +13476,27 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
         visible_window, visible_note = package_visible_window(pkg, cfg)
 
     visible_home = None
+    stale_home_probe = False
+    if mode == "hatcher" and raw_alive and not clean_fresh:
+        try:
+            stale_home_age = int(state_age_seconds(state)) if state else 999999
+        except Exception:
+            stale_home_age = 999999
+        stale_home_probe = bool(
+            state is None
+            or stale_home_age >= max(
+                60,
+                int(cfg.get("state_stale_seconds", 180) or 180),
+            )
+        )
+
     if (
         mode == "hatcher"
         and raw_alive
-        and hatcher_visible_home_watch_active(rt_tab, cfg)
+        and (
+            hatcher_visible_home_watch_active(rt_tab, cfg)
+            or stale_home_probe
+        )
     ):
         visible_home = android_roblox_home_ui_detail(pkg, cfg, force=False)
         if visible_home:
@@ -13897,9 +13925,15 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
             tab, target, "visible Roblox Home; Hatcher route retry", metadata=meta, bypass_manual=False
         )
         rt_tab["hatcher_visible_home_route_last"] = now()
-        rt_tab["note"] = "Roblox Home visible; route retry queued" if added else "Roblox Home visible; route retry already queued"
+        rt_tab["note"] = "Roblox Home visible; SOFT Hatcher route queued" if added else "Roblox Home visible; route retry already queued"
+        if added:
+            log_activity(
+                "Roblox Home visible -> SOFT Hatcher route queued; no PID-stop/no hard fallback",
+                pkg,
+                CYAN,
+            )
         core.save()
-        return ("Queued" if added else "Home"), rt_tab["note"], True
+        return ("Waking" if added else "Home"), rt_tab["note"], True
 
     # V4.81.40: Error 773 is commonly emitted while Market's own
     # TeleportToListing / low-player hop is in progress or has just failed. If
@@ -15207,15 +15241,20 @@ def android_roblox_home_ui_detail(pkg, cfg, force=False, required=False):
     age_gate = "access to popular games has changed" in joined
     recommended = "recommended for you" in joined
 
-    # Require Search + Home and a substantial navigation cluster, or one of the
-    # distinctive Home-only cards seen on the clone shell.  This avoids treating
-    # arbitrary in-game text or a single green/white icon as Roblox Home.
-    if not (search_hit and home_hit):
+    # V4.81.95: current Roblox Home does not always expose Search as text.
+    # Home + a strong left-navigation cluster is enough and remains scoped to
+    # this package / exact Option16 rectangle.
+    if not home_hit:
         return None
-    if len(nav_hits) < 3 and not age_gate and not recommended:
+    if (
+        len(nav_hits) < 3
+        and not (search_hit and len(nav_hits) >= 1)
+        and not age_gate
+        and not recommended
+    ):
         return None
 
-    hits = ["search", "home"] + nav_hits[:5]
+    hits = (["search"] if search_hit else []) + ["home"] + nav_hits[:5]
     if age_gate:
         hits.append("age-gate card")
     if recommended:
@@ -23750,7 +23789,21 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                     str(health.get("bad") or "") in {"ui_challenge", "challenge"}
                     or background_solver_active
                 )
-                recovery_age = 0 if (alive and (state_disconnect_ui(state) or challenge_active)) else age
+                visible_home_active = bool(
+                    alive and str(health.get("bad") or "") == "roblox_home"
+                )
+                recovery_age = (
+                    0
+                    if (
+                        alive
+                        and (
+                            state_disconnect_ui(state)
+                            or challenge_active
+                            or visible_home_active
+                        )
+                    )
+                    else age
+                )
 
                 ready_at = int((prof or {}).get("ready_pet_count", 200))
                 ready_pet = pets >= ready_at
@@ -23758,10 +23811,33 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                     clear_manual_login_block(rt_tab)
                     clear_captcha_ui_runtime(rt_tab)
 
-                problem_code, problem_note = hatcher_teleport_problem(
-                    tab, state, hcfg, cfg
-                )
-                if problem_code:
+                home_route_handled = False
+                if visible_home_active:
+                    home_status, home_note, home_handled = core.apply_rejoin_action(
+                        tab,
+                        "hatcher",
+                        rt_tab,
+                        health,
+                        hcfg=hcfg,
+                        mode="hatcher",
+                    )
+                    if home_handled:
+                        status = home_status
+                        note = home_note
+                        home_route_handled = True
+
+                if home_route_handled:
+                    problem_code, problem_note = None, ""
+                    rt_tab["hatcher_teleport_since"] = 0
+                    rt_tab["hatcher_teleport_problem"] = ""
+                else:
+                    problem_code, problem_note = hatcher_teleport_problem(
+                        tab, state, hcfg, cfg
+                    )
+
+                if home_route_handled:
+                    pass
+                elif problem_code:
                     should_q, wait_note = should_queue_hatcher_teleport_rejoin(rt_tab, hcfg, cfg, problem_code)
                     if should_q and cfg.get("rejoin_if_crash", True):
                         added, _ = core.queue_by_liveness(
@@ -23777,11 +23853,17 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                     else:
                         status = "Wrong server"
                         note = f"{problem_note} {wait_note}".strip()
-                else:
+                elif not home_route_handled:
                     rt_tab["hatcher_teleport_since"] = 0
                     rt_tab["hatcher_teleport_problem"] = ""
 
-                loading_grace = (not problem_code) and alive and in_post_open_grace(rt_tab, cfg) and state_is_old_after_open(state, rt_tab)
+                loading_grace = (
+                    not home_route_handled
+                    and not problem_code
+                    and alive
+                    and in_post_open_grace(rt_tab, cfg)
+                    and state_is_old_after_open(state, rt_tab)
+                )
 
                 # V3.76: 5m old-state hard rule
                 old_enabled, old_sec, old_max, old_cd = hatcher_alive_old_state_hard_settings(hcfg, cfg)
@@ -23836,7 +23918,12 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                             note = qnote
                             bubble_rescue_handled = True
 
-                if problem_code:
+                if home_route_handled:
+                    # Visible package-scoped Roblox Home is authoritative.
+                    # Hidden/stale Lua state and old-state cooldown cannot
+                    # overwrite the Home route status this cycle.
+                    pass
+                elif problem_code:
                     pass
                 elif background_fresh.get("active") and not challenge_active:
                     status = "Loading"
