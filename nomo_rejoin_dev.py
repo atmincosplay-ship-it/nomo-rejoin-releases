@@ -14,6 +14,17 @@
 # - No recovery rule, PID policy, Home routing, shell wake, solver, or Option 17
 #   behavior is changed.
 #
+# V4.81.103 — SHELL = PID ALIVE / ACTIVITY LOST; ACTIVE PROTOCOL RESTORE
+# - Screenshot showed nokaA/nokaB as Shell while their floating windows vanished.
+#   Shell means package PID alive but Roblox ActivityRecord/task missing.
+# - Legacy queued bubble-only HARD items are converted to a package-local
+#   exact VIEW protocol wake when siblings are alive.
+# - New shell wakes with live siblings also use exact package VIEW activity
+#   directly (SINGLE_TOP only), never PID stop and never hard fallback.
+# - Sibling PID + ActivityRecord state is checked before/after protocol start.
+# - Stale bubble-only hold notes/flags are cleared on Hatcher startup.
+# - Dashboard summary shows VER so screenshots prove the running build.
+#
 # V4.81.102 — SOLVER TEMP-ERROR DIAGNOSTICS + BLOCKSOLVE /JOIN NORMALIZATION
 # - Dashboard wording "SOLVER_UNAVAILABLE" was misleading: it represented the
 #   last package API request entering a retry gate, not a live BlockSolve status.
@@ -1706,7 +1717,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.102"
+__version__ = "V4.81.103"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -5785,7 +5796,7 @@ def open_roblox_protocol_activity_nudge(pkg, link, cfg, rt_tab=None):
                 ([peer_note] if not peer_ok else []) + activity_losses
             )
             log_activity(
-                "HOME PROTOCOL NUDGE peer warning; no sibling action: "
+                "PROTOCOL VIEW NUDGE peer warning; no sibling action: "
                 + cut(detail, 100),
                 pkg,
                 RED,
@@ -6178,6 +6189,7 @@ def queue_hatcher_bubble_only_recovery(core, tab, rt_tab, cfg, reason):
             metadata={
                 "bypass_recheck": True,
                 "bubble_only_soft_wake": True,
+                "bubble_only_protocol_wake": True,
                 "no_hard_fallback": True,
                 # A shell wake is itself the package-local recovery attempt.
                 # Provider probing may still happen later if a real challenge
@@ -6194,8 +6206,9 @@ def queue_hatcher_bubble_only_recovery(core, tab, rt_tab, cfg, reason):
             rt_tab["hatcher_startup_observe_until"] = 0
             rt_tab["note"] = "shell soft wake queued"
             log_activity(
-                "bubble shell -> SOFT wake queued; "
-                + cut(peer_note, 80)
+                "bubble shell (PID alive / ActivityRecord lost) -> exact-package "
+                "protocol wake queued; "
+                + cut(peer_note, 70)
                 + "; no PID-stop/no hard fallback",
                 pkg,
                 CYAN,
@@ -7613,6 +7626,7 @@ def status_screen(rows, cfg, session_start, loops):
     # config summary block
     up = format_uptime(now() - session_start)
     print(f"  {col('METHOD', DIM)} : Online     "
+          f"{col('VER', DIM)} : {col(__version__, CYAN)}     "
           f"{col('UPTIME', DIM)} : {col(up, CYAN)}   "
           f"{col('CHECKS', DIM)} : {loops}")
     print(f"  {col('BLOCK', DIM)}  : {onoff(cfg.get('rejoin_if_crash'))}    "
@@ -17909,23 +17923,37 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
     item_mode = str(item.get("mode", "hard") or "hard").lower()
     is_hard = item_mode not in ("soft", "route", "switch", "reuse_task")
 
-    # V4.81.90: last-second App Cloner sibling guard for bubble-only recovery.
-    # Drop the queued action instead of requeueing it; the watchdog will keep
-    # displaying the package-local shell hold while peers remain alive.
+    # V4.81.103: legacy persisted bubble HARD items must not become permanent
+    # holds. With live peers, convert the queued item in-place to a non-destructive
+    # exact-package protocol VIEW wake.
     if item.get("bubble_only_recovery"):
         peer_hold, peer_note = hatcher_bubble_only_live_sibling_guard(pkg, cfg)
         if peer_hold:
-            rt_tab["note"] = "bubble-only held; " + str(peer_note or "")
-            rt_tab["bubble_only_peer_hold"] = True
-            rt_tab["bubble_only_peer_hold_note"] = str(peer_note or "")
+            item["bubble_only_recovery"] = False
+            item["bubble_only_soft_wake"] = True
+            item["bubble_only_protocol_wake"] = True
+            item["no_hard_fallback"] = True
+            item["bypass_recheck"] = True
+            item["always_recheck_health"] = False
+            item["mode"] = "soft"
+            item["combined_stuck_recovery"] = False
+            item["combined_stuck_clear_cache"] = False
+            item["combined_stuck_refresh_private_link"] = False
+            mode = "soft"
+            item_mode = "soft"
+            is_hard = False
+            rt_tab["note"] = "legacy shell hold -> protocol wake"
+            rt_tab["bubble_only_peer_hold"] = False
+            rt_tab["bubble_only_peer_hold_note"] = ""
+            rt_tab["bubble_shell_soft_wake_mode"] = True
             log_activity(
-                "queued bubble-only recovery CANCELLED; "
-                + cut(peer_note, 90),
+                "legacy queued bubble HARD converted -> exact-package protocol wake; "
+                + cut(peer_note, 80)
+                + "; no PID-stop/no hard fallback",
                 pkg,
-                YELLOW,
+                CYAN,
             )
             core.save()
-            return True
 
     # V4.81.59: MODERATION FIRST. This is deliberately before Option 6's
     # legacy API bypass, solver/provider work, staggering, PID guards, and the
@@ -18587,6 +18615,8 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
         display_mode = "market-cache-protocol"
     elif item.get("visible_home_protocol_nudge"):
         display_mode = "home-protocol"
+    elif item.get("bubble_only_protocol_wake"):
+        display_mode = "shell-protocol"
     elif item.get("bubble_only_soft_wake"):
         display_mode = "shell-soft-wake"
     elif item.get("peer_safe_alive_soft_downgrade"):
@@ -18694,6 +18724,22 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
             )
             if ok:
                 rt_tab["target"] = target
+                rt_tab["note"] = reason
+    elif item.get("bubble_only_protocol_wake"):
+        link = core.target_link(tab, target, rt_tab)
+        if not link:
+            ok, msg = False, "shell protocol wake has no target link"
+        else:
+            ok, msg = open_roblox_protocol_activity_nudge(
+                pkg,
+                link,
+                cfg,
+                rt_tab=rt_tab,
+            )
+            if ok:
+                rt_tab["target"] = target
+                rt_tab["last_open"] = now()
+                rt_tab["last_open_mode"] = "shell-protocol"
                 rt_tab["note"] = reason
     elif item.get("visible_home_protocol_nudge"):
         link = core.target_link(tab, target, rt_tab)
@@ -24172,6 +24218,22 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
 
     hcfg = load_hatcher_config()
     rt = load_runtime()
+
+    # V4.81.103: clear stale runtime hold artifacts left by pre-active-shell builds.
+    shell_hold_migrated = False
+    for _profile in hatcher_profiles(hcfg, enabled_only=False):
+        _pkg = str((_profile or {}).get("package", "") or "")
+        if not _pkg:
+            continue
+        _rt_tab = get_runtime_tab(rt, _pkg)
+        _note = str(_rt_tab.get("note", "") or "").lower()
+        if "bubble-only held" in _note or _rt_tab.get("bubble_only_peer_hold"):
+            _rt_tab["bubble_only_peer_hold"] = False
+            _rt_tab["bubble_only_peer_hold_note"] = ""
+            _rt_tab["note"] = "legacy bubble hold cleared; shell protocol wake enabled"
+            shell_hold_migrated = True
+    if shell_hold_migrated:
+        save_runtime(rt)
 
     # V4.43 one-time startup-grace repair. Clear queue/open artifacts from the
     # previous immediate-startup hard-recovery behavior; the current process will
