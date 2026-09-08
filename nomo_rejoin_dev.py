@@ -1,5 +1,22 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.93 — ALIVE NOKA AUTO-HARD -> PEER-SAFE SOFT REUSE
+# - Live screenshot proved the ordinary Hatcher alive-old-state path could still:
+#     exact-PID stop target -> siblings verified intact -> hard am start target
+#   and then another App Cloner floating sibling could disappear.
+# - Therefore this is not limited to bubble-only recovery.
+# - NEW GLOBAL AUTOMATIC SAFETY RULE for Noka/App Cloner:
+#     If target package is ALIVE and a sibling Noka package is ALIVE,
+#     automatic HARD recovery is downgraded to SOFT task/deep-link reuse.
+# - The soft generation is marked no_hard_fallback so a timeout can never silently
+#   escalate back into the dangerous target PID-stop + hard launch while peers live.
+# - If sibling PID queries are unavailable, an ALIVE automatic target also takes
+#   the non-destructive soft path rather than guessing.
+# - Explicit/manual force operations are not silently rewritten.
+# - Genuine DEAD-package recovery remains hard because there is no live target task
+#   to reuse. All remaining hard Noka launches now snapshot/verify sibling PIDs
+#   after launch as a diagnostic, not only bubble-only launches.
+#
 # V4.81.92 — RESTORE OPTION 17 OFFLINE HELPERS / BUILD SYMBOL GUARD
 # - Fixes V4.81.91 Option 17 NameError:
 #     _exo_stop_selected_for_offline_install is not defined
@@ -1560,7 +1577,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.92"
+__version__ = "V4.81.93"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -5665,6 +5682,29 @@ def hatcher_bubble_only_recovery_candidate(pkg, cfg, *, process_status=None):
 
 
 
+
+def noka_live_sibling_detail(pkg, cfg):
+    """Return (has_live_peer, note, query_ok) using exact package PID queries."""
+    peers, errors = _sibling_pid_snapshot(pkg, cfg)
+    if errors:
+        return False, "sibling PID query unavailable: " + " | ".join(errors), False
+    if not peers:
+        return False, "no live sibling PIDs", True
+    names = ", ".join(short_pkg(peer) for peer in sorted(peers.keys()))
+    return True, f"live siblings: {names}", True
+
+
+def automatic_hard_item_can_soft_downgrade(item):
+    """Only automatic recovery is rewritten; explicit/manual force remains explicit."""
+    manual_keys = (
+        "manual_option6_force_override",
+        "manual_option6",
+        "manual_auth_open",
+        "manual_booster_hard_route",
+    )
+    return not any(bool(item.get(key)) for key in manual_keys)
+
+
 def hatcher_bubble_only_live_sibling_guard(pkg, cfg):
     """Return (held, note) for unsafe bubble-only auto recovery.
 
@@ -5779,7 +5819,7 @@ def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop
 
     link = android_launch_roblox_link(link, cfg)
 
-    bubble_launch_diag = False
+    hard_launch_peer_diag = False
     sibling_before_launch = {}
 
     if not soft and require_stop and not skip_force_stop:
@@ -5796,15 +5836,15 @@ def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop
             log_activity(f"hard open aborted: {cut(stop_note, 80)}", pkg, RED)
             return False, f"stop failed: {cut(stop_note, 60)}"
 
-        # Bubble recovery is the only path that recently showed sibling loss.
-        # Snapshot peers *after* the exact-PID stop and immediately before the
-        # one target launch. This is diagnostic only; it never kills/repairs peers.
-        if "bubble-only" in str(reason or "").lower():
-            bubble_launch_diag = True
+        # V4.81.93: snapshot peers for EVERY remaining Noka hard launch.
+        # Exact-PID stop verification only proves peers survived the stop; the
+        # subsequent App Cloner task launch can still disturb a sibling.
+        if _is_noka_clone_package(pkg):
+            hard_launch_peer_diag = True
             sibling_before_launch, sibling_errors = _sibling_pid_snapshot(pkg, cfg)
             if sibling_errors:
                 log_activity(
-                    "bubble launch peer snapshot unavailable: "
+                    "hard launch peer snapshot unavailable: "
                     + " | ".join(sibling_errors),
                     pkg,
                     YELLOW,
@@ -5857,27 +5897,27 @@ def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop
     code, out = shell_timeout(cmd, cfg, capture=True, timeout=15)
     if code == 0:
         invalidate_android_observation_caches()
-        if bubble_launch_diag and sibling_before_launch:
-            # Give Android/App Cloner a moment to settle, then prove whether the
-            # plain target launch itself affected a peer process. This does not
-            # attempt any sibling repair or additional launch.
+        if hard_launch_peer_diag and sibling_before_launch:
+            # Give Android/App Cloner a moment to settle, then distinguish
+            # stop-time safety from launch-time sibling loss.
             time.sleep(1.0)
             peer_ok, peer_note = _verify_sibling_pid_snapshot(
                 sibling_before_launch, cfg, pkg
             )
             if not peer_ok:
                 log_activity(
-                    "BUBBLE LAUNCH SIBLING LOSS; no further auto action: "
+                    "HARD LAUNCH SIBLING LOSS detected after target start; "
+                    "no sibling repair attempted: "
                     + cut(peer_note, 100),
                     pkg,
                     RED,
                 )
                 if rt_tab is not None:
-                    rt_tab["bubble_launch_sibling_loss"] = True
-                    rt_tab["bubble_launch_sibling_loss_note"] = str(peer_note or "")
-                    rt_tab["bubble_launch_sibling_loss_at"] = now()
+                    rt_tab["hard_launch_sibling_loss"] = True
+                    rt_tab["hard_launch_sibling_loss_note"] = str(peer_note or "")
+                    rt_tab["hard_launch_sibling_loss_at"] = now()
             elif rt_tab is not None:
-                rt_tab["bubble_launch_sibling_loss"] = False
+                rt_tab["hard_launch_sibling_loss"] = False
         return True, "soft hop" if soft else "opened"
 
     if (
@@ -17329,6 +17369,53 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
             core.save()
             return True
 
+    # V4.81.93: App Cloner safety now applies to EVERY automatic ALIVE Noka
+    # hard generation, not only bubble/Option6/AutoExec special cases.
+    #
+    # The real-device failure sequence was:
+    #   target exact-PID stop -> sibling verification PASS -> target hard am start
+    #   -> a sibling floating clone disappears.
+    #
+    # If the target is still ALIVE, reuse its existing task instead. This avoids
+    # both the destructive PID stop and creation/materialization of a fresh task.
+    if (
+        is_hard
+        and process_status == "ALIVE"
+        and _is_noka_clone_package(pkg)
+        and cfg.get("noka_alive_auto_hard_peer_safe_soft_enabled", True)
+        and automatic_hard_item_can_soft_downgrade(item)
+    ):
+        has_peer, peer_note, peer_query_ok = noka_live_sibling_detail(pkg, cfg)
+
+        # If peer queries fail, still choose the non-destructive route. We only
+        # need exact peer proof to permit a destructive decision, not a soft one.
+        if has_peer or not peer_query_ok:
+            original_mode = mode
+            item["peer_safe_alive_soft_downgrade"] = True
+            item["peer_safe_original_mode"] = str(original_mode or "")
+            item["peer_safe_peer_note"] = str(peer_note or "")
+            item["no_hard_fallback"] = True
+            item["mode"] = "soft"
+            item["combined_stuck_recovery"] = False
+            item["combined_stuck_clear_cache"] = False
+            item["combined_stuck_refresh_private_link"] = False
+
+            mode = "soft"
+            item_mode = "soft"
+            is_hard = False
+
+            rt_tab["peer_safe_alive_soft_at"] = now()
+            rt_tab["peer_safe_alive_soft_note"] = str(peer_note or "")
+            rt_tab["note"] = "peer-safe soft reuse; " + cut(peer_note, 80)
+            log_activity(
+                "ALIVE hard recovery downgraded -> soft task reuse; "
+                + cut(peer_note, 90)
+                + "; no hard fallback",
+                pkg,
+                YELLOW,
+            )
+            core.save()
+
     # V4.81.83: all auth/challenge holds are package-local. The target clone
     # is rechecked independently; another clone's Face Lock/CAPTCHA/solver cannot
     # suppress this package's exact-target recovery.
@@ -17746,7 +17833,9 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
         log_activity(f"open held by manual verification: {cut(manual_note, 70)}", pkg, YELLOW)
         return False, manual_note
     display_mode = str(mode or "hard")
-    if _alive_recovery_soft_allowed(reason, package_alive(pkg, cfg, fresh=True), cfg):
+    if item.get("peer_safe_alive_soft_downgrade"):
+        display_mode = "peer-safe-soft"
+    elif _alive_recovery_soft_allowed(reason, package_alive(pkg, cfg, fresh=True), cfg):
         display_mode = "alive-soft-first"
     opening_screen(tab, target, cfg, 1, max(1, len(open_queue) + 1), mode=display_mode)
     rt_tab["note"] = f"opening -> {target}"
