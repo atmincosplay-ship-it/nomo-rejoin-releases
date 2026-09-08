@@ -14,6 +14,20 @@
 # - No recovery rule, PID policy, Home routing, shell wake, solver, or Option 17
 #   behavior is changed.
 #
+# V4.81.102 — SOLVER TEMP-ERROR DIAGNOSTICS + BLOCKSOLVE /JOIN NORMALIZATION
+# - Dashboard wording "SOLVER_UNAVAILABLE" was misleading: it represented the
+#   last package API request entering a retry gate, not a live BlockSolve status.
+# - Temporary provider failures now display PROVIDER_TEMP_ERROR with sanitized
+#   provider/http/status/error detail so screenshots show what actually happened.
+# - The existing >=10-minute provider anti-spam interval remains unchanged.
+# - BlockSolve's canonical contract is POST /join. A legacy BlockSolve endpoint
+#   saved as /api/captcha/solve is now normalized to /join at request time.
+# - Manual package/sample solver tests now treat NO_CAPTCHA/NO_CHALLENGE as a
+#   successful provider response instead of printing a false "Solver failed".
+# - A successful manual package test clears a stale SOLVER_UNAVAILABLE/
+#   PROVIDER_TEMP_ERROR pending label for that package, while still respecting
+#   the normal provider interval for subsequent automatic submissions.
+#
 # V4.81.101 — MARKET CACHE FAILURE MUST ABORT REOPEN
 # - V4.81.98-.100 attempted forced Clear Cache before the peer-safe Market VIEW
 #   restart, but the helper could continue reopening even when cache_ok=False.
@@ -1692,7 +1706,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.101"
+__version__ = "V4.81.102"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -14004,7 +14018,18 @@ def maybe_queue_solver_busy_retry(open_queue, tab, target, rt_tab, cfg, health, 
         removed = core.cancel(pkg)
         if removed:
             core.save()
-        return "Waiting", f"solver {retry_reason}; retry provider in {format_age(left)} (no reopen)", True
+        detail = str(rt_tab.get("solver_last_provider_temp_error") or "")
+        if retry_reason in {"SOLVER_UNAVAILABLE", "PROVIDER_TEMP_ERROR"} and detail:
+            note = (
+                f"solver {retry_reason}; retry in {format_age(left)}: "
+                + cut(detail, 62)
+            )
+        else:
+            note = (
+                f"solver {retry_reason}; retry provider in "
+                f"{format_age(left)} (no reopen)"
+            )
+        return "Waiting", note, True
 
     if solver_job_running(pkg):
         return "Solving", solver_job_note(pkg), True
@@ -14090,7 +14115,17 @@ def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, he
     if busy_pending and busy_at > now():
         left = max(1, busy_at - now())
         reason = str(rt_tab.get("solver_retry_reason") or "PROVIDER")
-        note = f"verification UI; {reason} retry provider in {format_age(left)} (no reopen)"
+        detail = str(rt_tab.get("solver_last_provider_temp_error") or "")
+        if reason in {"SOLVER_UNAVAILABLE", "PROVIDER_TEMP_ERROR"} and detail:
+            note = (
+                f"verification UI; {reason} retry in {format_age(left)}: "
+                + cut(detail, 60)
+            )
+        else:
+            note = (
+                f"verification UI; {reason} retry provider in "
+                f"{format_age(left)} (no reopen)"
+            )
         rt_tab["note"] = note
         core.save()
         return "Captcha", note, True
@@ -37577,6 +37612,26 @@ def solver_response_http_status(data):
     return 0
 
 
+
+def solver_provider_failure_summary(data, cfg=None):
+    """Short sanitized reason for a provider/API failure."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    provider = solver_provider_name(cfg)
+    http_status = solver_response_http_status(data)
+    status = solver_response_status(data)
+    err = _solver_error_text(data) if "_solver_error_text" in globals() else ""
+    if not err and isinstance(data, dict):
+        err = str(data.get("error") or data.get("message") or "")
+    parts = [provider.upper()]
+    if http_status:
+        parts.append(f"HTTP {http_status}")
+    if status and status not in {"ERROR", "FAILED", "FAIL"}:
+        parts.append(status)
+    if err:
+        parts.append(cut(err, 70))
+    return " | ".join(parts[:4])
+
+
 def solver_response_provider_unavailable(data):
     if not isinstance(data, dict):
         return False
@@ -38693,12 +38748,27 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
                 YELLOW,
             )
         elif solver_response_provider_unavailable(response):
-            retry_after = max(600, int(cfg.get("solver_min_resubmit_seconds", 600) or 600))
+            retry_after = max(
+                600,
+                int(cfg.get("solver_min_resubmit_seconds", 600) or 600),
+            )
+            summary = solver_provider_failure_summary(response, cfg)
             rt_tab["solver_busy_retry_pending"] = True
             rt_tab["solver_busy_retry_at"] = now() + retry_after
-            rt_tab["solver_retry_reason"] = "SOLVER_UNAVAILABLE"
-            rt_tab["note"] = f"solver unavailable; retry provider in {format_age(retry_after)}"
-            log_activity(f"solver provider unavailable; retry provider in {format_age(retry_after)}", pkg, YELLOW)
+            rt_tab["solver_busy_retry_seconds"] = retry_after
+            rt_tab["solver_retry_reason"] = "PROVIDER_TEMP_ERROR"
+            rt_tab["solver_last_provider_temp_error"] = summary
+            rt_tab["solver_last_provider_temp_error_at"] = now()
+            rt_tab["note"] = (
+                f"provider temp error; retry in {format_age(retry_after)}: "
+                + cut(summary, 65)
+            )
+            log_activity(
+                f"solver provider TEMP ERROR; retry in {format_age(retry_after)}: "
+                + cut(summary, 90),
+                pkg,
+                YELLOW,
+            )
         elif status_code in {"SERVER_BUSY", "BUSY", "RATE_LIMITED", "TOO_MANY_REQUESTS"}:
             retry_after = max(600, int(cfg.get("solver_min_resubmit_seconds", 600) or 600))
             rt_tab["solver_busy_retry_pending"] = True
@@ -38815,11 +38885,20 @@ def normalized_solver_endpoint(endpoint, provider="auto"):
     if provider == "auto":
         provider = solver_provider_name({}, endpoint)
 
-    # Preserve an exact user-supplied path. Only a bare host gets a provider
-    # canonical path appended.
+    # Preserve an exact user-supplied path except for the known legacy
+    # BlockSolve generic-adapter path. BlockSolve's current contract is /join.
     try:
         parsed = urllib.parse.urlparse(endpoint)
         has_path = bool(parsed.path and parsed.path not in {"", "/"})
+        host = (parsed.hostname or "").lower()
+        path = str(parsed.path or "")
+        if (
+            provider == "blocksolve"
+            and (host == "blocksolve.site" or host.endswith(".blocksolve.site"))
+            and path.rstrip("/") == "/api/captcha/solve"
+        ):
+            rebuilt = parsed._replace(path="/join", params="", query="", fragment="")
+            return urllib.parse.urlunparse(rebuilt).rstrip("/")
     except Exception:
         after_scheme = endpoint.split("://", 1)[-1]
         has_path = "/" in after_scheme
@@ -40150,6 +40229,15 @@ def solver_menu(cfg):
         effective_endpoint = effective_solver_endpoint(cfg)
         print(f"1. Enable/disable: {cfg.get('solver_enabled', False)}")
         print(f"   Provider: {provider.upper()} | Effective endpoint: {effective_endpoint or '-'}")
+        raw_solver_endpoint = str(cfg.get("solver_endpoint", "") or "").strip()
+        if (
+            provider == "blocksolve"
+            and "/api/captcha/solve" in raw_solver_endpoint.lower()
+        ):
+            print(col(
+                "   Legacy BlockSolve path detected; NOMO will normalize it to /join.",
+                YELLOW,
+            ))
         print(f"2. Provider endpoint + API key: {cfg.get('solver_endpoint', 'https://solver.wintercode.dev')}")
         print(f"   API key: {mask_secret(cfg.get('solver_api_key', ''))}")
         if provider == "blocksolve":
@@ -40246,14 +40334,29 @@ def solver_menu(cfg):
             print(col(f"Testing solver for {pkg}...", YELLOW))
             try:
                 ok, resp = solve_captcha(cookie, cfg, place_id)
-                if ok:
-                    print(col("Solver success", GREEN))
+                response_kind = solver_response_kind(resp)
+                provider_ok = bool(ok or response_kind == "no_challenge")
+                if provider_ok:
+                    if response_kind == "no_challenge":
+                        print(col("Solver reachable: NO_CAPTCHA / no challenge", GREEN))
+                    else:
+                        print(col("Solver success", GREEN))
                     if is_on_hold(pkg):
                         clear_hold(pkg)
                         print(col("Hold cleared from captcha_hold.json.", GREEN))
                     rt = load_runtime()
                     rt_tab = get_runtime_tab(rt, pkg)
                     clear_manual_login_block(rt_tab)
+                    if str(rt_tab.get("solver_retry_reason") or "") in {
+                        "SOLVER_UNAVAILABLE",
+                        "PROVIDER_TEMP_ERROR",
+                    }:
+                        rt_tab["solver_busy_retry_pending"] = False
+                        rt_tab["solver_busy_retry_at"] = 0
+                        rt_tab["solver_retry_reason"] = ""
+                        rt_tab["solver_last_provider_temp_error"] = ""
+                        rt_tab["note"] = "manual solver test confirmed provider reachable"
+                        print(col("Cleared stale provider-temp-error label.", GREEN))
                     save_runtime(rt)
                     print(col("Manual login flag cleared from runtime.json.", GREEN))
                     status = check_cookie_challenge(cookie)
@@ -40287,8 +40390,12 @@ def solver_menu(cfg):
             if cookie:
                 print(col(f"Testing solver (timeout {cfg.get('solver_timeout_seconds', 180)}s)...", YELLOW))
                 ok, resp = solve_captcha(cookie, cfg)
-                if ok:
-                    print(col("Solver success", GREEN))
+                response_kind = solver_response_kind(resp)
+                if ok or response_kind == "no_challenge":
+                    if response_kind == "no_challenge":
+                        print(col("Solver reachable: NO_CAPTCHA / no challenge", GREEN))
+                    else:
+                        print(col("Solver success", GREEN))
                     status = check_cookie_challenge(cookie)
                     if status == "valid":
                         print(col("Cookie is now valid.", GREEN))
