@@ -1,5 +1,22 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.96 — ROBLOX HOME PROTOCOL-ACTIVITY NUDGE + VISUAL FRESH GUARD
+# - V4.81.95 correctly detected Roblox Home, but the peer-safe soft route could
+#   return "soft hop/open ok" while the same clone visibly remained on Home.
+# - CLEAR_TOP|SINGLE_TOP can simply foreground the current Home activity; some
+#   Noka/App Cloner builds do not deliver the deep link through that activity.
+# - Home recovery is now two-stage and remains non-destructive:
+#     1) first attempt: existing soft task-reuse VIEW intent;
+#     2) if Home remains visible: resolve that exact package's VIEW/deep-link
+#        activity and explicitly start that component with SINGLE_TOP only.
+# - The protocol-activity nudge performs NO PID stop and has NO hard fallback.
+# - Resolved activity must belong to the exact clone package or the nudge is refused.
+# - Home retries default to 10s so a clone does not sit on Home for minutes.
+# - Background fresh verification can no longer PASS while package/Option16-scoped
+#   Roblox Home is visibly present, even if an old Lua/state writer emits a fresh ts.
+# - Once Home disappears and a genuine fresh clean state appears, Home attempt
+#   counters reset.
+#
 # V4.81.95 — VISIBLE ROBLOX HOME OUTRANKS STALE STATE / ACTIVE SOFT ROUTE
 # - Screenshot proved nokaC/nokaD could visibly sit on Roblox Home while Hatcher
 #   still displayed Online + old-state hard cooldown.
@@ -1604,7 +1621,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.95"
+__version__ = "V4.81.96"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -5580,6 +5597,114 @@ def _is_noka_clone_package(pkg):
         or pkg_l.startswith("free.noka")
         or ".noka" in pkg_l
     )
+
+
+
+def resolve_package_view_activity(pkg, link, cfg):
+    """Resolve the exact clone package's Android VIEW handler for one Roblox link."""
+    pkg = str(pkg or "").strip()
+    link = str(link or "").strip()
+    if not pkg or not link:
+        return "", "missing package/link"
+
+    cmd = (
+        "cmd package resolve-activity --brief "
+        "-a android.intent.action.VIEW "
+        + "-d " + shlex.quote(link) + " "
+        + "-p " + shlex.quote(pkg)
+        + " 2>/dev/null | tail -n 1"
+    )
+    code, output = shell_timeout(cmd, cfg, capture=True, timeout=10)
+    lines = [line.strip() for line in str(output or "").splitlines() if line.strip()]
+    component = lines[-1] if lines else ""
+
+    if code != 0 or "/" not in component:
+        return "", "VIEW activity resolve failed: " + cut(output or f"exit {code}", 70)
+
+    owner = component.split("/", 1)[0].strip()
+    if owner != pkg:
+        return "", (
+            "VIEW activity owner mismatch; expected "
+            + pkg + " got " + cut(owner, 50)
+        )
+
+    return component, "resolved exact package VIEW activity"
+
+
+def open_roblox_protocol_activity_nudge(pkg, link, cfg, rt_tab=None):
+    """Deliver a Roblox deep link to the exact clone's VIEW activity without PID stop."""
+    pkg = str(pkg or "").strip()
+    link = android_launch_roblox_link(link, cfg)
+    if not pkg or not link:
+        return False, "missing package/link"
+
+    process_status, process_note = package_alive_status(pkg, cfg, fresh=True)
+    if process_status != "ALIVE":
+        return False, (
+            "protocol nudge requires ALIVE package; "
+            + str(process_status) + ": " + cut(process_note, 60)
+        )
+
+    component, resolve_note = resolve_package_view_activity(pkg, link, cfg)
+    if not component:
+        return False, resolve_note
+
+    sibling_pids, _sibling_pid_errors = _sibling_pid_snapshot(pkg, cfg)
+    sibling_activity_before = {}
+    for peer in sorted(sibling_pids.keys()):
+        a_status, a_note = package_activity_status(peer, cfg)
+        sibling_activity_before[peer] = (a_status, a_note)
+
+    cmd = (
+        "am start -W "
+        "-f 0x20000000 "
+        "-n " + shlex.quote(component) + " "
+        "-a android.intent.action.VIEW "
+        "-d " + shlex.quote(link)
+    )
+
+    invalidate_android_observation_caches()
+    code, output = shell_timeout(cmd, cfg, capture=True, timeout=20)
+    invalidate_android_observation_caches()
+
+    if code != 0:
+        return False, "protocol VIEW start failed: " + cut(output or f"exit {code}", 80)
+
+    if rt_tab is not None:
+        rt_tab["home_protocol_nudge_component"] = component
+        rt_tab["home_protocol_nudge_at"] = now()
+        rt_tab["home_protocol_nudge_result"] = cut(output or "started", 120)
+
+    if sibling_pids:
+        time.sleep(0.8)
+        peer_ok, peer_note = _verify_sibling_pid_snapshot(sibling_pids, cfg, pkg)
+        activity_losses = []
+        for peer, (before_status, _before_note) in sibling_activity_before.items():
+            if before_status != "ACTIVITY":
+                continue
+            after_status, after_note = package_activity_status(peer, cfg)
+            if after_status == "NO_ACTIVITY":
+                activity_losses.append(short_pkg(peer) + ": ActivityRecord lost")
+            elif after_status == "UNKNOWN":
+                activity_losses.append(
+                    short_pkg(peer) + ": activity check unknown (" + cut(after_note, 35) + ")"
+                )
+
+        if not peer_ok or activity_losses:
+            detail = "; ".join(
+                ([peer_note] if not peer_ok else []) + activity_losses
+            )
+            log_activity(
+                "HOME PROTOCOL NUDGE peer warning; no sibling action: "
+                + cut(detail, 100),
+                pkg,
+                RED,
+            )
+            if rt_tab is not None:
+                rt_tab["home_protocol_peer_warning"] = str(detail or "")
+                rt_tab["home_protocol_peer_warning_at"] = now()
+
+    return True, "protocol VIEW activity nudged"
 
 
 def open_package_launcher(pkg, cfg):
@@ -13032,6 +13157,39 @@ def hatcher_background_fresh_wait_status(tab, rt_tab, state, cfg):
         and int(state.get("ts", 0) or 0) >= opened_at - 2
         and state_is_clean_fresh(state, cfg)
     ):
+        pkg = str((tab or {}).get("package") or "")
+        visible_home = None
+        if pkg:
+            visible_home = android_roblox_home_ui_detail(
+                pkg,
+                cfg,
+                force=True,
+                required=True,
+            )
+        if visible_home:
+            rt_tab["hatcher_background_fresh_blocked_home_at"] = now()
+            rt_tab["hatcher_background_fresh_blocked_home_hits"] = ",".join(
+                visible_home.get("hits", [])[:6]
+            )
+            last_log = int(
+                rt_tab.get("hatcher_background_fresh_blocked_home_log_at", 0) or 0
+            )
+            if now() - last_log >= 15:
+                log_activity(
+                    "fresh heartbeat IGNORED; Roblox Home still visibly present",
+                    pkg,
+                    YELLOW,
+                )
+                rt_tab["hatcher_background_fresh_blocked_home_log_at"] = now()
+            remaining = max(0, deadline - now())
+            return {
+                "active": remaining > 0,
+                "timed_out": remaining <= 0,
+                "verified": False,
+                "elapsed": elapsed,
+                "remaining": remaining,
+            }
+
         state_ts = int(state.get("ts", 0) or 0)
         clear_hatcher_background_fresh_wait(rt_tab)
         core_finish_rejoin(rt_tab, verified=True, note="fresh state (background)", state_ts=state_ts)
@@ -13908,30 +14066,70 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
         removed = core.cancel(pkg)
         if removed:
             log_activity("visible Roblox Home cancelled pending hard recovery", pkg, YELLOW)
-        interval = max(15, int(cfg.get("hatcher_visible_home_route_retry_seconds", 30) or 30))
+        interval = max(
+            5,
+            int(cfg.get("hatcher_visible_home_route_retry_seconds", 10) or 10),
+        )
         last = int(rt_tab.get("hatcher_visible_home_route_last", 0) or 0)
         if last > 0 and now() - last < interval:
             left = max(1, interval - (now() - last))
             rt_tab["note"] = f"Roblox Home visible; route retry in {left}s"
             core.save()
             return "Home", rt_tab["note"], True
+
+        attempts = int(rt_tab.get("hatcher_visible_home_route_attempts", 0) or 0)
+        use_protocol_nudge = attempts >= 1
+
         meta = {
             "bypass_recheck": True,
             "skip_solver_probe": True,
             "no_hard_fallback": True,
             "visible_home_route_retry": True,
+            "visible_home_protocol_nudge": bool(use_protocol_nudge),
         }
+        reason = (
+            "visible Roblox Home; explicit protocol VIEW nudge"
+            if use_protocol_nudge
+            else "visible Roblox Home; first soft Hatcher route"
+        )
         added, _ = core.queue_route_retry(
-            tab, target, "visible Roblox Home; Hatcher route retry", metadata=meta, bypass_manual=False
+            tab,
+            target,
+            reason,
+            metadata=meta,
+            bypass_manual=False,
         )
         rt_tab["hatcher_visible_home_route_last"] = now()
-        rt_tab["note"] = "Roblox Home visible; SOFT Hatcher route queued" if added else "Roblox Home visible; route retry already queued"
         if added:
-            log_activity(
-                "Roblox Home visible -> SOFT Hatcher route queued; no PID-stop/no hard fallback",
-                pkg,
-                CYAN,
+            rt_tab["hatcher_visible_home_route_attempts"] = attempts + 1
+
+        if use_protocol_nudge:
+            rt_tab["note"] = (
+                "Roblox Home visible; protocol VIEW nudge queued"
+                if added
+                else "Roblox Home visible; protocol nudge already queued"
             )
+            if added:
+                log_activity(
+                    "Roblox Home persists -> exact-package protocol VIEW nudge queued; "
+                    "no PID-stop/no hard fallback",
+                    pkg,
+                    CYAN,
+                )
+        else:
+            rt_tab["note"] = (
+                "Roblox Home visible; first SOFT Hatcher route queued"
+                if added
+                else "Roblox Home visible; route already queued"
+            )
+            if added:
+                log_activity(
+                    "Roblox Home visible -> first SOFT Hatcher route queued; "
+                    "no PID-stop/no hard fallback",
+                    pkg,
+                    CYAN,
+                )
+
         core.save()
         return ("Waking" if added else "Home"), rt_tab["note"], True
 
@@ -17941,7 +18139,9 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
         log_activity(f"open held by manual verification: {cut(manual_note, 70)}", pkg, YELLOW)
         return False, manual_note
     display_mode = str(mode or "hard")
-    if item.get("bubble_only_soft_wake"):
+    if item.get("visible_home_protocol_nudge"):
+        display_mode = "home-protocol"
+    elif item.get("bubble_only_soft_wake"):
         display_mode = "shell-soft-wake"
     elif item.get("peer_safe_alive_soft_downgrade"):
         display_mode = "peer-safe-soft"
@@ -18033,17 +18233,36 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
         core.save()
 
     log_activity(f"opening -> {target} ({display_mode})", pkg)
-    ok, msg = core.open(
-        tab,
-        rt_tab,
-        target,
-        reason,
-        force=item.get("force", False),
-        mode=mode,
-        force_clear_cache=bool(
-            combined_stuck and item.get("combined_stuck_clear_cache")
-        ),
-    )
+
+    if item.get("visible_home_protocol_nudge"):
+        link = core.target_link(tab, target, rt_tab)
+        if not link:
+            ok, msg = False, "protocol nudge has no target link"
+        else:
+            ok, msg = open_roblox_protocol_activity_nudge(
+                pkg,
+                link,
+                cfg,
+                rt_tab=rt_tab,
+            )
+            if ok:
+                rt_tab["target"] = target
+                rt_tab["last_open"] = now()
+                rt_tab["last_open_mode"] = "home-protocol"
+                rt_tab["note"] = reason
+    else:
+        ok, msg = core.open(
+            tab,
+            rt_tab,
+            target,
+            reason,
+            force=item.get("force", False),
+            mode=mode,
+            force_clear_cache=bool(
+                combined_stuck and item.get("combined_stuck_clear_cache")
+            ),
+        )
+
     opened_at = int(rt_tab.get("last_open", now()))
 
     if ok and item.get("manual_option6"):
@@ -18955,6 +19174,9 @@ def _nomo_start_market_rejoin_original(cfg):
                 if health.get("clean_fresh"):
                     clear_manual_login_block(rt_tab)
                     clear_captcha_ui_runtime(rt_tab)
+                    if str(health.get("bad") or "") != "roblox_home":
+                        rt_tab["hatcher_visible_home_route_attempts"] = 0
+                        rt_tab["hatcher_visible_home_route_last"] = 0
                     rt_tab["hatcher_startup_observe_until"] = 0
 
             # -----------------------------------------------------
