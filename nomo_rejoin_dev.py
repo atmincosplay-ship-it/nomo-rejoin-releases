@@ -14,6 +14,18 @@
 # - No recovery rule, PID policy, Home routing, shell wake, solver, or Option 17
 #   behavior is changed.
 #
+# V4.81.109 — HATCHER STATUS TRUTH / NO-ACTION DISPLAY FIX
+# - V4.81.108 correctly stopped stale/no-visible telemetry from auto-rejoining,
+#   but the final Hatcher decision ladder could overwrite the health classifier
+#   and display those packages as Online.
+# - Display-only correction for the surgical Hatcher policy:
+#     valid state older than stale threshold -> Stale
+#     valid stale state + no visible window -> Stale with both facts in Note
+#     invalid/missing raw state timestamp -> Bad ts
+#     fresh clean heartbeat remains Ingame/Online even if dumpsys cannot see
+#       a floating/minimized window.
+# - This patch does NOT queue, stop, open, soft-hop, or otherwise touch Roblox.
+#
 # V4.81.108 — MODERN BASE + SURGICAL HATCHER ROLLBACK
 # - Base is V4.81.102, so modern unrelated fixes stay intact:
 #     BlockSolve /join + provider diagnostics,
@@ -1734,7 +1746,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.108"
+__version__ = "V4.81.109"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -25033,6 +25045,46 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                     status = "Queued"
                     note = "periodic hard queued"
 
+            # V4.81.109 DISPLAY ONLY. The surgical policy intentionally leaves
+            # stale/no-visible ALIVE clones untouched, but the table must not
+            # mislabel that passive state as Online.
+            if (
+                cfg.get("hatcher_surgical_stable_policy", False)
+                and alive
+                and state
+                and not core.has(pkg)
+                and captcha_action is None
+                and not manual_login_blocked(rt_tab, cfg, pkg)
+                and str(health.get("bad") or "") not in {
+                    "ui_challenge", "challenge", "disconnect", "face_lock",
+                    "account_banned", "manual", "process_unknown",
+                }
+                and status not in {
+                    "Queued", "Loading", "Wrong server", "Kicked", "Captcha",
+                    "Solving", "Manual", "Face Lock", "Banned", "Offline",
+                    "Unknown", "No server",
+                }
+            ):
+                try:
+                    display_age = int(state.get("age", 999999) or 999999)
+                except Exception:
+                    display_age = 999999
+
+                if not hatcher_state_timestamp_valid(state):
+                    status = "Bad ts"
+                    note = "invalid/missing state timestamp; no auto rejoin"
+                elif not health.get("clean_fresh"):
+                    stale_after = max(30, int(cfg.get("state_stale_seconds", 180) or 180))
+                    if display_age > stale_after:
+                        status = "Stale"
+                        if health.get("visible_window") is False:
+                            note = (
+                                f"telemetry {format_age(display_age)} old + "
+                                "no visible window; no auto rejoin"
+                            )
+                        else:
+                            note = f"telemetry {format_age(display_age)} old; no auto rejoin"
+
             status, note = core.queue_display(pkg, status, note)
             if manual_login_blocked(rt_tab, cfg, pkg) and not core.has(pkg):
                 status = "Manual"
@@ -25079,7 +25131,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
         hatcher_rejoin_status_screen(rows, hcfg, cfg, session_start, loops, last_msg)
         _old_on, _old_sec, _old_max, _old_cd = hatcher_alive_old_state_hard_settings(hcfg, cfg)
         print(col(
-            "  Hatcher stable policy: stale/no-state/Home/Shell alone do NOT auto-rejoin; "
+            "  Hatcher stable policy: stale/no-visible is SHOWN truthfully but does NOT auto-rejoin; "
             "only NOMO post-open 5m timeout gets new-PS + Clear Cache recovery.",
             GREEN,
         ))
