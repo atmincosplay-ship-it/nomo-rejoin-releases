@@ -14,6 +14,25 @@
 # - No recovery rule, PID policy, Home routing, shell wake, solver, or Option 17
 #   behavior is changed.
 #
+# V4.81.111 — EXACT VISIBLE CAPTCHA STARTS SOLVER / SUCCESS-COOLDOWN OVERRIDE
+# - V4.81.110 could correctly detect Security -> Verifying you're not a bot ->
+#   Start Puzzle, but display Captcha instead of starting BlockSolve.
+# - Root cause: solver_provider_next_submit_at applies the same >=10m provider
+#   gate after EVERY provider request, including a successful CAPTCHA_SUCCESS or
+#   NO_CAPTCHA result. A new exact visible challenge during that window was held.
+# - The >=10m anti-spam gate is now preserved for actual provider failures,
+#   BUSY/RATE_LIMITED/TEMP_ERROR/COOLDOWN/unknown submissions.
+# - A NEW exact package-scoped visible CAPTCHA may override a cooldown whose
+#   previous provider result was successful/clear:
+#       CAPTCHA_SUCCESS / SUCCESS / SOLVED / COMPLETED / OK
+#       NO_CAPTCHA / NO_CHALLENGE / NOT_REQUIRED / CLEAR / CLEAN
+# - Exact visible CAPTCHA also bypasses only the local solver_retry_cooldown;
+#   it does NOT bypass a real provider failure/busy cooldown.
+# - captcha_ui_retry_at no longer blocks a newly confirmed exact UI by itself;
+#   the actual provider failure gate remains authoritative.
+# - Temporary provider cooldown returns Captcha + countdown, NOT Manual login.
+# - No PID stop/reopen is added; solver remains in-place and package-local.
+#
 # V4.81.110 — STRONG CLOSED/TASK-LOST HATCHER RECOVERY
 # - V4.81.109 correctly displayed stale/no-visible clones but intentionally
 #   performed no recovery, so a clone whose floating Roblox task actually
@@ -1767,7 +1786,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.110"
+__version__ = "V4.81.111"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -12104,7 +12123,7 @@ class RejoinCore:
             self,
         )
 
-    def handle_detected_solver_challenge(self, tab, rt_tab, reason):
+    def handle_detected_solver_challenge(self, tab, rt_tab, reason, force=False):
         return handle_detected_solver_challenge(
             tab,
             self.cfg,
@@ -12112,6 +12131,7 @@ class RejoinCore:
             rt_tab,
             reason,
             core=self,
+            force=force,
         )
 
     def queue_exact_pid_recovery(
@@ -14363,13 +14383,35 @@ def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, he
         core.save()
         return "Captcha", note, True
 
+    detail_from_health = (
+        (health or {}).get("ui_challenge_detail")
+        if isinstance((health or {}).get("ui_challenge_detail"), dict)
+        else {}
+    )
+    exact_visible_captcha = bool(
+        str(detail_from_health.get("evidence_source") or "")
+        == "exact_option16_text"
+    )
+
     retry_at = int(rt_tab.get("captcha_ui_retry_at", 0) or 0)
-    if retry_at > now():
+    if retry_at > now() and not exact_visible_captcha:
         left = max(1, retry_at - now())
         note = f"verification UI; retry provider in {format_age(left)} (no reopen)"
         rt_tab["note"] = note
         core.save()
         return "Captcha", note, True
+
+    # Exact package-scoped Start Puzzle / verification text is stronger than the
+    # generic UI retry timer. Clear only that UI timer and let start_solver_job()
+    # enforce the real provider failure/busy gate.
+    if retry_at > now() and exact_visible_captcha and not busy_pending:
+        rt_tab["captcha_ui_retry_at"] = 0
+        log_activity(
+            "exact visible CAPTCHA bypassed stale UI retry timer; "
+            "provider failure gate still enforced",
+            pkg,
+            CYAN,
+        )
 
     if busy_pending:
         rt_tab["solver_busy_retry_pending"] = False
@@ -14382,16 +14424,33 @@ def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, he
         or (detail_obj or {}).get("reason")
         or "visible package-scoped verification UI"
     )
-    status, note = core.handle_detected_solver_challenge(tab, rt_tab, detail)
+    status, note = core.handle_detected_solver_challenge(
+        tab,
+        rt_tab,
+        detail,
+        force=exact_visible_captcha,
+    )
     rt_tab["note"] = note
 
     if status != "Solving":
-        # Provider disabled/cooldown/unavailable/cookie issue: keep THIS package
-        # in-place, but do not hammer the provider or hide the actual reason.
-        retry_seconds = max(
-            600,
-            int(cfg.get("solver_failure_retry_seconds", 600) or 600),
-        )
+        # Keep this package in-place. For a real provider cooldown, preserve the
+        # actual remaining gate instead of extending it by another full 10m.
+        if status == "Captcha":
+            retry_seconds = max(
+                1,
+                solver_provider_cooldown_left(rt_tab, cfg),
+            )
+            if retry_seconds <= 1:
+                retry_seconds = max(
+                    1,
+                    int(cfg.get("solver_retry_cooldown_seconds", 300) or 300),
+                )
+        else:
+            retry_seconds = max(
+                600,
+                int(cfg.get("solver_failure_retry_seconds", 600) or 600),
+            )
+
         rt_tab["captcha_ui_retry_at"] = max(
             int(rt_tab.get("captcha_ui_retry_at", 0) or 0),
             now() + retry_seconds,
@@ -14399,7 +14458,7 @@ def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, he
 
     core.save()
     log_activity(
-        "verification UI; solver provider started in-place (no package reopen)"
+        "verification UI; solver provider STARTED in-place (no package reopen)"
         if status == "Solving"
         else (
             "verification UI solver not started: "
@@ -38312,6 +38371,23 @@ def _solver_probe_worker(package, tab, cookie, cfg_snapshot, place_id):
                 job["finished_at"] = now()
 
 
+
+def solver_provider_status_was_success(status):
+    status = str(status or "").strip().upper()
+    return status in {
+        "CAPTCHA_SUCCESS",
+        "SUCCESS",
+        "SOLVED",
+        "COMPLETED",
+        "OK",
+        "NO_CAPTCHA",
+        "NO_CHALLENGE",
+        "NOT_REQUIRED",
+        "CLEAR",
+        "CLEAN",
+    }
+
+
 def solver_provider_cooldown_left(rt_tab, cfg, at=None):
     """Return seconds until this package may automatically hit the provider again."""
     current = int(at or now())
@@ -38644,6 +38720,25 @@ def start_solver_job(tab, cfg, rt, rt_tab, reason, force=False, phase="solve", o
     # V4.81.3/5: check the hard provider gate before touching the package cookie
     # DB. A cooldown-only rejoin can continue without doing a root DB copy.
     provider_left = solver_provider_cooldown_left(rt_tab, cfg)
+    if provider_left > 0 and challenge_confirmed:
+        last_provider_status = str(
+            rt_tab.get("solver_provider_last_status", "") or ""
+        ).strip().upper()
+        busy_pending = bool(rt_tab.get("solver_busy_retry_pending"))
+        if (
+            not busy_pending
+            and solver_provider_status_was_success(last_provider_status)
+        ):
+            # A prior SUCCESS/NO_CAPTCHA is not a provider failure. If this exact
+            # package now visibly presents a fresh CAPTCHA, allow one new solve.
+            log_activity(
+                "exact visible CAPTCHA overrides provider cooldown left from "
+                f"successful result {last_provider_status}",
+                pkg,
+                CYAN,
+            )
+            provider_left = 0
+
     if provider_left > 0:
         return False, f"provider cooldown {format_age(provider_left)}"
 
@@ -38771,10 +38866,27 @@ def _solver_error_text(response):
     return cut(str(value or "unknown solver error"), 180)
 
 
-def handle_detected_solver_challenge(tab, cfg, rt, rt_tab, reason, core=None):
-    """Start/describe a solver job, or isolate the package if unavailable."""
+def handle_detected_solver_challenge(
+    tab,
+    cfg,
+    rt,
+    rt_tab,
+    reason,
+    core=None,
+    force=False,
+):
+    """Start/describe a solver job, or isolate only genuine manual failures."""
     pkg = str((tab or {}).get("package", "") or "")
-    started, note = start_solver_job(tab, cfg, rt, rt_tab, reason, core=core, challenge_confirmed=True)
+    started, note = start_solver_job(
+        tab,
+        cfg,
+        rt,
+        rt_tab,
+        reason,
+        force=bool(force),
+        core=core,
+        challenge_confirmed=True,
+    )
     if started:
         rt_tab["note"] = note
         if core is not None:
@@ -38783,8 +38895,38 @@ def handle_detected_solver_challenge(tab, cfg, rt, rt_tab, reason, core=None):
             save_runtime(rt)
         return "Solving", note
 
-    # Disabled, missing credentials/cookie, or cooldown after a failed attempt.
-    retry_seconds = max(600, int(cfg.get("solver_failure_retry_seconds", 600) or 600))
+    note_l = str(note or "").lower()
+
+    # A provider/local cooldown is temporary. Keep the visible CAPTCHA in-place
+    # and show the countdown; do not misclassify it as a manual-login problem.
+    if (
+        note_l.startswith("provider cooldown ")
+        or note_l.startswith("solver retry in ")
+        or "provider cooldown" in note_l
+    ):
+        provider_left = solver_provider_cooldown_left(rt_tab, cfg)
+        if provider_left <= 0:
+            try:
+                cooldown = int(cfg.get("solver_retry_cooldown_seconds", 300) or 300)
+            except Exception:
+                cooldown = 300
+            last_attempt = int(rt_tab.get("solver_last_attempt", 0) or 0)
+            provider_left = max(1, cooldown - max(0, now() - last_attempt))
+
+        rt_tab["captcha_ui_retry_at"] = now() + max(1, provider_left)
+        rt_tab["note"] = note
+        if core is not None:
+            core.save()
+        else:
+            save_runtime(rt)
+        return "Captcha", note
+
+    # Missing credentials/cookie or a confirmed auth/config problem really does
+    # require manual intervention.
+    retry_seconds = max(
+        600,
+        int(cfg.get("solver_failure_retry_seconds", 600) or 600),
+    )
     mark_manual_login_block(
         rt_tab,
         "captcha/login challenge",
