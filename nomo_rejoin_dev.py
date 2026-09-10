@@ -14,6 +14,27 @@
 # - No recovery rule, PID policy, Home routing, shell wake, solver, or Option 17
 #   behavior is changed.
 #
+# V4.81.110 — STRONG CLOSED/TASK-LOST HATCHER RECOVERY
+# - V4.81.109 correctly displayed stale/no-visible clones but intentionally
+#   performed no recovery, so a clone whose floating Roblox task actually
+#   disappeared could remain stuck forever.
+# - Strong evidence is now Android ActivityRecord, NOT simple visibility:
+#     PID ALIVE + ActivityRecord exists
+#       -> leave clone alone, even with stale telemetry / minimized window.
+#     PID ALIVE + NO ActivityRecord continuously for >=60s
+#       -> treat as task-lost/closed and recover that exact package.
+# - Task-lost recovery uses the existing protected hard queue:
+#     auth/CAPTCHA/moderation preflight
+#     -> refresh/new owned Hatcher PS
+#     -> exact target PID stop
+#     -> forced Clear Cache
+#     -> one Hatcher reopen.
+# - Activity query UNKNOWN is fail-safe: no recovery.
+# - Home UI, stale telemetry alone, no-state alone, and visibility alone still
+#   do NOT auto-rejoin.
+# - Periodic hard refresh is disabled in surgical Hatcher mode so it cannot
+#   touch an otherwise healthy ALIVE clone.
+#
 # V4.81.109 — HATCHER STATUS TRUTH / NO-ACTION DISPLAY FIX
 # - V4.81.108 correctly stopped stale/no-visible telemetry from auto-rejoining,
 #   but the final Hatcher decision ladder could overwrite the health classifier
@@ -1746,7 +1767,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.109"
+__version__ = "V4.81.110"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -2836,6 +2857,9 @@ DEFAULT_CONFIG = {
     "hatcher_surgical_stable_policy": False,
     "hatcher_background_solver_probe_enabled": True,
     "hatcher_post_open_5m_recovery_enabled": True,
+    # V4.81.110: require continuous missing ActivityRecord before treating a
+    # live PID as a genuinely lost/closed clone task.
+    "hatcher_activity_lost_confirm_seconds": 60,
 
     # V4.81.66: ordinary automatic Hatcher opens are verified by the normal
     # watchdog instead of blocking the whole UI/main loop in wait_until_fresh_after_open().
@@ -12903,6 +12927,100 @@ def _queue_hatcher_alive_old_state_hard(open_queue, tab, rt_tab, hcfg, cfg, age_
 
 
 
+
+def queue_hatcher_activity_lost_recovery(core, tab, rt_tab, cfg):
+    """Recover only an ALIVE package whose live ActivityRecord disappeared.
+
+    Visibility is intentionally not used as the trigger because a minimized
+    floating clone may be non-visible while its Android activity remains valid.
+    """
+    pkg = str((tab or {}).get("package") or "")
+    if not pkg:
+        return False, "no package", False
+
+    process_status, process_note = package_alive_status(pkg, cfg, fresh=True)
+    if process_status != "ALIVE":
+        rt_tab["hatcher_activity_lost_since"] = 0
+        return False, f"process={process_status}", False
+
+    activity_status, activity_note = package_activity_status(pkg, cfg)
+
+    if activity_status == "ACTIVITY":
+        rt_tab["hatcher_activity_lost_since"] = 0
+        rt_tab["hatcher_activity_lost_note"] = ""
+        return False, "live ActivityRecord", False
+
+    if activity_status == "UNKNOWN":
+        rt_tab["hatcher_activity_lost_since"] = 0
+        rt_tab["hatcher_activity_lost_note"] = str(activity_note or "")
+        return False, "ActivityRecord query unavailable; no auto rejoin", False
+
+    # NO_ACTIVITY: confirm continuously before queueing.
+    first = int(rt_tab.get("hatcher_activity_lost_since", 0) or 0)
+    if first <= 0:
+        first = now()
+        rt_tab["hatcher_activity_lost_since"] = first
+
+    elapsed = max(0, now() - first)
+    try:
+        confirm = int(cfg.get("hatcher_activity_lost_confirm_seconds", 60) or 60)
+    except Exception:
+        confirm = 60
+    confirm = max(30, confirm)
+
+    rt_tab["hatcher_activity_lost_note"] = "PID alive / no ActivityRecord"
+
+    if elapsed < confirm:
+        return (
+            False,
+            f"task lost? confirming {format_age(elapsed)}/{format_age(confirm)}",
+            True,
+        )
+
+    if solver_job_running(pkg):
+        return False, "task lost confirmed; solver running", True
+
+    manual_hold, manual_note = recovery_manual_hold_active(rt_tab, cfg, pkg)
+    if manual_hold:
+        return False, manual_note, True
+
+    if core.has(pkg):
+        return False, "task lost confirmed; already queued", True
+
+    added, qnote = core.queue_exact_pid_recovery(
+        tab,
+        "hatcher",
+        f"Hatcher task lost; no ActivityRecord {elapsed}s",
+        front=False,
+        metadata={
+            "bypass_recheck": False,
+            "always_recheck_health": True,
+            "hatcher_activity_lost_recovery": True,
+            "combined_stuck_recovery": True,
+            "combined_stuck_refresh_private_link": bool(
+                cfg.get("hatcher_combined_stuck_refresh_private_link", True)
+            ),
+            "combined_stuck_clear_cache": bool(
+                cfg.get("hatcher_combined_stuck_clear_cache", True)
+            ),
+        },
+    )
+
+    if added:
+        rt_tab["hatcher_activity_lost_queued_at"] = now()
+        rt_tab["note"] = "task lost -> new-PS+cache recovery queued"
+        log_activity(
+            "Hatcher task LOST (PID alive / no ActivityRecord) -> "
+            "solver preflight + new PS + Clear Cache + exact-PID reopen queued",
+            pkg,
+            YELLOW,
+        )
+        core.save()
+        return True, rt_tab["note"], True
+
+    return False, qnote or "task-lost recovery not queued", True
+
+
 def queue_hatcher_post_open_5m_recovery(core, tab, rt_tab, cfg, elapsed=0):
     """Queue the only telemetry-based ALIVE Hatcher recovery."""
     pkg = str((tab or {}).get("package") or "")
@@ -18034,6 +18152,7 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
             or (
                 item.get("hatcher_old_state_recovery")
                 and not item.get("hatcher_post_open_5m_recovery")
+                and not item.get("hatcher_activity_lost_recovery")
             )
         )
         if legacy_hatcher_experiment:
@@ -18163,6 +18282,39 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
             log_activity(
                 "hard open deferred; process check unavailable (no PID stop/open)",
                 pkg, YELLOW,
+            )
+            core.save()
+            return True
+
+    # V4.81.110: task-lost recovery is strong but still revalidated at the
+    # final execution point. If Android restored the activity while queued,
+    # cancel rather than touching a healthy clone.
+    if (
+        target == "hatcher"
+        and item.get("hatcher_activity_lost_recovery")
+        and process_status == "ALIVE"
+    ):
+        activity_status, activity_note = package_activity_status(pkg, cfg)
+
+        if activity_status == "ACTIVITY":
+            rt_tab["hatcher_activity_lost_since"] = 0
+            rt_tab["hatcher_activity_lost_note"] = ""
+            rt_tab["note"] = "task restored; queued recovery cancelled"
+            log_activity(
+                "Hatcher task-lost recovery CANCELLED; ActivityRecord restored",
+                pkg,
+                GREEN,
+            )
+            core.save()
+            return True
+
+        if activity_status == "UNKNOWN":
+            core.requeue_front(item)
+            rt_tab["note"] = "task-lost recovery deferred; ActivityRecord query unavailable"
+            log_activity(
+                "Hatcher task-lost recovery deferred; ActivityRecord query unavailable",
+                pkg,
+                YELLOW,
             )
             core.save()
             return True
@@ -24693,6 +24845,21 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                     alive and startup_observe_until > now()
                 )
 
+                activity_lost_handled = False
+                if (
+                    cfg.get("hatcher_surgical_stable_policy", False)
+                    and alive
+                    and not problem_code
+                    and not challenge_active
+                ):
+                    lost_added, lost_note, lost_action = queue_hatcher_activity_lost_recovery(
+                        core, tab, rt_tab, cfg
+                    )
+                    if lost_action:
+                        status = "Queued" if (lost_added or core.has(pkg)) else "Closed"
+                        note = lost_note
+                        activity_lost_handled = True
+
                 bubble_rescue_handled = False
                 if (
                     not cfg.get("hatcher_surgical_stable_policy", False)
@@ -24724,7 +24891,9 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                             note = qnote
                             bubble_rescue_handled = True
 
-                if home_route_handled:
+                if activity_lost_handled:
+                    pass
+                elif home_route_handled:
                     # Visible package-scoped Roblox Home is authoritative.
                     # Hidden/stale Lua state and old-state cooldown cannot
                     # overwrite the Home route status this cycle.
@@ -24921,7 +25090,24 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                         str(health.get("bad") or "") in {"ui_challenge", "challenge"}
                         or background_solver_active
                     )
-                    if challenge_active:
+
+                    no_state_activity_lost_handled = False
+                    if (
+                        cfg.get("hatcher_surgical_stable_policy", False)
+                        and alive
+                        and not challenge_active
+                    ):
+                        lost_added, lost_note, lost_action = queue_hatcher_activity_lost_recovery(
+                            core, tab, rt_tab, cfg
+                        )
+                        if lost_action:
+                            status = "Queued" if (lost_added or core.has(pkg)) else "Closed"
+                            note = lost_note
+                            no_state_activity_lost_handled = True
+
+                    if no_state_activity_lost_handled:
+                        pass
+                    elif challenge_active:
                         status = "Solving" if background_solver_active else "Captcha"
                         note = (
                             (stuck_solver[1] if stuck_solver is not None else solver_job_note(pkg))
@@ -24974,6 +25160,9 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
             # state again, even if it healed without NOMO opening the package.
             if state and state_is_clean(state):
                 clear_disconnect_ui_incident(rt_tab)
+                if health.get("clean_fresh"):
+                    rt_tab["hatcher_activity_lost_since"] = 0
+                    rt_tab["hatcher_activity_lost_note"] = ""
                 if health.get("clean_fresh"):
                     rt_tab["bubble_shell_soft_wake_mode"] = False
                     rt_tab["bubble_shell_soft_wake_count"] = 0
@@ -25038,6 +25227,8 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
             # gets its normal turn; its queued generation performs one solver check before opening.
 
             due_refresh, refresh_left = periodic_hard_refresh_due(rt_tab, cfg)
+            if cfg.get("hatcher_surgical_stable_policy", False):
+                due_refresh = False
             if due_refresh and captcha_action is None and not manual_login_blocked(rt_tab, cfg, pkg) and core.idle_for(pkg):
                 added, _ = core.queue_hard_retry(tab, "hatcher", "periodic hard refresh")
                 if added:
@@ -25077,10 +25268,21 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                     stale_after = max(30, int(cfg.get("state_stale_seconds", 180) or 180))
                     if display_age > stale_after:
                         status = "Stale"
-                        if health.get("visible_window") is False:
+                        activity_status, _activity_note = package_activity_status(pkg, cfg)
+                        if activity_status == "NO_ACTIVITY":
+                            lost_since = int(
+                                rt_tab.get("hatcher_activity_lost_since", 0) or 0
+                            )
+                            lost_age = max(0, now() - lost_since) if lost_since else 0
+                            status = "Closed"
+                            note = (
+                                f"PID alive / no ActivityRecord {format_age(lost_age)}; "
+                                "recovery confirmation active"
+                            )
+                        elif health.get("visible_window") is False:
                             note = (
                                 f"telemetry {format_age(display_age)} old + "
-                                "no visible window; no auto rejoin"
+                                "window not visible but ActivityRecord exists; no auto rejoin"
                             )
                         else:
                             note = f"telemetry {format_age(display_age)} old; no auto rejoin"
@@ -25131,8 +25333,9 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
         hatcher_rejoin_status_screen(rows, hcfg, cfg, session_start, loops, last_msg)
         _old_on, _old_sec, _old_max, _old_cd = hatcher_alive_old_state_hard_settings(hcfg, cfg)
         print(col(
-            "  Hatcher stable policy: stale/no-visible is SHOWN truthfully but does NOT auto-rejoin; "
-            "only NOMO post-open 5m timeout gets new-PS + Clear Cache recovery.",
+            "  Hatcher stable policy: stale/minimized alone does NOT rejoin; "
+            "PID-alive + NO ActivityRecord 60s OR NOMO post-open 5m timeout gets "
+            "new-PS + Clear Cache recovery.",
             GREEN,
         ))
 
