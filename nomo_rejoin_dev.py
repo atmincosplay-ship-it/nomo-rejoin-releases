@@ -1,19 +1,500 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
-# V4.81.105 — STABILITY ROLLBACK TO V4.81.65 CORE
-# - Intentional rollback: runtime/detection/rejoin behavior is restored to the
-#   V4.81.65 codebase (which was built directly from the stable V4.81.64 core).
-# - Keeps ONLY the original V4.81.65 Hatcher 5-minute combined-stuck fix:
-#     solver/auth preflight
-#     -> refresh owned private-server join code
-#     -> exact-target PID stop
-#     -> forced Android CLEAR CACHE
-#     -> one Hatcher reopen.
-# - Removes all later V4.81.66 through V4.81.104 behavioral changes from this
-#   rollback branch, including the Home/Shell/stale-telemetry experiments.
-# - Market remains the older pre-V4.81.67 behavior; no later Market 5m recovery
-#   logic is included in this stability test branch.
-# - Clear Data / plain `pm clear <package>` remains forbidden.
+# V4.81.97 — HATCHER STARTUP HANDOFF / REMOVE SILENT DUPLICATE PRE-SCAN
+# - Fixes Option 1 appearing frozen on STARTUP: CACHE CLEANUP after the summary
+#   already said all caches were cleared.
+# - The Hatcher starter previously performed a second Android/process/state scan
+#   over every profile before entering the normal watchdog loop. The watchdog then
+#   repeated the same work before drawing its first table.
+# - That duplicate pre-scan is removed by default. Closed/stale/Home/shell recovery
+#   is now owned by the first normal watchdog cycle only.
+# - Immediately after cache cleanup NOMO prints a visible handoff message.
+# - Hatcher also draws a lightweight STARTING screen using only saved state files
+#   before any Android/UI probes, so the terminal never looks dead during first scan.
+# - No recovery rule, PID policy, Home routing, shell wake, solver, or Option 17
+#   behavior is changed.
+#
+# V4.81.108 — MODERN BASE + SURGICAL HATCHER ROLLBACK
+# - Base is V4.81.102, so modern unrelated fixes stay intact:
+#     BlockSolve /join + provider diagnostics,
+#     Market 5m cache/protocol recovery,
+#     Option 17 / EXO master + pet-team preservation,
+#     package-local CAPTCHA/Face-Lock/moderation safety,
+#     valid real state timestamps older than 24h.
+# - ONLY automatic Hatcher decision logic is simplified.
+# - Hatcher Home auto-routing is disabled.
+# - Hatcher bubble/Shell auto-recovery is disabled.
+# - Generic ALIVE old-state recovery is disabled.
+# - Generic ALIVE no-state soft-hop recovery is disabled.
+# - Generic ALIVE stale-state routing is disabled.
+# - Background stuck solver probing at 3m is disabled for Hatcher.
+# - The ONLY telemetry-based ALIVE Hatcher recovery is one NOMO-owned
+#   post-open generation that fails to produce a clean fresh state for 5m:
+#       normal auth/solver preflight
+#       -> refresh owned Hatcher private-server link/code
+#       -> exact target PID stop
+#       -> forced Clear Cache
+#       -> one Hatcher reopen.
+# - A fresh clean state newer than the NOMO open cancels that 5m deadline.
+#   If telemetry later becomes stale hours later, NOMO leaves that ALIVE clone alone.
+# - Real disconnect/kick, current CAPTCHA/auth/moderation, wrong-server routing,
+#   and genuinely DEAD package recovery remain available.
+# - Legacy queued Home/Shell/old-state experimental Hatcher actions are dropped
+#   at execution so runtime leftovers cannot reintroduce the removed behavior.
+#
+# V4.81.102 — SOLVER TEMP-ERROR DIAGNOSTICS + BLOCKSOLVE /JOIN NORMALIZATION
+# - Dashboard wording "SOLVER_UNAVAILABLE" was misleading: it represented the
+#   last package API request entering a retry gate, not a live BlockSolve status.
+# - Temporary provider failures now display PROVIDER_TEMP_ERROR with sanitized
+#   provider/http/status/error detail so screenshots show what actually happened.
+# - The existing >=10-minute provider anti-spam interval remains unchanged.
+# - BlockSolve's canonical contract is POST /join. A legacy BlockSolve endpoint
+#   saved as /api/captcha/solve is now normalized to /join at request time.
+# - Manual package/sample solver tests now treat NO_CAPTCHA/NO_CHALLENGE as a
+#   successful provider response instead of printing a false "Solver failed".
+# - A successful manual package test clears a stale SOLVER_UNAVAILABLE/
+#   PROVIDER_TEMP_ERROR pending label for that package, while still respecting
+#   the normal provider interval for subsequent automatic submissions.
+#
+# V4.81.101 — MARKET CACHE FAILURE MUST ABORT REOPEN
+# - V4.81.98-.100 attempted forced Clear Cache before the peer-safe Market VIEW
+#   restart, but the helper could continue reopening even when cache_ok=False.
+# - That meant a clone could be reported/rejoined and placed into recovery cooldown
+#   without actually receiving the cache repair that the 5-minute stuck flow requires.
+# - Market cache+protocol recovery now FAILS CLOSED if forced Clear Cache fails:
+#     * no VIEW reopen,
+#     * no successful recovery stamp,
+#     * no long cooldown.
+# - A separate failed-attempt timestamp enforces the existing 5-minute retry cadence
+#   so a cache failure cannot spam every watchdog cycle.
+# - Fresh healthy Market state clears both successful-attempt and failed-attempt
+#   cooldown state.
+#
+# V4.81.100 — MARKET STRONG-HEAL RECHECK + 5M FAILED-RETRY
+# - V4.81.99 prevented weak fresh timestamps from cancelling Market recovery,
+#   but that also allowed an old queued recovery to restart a clone that had
+#   genuinely become healthy before its queue turn.
+# - Market committed recovery now gets one STRONG health recheck immediately
+#   before destructive work. It cancels only when ALL are true:
+#     * target package is ALIVE,
+#     * state is clean + fresh,
+#     * place_id is Trade World (129954712878723),
+#     * current JobId is non-empty,
+#     * Market runtime marker is MARKET_RUNNING for that SAME JobId,
+#     * runtime marker age <= 120s (configurable).
+# - This is much stronger than V4.81.98's unsafe "fresh state timestamp only"
+#   heal test, so a loading-screen clone with a stale/ghost writer cannot cancel.
+# - A queued recovery for B/C that genuinely reached Market now self-cancels;
+#   A/D still stuck on the loader remain eligible.
+# - Failed Market stuck attempts no longer wait the historical 15m cooldown.
+#   Because a genuinely fresh healthy state already clears the incident, a still-
+#   unhealthy clone may retry after 5m by default.
+#
+# V4.81.99 — MARKET 5M RECOVERY IS COMMITTED / NO FALSE HEALED CANCEL
+# - V4.81.98 correctly selected the Market peer-safe cache+VIEW restart, but an
+#   older last-second generic health recheck could still cancel it with:
+#       "open cancelled: healed while queued"
+# - That generic check only uses a fresh state.json age and can be false while
+#   the clone is visibly still stuck on the Trade World loading screen.
+# - Market combined-stuck recovery is now COMMITTED once the 5-minute threshold
+#   has queued it. Its metadata sets bypass_recheck=True, so a fresh timestamp
+#   alone cannot cancel the cache repair while the item sits in the queue.
+# - This does NOT bypass auth/moderation/CAPTCHA/Account-Lock gates; those still
+#   run immediately before any PID stop.
+# - Ordinary Hatcher/other ALIVE hard recoveries keep the generic healed recheck.
+#
+# V4.81.98 — MARKET 5M CACHE RECOVERY MUST NOT BE SOFT-DOWNGRADED
+# - Fixes Market infinite Trade World loading regression introduced by the
+#   V4.81.93 global ALIVE-Noka sibling safety downgrade.
+# - Market combined-stuck items were queued with forced Clear Cache metadata,
+#   but execution converted them to soft task reuse whenever siblings were alive.
+# - Market combined-stuck recovery is now exempt from that generic downgrade.
+# - With live siblings it uses a dedicated peer-safe cache restart:
+#     exact target PID stop -> forced Clear Cache -> exact package VIEW component.
+# - The restart uses SINGLE_TOP only and never falls back to generic hard launch.
+#
+# V4.81.96 — ROBLOX HOME PROTOCOL-ACTIVITY NUDGE + VISUAL FRESH GUARD
+# - V4.81.95 correctly detected Roblox Home, but the peer-safe soft route could
+#   return "soft hop/open ok" while the same clone visibly remained on Home.
+# - CLEAR_TOP|SINGLE_TOP can simply foreground the current Home activity; some
+#   Noka/App Cloner builds do not deliver the deep link through that activity.
+# - Home recovery is now two-stage and remains non-destructive:
+#     1) first attempt: existing soft task-reuse VIEW intent;
+#     2) if Home remains visible: resolve that exact package's VIEW/deep-link
+#        activity and explicitly start that component with SINGLE_TOP only.
+# - The protocol-activity nudge performs NO PID stop and has NO hard fallback.
+# - Resolved activity must belong to the exact clone package or the nudge is refused.
+# - Home retries default to 10s so a clone does not sit on Home for minutes.
+# - Background fresh verification can no longer PASS while package/Option16-scoped
+#   Roblox Home is visibly present, even if an old Lua/state writer emits a fresh ts.
+# - Once Home disappears and a genuine fresh clean state appears, Home attempt
+#   counters reset.
+#
+# V4.81.95 — VISIBLE ROBLOX HOME OUTRANKS STALE STATE / ACTIVE SOFT ROUTE
+# - Screenshot proved nokaC/nokaD could visibly sit on Roblox Home while Hatcher
+#   still displayed Online + old-state hard cooldown.
+# - Home detection no longer requires a Search accessibility label; package/
+#   Option16-scoped Home + >=3 navigation labels is sufficient.
+# - ALIVE stale/no-fresh Hatcher candidates are Home-probed even outside the old
+#   post-open watch window.
+# - Visible Home now outranks old-state/cooldown/bubble/stale routing.
+# - Pending hard recovery for that package is cancelled and only a SOFT Hatcher
+#   route is sent, using no_hard_fallback=True.
+#
+# V4.81.94 — BUBBLE SHELL ACTIVE SOFT-WAKE (NO MORE PERMANENT HOLD)
+# - V4.81.90/.93 could leave stale bubble-only shells stuck forever:
+#     "bubble-only auto recovery HELD; live siblings ..."
+# - A stale (> normal old-state threshold) ALIVE Noka with NO ActivityRecord now
+#   actively receives a package-local SOFT deep-link wake when siblings are alive.
+# - Soft wake uses CLEAR_TOP|SINGLE_TOP task reuse flags and NEVER PID-stops the
+#   target or any sibling.
+# - Soft wake is marked no_hard_fallback, so failure cannot escalate into the
+#   hard target launch path that was proven able to disturb sibling floating tasks.
+# - If the shell stays stale/no-activity, NOMO may retry the soft wake every
+#   bubble_shell_soft_wake_retry_seconds (default 45s), one package at a time.
+# - If there are NO live siblings, the existing exact-PID hard shell recovery is
+#   still allowed because there is no sibling floating task to protect.
+# - Fresh/healthy minimized clones are not classified as stale shell recovery;
+#   the shell path still requires the existing old-state age threshold.
+#
+# V4.81.93 — ALIVE NOKA AUTO-HARD -> PEER-SAFE SOFT REUSE
+# - Live screenshot proved the ordinary Hatcher alive-old-state path could still:
+#     exact-PID stop target -> siblings verified intact -> hard am start target
+#   and then another App Cloner floating sibling could disappear.
+# - Therefore this is not limited to bubble-only recovery.
+# - NEW GLOBAL AUTOMATIC SAFETY RULE for Noka/App Cloner:
+#     If target package is ALIVE and a sibling Noka package is ALIVE,
+#     automatic HARD recovery is downgraded to SOFT task/deep-link reuse.
+# - The soft generation is marked no_hard_fallback so a timeout can never silently
+#   escalate back into the dangerous target PID-stop + hard launch while peers live.
+# - If sibling PID queries are unavailable, an ALIVE automatic target also takes
+#   the non-destructive soft path rather than guessing.
+# - Explicit/manual force operations are not silently rewritten.
+# - Genuine DEAD-package recovery remains hard because there is no live target task
+#   to reuse. All remaining hard Noka launches now snapshot/verify sibling PIDs
+#   after launch as a diagnostic, not only bubble-only launches.
+#
+# V4.81.92 — RESTORE OPTION 17 OFFLINE HELPERS / BUILD SYMBOL GUARD
+# - Fixes V4.81.91 Option 17 NameError:
+#     _exo_stop_selected_for_offline_install is not defined
+# - Restores the V4.81.90 offline helper block accidentally removed by V4.81.91.
+# - Keeps V4.81.91 exact File1 preflight + exact preserved-identity verification.
+# - Adds Option 17 runtime helper-symbol validation before showing the menu.
+# - Build now AST-validates critical Option 17 helpers are defined exactly once.
+#
+# V4.81.91 — EXO PET-TEAM PRESERVATION FAIL-CLOSED + IDENTITY VERIFICATION
+# - Fixes a dangerous Option 17 edge case: if the exact existing
+#   <UID>file1.json was missing/wrong Workspace, previous builds scrubbed the
+#   template's foreign pet UUIDs and could create a valid config with EMPTY teams.
+# - Option 17 now REQUIRES each selected UID's exact existing <UID>file1.json
+#   before stopping clones or modifying anything. Missing File1 = fail closed.
+# - The install plan shows the exact existing File1 path and a pet-team snapshot
+#   summary before confirmation.
+# - The installer stores the actual preserved identity snapshot in memory.
+# - Read-back verification now proves BOTH:
+#     1) all normal settings match the selected Hatching/Market master, and
+#     2) every preserved pet UUID/team field exactly matches the pre-write value.
+# - It also rejects any unexpected NON-EMPTY pet/team identity field that was not
+#   present in the target UID snapshot, preventing foreign template UUID leakage.
+# - File2/Session may still be created if missing; File1 may not, because File1 is
+#   the authoritative source of the account's pet teams.
+#
+# V4.81.90 — BUBBLE-ONLY LIVE-SIBLING PROTECTION
+# - Fixes the Hatcher path seen in the live screenshot:
+#     "bubble-only shell confirmed; target-only recovery queued".
+# - On Redfinger/App Cloner, exact target PID stop is sibling-safe, but creating
+#   a new floating target task with plain `am start` can still reshuffle/close a
+#   sibling floating clone. Bubble-only recovery is the path where this has been
+#   observed.
+# - Automatic bubble-only hard recovery is therefore HELD whenever any configured
+#   sibling clone is currently ALIVE.
+# - A PID-query error for any sibling also fails safe and holds the bubble recovery.
+# - Existing queued bubble-only items are rechecked at execution and dropped if
+#   live siblings are present, so a queue created before the update cannot kill/open.
+# - Normal DEAD-package recovery, ordinary non-bubble stale recovery, solver/auth,
+#   Option 17, and manual recovery paths are unchanged.
+#
+# V4.81.89 — PRE-WRITE RESPAWN GUARD
+# - V4.81.88 handled respawns during the post-write offline hold, but a clone
+#   could respawn immediately during initial offline preparation and cause an
+#   abort before the respawn guard ran.
+# - Initial Option 17 offline prep now also tolerates brief exact-package respawns:
+#     * first exact-PID stop every selected package,
+#     * run a PRE-WRITE stable-DEAD guard,
+#     * exact-PID stop a respawned selected package again,
+#     * require 2 continuous seconds DEAD before reading/preserving pet identity.
+# - No payload is re-applied during PRE-WRITE because nothing has been written yet.
+# - POST-WRITE guard still re-applies the immutable prepared payload after any
+#   brief respawn and requires the existing 4-second stable-DEAD window.
+# - Both guards remain bounded to max 3 respawns/package and fail closed on
+#   UNKNOWN PID state or repeated relaunch loops.
+#
+# V4.81.88 — OPTION 17 RESPAWN GUARD / REAPPLY PAYLOAD
+# - V4.81.87 correctly detected when a selected clone came back ALIVE during
+#   the offline hold, but immediately failed the install.
+# - Option 17 now tolerates brief package respawns safely:
+#     * detect the exact selected package PID,
+#     * stop only that exact package again with the existing sibling-safe PID stop,
+#     * re-apply the exact already-prepared EXO payload,
+#     * require a stable DEAD window before certifying PASS.
+# - The payload is prepared only after the first confirmed offline stop, so a
+#   respawn cannot change which pet UUID/team identity was preserved.
+# - If a package repeatedly respawns beyond the bounded retry limit, or PID
+#   state becomes UNKNOWN, the install fails closed with a clear reason.
+# - No am force-stop, killall, pkill, broad package kill, or sibling stop added.
+#
+# V4.81.87 — OPTION 17 OFFLINE EXO INSTALL / LIVE-CONFIG WRITEBACK FIX
+# - Fixes a real failure mode where Option 17 wrote the correct master JSON and
+#   immediate read-back passed, but the already-running ExoticHub Lua still had
+#   its old config in memory (and could later save that stale config back).
+# - Before any EXO master write, Option 17 now stops ONLY the selected packages'
+#   verified exact PIDs, one package at a time, using the existing fail-closed
+#   sibling-safe PID stop. No am force-stop / killall / pkill.
+# - Pet UUID/team identity is read only AFTER the selected package is confirmed
+#   stopped, so the preserved account-specific team data is the stable on-disk state.
+# - If any selected package PID state is UNKNOWN or an exact stop fails, the whole
+#   install aborts BEFORE modifying EXO files.
+# - After install, NOMO waits for disk settle and verifies all selected packages
+#   are still stopped, then performs the existing master-vs-installed verification.
+# - Selected clones are intentionally left stopped. The next normal launch/rejoin
+#   starts EXO fresh so the new sellingpets/giftpets/etc. are actually loaded.
+#
+# V4.81.86 — EXO MASTER REPLACES SETTINGS BUT PRESERVES PET-IDENTITY/TEAM DATA
+# - Master settings overwrite the account config EXCEPT per-account pet UUID/team identity.
+# - Preserve team membership lists (team1..team7, custom/nested *_team lists).
+# - Preserve pet UUID selection lists such as selected_pet_uuids and
+#   pet_level_selected_pets, plus direct *_uuid pet identity/state.
+# - Normal settings still come from the master: sellingpets, sell_pets, giftpets,
+#   toggles, delays, booleans, sizes, pet-name filters, etc.
+# - file1/file2/filesession/gag2 all use the same identity-safe overlay.
+# - Missing target file: scrub source-template pet UUID/team values instead of
+#   copying another account's pet IDs.
+# - Verification compares all NON-pet-identity settings against the selected master.
+#
+# V4.81.85 — OPTION 17 EXO GROUPING IS UID-BASED; REST = MARKET
+# - Corrects V4.81.84's experimental username-grouping idea. EXO config ownership
+#   is always Roblox UID-based: <UID>file1.json / <UID>file2.json / <UID>filesession.json.
+# - Option 17 now has a persistent UID Group Manager. It resolves each installed
+#   package's live Roblox username + UID only to help the user identify the account,
+#   then stores the classification by exact UID.
+# - Exact UID in Hatching -> file1_hatching.json.
+# - Every other selected UID -> file1_market.json (REST = MARKET).
+# - Local UID classification overrides old/bad master groups.json values. This lets
+#   the user repair an older master that had 111 Ungrouped without regenerating it.
+# - V4.81.84 username-grouping masters are rejected so they cannot silently apply
+#   the wrong ownership model.
+# - Install plan now shows grouping source plus pet/target counts, and performs a
+#   post-write read-back verification of every <UID>file1.json.
+#
+# V4.81.83 — EXACT CAPTCHA OVERRIDES FRESH HEARTBEAT + AUTH IS PACKAGE-LOCAL
+# - FIX: a visible Roblox Security / "Verifying you're not a bot" challenge could be hidden by a
+#   clean/fresh Lua heartbeat. The dashboard could therefore show Ingame while the clone visibly
+#   sat on Start Puzzle.
+# - Exact package-scoped Option-16 accessibility text for CAPTCHA/529 is now checked even when the
+#   Lua heartbeat is fresh. Exact verification UI outranks Ingame.
+# - Screenshot/geometry CAPTCHA heuristics remain loading-only to avoid normal-game false positives.
+# - CAPTCHA/529/solver state is now package-local just like Face Lock/Ban: it never suppresses
+#   sibling recovery. A challenged D can be held/solved while A/B/C continue independently.
+# - When visible verification is detected but the provider does not start, Activity now prints the
+#   actual solver reason and applies a bounded retry time instead of repeating the generic
+#   "held in-place" line every dashboard cycle.
+# - No package is reopened simply because verification is visible.
+#
+# V4.81.82 — MARKET AUTH HOLD MUST CANCEL ITS OWN RECOVERY QUEUE
+# - FIX: proactive moderation could classify a Market package as FACE LOCK, but
+#   apply_rejoin_action() had no explicit bad=='face_lock' branch. The same package
+#   could therefore immediately queue market alive-old-state hard_force anyway.
+# - A package-local Face Lock now cancels only that package's queued recovery and
+#   returns Face Lock immediately. No PID/cache/open intent survives for that clone.
+# - Market FIFO cosmetics no longer overwrite Face Lock/Banned/Manual status with
+#   Waiting/Next when an old queue item existed.
+# - This removes dead queue slots in front of healthy stuck Market clones, so B/C/D
+#   can reach the existing solver -> Clear Cache -> exact-PID Market recovery faster.
+# - No change to the one-at-a-time exact-PID safety model or 5m Market stuck threshold.
+#
+# V4.81.81 — FACE LOCK / BAN IS PACKAGE-LOCAL, NEVER PEER BLOCKER
+# - FIX: active_noka_auth_incident() still returned authoritative Face Lock/Banned runtime state
+#   as a pool-wide auth incident. If nokaC was Face Locked, A/B/D ALIVE App Cloner shells could
+#   have their exact-target hard recovery suppressed forever with:
+#       hard recovery suppressed; peer nokaC auth incident (face lock)
+# - Authoritative Face Lock and account ban/moderation now hold ONLY that exact package.
+# - Healthy/stuck/closed sibling clones continue normal Hatcher/Market recovery and reopen.
+# - Peer-wide short safety suppression remains only for active transient challenge work:
+#   current CAPTCHA/529/verification UI and a running solver/auth job.
+# - The selected package still performs its own direct moderation/API + exact Account Locked check
+#   before any PID stop/open, so removing peer Face Lock suppression does not weaken target safety.
+#
+# V4.81.80 — REAL EXOTIC MASTER INSTALLER
+# - FIX: Option 17 was still prompting for /Download/config.zip and treating exotic_master.zip
+#   as a generic Workspace ZIP. exotic_master.zip is a template bundle, not a ready Workspace tree.
+# - Option 17 -> 1 now auto-finds the newest exotic_master*.zip in /storage/emulated/0/Download
+#   (with /sdcard/Download and /storage/emulated/0 fallback) and installs it to the selected
+#   packages' CURRENT executor Workspace(s).
+# - Each selected package's live Roblox UID is resolved from its own cookie/API (cached UID fallback).
+# - groups.json decides the sender config:
+#       Hatching UID -> file1_hatching.json (Divine -> Market targets)
+#       Market UID   -> file1_market.json   (Trash -> Hatching targets)
+#       Other UID    -> file1_default.json
+# - Master shared templates are expanded per UID:
+#       file2.json       -> <UID>file2.json
+#       filesession.json -> <UID>filesession.json
+#       gag2.json        -> <UID>gag2.json (when present)
+#   under Workspace/exotichub99/.
+# - Existing per-UID files are backed up before overwrite.
+# - Generic Workspace ZIP import is preserved as Option 17 -> 2.
+#
+# V4.81.79 — OPTION 17 USES CURRENT EXECUTOR WORKSPACE
+# - FIX: Workspace ZIP Tools were still hardcoded to /Delta/Workspace even when
+#   the selected package was configured for Arceus X Global, Arceus per-clone,
+#   or a custom global executor path.
+# - Option 17 now resolves the Workspace from each selected package's CURRENT
+#   executor configuration/state path (same source of truth used by Option 20).
+# - Shared/global paths are automatically deduplicated; per-clone executor
+#   Workspaces are handled separately.
+# - Import writes the ZIP to every selected unique current Workspace and backs
+#   up overwritten files per destination first.
+# - Export creates one ZIP per selected unique current Workspace.
+# - Legacy import_workspace_zip_to_delta()/export_delta_workspace_zip() remain
+#   for compatibility, but the interactive Option 17 no longer forces Delta.
+#
+# V4.81.78 — RESTORE HIDDEN MAIN-MENU OPTIONS 16/17/18
+# - FIX: Main dispatch handlers for Options 16, 17, and 18 still existed, but their entries
+#   were accidentally missing from MAIN_MENU_ITEMS. read_menu_choice() therefore rejected
+#   those numbers before the handlers could run.
+# - Restore 16 Layout / detector tools.
+# - Restore 17 Workspace ZIP / EXO config tools.
+# - Restore 18 APK download / install tools.
+# - No Workspace ZIP, EXO groups, Face Lock, solver, PID, or recovery behavior is changed.
+#
+# V4.81.77 — PROACTIVE LOADING MODERATION API WATCH
+# - V4.81.76 restored authenticated Face Lock source=5/status=2, but the direct moderation API was still
+#   primarily reached at queued recovery/open boundaries. A genuinely locked/banned clone could therefore
+#   sit in Loading/HTTP-error state until the recovery timer expired.
+# - ALIVE + no clean/fresh post-open state now starts a NONBLOCKING package-local moderation API check
+#   immediately, then at a throttled interval (default 5m) while it remains unhealthy.
+# - A completed API Face Lock/Ban result updates the dashboard to Face Lock/Banned and holds only that package.
+# - Before a confirmed current non-529 disconnect is allowed to become Kicked, NOMO performs one throttled
+#   synchronous package-local moderation check. API Face Lock/Ban outranks the kick before any recovery queue.
+# - Existing direct moderation check before route/PID/solver/open remains the final destructive safety boundary.
+# - Healthy siblings are never stopped or held because another package is Face Locked/Banned.
+#
+# V4.81.76 — RESTORE AUTH FACE-LOCK + EXO GROUP IMPORT GUARD
+# - Restore Roblox's authenticated moderation restriction source=5 + moderationStatus=2 as package-local
+#   authoritative Face Lock evidence. Later testing isolated the major false-lock cascade to stale/cross-clone
+#   UI evidence; disabling this authenticated signature caused a genuinely locked clone to be treated as Kicked.
+# - The direct moderation guard still runs before ANY route/PID/solver/open intent, so a confirmed Face Lock
+#   cannot be restarted as a kick and cannot disturb healthy sibling App Cloner tasks.
+# - Face Lock evidence source is recorded as api_restriction_5_2 for diagnostics.
+# - Option 17 Workspace ZIP import now recognizes EXO master groups.json and prints Hatching/Market/Ungrouped counts.
+# - If hatchingAuto=true produced the exact complement all-market (e.g. 139 total - 28 market = 111 hatching),
+#   NOMO flags it as AUTO-COMPLEMENT and requires an explicit unsafe-import confirmation instead of silently
+#   installing a bad group map.
+# - NOMO does not guess which UIDs belong to the real Hatching group.
+#
+# V4.81.75 — RESTORE BACKGROUND STUCK CAPTCHA SOLVER
+# - V4.81.66/.70 moved Hatcher/Market fresh verification out of wait_until_fresh_after_open() so the
+#   dashboard would no longer freeze for minutes. That also accidentally bypassed the old ~3m
+#   post-open CAPTCHA provider probe that lived inside the synchronous wait loop.
+# - Restore that probe as a package-local background watchdog: an ALIVE clone with no clean fresh state
+#   for solver_probe_after_seconds (default 180s) gets one direct provider check for that stuck incident.
+# - This background solver probe is NON-DESTRUCTIVE: no PID stop, no cache clear, no route/open.
+# - A confirmed Face Lock on one peer does NOT suppress another package's solver-only probe. Peer-auth
+#   protection still blocks destructive sibling hard recovery while its safety condition applies.
+# - The background probe explicitly calls the provider even when Roblox base auth is valid, matching
+#   Manual Solver Test behavior; this catches invisible join CAPTCHAs that UI/Lua cannot see.
+# - One probe per stuck incident/open generation + existing >=10m provider submit cooldown prevents spam.
+# - A clean fresh heartbeat resets the package-local stuck-probe incident.
+#
+# V4.81.74 — CURRENT DISCONNECT ONLY + STRICT OPTION-16 UI ISOLATION
+# - Hours-old disconnect/267 fields in stale state.json are no longer treated as CURRENT kick popups.
+# - Android auth/disconnect text uses the exact saved Option-16 rectangle as the authoritative clone boundary.
+# - Shared/App-Cloner package-name text is no longer unioned across clone cells when a saved rectangle exists.
+# - Adds Recovery Tools option 9 to persist one user-confirmed Face Lock package across transient HTTP/kick/loading UI.
+#
+# V4.81.73 — NUMERIC MODERATION RESTRICTION IS NOT FACE-LOCK PROOF
+# - Roblox moderation restriction source=5 + moderationStatus=2 is no longer sufficient by itself to create
+#   FACE LOCK HOLD. Multiple normal accounts can expose that numeric restriction shape, so treating it as
+#   Account Locked caused pool-wide false face-locks.
+# - The numeric restriction remains diagnostic/advisory. It becomes Face Lock only when the same API payload
+#   contains explicit Account Locked / suspicious-activity / unlock-account wording.
+# - Exact package-scoped Account Locked UI text remains authoritative.
+# - Old V4.81.58-.72 API-numeric Face Lock latches self-clear unless actual explicit lock wording is retained.
+# - Activity now names the authoritative source when Face Lock is created.
+#
+# V4.81.72 — LEGACY/GENERIC FACE-LOCK LATCH SELF-HEAL
+# - V4.81.71 only cleared Face Lock runtime entries that still contained the original visual-panel marker.
+#   Older runtime.json entries can retain only generic face_lock / face_lock_detected fields, so they still
+#   suppressed every sibling even when no clone currently has Account Locked.
+# - A persisted Face Lock is now authoritative only when runtime retains strong Account Locked text or a direct
+#   Roblox moderation/API face_lock result. Bare/generic/visual-only legacy Face Lock latches self-clear.
+# - Peer-auth suppression also ignores generic Face Lock state unless that strong evidence exists.
+# - The final destructive boundary still performs the direct moderation API + exact Account Locked UI checks,
+#   so a real lock is re-established before any PID stop.
+#
+# V4.81.71 — VISUAL FACE-LOCK IS ADVISORY, NEVER AUTHORITATIVE
+# - Screenshot-only Face Lock candidates no longer create manual holds, peer-auth suppression, or hard-open deferrals.
+# - Only exact package-scoped Account Locked text or Roblox moderation/API proof may create a real Face Lock hold.
+# - Existing V4.81.69/V4.81.70 visual-only Face Lock latches are automatically cleared package-locally.
+# - Grow Offline/hourglass/loading overlays can therefore no longer freeze the entire Hatcher/Market recovery pool.
+# - Real Account Locked / moderation / 529 / CAPTCHA protections remain unchanged.
+#
+# V4.81.70 — NONBLOCKING MARKET CACHE RECOVERY QUEUE
+# - Market combined-stuck recovery no longer monopolizes the single-flight queue while waiting minutes for a
+#   fresh post-open heartbeat. After exact-target PID stop -> forced Clear Cache -> Market open, verification is
+#   package-local/backgrounded and the queue immediately continues to the next clone.
+# - Existing post-open grace + Market incident cooldown still prevent rapid PID/cache loops. A fresh clean Market
+#   state resets the incident normally; a clone that remains stuck can recover again after the package cooldown.
+# - Pending legacy Market hard items from older runtime.json generations (market alive old/no-state or the old
+#   homepage/no-state hard retry) are upgraded at execution time into the combined Market Clear Cache generation,
+#   unless they belong to manual/solver/auth/disconnect/AutoExec/Exotic recovery.
+# - This preserves the package-only exact-PID rule, peer-auth safety, and all Face Lock/Account Locked protections.
+#
+# V4.81.69 — DISCONNECT OUTRANKS VISUAL FACE-LOCK FALSE POSITIVES
+# - A current package-scoped Roblox kick/disconnect popup (267/288/524/etc.) now outranks screenshot-only
+#   Face Lock/CAPTCHA heuristics. The visual Account-Locked detector is skipped while that strong disconnect is
+#   visible, so a normal gray Disconnected modal cannot become a false FACE LOCK HOLD.
+# - If an earlier screenshot-only Face Lock hold is still latched for that same package, a current non-529
+#   disconnect clears only that visual-origin hold and its peer-auth suppression. Direct Account Locked text,
+#   moderation API source=5/status=2, bans, and real 529/verification evidence remain authoritative.
+# - The queued HARD boundary performs the same precedence check before the strong-auth discard and again before
+#   visual auth checks, so an Error 267 kick can reach its exact-PID recovery instead of being discarded as auth.
+#
+# V4.81.68 — MARKET PEER-AUTH QUEUE FIX
+# - Market 5m stuck recoveries no longer downgrade an ALIVE stuck clone into a sticky peer-auth route-only
+#   generation while another Noka clone is running solver/auth protection. That route-only metadata blocked the
+#   later exact-PID + Clear Cache upgrade and could leave a genuinely stuck Market clone sitting on Next forever.
+# - During any peer auth/solver safety window, the Market combined-stuck path now simply waits package-locally.
+#   Once the peer blocker clears, the same >=5m stale/no-state clone queues its normal exact-target PID stop, forced
+#   Clear Cache, and Market reopen. Confirmed face-lock/Account Locked protection is not weakened.
+# - On upgrade from V4.81.67, any still-pending peer-auth safe-route item for that stuck Market package is removed
+#   before waiting, so old runtime queue metadata cannot keep suppressing the cache recovery after restart.
+#
+# V4.81.67 — MARKET 5M STUCK CACHE RECOVERY + VALID-TS MARKET AGE
+# - Market now gets the package-scoped equivalent of the proven Hatcher stuck repair. When the actual Market
+#   Roblox session has a clean-but-stale valid timestamp for >=5m, or stays ALIVE with no state for >=5m, NOMO
+#   runs one solver/auth safety preflight, exact-target PID stop, forced Android Clear Cache, then reopens the
+#   normal Market route. Market never regenerates a private-server link because Trade World does not use one.
+# - Market no longer discards a real 24h/146h/etc. state merely because it crosses the historical 24h ceiling.
+#   A plausible Unix `ts` is authoritative; only the missing/broken `ts=0` -> `999999s` (~277h) sentinel remains
+#   invalid and cannot drive a destructive recovery.
+# - The Market combined-stuck generation has no automatic route/hard fallback chain after its one cache repair.
+#   If it still cannot produce fresh state, a package-local cooldown prevents rapid cache/PID loops; a clean fresh
+#   heartbeat resets the incident so a later independent 5m stall can recover normally.
+# - Existing face-lock/Account Locked/moderation/CAPTCHA gates remain authoritative. Market AutoExec script-only
+#   failures still use the existing loader self-heal path and are NOT converted into Android PID/cache recovery.
+#
+# V4.81.66 — VALID-TS STALE RECOVERY + NONBLOCKING HATCHER FRESH WAIT
+# - Hatcher no longer treats every state older than 24h as invalid. A real Unix `ts` is now authoritative: any
+#   clean stale state at/after the 5-minute recovery threshold remains eligible even at 24h/146h/etc. The historic
+#   `999999s` (~277h) missing/broken-timestamp sentinel is still rejected because its `ts` is absent/invalid.
+# - Automatic Hatcher opens no longer hold the whole watchdog inside the old synchronous 240s fresh-state wait.
+#   NOMO records a package-local background fresh deadline, releases the single-flight lock immediately, redraws
+#   uptime/checks normally, and keeps checking the other clones every watchdog cycle.
+# - While that background deadline is active, the old-state watchdog cannot race/upgrade the same package. A fresh
+#   post-open state clears the pending incident; if five minutes pass with no fresh state, the normal package-scoped
+#   5m recovery is queued (solver -> refreshed PS -> exact PID -> Clear Cache -> one reopen).
+# - Manual Option 6, explicit solver-result recovery, disconnect recovery, auth/manual opens, and Booster routing keep
+#   their existing synchronous verification semantics; only ordinary automatic Hatcher watchdog opens are backgrounded.
 #
 # V4.81.65 — COMBINED 5M STUCK RECOVERY (NEW PS CODE + CACHE + EXACT PID)
 # - A real Hatcher 5-minute ALIVE old/no-state incident is now one atomic recovery generation: one solver
@@ -1253,7 +1734,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.105"
+__version__ = "V4.81.108"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1276,8 +1757,10 @@ DELTA_KEY_AUTH_URL_FILE = Path("/storage/emulated/0/Download/delta_auth_url.txt"
 DELTA_KEY_CAPTURED_FILE = Path("/storage/emulated/0/Download/delta_key_captured.txt")
 DELTA_KEY_DEFAULT_LICENSE_FILE = DELTA_GLOBAL_ROOT / "Internals" / "Cache" / "license"
 DELTA_WORKSPACE_DEFAULT_IMPORT_ZIP = Path("/storage/emulated/0/Download/config.zip")
+EXOTIC_MASTER_DEFAULT_IMPORT_ZIP = Path("/storage/emulated/0/Download/exotic_master.zip")
 DELTA_WORKSPACE_EXPORT_DIR = BASE_DIR / "workspace_exports"
 DELTA_WORKSPACE_BACKUP_DIR = BASE_DIR / "workspace_backups"
+EXO_UID_GROUPS_FILE = BASE_DIR / "exo_uid_groups.json"
 
 EXOTIC_KEY_STATE_FILE = BASE_DIR / "exotic_key_state.json"
 EXOTIC_KEY_SHARED_RELATIVE = Path("Nomo") / "exotic_key.json"
@@ -2103,6 +2586,17 @@ DEFAULT_CONFIG = {
     "min_seconds_between_reopen": 60,
 
     "alive_old_state_hard_seconds": 180,
+    # V4.81.67: actual Trade World/Market session stuck recovery. This is
+    # intentionally separate from Market AutoExec loader self-heal.
+    "market_combined_stuck_recovery_enabled": True,
+    "market_combined_stuck_recovery_seconds": 300,
+    "market_combined_stuck_clear_cache": True,
+    "market_combined_stuck_cooldown_seconds": 900,
+    # V4.81.100: an unsuccessful cache restart may retry after 5m. A genuinely
+    # healthy fresh Market state clears the incident entirely, so this only
+    # matters while the clone remains unhealthy.
+    "market_combined_failed_retry_seconds": 300,
+    "market_strong_heal_runtime_max_age_seconds": 120,
     # V3.79: how long a clone that is ALIVE at hatcher startup may sit without a
     # readable state file before the table stops showing "waiting" and surfaces
     # an actionable "check Lua/username" note. Short so it never looks stuck.
@@ -2121,12 +2615,9 @@ DEFAULT_CONFIG = {
     # account actually logged in. Makes the manual "get username" step optional.
     "auto_resolve_usernames_enabled": True,
     "username_resolve_interval_seconds": 600,
-    # V3.79: MARKET phantom-age ceiling (mirror of the hatcher's
-    # hatcher_alive_old_state_max_valid_seconds). A missing `ts` in the state
-    # file makes age compute to an impossible value (e.g. 277h). Any age above
-    # this is treated as invalid and IGNORED — never drives a kill+open. This is
-    # the guard the market path was missing while the hatcher path had it, which
-    # is why one instance ran 11h and another rejoin-looped on the same 277h age.
+    # Legacy max-age ceiling for shared non-combined paths. V4.81.67 Market
+    # uses timestamp validity instead: real old ts is recoverable; ts=0/999999s
+    # sentinel is ignored. Keep this key for compatibility with other paths.
     "alive_old_state_max_valid_seconds": 86400,
 
     "open_all_on_start": True,
@@ -2327,6 +2818,17 @@ DEFAULT_CONFIG = {
     "hatcher_combined_stuck_recovery_enabled": True,
     "hatcher_combined_stuck_refresh_private_link": True,
     "hatcher_combined_stuck_clear_cache": True,
+
+    # V4.81.108 surgical Hatcher policy. Enabled by start_hatcher_safe_rejoiner()
+    # so unrelated menus/modes keep their existing behavior.
+    "hatcher_surgical_stable_policy": False,
+    "hatcher_background_solver_probe_enabled": True,
+    "hatcher_post_open_5m_recovery_enabled": True,
+
+    # V4.81.66: ordinary automatic Hatcher opens are verified by the normal
+    # watchdog instead of blocking the whole UI/main loop in wait_until_fresh_after_open().
+    "hatcher_background_fresh_wait_enabled": True,
+    "hatcher_background_fresh_timeout_seconds": 300,
 
     "market_link": DEFAULT_MARKET_LINK,
     "restock_link": DEFAULT_RESTOCK_LINK,
@@ -3344,6 +3846,16 @@ def apply_update_migrations(cfg):
         set_cfg("stale_reopen_after_seconds", 60)
     if _int_cfg(cfg.get("force_rejoin_if_stale_seconds"), 999999) > 180:
         set_cfg("force_rejoin_if_stale_seconds", 180)
+
+    # V4.81.67: Market's real session-stuck path is 5m and package-local.
+    if "market_combined_stuck_recovery_enabled" not in cfg:
+        set_cfg("market_combined_stuck_recovery_enabled", True)
+    if _int_cfg(cfg.get("market_combined_stuck_recovery_seconds"), 0) < 300:
+        set_cfg("market_combined_stuck_recovery_seconds", 300)
+    if "market_combined_stuck_clear_cache" not in cfg:
+        set_cfg("market_combined_stuck_clear_cache", True)
+    if _int_cfg(cfg.get("market_combined_stuck_cooldown_seconds"), 0) < 300:
+        set_cfg("market_combined_stuck_cooldown_seconds", 900)
 
     # V3.60: safer Redfinger defaults. Some Roblox clones can take 2+ minutes
     # to load into the game, so do NOT hard-rejoin too early. V3.58/3.59 used
@@ -5211,6 +5723,265 @@ def _is_noka_clone_package(pkg):
     )
 
 
+
+def resolve_package_view_activity(pkg, link, cfg):
+    """Resolve the exact clone package's Android VIEW handler for one Roblox link."""
+    pkg = str(pkg or "").strip()
+    link = str(link or "").strip()
+    if not pkg or not link:
+        return "", "missing package/link"
+
+    cmd = (
+        "cmd package resolve-activity --brief "
+        "-a android.intent.action.VIEW "
+        + "-d " + shlex.quote(link) + " "
+        + "-p " + shlex.quote(pkg)
+        + " 2>/dev/null | tail -n 1"
+    )
+    code, output = shell_timeout(cmd, cfg, capture=True, timeout=10)
+    lines = [line.strip() for line in str(output or "").splitlines() if line.strip()]
+    component = lines[-1] if lines else ""
+
+    if code != 0 or "/" not in component:
+        return "", "VIEW activity resolve failed: " + cut(output or f"exit {code}", 70)
+
+    owner = component.split("/", 1)[0].strip()
+    if owner != pkg:
+        return "", (
+            "VIEW activity owner mismatch; expected "
+            + pkg + " got " + cut(owner, 50)
+        )
+
+    return component, "resolved exact package VIEW activity"
+
+
+def open_roblox_protocol_activity_nudge(pkg, link, cfg, rt_tab=None):
+    """Deliver a Roblox deep link to the exact clone's VIEW activity without PID stop."""
+    pkg = str(pkg or "").strip()
+    link = android_launch_roblox_link(link, cfg)
+    if not pkg or not link:
+        return False, "missing package/link"
+
+    process_status, process_note = package_alive_status(pkg, cfg, fresh=True)
+    if process_status != "ALIVE":
+        return False, (
+            "protocol nudge requires ALIVE package; "
+            + str(process_status) + ": " + cut(process_note, 60)
+        )
+
+    component, resolve_note = resolve_package_view_activity(pkg, link, cfg)
+    if not component:
+        return False, resolve_note
+
+    sibling_pids, _sibling_pid_errors = _sibling_pid_snapshot(pkg, cfg)
+    sibling_activity_before = {}
+    for peer in sorted(sibling_pids.keys()):
+        a_status, a_note = package_activity_status(peer, cfg)
+        sibling_activity_before[peer] = (a_status, a_note)
+
+    cmd = (
+        "am start -W "
+        "-f 0x20000000 "
+        "-n " + shlex.quote(component) + " "
+        "-a android.intent.action.VIEW "
+        "-d " + shlex.quote(link)
+    )
+
+    invalidate_android_observation_caches()
+    code, output = shell_timeout(cmd, cfg, capture=True, timeout=20)
+    invalidate_android_observation_caches()
+
+    if code != 0:
+        return False, "protocol VIEW start failed: " + cut(output or f"exit {code}", 80)
+
+    if rt_tab is not None:
+        rt_tab["home_protocol_nudge_component"] = component
+        rt_tab["home_protocol_nudge_at"] = now()
+        rt_tab["home_protocol_nudge_result"] = cut(output or "started", 120)
+
+    if sibling_pids:
+        time.sleep(0.8)
+        peer_ok, peer_note = _verify_sibling_pid_snapshot(sibling_pids, cfg, pkg)
+        activity_losses = []
+        for peer, (before_status, _before_note) in sibling_activity_before.items():
+            if before_status != "ACTIVITY":
+                continue
+            after_status, after_note = package_activity_status(peer, cfg)
+            if after_status == "NO_ACTIVITY":
+                activity_losses.append(short_pkg(peer) + ": ActivityRecord lost")
+            elif after_status == "UNKNOWN":
+                activity_losses.append(
+                    short_pkg(peer) + ": activity check unknown (" + cut(after_note, 35) + ")"
+                )
+
+        if not peer_ok or activity_losses:
+            detail = "; ".join(
+                ([peer_note] if not peer_ok else []) + activity_losses
+            )
+            log_activity(
+                "HOME PROTOCOL NUDGE peer warning; no sibling action: "
+                + cut(detail, 100),
+                pkg,
+                RED,
+            )
+            if rt_tab is not None:
+                rt_tab["home_protocol_peer_warning"] = str(detail or "")
+                rt_tab["home_protocol_peer_warning_at"] = now()
+
+    return True, "protocol VIEW activity nudged"
+
+
+
+def market_peer_safe_cache_protocol_restart(
+    pkg,
+    link,
+    cfg,
+    rt_tab,
+    reason="market stuck",
+):
+    """Market 5m recovery: exact PID stop -> cache -> exact VIEW component."""
+    pkg = str(pkg or "").strip()
+    link = android_launch_roblox_link(link, cfg)
+    reason = str(reason or "market stuck")
+
+    if not pkg or not link:
+        return False, "missing package/link"
+
+    sibling_pids_before, sibling_pid_errors = _sibling_pid_snapshot(pkg, cfg)
+    if sibling_pid_errors:
+        return False, (
+            "Market peer-safe restart refused; sibling PID query unavailable: "
+            + " | ".join(sibling_pid_errors)
+        )
+
+    sibling_activity_before = {}
+    for peer in sorted(sibling_pids_before.keys()):
+        status, note = package_activity_status(peer, cfg)
+        sibling_activity_before[peer] = (status, note)
+
+    stopped, stop_note = force_stop_package(
+        pkg, cfg, tries=3, wait_after=0.8, settle=1.0
+    )
+    log_activity(
+        "Market cache restart stop check: " + cut(stop_note, 75),
+        pkg,
+        DIM,
+    )
+    if not stopped:
+        return False, "Market exact-PID stop failed: " + cut(stop_note, 70)
+
+    cache_ok, cache_note = clear_package_cache(
+        pkg,
+        cfg,
+        rt_tab=rt_tab,
+        reason=reason,
+        force=True,
+    )
+    rt_tab["market_peer_safe_cache_attempted_at"] = now()
+    rt_tab["market_peer_safe_cache_ok"] = bool(cache_ok)
+    rt_tab["market_peer_safe_cache_note"] = str(cache_note or "")
+    log_activity(
+        "Market forced cache "
+        + ("ok: " if cache_ok else "FAILED: ")
+        + cut(cache_note, 80),
+        pkg,
+        GREEN if cache_ok else RED,
+    )
+
+    if not cache_ok:
+        rt_tab["market_combined_stuck_failed_at"] = now()
+        rt_tab["market_combined_stuck_failed_reason"] = (
+            "forced cache failed: " + str(cache_note or "")
+        )
+        return False, (
+            "Market forced cache FAILED; reopen skipped: "
+            + cut(cache_note, 80)
+        )
+
+    # Cache repair really succeeded; clear any prior failed-attempt cooldown.
+    rt_tab["market_combined_stuck_failed_at"] = 0
+    rt_tab["market_combined_stuck_failed_reason"] = ""
+
+    component, resolve_note = resolve_package_view_activity(pkg, link, cfg)
+    if not component:
+        rt_tab["market_peer_safe_protocol_failed_at"] = now()
+        rt_tab["market_peer_safe_protocol_failed_note"] = str(resolve_note or "")
+        return False, (
+            "Market VIEW resolve failed after cache: "
+            + cut(resolve_note, 75)
+        )
+
+    cmd = (
+        "am start -W "
+        "-f 0x20000000 "
+        "-n " + shlex.quote(component) + " "
+        "-a android.intent.action.VIEW "
+        "-d " + shlex.quote(link)
+    )
+
+    invalidate_android_observation_caches()
+    code, output = shell_timeout(cmd, cfg, capture=True, timeout=20)
+    invalidate_android_observation_caches()
+
+    if code != 0:
+        rt_tab["market_peer_safe_protocol_failed_at"] = now()
+        rt_tab["market_peer_safe_protocol_failed_note"] = cut(
+            output or f"exit {code}",
+            120,
+        )
+        return False, (
+            "Market exact VIEW start failed after cache: "
+            + cut(output or f"exit {code}", 80)
+        )
+
+    rt_tab["target"] = "market"
+    rt_tab["last_open"] = now()
+    rt_tab["last_open_mode"] = "market-cache-protocol"
+    rt_tab["market_peer_safe_protocol_component"] = component
+    rt_tab["market_peer_safe_protocol_opened_at"] = now()
+    rt_tab["market_peer_safe_protocol_result"] = cut(output or "started", 120)
+
+    if sibling_pids_before:
+        time.sleep(1.0)
+        peer_ok, peer_note = _verify_sibling_pid_snapshot(
+            sibling_pids_before, cfg, pkg
+        )
+        activity_losses = []
+        for peer, (before_status, _before_note) in sibling_activity_before.items():
+            if before_status != "ACTIVITY":
+                continue
+            after_status, after_note = package_activity_status(peer, cfg)
+            if after_status == "NO_ACTIVITY":
+                activity_losses.append(short_pkg(peer) + ": ActivityRecord lost")
+            elif after_status == "UNKNOWN":
+                activity_losses.append(
+                    short_pkg(peer)
+                    + ": activity check unknown ("
+                    + cut(after_note, 35)
+                    + ")"
+                )
+
+        if not peer_ok or activity_losses:
+            detail = "; ".join(
+                ([peer_note] if not peer_ok else []) + activity_losses
+            )
+            rt_tab["market_protocol_peer_warning"] = str(detail or "")
+            rt_tab["market_protocol_peer_warning_at"] = now()
+            log_activity(
+                "MARKET PROTOCOL RESTART peer warning; no sibling action: "
+                + cut(detail, 100),
+                pkg,
+                RED,
+            )
+        else:
+            rt_tab["market_protocol_peer_warning"] = ""
+
+    return True, (
+        "Market cache+protocol restart opened"
+        + ("" if cache_ok else " (cache helper reported warning)")
+    )
+
+
 def open_package_launcher(pkg, cfg):
     """Open one clone through its launcher activity without stopping siblings."""
     pkg = str(pkg or "").strip()
@@ -5337,22 +6108,142 @@ def hatcher_bubble_only_recovery_candidate(pkg, cfg, *, process_status=None):
     return False, activity_note or "live ActivityRecord"
 
 
-def queue_hatcher_bubble_only_recovery(core, tab, rt_tab, cfg, reason):
-    """Queue one package-local recovery for a confirmed bubble-only shell.
 
-    Do not bypass manual/solver holds. This path exists only to bypass the stale
-    startup-observe / old-state cooldown gates after Android directly confirms
-    that the package has a process but no Roblox ActivityRecord.
+
+def noka_live_sibling_detail(pkg, cfg):
+    """Return (has_live_peer, note, query_ok) using exact package PID queries."""
+    peers, errors = _sibling_pid_snapshot(pkg, cfg)
+    if errors:
+        return False, "sibling PID query unavailable: " + " | ".join(errors), False
+    if not peers:
+        return False, "no live sibling PIDs", True
+    names = ", ".join(short_pkg(peer) for peer in sorted(peers.keys()))
+    return True, f"live siblings: {names}", True
+
+
+def automatic_hard_item_can_soft_downgrade(item):
+    """Only automatic recovery is rewritten; explicit/manual force remains explicit."""
+    manual_keys = (
+        "manual_option6_force_override",
+        "manual_option6",
+        "manual_auth_open",
+        "manual_booster_hard_route",
+    )
+    return not any(bool(item.get(key)) for key in manual_keys)
+
+
+def hatcher_bubble_only_live_sibling_guard(pkg, cfg):
+    """Return (held, note) for unsafe bubble-only auto recovery.
+
+    Bubble-shell recovery can require materializing a new App Cloner floating
+    task. On affected Redfinger builds that launch itself can disturb a sibling,
+    even though the PID stop touched only the exact target package.
+    """
+    if not cfg.get("bubble_only_live_sibling_protection_enabled", True):
+        return False, "peer protection disabled"
+
+    peers, errors = _sibling_pid_snapshot(pkg, cfg)
+    if errors:
+        return True, (
+            "sibling PID check unavailable; "
+            + " | ".join(errors)
+        )
+
+    if peers:
+        names = ", ".join(
+            short_pkg(peer)
+            for peer in sorted(peers.keys())
+        )
+        return True, f"live siblings: {names}"
+
+    return False, "no live sibling PIDs"
+
+
+def queue_hatcher_bubble_only_recovery(core, tab, rt_tab, cfg, reason):
+    """Recover one stale Noka bubble shell without endangering live siblings.
+
+    With peers alive we must not use exact-PID hard stop + fresh App Cloner task
+    launch, because the target launch itself has been observed removing a sibling
+    floating task. Instead, actively send a soft package-local deep link and retry
+    it on a bounded cadence while the shell remains stale.
     """
     pkg = str((tab or {}).get("package", "") or "")
     if not pkg:
         return False, "no package"
     if solver_job_running(pkg):
         return False, "solver running"
+
     manual_hold, manual_note = recovery_manual_hold_active(rt_tab, cfg, pkg)
     if manual_hold:
         return False, manual_note
 
+    peer_hold, peer_note = hatcher_bubble_only_live_sibling_guard(pkg, cfg)
+
+    if peer_hold:
+        retry_seconds = max(
+            20,
+            int(cfg.get("bubble_shell_soft_wake_retry_seconds", 45) or 45),
+        )
+        last = int(rt_tab.get("bubble_shell_soft_wake_last", 0) or 0)
+        left = max(0, retry_seconds - max(0, now() - last))
+
+        rt_tab["bubble_only_peer_hold"] = False
+        rt_tab["bubble_shell_soft_wake_mode"] = True
+        rt_tab["bubble_shell_soft_wake_peer_note"] = str(peer_note or "")
+
+        if left > 0:
+            note = (
+                "shell soft-wake retry in "
+                + format_age(left)
+                + "; "
+                + cut(peer_note, 60)
+            )
+            rt_tab["note"] = note
+            return False, note
+
+        added, qnote = core.queue(
+            tab,
+            "hatcher",
+            str(reason or "bubble-only shell") + "; peer-safe soft wake",
+            force=True,
+            mode="soft",
+            front=True,
+            bypass_manual=False,
+            metadata={
+                "bypass_recheck": True,
+                "bubble_only_soft_wake": True,
+                "no_hard_fallback": True,
+                # A shell wake is itself the package-local recovery attempt.
+                # Provider probing may still happen later if a real challenge
+                # becomes visible/fresh, but this intent never becomes hard.
+                "bubble_shell_peer_note": str(peer_note or ""),
+            },
+        )
+
+        if added:
+            rt_tab["bubble_shell_soft_wake_last"] = now()
+            rt_tab["bubble_shell_soft_wake_count"] = (
+                int(rt_tab.get("bubble_shell_soft_wake_count", 0) or 0) + 1
+            )
+            rt_tab["hatcher_startup_observe_until"] = 0
+            rt_tab["note"] = "shell soft wake queued"
+            log_activity(
+                "bubble shell -> SOFT wake queued; "
+                + cut(peer_note, 80)
+                + "; no PID-stop/no hard fallback",
+                pkg,
+                CYAN,
+            )
+            core.save()
+            return True, "shell soft wake queued"
+
+        if core.has(pkg):
+            return False, "shell soft wake already queued"
+        return False, qnote or "shell soft wake blocked"
+
+    # No live siblings: the original target-only hard shell recovery is allowed.
+    rt_tab["bubble_shell_soft_wake_mode"] = False
+    rt_tab["bubble_only_peer_hold"] = False
     added, note = core.queue_exact_pid_recovery(
         tab,
         "hatcher",
@@ -5369,7 +6260,11 @@ def queue_hatcher_bubble_only_recovery(core, tab, rt_tab, cfg, reason):
     if added:
         rt_tab["hatcher_startup_observe_until"] = 0
         rt_tab["note"] = "bubble-only rescue queued"
-        log_activity("bubble-only shell confirmed; target-only recovery queued", pkg, YELLOW)
+        log_activity(
+            "bubble-only shell confirmed; no live siblings; target-only hard recovery queued",
+            pkg,
+            YELLOW,
+        )
         core.save()
         return True, "bubble-only rescue queued"
     if core.has(pkg):
@@ -5404,7 +6299,7 @@ def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop
 
     link = android_launch_roblox_link(link, cfg)
 
-    bubble_launch_diag = False
+    hard_launch_peer_diag = False
     sibling_before_launch = {}
 
     if not soft and require_stop and not skip_force_stop:
@@ -5421,15 +6316,15 @@ def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop
             log_activity(f"hard open aborted: {cut(stop_note, 80)}", pkg, RED)
             return False, f"stop failed: {cut(stop_note, 60)}"
 
-        # Bubble recovery is the only path that recently showed sibling loss.
-        # Snapshot peers *after* the exact-PID stop and immediately before the
-        # one target launch. This is diagnostic only; it never kills/repairs peers.
-        if "bubble-only" in str(reason or "").lower():
-            bubble_launch_diag = True
+        # V4.81.93: snapshot peers for EVERY remaining Noka hard launch.
+        # Exact-PID stop verification only proves peers survived the stop; the
+        # subsequent App Cloner task launch can still disturb a sibling.
+        if _is_noka_clone_package(pkg):
+            hard_launch_peer_diag = True
             sibling_before_launch, sibling_errors = _sibling_pid_snapshot(pkg, cfg)
             if sibling_errors:
                 log_activity(
-                    "bubble launch peer snapshot unavailable: "
+                    "hard launch peer snapshot unavailable: "
                     + " | ".join(sibling_errors),
                     pkg,
                     YELLOW,
@@ -5482,27 +6377,27 @@ def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop
     code, out = shell_timeout(cmd, cfg, capture=True, timeout=15)
     if code == 0:
         invalidate_android_observation_caches()
-        if bubble_launch_diag and sibling_before_launch:
-            # Give Android/App Cloner a moment to settle, then prove whether the
-            # plain target launch itself affected a peer process. This does not
-            # attempt any sibling repair or additional launch.
+        if hard_launch_peer_diag and sibling_before_launch:
+            # Give Android/App Cloner a moment to settle, then distinguish
+            # stop-time safety from launch-time sibling loss.
             time.sleep(1.0)
             peer_ok, peer_note = _verify_sibling_pid_snapshot(
                 sibling_before_launch, cfg, pkg
             )
             if not peer_ok:
                 log_activity(
-                    "BUBBLE LAUNCH SIBLING LOSS; no further auto action: "
+                    "HARD LAUNCH SIBLING LOSS detected after target start; "
+                    "no sibling repair attempted: "
                     + cut(peer_note, 100),
                     pkg,
                     RED,
                 )
                 if rt_tab is not None:
-                    rt_tab["bubble_launch_sibling_loss"] = True
-                    rt_tab["bubble_launch_sibling_loss_note"] = str(peer_note or "")
-                    rt_tab["bubble_launch_sibling_loss_at"] = now()
+                    rt_tab["hard_launch_sibling_loss"] = True
+                    rt_tab["hard_launch_sibling_loss_note"] = str(peer_note or "")
+                    rt_tab["hard_launch_sibling_loss_at"] = now()
             elif rt_tab is not None:
-                rt_tab["bubble_launch_sibling_loss"] = False
+                rt_tab["hard_launch_sibling_loss"] = False
         return True, "soft hop" if soft else "opened"
 
     if (
@@ -6517,6 +7412,9 @@ MAIN_MENU_ITEMS = [
     ("12", "AutoExec manager"),
     ("13", "Redfinger setup wizard"),
     ("15", "Update NOMO"),
+    ("16", "Layout / detector tools"),
+    ("17", "Workspace ZIP / EXO config"),
+    ("18", "APK download / install"),
     ("19", "Delta key manager"),
     ("20", "Executor paths"),
     ("21", "Doctor"),
@@ -6749,6 +7647,7 @@ def status_screen(rows, cfg, session_start, loops):
     # config summary block
     up = format_uptime(now() - session_start)
     print(f"  {col('METHOD', DIM)} : Online     "
+          f"{col('VER', DIM)} : {col(__version__, CYAN)}     "
           f"{col('UPTIME', DIM)} : {col(up, CYAN)}   "
           f"{col('CHECKS', DIM)} : {loops}")
     print(f"  {col('BLOCK', DIM)}  : {onoff(cfg.get('rejoin_if_crash'))}    "
@@ -11790,12 +12689,13 @@ def _counter_version_tuple(state):
 def state_disconnect_ui(state):
     """True only for a CURRENT, high-confidence disconnect observation.
 
-    Counter <=2.4 could latch GuiService/Rejoin text forever while continuing to
-    write fresh heartbeats. Those legacy flags are ignored unless Python itself
-    confirmed the native popup for this exact package.
+    V4.81.74: an hours-old state.json cannot represent current UI. Stale files
+    may preserve the last 267/288 values from before the executor stopped.
     """
     if not state:
         return False
+
+    # Injected by Python from a CURRENT package/Option-16 UI observation.
     if bool(state.get("_android_disconnect_confirmed")):
         return True
 
@@ -11813,11 +12713,6 @@ def state_disconnect_ui(state):
     if not disconnected and not has_strong_text:
         return False
 
-    # Counter v2.5+ actively clears a vanished prompt, so its current boolean is safe.
-    if _counter_version_tuple(state) >= (2, 5):
-        return True
-
-    # Transitional support for any counter that writes a real observation epoch.
     try:
         seen = int(state.get("disconnect_observed_ts", 0) or 0)
     except Exception:
@@ -11825,7 +12720,18 @@ def state_disconnect_ui(state):
     if seen > 0 and abs(now() - seen) <= 45:
         return True
 
-    # Legacy v2.4 and older: do not trust sticky state without Android confirmation.
+    # Even Counter v2.5+ is only authoritative while its state heartbeat is
+    # recent. Never promote a 1h/14h-old saved kick into a current popup.
+    try:
+        age = int(state_age_seconds(state))
+    except Exception:
+        age = 999999
+    if age > 90:
+        return False
+
+    if _counter_version_tuple(state) >= (2, 5):
+        return True
+
     return False
 
 
@@ -11877,6 +12783,8 @@ def hatcher_alive_old_state_hard_settings(hcfg, cfg):
         "hatcher_alive_old_state_hard_force_enabled",
         cfg.get("hatcher_alive_old_state_hard_force_enabled", True)
     ))
+    if cfg.get("hatcher_surgical_stable_policy", False):
+        enabled = False
     try:
         age_seconds = int(hcfg.get(
             "hatcher_alive_old_state_hard_force_seconds",
@@ -11927,8 +12835,9 @@ def _queue_hatcher_alive_old_state_hard(open_queue, tab, rt_tab, hcfg, cfg, age_
         age_i = 0
     if age_i < age_seconds:
         return False, "alive old state", False
-    if age_i > max_valid_seconds:
-        return False, f"invalid old state ignored {age_i}s", False
+    # V4.81.66: do not reject a real stale state merely because it is older
+    # than the historical 24h ceiling. State-bearing callers validate `ts`
+    # explicitly; no-state callers pass a locally measured elapsed duration.
 
     t = now()
     last = int(rt_tab.get("hatcher_alive_old_state_hard_last", 0) or 0)
@@ -11978,6 +12887,82 @@ def _queue_hatcher_alive_old_state_hard(open_queue, tab, rt_tab, hcfg, cfg, age_
     rt_tab["hatcher_alive_old_state_hard_age"] = age_i
     rt_tab["hatcher_alive_old_state_hard_reason"] = str(reason or "alive old state")
     return True, "old-state PID hard queued", True
+
+
+
+
+def queue_hatcher_post_open_5m_recovery(core, tab, rt_tab, cfg, elapsed=0):
+    """Queue the only telemetry-based ALIVE Hatcher recovery."""
+    pkg = str((tab or {}).get("package") or "")
+    if not pkg:
+        return False, "no package", False
+    if not cfg.get("hatcher_post_open_5m_recovery_enabled", True):
+        return False, "post-open 5m recovery disabled", False
+    if solver_job_running(pkg):
+        return False, "solver running", False
+
+    manual_hold, manual_note = recovery_manual_hold_active(rt_tab, cfg, pkg)
+    if manual_hold:
+        return False, manual_note, False
+
+    try:
+        generation = int(
+            rt_tab.get("hatcher_background_fresh_timeout_generation", 0) or 0
+        )
+    except Exception:
+        generation = 0
+    if generation <= 0:
+        return False, "no timed-out NOMO open generation", False
+
+    try:
+        elapsed_i = int(
+            elapsed
+            or rt_tab.get("hatcher_background_fresh_timeout_elapsed", 0)
+            or 0
+        )
+    except Exception:
+        elapsed_i = 0
+    if elapsed_i < 300:
+        return False, "post-open wait below 5m", False
+
+    if core.has(pkg):
+        return False, "already queued", True
+
+    added, qnote = core.queue_exact_pid_recovery(
+        tab,
+        "hatcher",
+        f"Hatcher NOMO-open stuck {elapsed_i}s; 5m combined recovery",
+        front=False,
+        metadata={
+            "bypass_recheck": False,
+            "always_recheck_health": True,
+            "hatcher_post_open_5m_recovery": True,
+            "hatcher_post_open_generation": generation,
+            "combined_stuck_recovery": True,
+            "combined_stuck_refresh_private_link": bool(
+                cfg.get("hatcher_combined_stuck_refresh_private_link", True)
+            ),
+            "combined_stuck_clear_cache": bool(
+                cfg.get("hatcher_combined_stuck_clear_cache", True)
+            ),
+        },
+    )
+
+    if added:
+        rt_tab["hatcher_post_open_5m_queued_generation"] = generation
+        rt_tab["hatcher_post_open_5m_queued_at"] = now()
+        rt_tab["hatcher_background_fresh_timeout_due"] = False
+        rt_tab["note"] = "post-open 5m new-PS+cache recovery queued"
+        log_activity(
+            "Hatcher NOMO-open stuck 5m -> solver preflight + new PS + "
+            "Clear Cache + exact-PID reopen queued",
+            pkg,
+            YELLOW,
+        )
+        core.save()
+        return True, rt_tab["note"], True
+
+    return False, qnote or "post-open 5m recovery not queued", False
 
 
 
@@ -12448,6 +13433,130 @@ def state_age_seconds(state):
         return 999999
 
 
+def state_timestamp_valid(state):
+    """Return True only for a real state-writer Unix timestamp.
+
+    The Lua writer uses >=1600000000 as its minimum plausible epoch. Missing or
+    broken clocks become ts=0 and read_state() maps those to the legacy 999999s
+    (~277h) sentinel. Age alone is therefore not a safe validity test.
+    """
+    if not isinstance(state, dict):
+        return False
+    try:
+        ts = int(state.get("ts", 0) or 0)
+    except Exception:
+        return False
+    if ts < 1600000000:
+        return False
+    # Reject obviously future/corrupt epochs without punishing normal clock skew.
+    return ts <= now() + 86400
+
+
+def hatcher_state_timestamp_valid(state):
+    """Compatibility alias for older Hatcher call sites."""
+    return state_timestamp_valid(state)
+
+
+def mark_hatcher_background_fresh_wait(rt_tab, opened_at, cfg, reason="", mode=""):
+    """Start one package-local post-open fresh-state deadline."""
+    if not isinstance(rt_tab, dict):
+        return 0
+    try:
+        timeout = int(cfg.get("hatcher_background_fresh_timeout_seconds", 300) or 300)
+    except Exception:
+        timeout = 300
+    timeout = max(300, timeout)
+    opened_at = int(opened_at or now())
+    rt_tab["hatcher_background_fresh_opened_at"] = opened_at
+    rt_tab["hatcher_background_fresh_until"] = opened_at + timeout
+    rt_tab["hatcher_background_fresh_reason"] = str(reason or "")
+    rt_tab["hatcher_background_fresh_mode"] = str(mode or "")
+    rt_tab["hatcher_background_fresh_timeout_due"] = False
+    return timeout
+
+
+def clear_hatcher_background_fresh_wait(rt_tab):
+    if not isinstance(rt_tab, dict):
+        return
+    for key, value in (
+        ("hatcher_background_fresh_opened_at", 0),
+        ("hatcher_background_fresh_until", 0),
+        ("hatcher_background_fresh_reason", ""),
+        ("hatcher_background_fresh_mode", ""),
+        ("hatcher_background_fresh_timeout_due", False),
+    ):
+        rt_tab[key] = value
+
+
+def hatcher_background_fresh_wait_status(tab, rt_tab, state, cfg):
+    """Verify only the NOMO-owned post-open fresh-state generation.
+
+    V4.81.108 intentionally does not use Home/Shell UI heuristics here.
+    A clean valid state newer than the exact NOMO open ends the incident.
+    If no such state appears for 5m, the dedicated combined recovery may run.
+    """
+    try:
+        opened_at = int(rt_tab.get("hatcher_background_fresh_opened_at", 0) or 0)
+        deadline = int(rt_tab.get("hatcher_background_fresh_until", 0) or 0)
+    except Exception:
+        opened_at = 0
+        deadline = 0
+
+    if opened_at <= 0 or deadline <= 0:
+        return {
+            "active": False, "timed_out": False, "verified": False,
+            "elapsed": 0, "remaining": 0, "generation": 0,
+        }
+
+    elapsed = max(0, now() - opened_at)
+
+    if (
+        state
+        and hatcher_state_timestamp_valid(state)
+        and int(state.get("ts", 0) or 0) >= opened_at - 2
+        and state_is_clean_fresh(state, cfg)
+    ):
+        state_ts = int(state.get("ts", 0) or 0)
+        clear_hatcher_background_fresh_wait(rt_tab)
+        rt_tab["hatcher_background_fresh_timeout_generation"] = 0
+        rt_tab["hatcher_background_fresh_timeout_due"] = False
+        core_finish_rejoin(
+            rt_tab,
+            verified=True,
+            note="fresh state (background)",
+            state_ts=state_ts,
+        )
+        last_log = int(rt_tab.get("hatcher_background_fresh_verified_at", 0) or 0)
+        if last_log <= 0 or now() - last_log > 5:
+            log_activity(
+                "fresh state confirmed in background",
+                str((tab or {}).get("package") or ""),
+                GREEN,
+            )
+        rt_tab["hatcher_background_fresh_verified_at"] = now()
+        return {
+            "active": False, "timed_out": False, "verified": True,
+            "elapsed": elapsed, "remaining": 0, "generation": opened_at,
+        }
+
+    remaining = deadline - now()
+    if remaining > 0:
+        return {
+            "active": True, "timed_out": False, "verified": False,
+            "elapsed": elapsed, "remaining": remaining, "generation": opened_at,
+        }
+
+    rt_tab["hatcher_background_fresh_timeout_generation"] = opened_at
+    clear_hatcher_background_fresh_wait(rt_tab)
+    rt_tab["hatcher_background_fresh_timeout_due"] = True
+    rt_tab["hatcher_background_fresh_timeout_at"] = now()
+    rt_tab["hatcher_background_fresh_timeout_elapsed"] = elapsed
+    return {
+        "active": False, "timed_out": True, "verified": False,
+        "elapsed": elapsed, "remaining": 0, "generation": opened_at,
+    }
+
+
 def state_is_fresh(state, cfg, seconds=None):
     if not state:
         return False
@@ -12537,6 +13646,17 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
     if clear_obsolete_age_access_hold(rt_tab, pkg):
         log_activity("obsolete V4.81.61 age/access hold cleared", pkg, GREEN)
 
+    # V4.81.71 migration/self-heal: older builds could persist a screenshot-only
+    # Face Lock in runtime.json and then suppress the whole pool for hours.
+    if clear_visual_face_lock_false_positive(
+        rt_tab, pkg, "stale visual Face Lock cleared; exact text/API required"
+    ):
+        log_activity(
+            "stale generic/visual face-lock latch cleared; recovery allowed",
+            pkg,
+            GREEN,
+        )
+
     if process_status is None:
         if raw_alive is None:
             process_status, process_note = package_alive_status(pkg, cfg)
@@ -12588,6 +13708,63 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
             rt_tab["android_disconnect_candidate_at"] = 0
             rt_tab["android_disconnect_candidate_count"] = 0
 
+    # V4.81.69: a current high-confidence kick/disconnect is not an auth screen.
+    # Suppress screenshot-only Face Lock/CAPTCHA heuristics for that package and
+    # self-heal only a previously latched *visual-origin* Face Lock. Strong
+    # Account-Locked text/API evidence is checked below and may still override.
+    non_auth_disconnect = None
+    if raw_alive and state_disconnect_ui(state):
+        code = str((state or {}).get("disconnect_code", "") or "").strip()
+        if code != "529":
+            non_auth_disconnect = {
+                "code": code,
+                "text": str((state or {}).get("disconnect_text", "") or ""),
+                "reason": str((state or {}).get("disconnect_reason", "") or "state_disconnect"),
+            }
+
+            # V4.81.77: a real Face Lock/Ban may later surface as a generic
+            # HTTP/267/etc. client failure. Before we allow that screen to become
+            # Kicked, run the authenticated package-local moderation guard.
+            # Throttle this synchronous safety check so a persistent popup does
+            # not stall every dashboard cycle.
+            last_disconnect_mod = int(
+                rt_tab.get("disconnect_moderation_last_check", 0) or 0
+            )
+            if (
+                cfg.get("api_precheck_not_approved_enabled", True)
+                and now() - last_disconnect_mod >= 60
+            ):
+                rt_tab["disconnect_moderation_last_check"] = now()
+                moderation_blocked, moderation_note = direct_moderation_guard_before_open(
+                    tab,
+                    rt_tab,
+                    cfg,
+                    "disconnect classify before Kicked",
+                )
+                if moderation_blocked:
+                    kind = (
+                        "face_lock"
+                        if str(rt_tab.get("moderation_guard_last_status") or "") == "face_lock"
+                        else "account_banned"
+                    )
+                    return _moderation_health_result(
+                        tab,
+                        rt_tab,
+                        state,
+                        err,
+                        raw_alive,
+                        {
+                            "kind": kind,
+                            "status": "Face Lock" if kind == "face_lock" else "Banned",
+                            "note": moderation_note or rt_tab.get("note"),
+                        },
+                    )
+
+            clear_visual_face_lock_confirmation(pkg)
+            clear_visual_captcha_confirmation(pkg)
+            if clear_visual_face_lock_for_disconnect(rt_tab, pkg, non_auth_disconnect):
+                log_activity("disconnect UI cleared false visual face-lock hold", pkg, GREEN)
+
     # V4.29: both visual blockers are checked only before a clean/fresh game
     # heartbeat newer than the current open generation exists. This produces no
     # screenshot/uiautomator overhead during normal Online sessions.
@@ -12595,6 +13772,23 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
         state_is_clean_fresh(state, cfg)
         and not state_is_old_after_open(state, rt_tab)
     )
+
+    # V4.81.77: moderation API is no longer only a recovery/open-boundary check.
+    # While an ALIVE clone is unhealthy/loading, poll a package-local background
+    # Not Approved check without blocking the dashboard.
+    if raw_alive and not loading_online_proof:
+        loading_mod = poll_loading_moderation_job(pkg, rt_tab, cfg)
+        if loading_mod is not None:
+            return _moderation_health_result(
+                tab, rt_tab, state, err, raw_alive, loading_mod
+            )
+        if start_loading_moderation_job(tab, cfg, rt_tab):
+            log_activity(
+                "loading/no-fresh -> moderation API check started (package-only)",
+                pkg,
+                CYAN,
+            )
+
     face_lock_loading_only = bool(cfg.get("face_lock_visual_loading_only", True))
     face_lock_scan_eligible = bool(raw_alive) and (
         (not face_lock_loading_only) or (not loading_online_proof)
@@ -12625,12 +13819,21 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
         }
 
     text_face = account_ui if account_ui and account_ui.get("kind") == "face_lock" else None
-    face_lock = text_face or (visual_face_lock_detail(pkg, cfg, force=False) if face_lock_scan_eligible else None)
-    if face_lock:
+    visual_face = (
+        visual_face_lock_detail(pkg, cfg, force=False)
+        if face_lock_scan_eligible and not non_auth_disconnect
+        else None
+    )
+
+    # V4.81.71: exact Account Locked text is authoritative. Screenshot geometry
+    # alone is only a diagnostic candidate because normal loading/hourglass
+    # overlays have repeatedly matched the old detector.
+    if text_face:
         first_hit = not bool(rt_tab.get("face_lock_detected"))
-        detail = str(face_lock.get("text", "") or "account locked")
+        detail = str(text_face.get("text", "") or "account locked")
         rt_tab["face_lock_detected"] = True
         rt_tab["face_lock_detail"] = detail
+        rt_tab["face_lock_evidence_source"] = "exact_account_locked_ui"
         rt_tab["face_lock_last_seen_at"] = now()
         if not int(rt_tab.get("face_lock_detected_at", 0) or 0):
             rt_tab["face_lock_detected_at"] = now()
@@ -12647,7 +13850,7 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
             if first_hit:
                 set_hold(pkg, "face_lock", retry_seconds)
                 log_activity(
-                    f"FACE LOCK detected; package held, retry in {format_age(retry_seconds)}",
+                    f"FACE LOCK source=exact_account_locked_ui; package held, retry in {format_age(retry_seconds)}",
                     pkg,
                     RED,
                 )
@@ -12659,24 +13862,51 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
             "age": state_age_seconds(state) if state else "-",
             "status": "Face Lock", "note": "account locked; manual verification",
             "bad": "face_lock", "visible_window": True,
-            "face_lock_detail": face_lock,
+            "face_lock_detail": text_face,
         }
+
+    if visual_face:
+        rt_tab["visual_face_lock_candidate_detail"] = str(
+            visual_face.get("text")
+            or visual_face.get("reason")
+            or "visual candidate"
+        )
+        rt_tab["visual_face_lock_candidate_last_seen_at"] = now()
+        last_log = int(rt_tab.get("visual_face_lock_candidate_last_log", 0) or 0)
+        if last_log <= 0 or now() - last_log >= 60:
+            rt_tab["visual_face_lock_candidate_last_log"] = now()
+            log_activity(
+                "visual Face Lock candidate ignored; exact text/API proof required",
+                pkg,
+                YELLOW,
+            )
 
     # V4.81.62: age/access banner is informational in this client and must not
     # create a hold or suppress normal join/recovery.
 
-    # V4.29: visual CAPTCHA uses the same Loading-only gate and shared raw frame
-    # as face lock. Once the package has a clean post-open heartbeat, clear stale
-    # screenshot confirmations and perform no more visual/accessibility checks.
+    # V4.81.83: exact package-scoped verification text outranks even a clean
+    # heartbeat. A Security/Start Puzzle modal can coexist with a live Lua state.
+    exact_captcha_ui = (
+        android_exact_login_challenge_text_detail(pkg, cfg, force=False)
+        if raw_alive and not non_auth_disconnect
+        else None
+    )
+
+    # Screenshot/geometry CAPTCHA remains Loading-only. This preserves the
+    # false-positive protection we added for normal Grow Offline/hourglass UI.
     captcha_loading_only = bool(cfg.get("captcha_visual_loading_only", True))
     captcha_scan_eligible = bool(raw_alive) and (
         (not captcha_loading_only) or (not loading_online_proof)
     )
     if not captcha_scan_eligible:
         clear_visual_captcha_confirmation(pkg)
-    captcha_ui = android_login_challenge_ui_detail(
-        pkg, cfg, force=False, auth_hint=_runtime_auth_hint(rt_tab)
-    ) if captcha_scan_eligible else None
+
+    captcha_ui = exact_captcha_ui
+    if captcha_ui is None and captcha_scan_eligible and not non_auth_disconnect:
+        captcha_ui = android_login_challenge_ui_detail(
+            pkg, cfg, force=False, auth_hint=_runtime_auth_hint(rt_tab)
+        )
+
     if captcha_ui:
         detail = ",".join(captcha_ui.get("hits", []) or []) or "verification UI"
         rt_tab["captcha_ui_visible"] = True
@@ -12688,7 +13918,12 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
             "pets": int(state.get("pet_count", 0) or 0) if state else "-",
             "eggs": int(state.get("egg_total", 0) or 0) if state else "-",
             "age": state_age_seconds(state) if state else "-",
-            "status": "Captcha", "note": "verification UI detected",
+            "status": "Captcha",
+            "note": (
+                "verification UI detected (exact text)"
+                if str((captcha_ui or {}).get("evidence_source") or "") == "exact_option16_text"
+                else "verification UI detected"
+            ),
             "bad": "ui_challenge", "visible_window": True,
             "ui_challenge_detail": captcha_ui,
         }
@@ -12724,6 +13959,11 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
         }
 
     if clean_fresh:
+        # A new healthy session closes the loading-moderation incident. A later
+        # independent loading incident may receive an immediate API check.
+        rt_tab["loading_moderation_last_started_at"] = 0
+        rt_tab["disconnect_moderation_last_check"] = 0
+
         # A genuinely healthy heartbeat starts a new disconnect-recovery cycle.
         # Do not let an old popup cooldown delay a later, unrelated Error 288.
         rt_tab["disconnect_ui_since"] = 0
@@ -12737,10 +13977,28 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
         visible_window, visible_note = package_visible_window(pkg, cfg)
 
     visible_home = None
+    stale_home_probe = False
+    if mode == "hatcher" and raw_alive and not clean_fresh:
+        try:
+            stale_home_age = int(state_age_seconds(state)) if state else 999999
+        except Exception:
+            stale_home_age = 999999
+        stale_home_probe = bool(
+            state is None
+            or stale_home_age >= max(
+                60,
+                int(cfg.get("state_stale_seconds", 180) or 180),
+            )
+        )
+
     if (
         mode == "hatcher"
         and raw_alive
-        and hatcher_visible_home_watch_active(rt_tab, cfg)
+        and not cfg.get("hatcher_surgical_stable_policy", False)
+        and (
+            hatcher_visible_home_watch_active(rt_tab, cfg)
+            or stale_home_probe
+        )
     ):
         visible_home = android_roblox_home_ui_detail(pkg, cfg, force=False)
         if visible_home:
@@ -12863,7 +14121,18 @@ def maybe_queue_solver_busy_retry(open_queue, tab, target, rt_tab, cfg, health, 
         removed = core.cancel(pkg)
         if removed:
             core.save()
-        return "Waiting", f"solver {retry_reason}; retry provider in {format_age(left)} (no reopen)", True
+        detail = str(rt_tab.get("solver_last_provider_temp_error") or "")
+        if retry_reason in {"SOLVER_UNAVAILABLE", "PROVIDER_TEMP_ERROR"} and detail:
+            note = (
+                f"solver {retry_reason}; retry in {format_age(left)}: "
+                + cut(detail, 62)
+            )
+        else:
+            note = (
+                f"solver {retry_reason}; retry provider in "
+                f"{format_age(left)} (no reopen)"
+            )
+        return "Waiting", note, True
 
     if solver_job_running(pkg):
         return "Solving", solver_job_note(pkg), True
@@ -12949,7 +14218,17 @@ def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, he
     if busy_pending and busy_at > now():
         left = max(1, busy_at - now())
         reason = str(rt_tab.get("solver_retry_reason") or "PROVIDER")
-        note = f"verification UI; {reason} retry provider in {format_age(left)} (no reopen)"
+        detail = str(rt_tab.get("solver_last_provider_temp_error") or "")
+        if reason in {"SOLVER_UNAVAILABLE", "PROVIDER_TEMP_ERROR"} and detail:
+            note = (
+                f"verification UI; {reason} retry in {format_age(left)}: "
+                + cut(detail, 60)
+            )
+        else:
+            note = (
+                f"verification UI; {reason} retry provider in "
+                f"{format_age(left)} (no reopen)"
+            )
         rt_tab["note"] = note
         core.save()
         return "Captcha", note, True
@@ -12975,15 +14254,161 @@ def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, he
     )
     status, note = core.handle_detected_solver_challenge(tab, rt_tab, detail)
     rt_tab["note"] = note
+
+    if status != "Solving":
+        # Provider disabled/cooldown/unavailable/cookie issue: keep THIS package
+        # in-place, but do not hammer the provider or hide the actual reason.
+        retry_seconds = max(
+            600,
+            int(cfg.get("solver_failure_retry_seconds", 600) or 600),
+        )
+        rt_tab["captcha_ui_retry_at"] = max(
+            int(rt_tab.get("captcha_ui_retry_at", 0) or 0),
+            now() + retry_seconds,
+        )
+
     core.save()
     log_activity(
         "verification UI; solver provider started in-place (no package reopen)"
         if status == "Solving"
-        else "verification UI held in-place; no package reopen",
+        else (
+            "verification UI solver not started: "
+            + cut(note or "unknown solver reason", 100)
+            + f"; package held {format_age(max(1, int(rt_tab.get('captcha_ui_retry_at', now()) or now()) - now()))}"
+        ),
         pkg,
         CYAN if status == "Solving" else YELLOW,
     )
     return status, note, True
+
+
+def market_strong_healthy_proof(tab, cfg):
+    """High-confidence proof that a queued Market recovery is obsolete.
+
+    A fresh state timestamp alone is NOT enough. Require both the current Trade
+    World state and the Market loader's current-job MARKET_RUNNING heartbeat.
+    """
+    pkg = str((tab or {}).get("package") or "")
+    user = str((tab or {}).get("user_name") or pkg)
+
+    process_status, process_note = package_alive_status(pkg, cfg, fresh=True)
+    if process_status != "ALIVE":
+        return False, f"process={process_status}: {cut(process_note, 55)}"
+
+    state, err = read_state(tab)
+    if not state:
+        return False, "no state"
+
+    if not state_timestamp_valid(state):
+        return False, "invalid state timestamp"
+
+    if not state_is_clean_fresh(state, cfg):
+        return False, f"state not clean/fresh age={format_age(state_age_seconds(state))}"
+
+    place_id = str(state.get("place_id") or "").strip()
+    if place_id != "129954712878723":
+        return False, f"place={place_id or '?'} not Trade World"
+
+    job_id = str(state.get("job_id") or "").strip()
+    if not job_id:
+        return False, "current Market JobId missing"
+
+    marker = market_runtime_for_username(user)
+    if not isinstance(marker, dict):
+        return False, "Market runtime marker missing"
+
+    stage = str(marker.get("stage") or "").strip().upper()
+    marker_job = str(marker.get("job_id") or marker.get("jobId") or "").strip()
+    try:
+        marker_age = int(marker.get("age", 999999) or 999999)
+    except Exception:
+        marker_age = 999999
+    max_age = max(
+        60,
+        int(cfg.get("market_strong_heal_runtime_max_age_seconds", 120) or 120),
+    )
+
+    if stage != "MARKET_RUNNING":
+        return False, f"runtime stage={stage or '?'}"
+    if marker_job != job_id:
+        return False, "runtime JobId does not match current state"
+    if marker_age > max_age:
+        return False, f"MARKET_RUNNING marker stale {format_age(marker_age)}"
+
+    return True, (
+        f"clean Trade World + MARKET_RUNNING same JobId "
+        f"(marker {format_age(marker_age)} old)"
+    )
+
+
+def market_combined_stuck_enabled(cfg, mode="market", target="market"):
+    return bool(
+        str(mode or "").lower() == "market"
+        and str(target or "").lower() == "market"
+        and cfg.get("market_combined_stuck_recovery_enabled", True)
+    )
+
+
+def market_combined_stuck_metadata(cfg, age_or_seconds=0, reason=""):
+    enabled = bool(cfg.get("market_combined_stuck_recovery_enabled", True))
+    return {
+        "combined_stuck_recovery": enabled,
+        "market_combined_stuck_recovery": enabled,
+        "combined_stuck_refresh_private_link": False,
+        "combined_stuck_clear_cache": bool(
+            enabled and cfg.get("market_combined_stuck_clear_cache", True)
+        ),
+        # V4.81.99: once Market has crossed the 5-minute stuck threshold this
+        # recovery is committed. A generic fresh state.json timestamp is not
+        # enough to cancel it while queued; the visible Trade World loader can
+        # coexist with stale/old Lua writers.
+        "bypass_recheck": bool(enabled),
+        "always_recheck_health": False,
+        "market_stuck_committed": bool(enabled),
+        # The cache repair itself is the single recovery attempt. Do not append
+        # the legacy route -> hard fallback chain if fresh state is still late.
+        "no_hard_fallback": True,
+        "market_stuck_age": int(age_or_seconds or 0),
+        "market_stuck_reason": str(reason or "market stuck"),
+    }
+
+
+def market_combined_stuck_cooldown_left(rt_tab, cfg):
+    try:
+        last_success = int(rt_tab.get("market_combined_stuck_last", 0) or 0)
+    except Exception:
+        last_success = 0
+    try:
+        last_failed = int(rt_tab.get("market_combined_stuck_failed_at", 0) or 0)
+    except Exception:
+        last_failed = 0
+
+    last = max(last_success, last_failed)
+    if last <= 0:
+        return 0
+
+    # V4.81.100/101: unsuccessful recovery/cache attempts retry after the shorter
+    # failed-retry interval. Fresh healthy Market state clears both timestamps.
+    try:
+        configured = int(
+            cfg.get("market_combined_stuck_cooldown_seconds", 900) or 900
+        )
+    except Exception:
+        configured = 900
+    try:
+        failed_retry = int(
+            cfg.get("market_combined_failed_retry_seconds", 300) or 300
+        )
+    except Exception:
+        failed_retry = 300
+
+    if last_failed >= last_success and last_failed > 0:
+        effective = max(300, failed_retry)
+    else:
+        effective = max(300, min(max(300, configured), max(300, failed_retry)))
+
+    return max(0, effective - max(0, now() - last))
+
 
 def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=None, mode="market", core=None):
     """SHARED rejoin engine for both Market and Hatcher."""
@@ -13011,6 +14436,15 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
     if busy_action is not None:
         return busy_action
 
+    # V4.81.75: restore the old 3m post-open CAPTCHA probe after Market fresh
+    # verification became backgrounded. This is solver-only and is deliberately
+    # evaluated before any peer-auth/destructive recovery gate.
+    stuck_solver = maybe_start_background_stuck_solver_probe(
+        tab, target, cfg, rt, rt_tab, health, core
+    )
+    if stuck_solver is not None:
+        return stuck_solver[0], stuck_solver[1], True
+
     if not cfg.get("rejoin_if_crash", True):
         if not cfg.get("alive_old_state_rejoin_in_safe_mode", True):
             return health.get("status", ""), "SAFEMODE-off " + str(health.get("note", "")), False
@@ -13019,15 +14453,54 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
     max_valid = int(cfg.get("alive_old_state_max_valid_seconds", 86400) or 86400)
     stale_limit = int(cfg.get("state_stale_seconds", 180) or 180)
     grace = int(cfg.get("post_open_grace_seconds", 360) or 360)
+    market_combined = market_combined_stuck_enabled(cfg, mode, target)
+    if market_combined:
+        trigger = max(300, int(cfg.get("market_combined_stuck_recovery_seconds", 300) or 300))
+        # A configured global post-open grace must not postpone the requested
+        # Market 5m stuck decision beyond the Market-specific threshold.
+        grace = min(grace, trigger)
 
-    # --- join/login challenge: solve current live challenge in-place ---
+    # --- package-local auth/moderation holds outrank EVERY recovery queue ---
+    if bad == "face_lock":
+        removed = core.cancel(pkg)
+        rt_tab["note"] = (
+            rt_tab.get("note")
+            or "FACE LOCK HOLD - package-local; recovery cancelled"
+        )
+        if removed:
+            log_activity(
+                f"Face Lock cancelled {removed} queued recovery item(s) for this package",
+                pkg,
+                RED,
+            )
+        core.save()
+        return "Face Lock", rt_tab["note"], True
+
     if bad == "account_banned":
         removed = core.cancel(pkg)
         rt_tab["note"] = rt_tab.get("note") or "ACCOUNT BANNED / TERMINATED - held"
         if removed:
-            core.save()
+            log_activity(
+                f"ban/moderation hold cancelled {removed} queued recovery item(s) for this package",
+                pkg,
+                RED,
+            )
+        core.save()
         return "Banned", rt_tab["note"], True
 
+    if bad == "manual" and manual_login_blocked(rt_tab, cfg, pkg):
+        removed = core.cancel(pkg)
+        rt_tab["note"] = rt_tab.get("note") or "manual auth hold; recovery cancelled"
+        if removed:
+            log_activity(
+                f"manual auth hold cancelled {removed} queued recovery item(s) for this package",
+                pkg,
+                YELLOW,
+            )
+        core.save()
+        return "Manual", rt_tab["note"], True
+
+    # --- join/login challenge: solve current live challenge in-place ---
     if bad == "challenge" or (state and state_login_challenge_detail(state)):
         if alive:
             removed = core.cancel(pkg)
@@ -13047,26 +14520,72 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
         removed = core.cancel(pkg)
         if removed:
             log_activity("visible Roblox Home cancelled pending hard recovery", pkg, YELLOW)
-        interval = max(15, int(cfg.get("hatcher_visible_home_route_retry_seconds", 30) or 30))
+        interval = max(
+            5,
+            int(cfg.get("hatcher_visible_home_route_retry_seconds", 10) or 10),
+        )
         last = int(rt_tab.get("hatcher_visible_home_route_last", 0) or 0)
         if last > 0 and now() - last < interval:
             left = max(1, interval - (now() - last))
             rt_tab["note"] = f"Roblox Home visible; route retry in {left}s"
             core.save()
             return "Home", rt_tab["note"], True
+
+        attempts = int(rt_tab.get("hatcher_visible_home_route_attempts", 0) or 0)
+        use_protocol_nudge = attempts >= 1
+
         meta = {
             "bypass_recheck": True,
             "skip_solver_probe": True,
             "no_hard_fallback": True,
             "visible_home_route_retry": True,
+            "visible_home_protocol_nudge": bool(use_protocol_nudge),
         }
+        reason = (
+            "visible Roblox Home; explicit protocol VIEW nudge"
+            if use_protocol_nudge
+            else "visible Roblox Home; first soft Hatcher route"
+        )
         added, _ = core.queue_route_retry(
-            tab, target, "visible Roblox Home; Hatcher route retry", metadata=meta, bypass_manual=False
+            tab,
+            target,
+            reason,
+            metadata=meta,
+            bypass_manual=False,
         )
         rt_tab["hatcher_visible_home_route_last"] = now()
-        rt_tab["note"] = "Roblox Home visible; route retry queued" if added else "Roblox Home visible; route retry already queued"
+        if added:
+            rt_tab["hatcher_visible_home_route_attempts"] = attempts + 1
+
+        if use_protocol_nudge:
+            rt_tab["note"] = (
+                "Roblox Home visible; protocol VIEW nudge queued"
+                if added
+                else "Roblox Home visible; protocol nudge already queued"
+            )
+            if added:
+                log_activity(
+                    "Roblox Home persists -> exact-package protocol VIEW nudge queued; "
+                    "no PID-stop/no hard fallback",
+                    pkg,
+                    CYAN,
+                )
+        else:
+            rt_tab["note"] = (
+                "Roblox Home visible; first SOFT Hatcher route queued"
+                if added
+                else "Roblox Home visible; route already queued"
+            )
+            if added:
+                log_activity(
+                    "Roblox Home visible -> first SOFT Hatcher route queued; "
+                    "no PID-stop/no hard fallback",
+                    pkg,
+                    CYAN,
+                )
+
         core.save()
-        return ("Queued" if added else "Home"), rt_tab["note"], True
+        return ("Waking" if added else "Home"), rt_tab["note"], True
 
     # V4.81.40: Error 773 is commonly emitted while Market's own
     # TeleportToListing / low-player hop is in progress or has just failed. If
@@ -13141,19 +14660,34 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
     if state:
         age = state_age_seconds(state)
 
-        # V3.79: PHANTOM AGE GUARD (mirror of the hatcher path).
-        # A missing `ts` field makes age compute to an impossible value like 277h.
-        # Never drive a kill+open off that — ignore it and trust the live package
-        # check instead. Checked BEFORE grace/trigger so a garbage age can't force
-        # a rejoin under any branch. This is the exact guard the market path was
-        # missing while the hatcher had it.
-        if max_valid > 0 and age > max_valid:
+        # V4.81.67: Market mirrors the Hatcher valid-ts rule. A real Unix
+        # timestamp remains authoritative even at 24h/146h/etc.; only the old
+        # missing/broken-ts sentinel is invalid. Other shared modes keep the
+        # historical max-age guard.
+        if market_combined:
+            if age >= trigger and not state_timestamp_valid(state):
+                rt_tab["market_no_state_since"] = 0
+                return ("Ingame" if alive else "Stale"), \
+                       "invalid state timestamp ignored", False
+        elif max_valid > 0 and age > max_valid:
             return ("Ingame" if alive else "Stale"), \
                    f"invalid old state ignored {format_age(age)}", False
+
+        if market_combined:
+            rt_tab["market_last_state_seen_at"] = now()
+            rt_tab["market_no_state_since"] = 0
 
         # fresh -> healthy, skip
         if age <= stale_limit and state_is_clean(state):
             clear_disconnect_ui_incident(rt_tab)
+            if market_combined:
+                rt_tab["market_combined_stuck_last"] = 0
+                rt_tab["market_combined_stuck_last_age"] = 0
+                rt_tab["market_combined_stuck_last_reason"] = ""
+                rt_tab["market_combined_stuck_failed_at"] = 0
+                rt_tab["market_combined_stuck_failed_reason"] = ""
+                rt_tab["market_background_fresh_opened_at"] = 0
+                rt_tab["market_background_fresh_until"] = 0
             return ("Ingame" if alive else "Loading"), "ok", False
 
         # old state but still loading (inside our grace window) -> wait
@@ -13175,6 +14709,18 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
                         core.cancel(pkg)
                         core.save()
                         return "Manual", own_note or rt_tab.get("note") or "auth/moderation hold", True
+
+                    if market_combined:
+                        # V4.81.68: do not turn a real Market 5m cache recovery
+                        # into a sticky route-only generation while peer auth/solver
+                        # protection is active. Wait, then take the cache-recovery turn.
+                        pending = _queue_latest_for_package(open_queue, pkg)
+                        if pending and pending.get("peer_auth_safe_route_only"):
+                            core.cancel(pkg)
+                        rt_tab["peer_auth_safe_route_last"] = 0
+                        rt_tab["note"] = f"peer auth {short_pkg(peer_pkg)}; Market cache recovery waiting"
+                        core.save()
+                        return "Waiting", rt_tab["note"], True
 
                     interval = max(30, int(cfg.get("noka_peer_auth_safe_route_retry_seconds", 45) or 45))
                     last_peer_route = int(rt_tab.get("peer_auth_safe_route_last", 0) or 0)
@@ -13199,12 +14745,25 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
                     )
                     core.save()
                     return ("Queued" if added else "Waiting"), rt_tab["note"], True
+            recovery_meta = None
+            if market_combined:
+                cooldown_left = market_combined_stuck_cooldown_left(rt_tab, cfg)
+                if cooldown_left > 0:
+                    return "Waiting", f"Market failed-retry cooldown {format_age(cooldown_left)}", True
+                recovery_meta = market_combined_stuck_metadata(
+                    cfg, age, f"market valid-ts stale {format_age(age)}"
+                )
             added, _ = core.queue_alive_old_state_recovery(
                 tab,
                 target,
                 f"{mode} alive old state {format_age(age)}",
+                metadata=recovery_meta,
             )
             if added:
+                if market_combined:
+                    return "Queued", (
+                        f"Market 5m stuck -> COMMITTED cache restart ({format_age(age)})"
+                    ), True
                 return "Queued", f"old {format_age(age)} kill+open", True
             status, note = core.queue_display(pkg, "Queued", "already queued")
             return status, note, True
@@ -13214,7 +14773,24 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
 
     # --- no state at all ---
     if alive:
-        if in_grace:
+        if market_combined:
+            try:
+                no_state_since = int(rt_tab.get("market_no_state_since", 0) or 0)
+            except Exception:
+                no_state_since = 0
+            if no_state_since <= 0:
+                # Prefer the latest known local proof that this package had a
+                # state/open. This avoids instant recovery when state only just
+                # disappeared, while a freshly opened stuck clone still reaches
+                # the decision at the requested 5m mark.
+                last_seen = int(rt_tab.get("market_last_state_seen_at", 0) or 0)
+                baseline = max(int(last_open or 0), last_seen)
+                no_state_since = baseline if baseline > 0 else now()
+                rt_tab["market_no_state_since"] = no_state_since
+            no_state_for = max(0, now() - no_state_since)
+            if no_state_for < trigger:
+                return "Loading", f"Market no-state {format_age(no_state_for)}/{format_age(trigger)}", True
+        elif in_grace:
             return "Loading", "no state grace", True
         if _is_noka_clone_package(pkg):
             peer_pkg, peer_reason = active_noka_auth_incident(cfg, rt, exclude_pkg=pkg)
@@ -13226,6 +14802,16 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
                     core.cancel(pkg)
                     core.save()
                     return "Manual", own_note or rt_tab.get("note") or "auth/moderation hold", True
+
+                if market_combined:
+                    # V4.81.68: same rule for Market ALIVE/no-state incidents.
+                    pending = _queue_latest_for_package(open_queue, pkg)
+                    if pending and pending.get("peer_auth_safe_route_only"):
+                        core.cancel(pkg)
+                    rt_tab["peer_auth_safe_route_last"] = 0
+                    rt_tab["note"] = f"peer auth {short_pkg(peer_pkg)}; Market cache recovery waiting"
+                    core.save()
+                    return "Waiting", rt_tab["note"], True
 
                 interval = max(30, int(cfg.get("noka_peer_auth_safe_route_retry_seconds", 45) or 45))
                 last_peer_route = int(rt_tab.get("peer_auth_safe_route_last", 0) or 0)
@@ -13250,12 +14836,24 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
                 )
                 core.save()
                 return ("Queued" if added else "Waiting"), rt_tab["note"], True
+        recovery_meta = None
+        if market_combined:
+            cooldown_left = market_combined_stuck_cooldown_left(rt_tab, cfg)
+            if cooldown_left > 0:
+                return "Waiting", f"Market failed-retry cooldown {format_age(cooldown_left)}", True
+            recovery_meta = market_combined_stuck_metadata(
+                cfg, max(trigger, int(now() - int(rt_tab.get("market_no_state_since", now()) or now()))),
+                "market no-state 5m",
+            )
         added, _ = core.queue_alive_no_state_recovery(
             tab,
             target,
             f"{mode} alive no-state hard",
+            metadata=recovery_meta,
         )
         if added:
+            if market_combined:
+                return "Queued", "Market 5m no-state -> COMMITTED cache restart", True
             return "Queued", "no-state kill+open", True
         status, note = core.queue_display(pkg, "Queued", "already queued")
         return status, note, True
@@ -13547,7 +15145,15 @@ def roblox_cookie_not_approved_api_detection(cookie, expected_user_id=None, cfg=
             restriction_duration = restriction.get("durationSeconds")
 
             if restriction_source == 5 and restriction_status == 2:
-                bits = ["api account locked / face lock", "restriction source=5 status=2"]
+                # V4.81.76: restore the authenticated restriction signature as
+                # authoritative Face Lock evidence. This request is made with the
+                # selected package's own fresh .ROBLOSECURITY cookie, so it is
+                # package-local and independent from screenshot/App-Cloner UI
+                # aliasing that caused the earlier pool-wide false detections.
+                bits = [
+                    "api face lock",
+                    "restriction source=5 status=2",
+                ]
                 if restriction_start:
                     bits.append("start=" + restriction_start)
                 if restriction_end:
@@ -13592,6 +15198,224 @@ def roblox_cookie_not_approved_api_detection(cookie, expected_user_id=None, cfg=
 
 
 
+
+_LOADING_MODERATION_LOCK = threading.Lock()
+_LOADING_MODERATION_JOBS = {}
+
+
+def _loading_moderation_worker(package, cfg_snapshot):
+    """Network-only worker. Runtime mutation stays on the dashboard thread."""
+    pkg = str(package or "")
+    result = {
+        "done": True,
+        "hit": None,
+        "detail": "",
+        "cookie_source": "",
+        "finished_at": now(),
+    }
+    try:
+        cookie, cookie_source, cookie_note = solver_cookie_for_package(pkg, cfg_snapshot)
+        cookie = str(cookie or "").strip()
+        result["cookie_source"] = str(cookie_source or "")
+        if not cookie:
+            result["detail"] = "loading moderation: no package cookie"
+        else:
+            expected_user_id = ""
+            try:
+                cache = load_cookie_cache()
+                ent = cache.get(pkg) if isinstance(cache, dict) else {}
+                if isinstance(ent, dict):
+                    expected_user_id = str(
+                        ent.get("user_id") or ent.get("userID") or ""
+                    ).strip()
+            except Exception:
+                expected_user_id = ""
+
+            if not expected_user_id:
+                try:
+                    info = get_roblox_user_info(cookie) or {}
+                    expected_user_id = str(
+                        info.get("userID") or info.get("id") or ""
+                    ).strip()
+                except Exception:
+                    expected_user_id = ""
+
+            hit, detail, _payload = roblox_cookie_not_approved_api_detection(
+                cookie, expected_user_id, cfg_snapshot
+            )
+            result["hit"] = hit
+            result["detail"] = str(detail or "")
+    except Exception as exc:
+        result["hit"] = None
+        result["detail"] = "loading moderation unavailable: " + cut(exc, 100)
+
+    result["finished_at"] = now()
+    with _LOADING_MODERATION_LOCK:
+        job = _LOADING_MODERATION_JOBS.get(pkg)
+        if job is not None:
+            job.update(result)
+
+
+def start_loading_moderation_job(tab, cfg, rt_tab):
+    """Start one nonblocking API moderation check for an unhealthy ALIVE clone."""
+    if not cfg.get("api_precheck_not_approved_enabled", True):
+        return False
+
+    pkg = str((tab or {}).get("package") or "")
+    if not pkg:
+        return False
+
+    interval = max(
+        60,
+        int(cfg.get("api_loading_moderation_interval_seconds", 300) or 300),
+    )
+    last_started = int(rt_tab.get("loading_moderation_last_started_at", 0) or 0)
+
+    with _LOADING_MODERATION_LOCK:
+        existing = _LOADING_MODERATION_JOBS.get(pkg)
+        if existing and not existing.get("done"):
+            return False
+        if existing and existing.get("done"):
+            # Let the dashboard consume the completed result first.
+            return False
+
+        if last_started > 0 and now() - last_started < interval:
+            return False
+
+        _LOADING_MODERATION_JOBS[pkg] = {
+            "done": False,
+            "hit": None,
+            "detail": "",
+            "started_at": now(),
+        }
+        rt_tab["loading_moderation_last_started_at"] = now()
+
+    thread = threading.Thread(
+        target=_loading_moderation_worker,
+        args=(pkg, dict(cfg or {})),
+        name="nomo-loading-moderation-" + short_pkg(pkg),
+        daemon=True,
+    )
+    thread.start()
+    return True
+
+
+def poll_loading_moderation_job(pkg, rt_tab, cfg):
+    """Consume a completed background moderation result on the main thread."""
+    pkg = str(pkg or "")
+    if not pkg:
+        return None
+
+    with _LOADING_MODERATION_LOCK:
+        job = _LOADING_MODERATION_JOBS.get(pkg)
+        if not job or not job.get("done"):
+            return None
+        result = dict(job)
+        del _LOADING_MODERATION_JOBS[pkg]
+
+    hit = result.get("hit")
+    detail = str(result.get("detail") or "")
+    detail_l = detail.lower()
+    rt_tab["moderation_guard_last_check"] = int(result.get("finished_at", now()) or now())
+    rt_tab["moderation_guard_cookie_source"] = str(result.get("cookie_source") or "")
+    rt_tab["moderation_guard_last_detail"] = cut(detail, 220)
+
+    if hit is not True:
+        rt_tab["moderation_guard_last_status"] = "unknown" if hit is None else "clear"
+        return None
+
+    retry_seconds = max(
+        600, int(cfg.get("manual_auth_retry_seconds", 3600) or 3600)
+    )
+    is_face_lock = bool(
+        "api face lock" in detail_l
+        or "restriction source=5 status=2" in detail_l
+        or "explicit account locked" in detail_l
+        or "account locked" in detail_l
+        or "unlock your account" in detail_l
+        or "suspicious activity" in detail_l
+    )
+
+    if is_face_lock:
+        rt_tab["moderation_guard_last_status"] = "face_lock"
+        rt_tab["face_lock_detected"] = True
+        rt_tab["face_lock_detail"] = detail or "api face lock"
+        rt_tab["face_lock_evidence_source"] = (
+            "api_restriction_5_2"
+            if "restriction source=5 status=2" in detail_l
+            else "api_explicit_lock_text"
+        )
+        rt_tab["face_lock_last_seen_at"] = now()
+        if not int(rt_tab.get("face_lock_detected_at", 0) or 0):
+            rt_tab["face_lock_detected_at"] = now()
+        mark_manual_login_block(
+            rt_tab,
+            "face_lock",
+            detail or "api account locked / face lock",
+            "FACE LOCK HOLD - loading moderation API",
+            int(rt_tab.get("face_lock_detected_at", now()) or now()),
+            retry_seconds,
+        )
+        set_hold(pkg, "face_lock", retry_seconds)
+        rt_tab["note"] = "FACE LOCK HOLD - loading moderation API"
+        log_activity(
+            "loading moderation API = FACE LOCK; package held (no recovery)",
+            pkg,
+            RED,
+        )
+        return {
+            "kind": "face_lock",
+            "status": "Face Lock",
+            "note": rt_tab["note"],
+        }
+
+    rt_tab["moderation_guard_last_status"] = "moderated"
+    mark_manual_login_block(
+        rt_tab,
+        "account_banned",
+        detail or "api user moderated/banned",
+        "ACCOUNT BANNED / MODERATED - loading API",
+        now(),
+        retry_seconds,
+    )
+    set_hold(pkg, "account_banned", retry_seconds)
+    rt_tab["note"] = "ACCOUNT BANNED / MODERATED - loading API"
+    log_activity(
+        "loading moderation API = restricted/banned; package held (no recovery)",
+        pkg,
+        RED,
+    )
+    return {
+        "kind": "account_banned",
+        "status": "Banned",
+        "note": rt_tab["note"],
+    }
+
+
+def _moderation_health_result(tab, rt_tab, state, err, raw_alive, result):
+    """Build a normal health row from a package-local API moderation hit."""
+    kind = str((result or {}).get("kind") or "account_banned")
+    status = str((result or {}).get("status") or (
+        "Face Lock" if kind == "face_lock" else "Banned"
+    ))
+    return {
+        "pkg": tab.get("package"),
+        "user": tab.get("user_name", tab.get("package")),
+        "alive": bool(raw_alive),
+        "state": state,
+        "state_err": err,
+        "fresh": False,
+        "clean_fresh": False,
+        "pets": int(state.get("pet_count", 0) or 0) if state else "-",
+        "eggs": int(state.get("egg_total", 0) or 0) if state else "-",
+        "age": state_age_seconds(state) if state else "-",
+        "status": status,
+        "note": str((result or {}).get("note") or rt_tab.get("note") or status),
+        "bad": kind,
+        "visible_window": True,
+    }
+
+
 def direct_moderation_guard_before_open(tab, rt_tab, cfg, reason="queued open"):
     """Run the direct Roblox Not Approved moderation check before ANY open intent.
 
@@ -13607,6 +15431,13 @@ def direct_moderation_guard_before_open(tab, rt_tab, cfg, reason="queued open"):
     pkg = str((tab or {}).get("package", "") or "").strip()
     if not pkg:
         return False, "direct moderation guard no package"
+
+    # V4.81.71: clear only old screenshot-origin Face Lock before the
+    # authoritative Roblox moderation API gets a chance to classify the package.
+    if clear_visual_face_lock_false_positive(
+        rt_tab, pkg, "visual Face Lock cleared before moderation API"
+    ):
+        log_activity("visual-only face-lock cleared before moderation API", pkg, GREEN)
 
     if manual_login_blocked(rt_tab, cfg, pkg) and _runtime_auth_hint(rt_tab):
         return True, str(rt_tab.get("note") or "existing auth/moderation hold")
@@ -13649,21 +15480,26 @@ def direct_moderation_guard_before_open(tab, rt_tab, cfg, reason="queued open"):
         return False, detail
 
     retry_seconds = max(600, int(cfg.get("manual_auth_retry_seconds", 3600) or 3600))
-    restriction = payload.get("restriction") if isinstance(payload, dict) else None
-    is_face_lock = "account locked" in detail_l or "face lock" in detail_l
-    if isinstance(restriction, dict):
-        try:
-            is_face_lock = is_face_lock or (
-                int(restriction.get("source")) == 5
-                and int(restriction.get("moderationStatus")) == 2
-            )
-        except Exception:
-            pass
+    # V4.81.76: the authenticated source=5/status=2 signature is again
+    # authoritative Face Lock evidence for this exact package.
+    is_face_lock = bool(
+        "api face lock" in detail_l
+        or "restriction source=5 status=2" in detail_l
+        or "explicit account locked" in detail_l
+        or "account locked" in detail_l
+        or "unlock your account" in detail_l
+        or "suspicious activity" in detail_l
+    )
 
     if is_face_lock:
         rt_tab["moderation_guard_last_status"] = "face_lock"
         rt_tab["face_lock_detected"] = True
-        rt_tab["face_lock_detail"] = detail or "api account locked / face lock"
+        rt_tab["face_lock_detail"] = detail or "api face lock"
+        rt_tab["face_lock_evidence_source"] = (
+            "api_restriction_5_2"
+            if "restriction source=5 status=2" in detail_l
+            else "api_explicit_lock_text"
+        )
         rt_tab["face_lock_last_seen_at"] = now()
         if not int(rt_tab.get("face_lock_detected_at", 0) or 0):
             rt_tab["face_lock_detected_at"] = now()
@@ -13941,19 +15777,16 @@ def android_ui_text_for_package(pkg, cfg, force=False):
 
 
 def android_ui_text_for_package_or_rect(pkg, cfg, force=False):
-    """Package text with a saved-rectangle fallback for App Cloner package aliasing.
+    """Return clone-isolated Android text.
 
-    The fallback never consumes unscoped global text: only accessibility nodes whose
-    center point is physically inside this package's exact Option 16 rectangle are
-    added. This is the same isolation rule used by the Home detector.
+    V4.81.74: when Option 16 has a valid saved rectangle, that rectangle is the
+    authoritative clone boundary. App Cloner/uiautomator can report sibling or
+    shared Roblox package names, so package-name text must not be unioned with
+    another cell's modal.
     """
     pkg = str(pkg or "")
     snapshot = capture_android_ui_snapshot(cfg, force=force)
     by_pkg = snapshot.get("by_pkg", {}) if isinstance(snapshot, dict) else {}
-    values = []
-    for node_pkg, node_values in (by_pkg or {}).items():
-        if node_pkg == pkg or node_pkg.startswith(pkg + ":"):
-            values.extend(node_values if isinstance(node_values, list) else [str(node_values)])
 
     rect = _loading_visual_rect_for_package(pkg, cfg)
     if rect and isinstance(snapshot, dict):
@@ -13962,12 +15795,13 @@ def android_ui_text_for_package_or_rect(pkg, cfg, force=False):
         except Exception:
             rx1 = ry1 = rx2 = ry2 = 0
         if rx2 > rx1 and ry2 > ry1:
+            rect_values = []
             for node in snapshot.get("text_nodes", []) or []:
                 if not isinstance(node, dict):
                     continue
                 bounds = node.get("bounds")
-                text = str(node.get("text", "") or "").strip()
-                if not text or not isinstance(bounds, (list, tuple)) or len(bounds) != 4:
+                node_text = str(node.get("text", "") or "").strip()
+                if not node_text or not isinstance(bounds, (list, tuple)) or len(bounds) != 4:
                     continue
                 try:
                     x1, y1, x2, y2 = (int(v) for v in bounds)
@@ -13976,8 +15810,16 @@ def android_ui_text_for_package_or_rect(pkg, cfg, force=False):
                 cx = (x1 + x2) / 2.0
                 cy = (y1 + y2) / 2.0
                 if rx1 <= cx <= rx2 and ry1 <= cy <= ry2:
-                    values.append(text)
+                    rect_values.append(node_text)
 
+            # Valid saved rectangle => never fall back to alias-prone package
+            # text for this sensitive auth/disconnect classification.
+            return list(dict.fromkeys(rect_values)), str(snapshot.get("error", "") or "")
+
+    values = []
+    for node_pkg, node_values in (by_pkg or {}).items():
+        if node_pkg == pkg or node_pkg.startswith(pkg + ":"):
+            values.extend(node_values if isinstance(node_values, list) else [str(node_values)])
     values = list(dict.fromkeys(str(v or "").strip() for v in values if str(v or "").strip()))
     return values, str(snapshot.get("error", "") or "")
 
@@ -14055,15 +15897,20 @@ def android_roblox_home_ui_detail(pkg, cfg, force=False, required=False):
     age_gate = "access to popular games has changed" in joined
     recommended = "recommended for you" in joined
 
-    # Require Search + Home and a substantial navigation cluster, or one of the
-    # distinctive Home-only cards seen on the clone shell.  This avoids treating
-    # arbitrary in-game text or a single green/white icon as Roblox Home.
-    if not (search_hit and home_hit):
+    # V4.81.95: current Roblox Home does not always expose Search as text.
+    # Home + a strong left-navigation cluster is enough and remains scoped to
+    # this package / exact Option16 rectangle.
+    if not home_hit:
         return None
-    if len(nav_hits) < 3 and not age_gate and not recommended:
+    if (
+        len(nav_hits) < 3
+        and not (search_hit and len(nav_hits) >= 1)
+        and not age_gate
+        and not recommended
+    ):
         return None
 
-    hits = ["search", "home"] + nav_hits[:5]
+    hits = (["search"] if search_hit else []) + ["home"] + nav_hits[:5]
     if age_gate:
         hits.append("age-gate card")
     if recommended:
@@ -14144,6 +15991,160 @@ def android_disconnect_ui_detail(pkg, cfg):
         "hits": hits[:5],
     }
 
+
+
+def current_non_auth_disconnect_ui_detail(pkg, cfg, force=False):
+    """Return a current strong disconnect that is not the 529 auth wrapper.
+
+    A normal Roblox kick/disconnect modal (267/288/524/etc.) is an in-session
+    failure. It must outrank screenshot-only CAPTCHA/Face-Lock heuristics, while
+    exact Account-Locked text/API evidence is still checked separately.
+    """
+    if force:
+        try:
+            capture_android_ui_snapshot(cfg, force=True)
+        except Exception:
+            pass
+    detail = android_disconnect_ui_detail(str(pkg or ""), cfg)
+    if not detail:
+        return None
+    code = str(detail.get("code", "") or "").strip()
+    if code == "529":
+        return None
+    return detail
+
+
+def _authoritative_face_lock_runtime(rt_tab):
+    """True only when persisted runtime retains explicit Face Lock evidence.
+
+    V4.81.73 deliberately does NOT trust moderation_guard_last_status=face_lock
+    by itself because older builds wrote that status from source=5/status=2
+    numerics. Require an explicit evidence source or exact lock wording.
+    """
+    if not isinstance(rt_tab, dict):
+        return False
+
+    source = str(rt_tab.get("face_lock_evidence_source", "") or "").strip().lower()
+    if source in (
+        "exact_account_locked_ui",
+        "api_explicit_lock_text",
+        "api_restriction_5_2",
+        "manual_confirmed",
+    ):
+        return True
+
+    detail = " ".join(str(rt_tab.get(k, "") or "") for k in (
+        "face_lock_detail",
+        "manual_login_detail",
+        "moderation_guard_last_detail",
+        "note",
+    )).lower()
+
+    # Exclude the legacy numeric-only API phrase first.
+    numeric_only = (
+        "restriction source=5 status=2" in detail
+        and source != "api_restriction_5_2"
+        and not any(term in detail for term in (
+            "suspicious activity",
+            "unlock your account",
+            "confirming that you're a human",
+            "confirming that you are a human",
+        ))
+    )
+    if numeric_only:
+        return False
+
+    exact_ui_like = (
+        "account locked" in detail
+        and any(term in detail for term in (
+            "suspicious activity",
+            "unlock your account",
+            "confirming that you're a human",
+            "confirming that you are a human",
+            "continue",
+        ))
+    )
+    api_explicit = "moderation api explicit account locked" in detail
+    return bool(exact_ui_like or api_explicit)
+
+def _visual_face_lock_runtime_only(rt_tab):
+    """True for any persisted Face Lock state lacking authoritative proof.
+
+    Name kept for compatibility with the V4.81.69/.71 self-heal call sites.
+    V4.81.72 intentionally includes generic legacy `face_lock` latches whose
+    original visual marker was lost from runtime.json.
+    """
+    if not isinstance(rt_tab, dict):
+        return False
+
+    reason = str(rt_tab.get("manual_login_reason", "") or "").strip().lower()
+    detail = " ".join(str(rt_tab.get(k, "") or "") for k in (
+        "face_lock_detail", "manual_login_detail",
+    )).lower()
+
+    has_face_state = bool(
+        rt_tab.get("face_lock_detected")
+        or reason in ("face_lock", "face lock")
+        or str(rt_tab.get("moderation_guard_last_status", "") or "").strip().lower() == "face_lock"
+        or "face_lock" in detail
+        or "face lock" in detail
+        or "visual panel=" in detail
+        or "android_package_scoped_visual_face_lock" in detail
+    )
+    if not has_face_state:
+        return False
+
+    return not _authoritative_face_lock_runtime(rt_tab)
+
+def clear_visual_face_lock_false_positive(rt_tab, pkg, why="visual Face Lock is advisory only"):
+    """Clear only a persisted screenshot-origin Face Lock latch/hold."""
+    if not _visual_face_lock_runtime_only(rt_tab):
+        return False
+    old_detail = str(
+        rt_tab.get("face_lock_detail")
+        or rt_tab.get("manual_login_detail")
+        or ""
+    )
+    if str(rt_tab.get("manual_login_reason", "") or "").strip().lower() == "face_lock":
+        clear_manual_login_block(rt_tab)
+    else:
+        clear_face_lock_runtime(rt_tab)
+    try:
+        clear_hold(pkg)
+    except Exception:
+        pass
+    try:
+        clear_visual_face_lock_confirmation(pkg)
+    except Exception:
+        pass
+    if str(rt_tab.get("moderation_guard_last_status", "") or "").strip().lower() == "face_lock":
+        rt_tab["moderation_guard_last_status"] = "unknown"
+    rt_tab["face_lock_evidence_source"] = ""
+    rt_tab["visual_face_lock_candidate_detail"] = old_detail
+    rt_tab["visual_face_lock_candidate_cleared_at"] = now()
+    rt_tab["note"] = str(why or "non-authoritative Face Lock ignored")
+    return True
+
+
+def clear_visual_face_lock_for_disconnect(rt_tab, pkg, disconnect_detail=None):
+    """Remove only a screenshot-origin Face Lock when a real disconnect is visible."""
+    if not _visual_face_lock_runtime_only(rt_tab):
+        return False
+    if str(rt_tab.get("manual_login_reason", "") or "").strip().lower() == "face_lock":
+        clear_manual_login_block(rt_tab)
+    else:
+        clear_face_lock_runtime(rt_tab)
+    try:
+        clear_hold(pkg)
+    except Exception:
+        pass
+    try:
+        clear_visual_face_lock_confirmation(pkg)
+    except Exception:
+        pass
+    code = str((disconnect_detail or {}).get("code", "") or "").strip()
+    rt_tab["note"] = "disconnect UI overrides false visual face-lock" + (f" ({code})" if code else "")
+    return True
 
 
 _LOADING_VISUAL_FRAME_CACHE = {
@@ -14778,42 +16779,20 @@ def visual_join_error_detail(pkg, cfg, force=False, bypass_confirm=False):
 
 
 def _auth_incident_runtime_reason(rt_tab, cfg):
-    if not isinstance(rt_tab, dict):
-        return ""
-    recent = max(120, int(cfg.get("noka_peer_auth_recent_seconds", 900) or 900))
-    reason = " ".join(str(rt_tab.get(k, "") or "") for k in (
-        "manual_login_reason", "manual_login_detail", "captcha_ui_detail", "face_lock_detail",
-    )).lower()
-    if bool(rt_tab.get("face_lock_detected")):
-        return "face lock"
-    if any(term in reason for term in (
-        "account locked", "face_lock", "face lock", "529", "captcha", "verification",
-        "account_banned", "account banned", "terminated", "moderated",
-    )):
-        return cut(reason, 70)
-    if bool(rt_tab.get("captcha_ui_visible")):
-        seen = int(rt_tab.get("captcha_ui_last_seen_at", 0) or 0)
-        if seen <= 0 or now() - seen <= recent:
-            return "verification UI"
+    """V4.81.83: auth/challenge state is package-local, never a sibling blocker."""
     return ""
 
 
+
 def active_noka_auth_incident(cfg, rt, exclude_pkg=""):
-    """Return (package, reason) for any active Noka auth blocker in this pool."""
-    if not cfg.get("noka_peer_auth_hard_suppression_enabled", True):
-        return "", ""
-    exclude_pkg = str(exclude_pkg or "")
-    for tab in (cfg or {}).get("tabs", []):
-        pkg = str((tab or {}).get("package", "") or "")
-        if not pkg or pkg == exclude_pkg or not _is_noka_clone_package(pkg):
-            continue
-        rt_tab = get_runtime_tab(rt, pkg)
-        reason = _auth_incident_runtime_reason(rt_tab, cfg)
-        if reason:
-            return pkg, reason
-        if solver_job_running(pkg):
-            return pkg, "solver/auth job running"
+    """Compatibility no-op: auth/CAPTCHA/solver holds are package-local.
+
+    Each target package is rechecked independently before destructive recovery.
+    A Face Lock, CAPTCHA, 529, ban, or running solver on one clone never blocks
+    another clone's queue.
+    """
     return "", ""
+
 
 
 def join_error_529_auth_detail(
@@ -14883,6 +16862,80 @@ def join_error_529_auth_detail(
     }
 
 
+
+def android_exact_login_challenge_text_detail(pkg, cfg, force=False):
+    """High-confidence package-scoped CAPTCHA/529 from exact UI text only.
+
+    V4.81.83: this detector is allowed even when Lua state is clean/fresh.
+    It never uses screenshot geometry, unscoped global text, or color heuristics.
+    With an Option-16 rectangle, android_ui_text_for_package_or_rect() already
+    isolates nodes to that exact clone cell.
+    """
+    if not cfg.get("captcha_ui_override_enabled", True):
+        return None
+    if not cfg.get("login_challenge_ui_detection_enabled", True):
+        return None
+
+    texts, _ = android_ui_text_for_package_or_rect(
+        str(pkg or ""),
+        cfg,
+        force=force,
+    )
+    if not texts:
+        return None
+
+    auth_529 = join_error_529_auth_detail(texts, cfg)
+    if auth_529:
+        auth_529 = dict(auth_529)
+        auth_529["evidence_source"] = "exact_option16_text"
+        return auth_529
+
+    joined = "\n".join(
+        str(value)
+        for value in texts
+        if str(value or "").strip()
+    )
+    low = joined.lower()
+
+    strong_terms = [
+        "verifying you're not a bot",
+        "verifying you are not a bot",
+        "please solve this challenge so we know you are a real person",
+        "please solve this challenge",
+        "start puzzle",
+        "solve this puzzle",
+        "solve this challenge",
+        "complete the challenge",
+        "human verification",
+        "prove you are human",
+        "arkose",
+        "fun captcha",
+    ]
+    hits = [term for term in strong_terms if term in low]
+
+    if not hits and "verification" in low and "real person" in low:
+        hits = ["verification + real person"]
+
+    if (
+        not hits
+        and "not a bot" in low
+        and ("verification" in low or "security" in low)
+    ):
+        hits = ["not a bot"]
+
+    if not hits:
+        return None
+
+    return {
+        "title": "Roblox Verification",
+        "text": joined,
+        "reason": "android_package_scoped_exact_captcha_text",
+        "hits": hits[:5],
+        "evidence_source": "exact_option16_text",
+        "visual_only": False,
+    }
+
+
 def android_login_challenge_ui_detail(
     pkg,
     cfg,
@@ -14901,7 +16954,14 @@ def android_login_challenge_ui_detail(
     ):
         return None
 
-    # Keep the low-overhead visual CAPTCHA detector first.
+    # V4.81.83: exact Option-16 accessibility text is stronger than visual
+    # geometry and remains valid even with screenshot-only visual mode enabled.
+    exact = android_exact_login_challenge_text_detail(pkg, cfg, force=force)
+    if exact:
+        return exact
+
+    # Visual CAPTCHA remains a fallback and is still gated by the caller's
+    # Loading-only policy.
     visual = visual_captcha_detail(
         pkg,
         cfg,
@@ -14911,19 +16971,11 @@ def android_login_challenge_ui_detail(
     if visual:
         return visual
 
-    # Join Error 529 is a native package-scoped popup. Check it even when
-    # screenshot-only CAPTCHA mode is enabled.
     texts, _ = android_ui_text_for_package_or_rect(
         str(pkg or ""),
         cfg,
         force=force,
     )
-    auth_529 = join_error_529_auth_detail(
-        texts,
-        cfg,
-    )
-    if auth_529:
-        return auth_529
 
     # V4.81.54: exact text remains preferred. If App Cloner hides that text, a
     # strict Join Error visual may stand in for 529 only when this exact package
@@ -15960,6 +18012,46 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
     item_mode = str(item.get("mode", "hard") or "hard").lower()
     is_hard = item_mode not in ("soft", "route", "switch", "reuse_task")
 
+    if target == "hatcher" and cfg.get("hatcher_surgical_stable_policy", False):
+        legacy_hatcher_experiment = bool(
+            item.get("bubble_only_recovery")
+            or item.get("bubble_only_soft_wake")
+            or item.get("visible_home_route_retry")
+            or item.get("visible_home_protocol_nudge")
+            or item.get("peer_safe_alive_soft_downgrade")
+            or (
+                item.get("hatcher_old_state_recovery")
+                and not item.get("hatcher_post_open_5m_recovery")
+            )
+        )
+        if legacy_hatcher_experiment:
+            rt_tab["note"] = "legacy Hatcher experimental queue item dropped"
+            log_activity(
+                "legacy Home/Shell/old-state Hatcher queue item DROPPED by stable policy",
+                pkg,
+                GREEN,
+            )
+            core.save()
+            return True
+
+    # V4.81.90: last-second App Cloner sibling guard for bubble-only recovery.
+    # Drop the queued action instead of requeueing it; the watchdog will keep
+    # displaying the package-local shell hold while peers remain alive.
+    if item.get("bubble_only_recovery"):
+        peer_hold, peer_note = hatcher_bubble_only_live_sibling_guard(pkg, cfg)
+        if peer_hold:
+            rt_tab["note"] = "bubble-only held; " + str(peer_note or "")
+            rt_tab["bubble_only_peer_hold"] = True
+            rt_tab["bubble_only_peer_hold_note"] = str(peer_note or "")
+            log_activity(
+                "queued bubble-only recovery CANCELLED; "
+                + cut(peer_note, 90),
+                pkg,
+                YELLOW,
+            )
+            core.save()
+            return True
+
     # V4.81.59: MODERATION FIRST. This is deliberately before Option 6's
     # legacy API bypass, solver/provider work, staggering, PID guards, and the
     # Android route/open itself. Strong direct Not Approved proof must stop the
@@ -15978,6 +18070,17 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
             )
         core.save()
         return True
+
+    # V4.81.69: before a persisted auth hint can discard this HARD item, check
+    # whether it was created by the screenshot Face-Lock heuristic while the
+    # package is actually showing a strong non-529 kick/disconnect popup.
+    queue_non_auth_disconnect = None
+    if is_hard and _runtime_auth_hint(rt_tab) and _visual_face_lock_runtime_only(rt_tab):
+        queue_non_auth_disconnect = current_non_auth_disconnect_ui_detail(pkg, cfg, force=True)
+        if queue_non_auth_disconnect and clear_visual_face_lock_for_disconnect(
+            rt_tab, pkg, queue_non_auth_disconnect
+        ):
+            log_activity("queued recovery: disconnect cleared false visual face-lock before auth gate", pkg, GREEN)
 
     # V4.81.56: strong auth evidence outranks bypass_manual/recovery_must_open_once.
     # An old hard item that predates Account Locked/529 must die here, before
@@ -16052,9 +18155,144 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
             core.save()
             return True
 
-    # V4.81.54: if another Noka clone is in CAPTCHA/529/face-lock/banned state,
-    # never execute a destructive hard action against an ALIVE sibling. App Cloner
-    # can collapse sibling floating tasks even when exact-PID signaling is correct.
+    # V4.81.100: a Market item may have waited in FIFO after the original 5m
+    # stuck observation. Cancel it only on STRONG proof that this exact account is
+    # now genuinely running Market in the current JobId. Fresh ts alone is not proof.
+    if (
+        is_hard
+        and target == "market"
+        and item.get("market_combined_stuck_recovery")
+        and process_status == "ALIVE"
+    ):
+        strong_ok, strong_note = market_strong_healthy_proof(tab, cfg)
+        if strong_ok:
+            rt_tab["note"] = "Market healthy - queued recovery cancelled"
+            rt_tab["market_combined_stuck_last"] = 0
+            rt_tab["market_combined_stuck_last_age"] = 0
+            rt_tab["market_combined_stuck_last_reason"] = ""
+            rt_tab["market_combined_stuck_failed_at"] = 0
+            rt_tab["market_combined_stuck_failed_reason"] = ""
+            rt_tab["market_background_fresh_opened_at"] = 0
+            rt_tab["market_background_fresh_until"] = 0
+            log_activity(
+                "Market queued recovery CANCELLED by strong healthy proof: "
+                + cut(strong_note, 95),
+                pkg,
+                GREEN,
+            )
+            core.save()
+            return True
+        else:
+            rt_tab["market_strong_heal_last_reject"] = str(strong_note or "")
+            rt_tab["market_strong_heal_last_reject_at"] = now()
+
+    # V4.81.93: App Cloner safety now applies to EVERY automatic ALIVE Noka
+    # hard generation, not only bubble/Option6/AutoExec special cases.
+    #
+    # The real-device failure sequence was:
+    #   target exact-PID stop -> sibling verification PASS -> target hard am start
+    #   -> a sibling floating clone disappears.
+    #
+    # If the target is still ALIVE, reuse its existing task instead. This avoids
+    # both the destructive PID stop and creation/materialization of a fresh task.
+    if (
+        is_hard
+        and process_status == "ALIVE"
+        and _is_noka_clone_package(pkg)
+        and cfg.get("noka_alive_auto_hard_peer_safe_soft_enabled", True)
+        and automatic_hard_item_can_soft_downgrade(item)
+        and not (
+            target == "hatcher"
+            and cfg.get("hatcher_surgical_stable_policy", False)
+        )
+        and not (
+            target == "market"
+            and item.get("market_combined_stuck_recovery")
+            and item.get("combined_stuck_recovery")
+        )
+    ):
+        has_peer, peer_note, peer_query_ok = noka_live_sibling_detail(pkg, cfg)
+
+        # If peer queries fail, still choose the non-destructive route. We only
+        # need exact peer proof to permit a destructive decision, not a soft one.
+        if has_peer or not peer_query_ok:
+            original_mode = mode
+            item["peer_safe_alive_soft_downgrade"] = True
+            item["peer_safe_original_mode"] = str(original_mode or "")
+            item["peer_safe_peer_note"] = str(peer_note or "")
+            item["no_hard_fallback"] = True
+            item["mode"] = "soft"
+            item["combined_stuck_recovery"] = False
+            item["combined_stuck_clear_cache"] = False
+            item["combined_stuck_refresh_private_link"] = False
+
+            mode = "soft"
+            item_mode = "soft"
+            is_hard = False
+
+            rt_tab["peer_safe_alive_soft_at"] = now()
+            rt_tab["peer_safe_alive_soft_note"] = str(peer_note or "")
+            rt_tab["note"] = "peer-safe soft reuse; " + cut(peer_note, 80)
+            log_activity(
+                "ALIVE hard recovery downgraded -> soft task reuse; "
+                + cut(peer_note, 90)
+                + "; no hard fallback",
+                pkg,
+                YELLOW,
+            )
+            core.save()
+
+    # V4.81.98: Market 5m combined-stuck recovery keeps its cache repair.
+    # With live peers, use exact stop+cache+exact VIEW component instead of
+    # generic hard package launch.
+    if (
+        is_hard
+        and process_status == "ALIVE"
+        and target == "market"
+        and item.get("market_combined_stuck_recovery")
+        and item.get("combined_stuck_recovery")
+        and _is_noka_clone_package(pkg)
+    ):
+        has_peer, peer_note, peer_query_ok = noka_live_sibling_detail(pkg, cfg)
+        if not peer_query_ok:
+            core.requeue_front(item)
+            rt_tab["note"] = "Market cache recovery deferred; sibling PID query unavailable"
+            log_activity(
+                "Market cache recovery deferred; peer safety query unavailable",
+                pkg,
+                YELLOW,
+            )
+            core.save()
+            return True
+        if has_peer:
+            item["market_peer_safe_cache_protocol"] = True
+            item["market_peer_safe_peer_note"] = str(peer_note or "")
+            item["no_hard_fallback"] = True
+            rt_tab["note"] = "Market stuck -> peer-safe cache restart"
+            log_activity(
+                "Market 5m stuck -> exact PID stop + Clear Cache + exact VIEW restart; "
+                + cut(peer_note, 85),
+                pkg,
+                CYAN,
+            )
+            core.save()
+
+    if item.get("market_stuck_committed"):
+        last_commit_log = int(
+            rt_tab.get("market_stuck_committed_execution_log_at", 0) or 0
+        )
+        if now() - last_commit_log >= 10:
+            log_activity(
+                "Market 5m recovery COMMITTED; generic fresh-state healed-cancel bypassed",
+                pkg,
+                CYAN,
+            )
+            rt_tab["market_stuck_committed_execution_log_at"] = now()
+            core.save()
+
+    # V4.81.83: all auth/challenge holds are package-local. The target clone
+    # is rechecked independently; another clone's Face Lock/CAPTCHA/solver cannot
+    # suppress this package's exact-target recovery.
     if (
         is_hard
         and process_status == "ALIVE"
@@ -16113,7 +18351,12 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
     # V3.79: LAST-SECOND HEALTH RECHECK
     # The clone may have recovered while it sat in the queue. Do not force-stop a
     # package that is alive AND writing fresh state right now.
-    if is_hard and cfg.get("recheck_before_hard_open", True) and not item.get("bypass_recheck"):
+    if (
+        is_hard
+        and cfg.get("recheck_before_hard_open", True)
+        and not item.get("bypass_recheck")
+        and not item.get("market_combined_stuck_recovery")
+    ):
         queued_at = int(item.get("queued_at", 0) or 0)
         min_age = (
             0
@@ -16193,18 +18436,35 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
                     return True
                 rt_tab["face_lock_detected"] = True
                 rt_tab["face_lock_detail"] = detail
+                rt_tab["face_lock_evidence_source"] = "exact_account_locked_ui"
                 rt_tab["face_lock_last_seen_at"] = now()
                 if not int(rt_tab.get("face_lock_detected_at", 0) or 0):
                     rt_tab["face_lock_detected_at"] = now()
                 mark_manual_login_block(rt_tab, "face_lock", detail, "account locked; hard recovery blocked", int(rt_tab.get("face_lock_detected_at", now()) or now()), retry_seconds)
                 set_hold(pkg, "face_lock", retry_seconds)
                 rt_tab["note"] = "account locked; hard recovery blocked"
-                log_activity("Account Locked text blocked queued hard recovery before PID stop", pkg, RED)
+                log_activity("FACE LOCK source=exact_account_locked_ui blocked queued hard recovery before PID stop", pkg, RED)
                 core.save()
                 return True
 
-            visible_auth = android_login_challenge_ui_detail(
-                pkg, cfg, force=True, auth_hint=_runtime_auth_hint(rt_tab)
+            # V4.81.69: reuse the exact same accessibility snapshot. A current
+            # 267/288/524/etc. popup blocks screenshot-only auth promotion, but
+            # the explicit Account-Locked text check above still wins.
+            current_disconnect = queue_non_auth_disconnect or current_non_auth_disconnect_ui_detail(
+                pkg, cfg, force=False
+            )
+            if current_disconnect:
+                clear_visual_face_lock_confirmation(pkg)
+                clear_visual_captcha_confirmation(pkg)
+                if clear_visual_face_lock_for_disconnect(rt_tab, pkg, current_disconnect):
+                    log_activity("pre-open disconnect cleared false visual face-lock", pkg, GREEN)
+
+            visible_auth = (
+                android_login_challenge_ui_detail(
+                    pkg, cfg, force=True, auth_hint=_runtime_auth_hint(rt_tab)
+                )
+                if not current_disconnect
+                else None
             )
             if visible_auth:
                 detail = str(
@@ -16229,7 +18489,7 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
                 core.save()
                 return True
 
-            if _runtime_auth_hint(rt_tab):
+            if _runtime_auth_hint(rt_tab) and not current_disconnect:
                 visual_join = visual_join_error_detail(pkg, cfg, force=True, bypass_confirm=True)
                 if visual_join:
                     rt_tab["note"] = "visual Join Error after auth/face-lock; hard recovery blocked"
@@ -16240,35 +18500,31 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
                     core.save()
                     return True
 
-            # The Account-Locked visual detector is deliberately stricter during
-            # normal monitoring (two confirmations). At the destructive boundary,
-            # a raw candidate only defers this hard open; it does not create a
-            # persistent hold until the normal detector confirms it.
-            face_snap = capture_visual_face_lock_snapshot(cfg, force=True)
+            # V4.81.71: direct moderation API + exact Account Locked text have
+            # already run above. A screenshot/color candidate alone cannot block
+            # or defer the exact-target hard recovery.
+            face_snap = (
+                capture_visual_face_lock_snapshot(cfg, force=True)
+                if not current_disconnect
+                else {"raw_candidates": {}}
+            )
             raw_face = bool((face_snap.get("raw_candidates") or {}).get(pkg, False))
-            confirmed_face = visual_face_lock_detail(pkg, cfg, force=False, bypass_confirm=False)
-            if confirmed_face:
-                retry_seconds = max(600, int(cfg.get("manual_auth_retry_seconds", 3600) or 3600))
-                detail = str(confirmed_face.get("text") or "account locked")
-                rt_tab["face_lock_detected"] = True
-                rt_tab["face_lock_detail"] = detail
-                rt_tab["face_lock_last_seen_at"] = now()
-                if not int(rt_tab.get("face_lock_detected_at", 0) or 0):
-                    rt_tab["face_lock_detected_at"] = now()
-                mark_manual_login_block(
-                    rt_tab, "face_lock", detail, "account locked; hard recovery blocked",
-                    int(rt_tab.get("face_lock_detected_at", now()) or now()), retry_seconds,
+            confirmed_face = (
+                visual_face_lock_detail(pkg, cfg, force=False, bypass_confirm=False)
+                if not current_disconnect
+                else None
+            )
+            if confirmed_face or raw_face:
+                candidate = confirmed_face or {}
+                rt_tab["visual_face_lock_candidate_detail"] = str(
+                    candidate.get("text") or "raw visual candidate"
                 )
-                set_hold(pkg, "face_lock", retry_seconds)
-                rt_tab["note"] = "account locked; hard recovery blocked"
-                log_activity("Account Locked blocked queued hard recovery before PID stop", pkg, RED)
-                core.save()
-                return True
-            if raw_face:
-                rt_tab["note"] = "possible Account Locked UI; hard recovery deferred for confirmation"
-                log_activity("possible Account Locked UI; destructive recovery deferred", pkg, YELLOW)
-                core.save()
-                return True
+                rt_tab["visual_face_lock_candidate_last_seen_at"] = now()
+                log_activity(
+                    "visual Face Lock candidate ignored at hard boundary; text/API clear",
+                    pkg,
+                    YELLOW,
+                )
 
     preflight_state, preflight_item = core.solver_preflight_before_open(
         item, tab, rt_tab, pkg, target
@@ -16456,18 +18712,79 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
         log_activity(f"open held by manual verification: {cut(manual_note, 70)}", pkg, YELLOW)
         return False, manual_note
     display_mode = str(mode or "hard")
-    if _alive_recovery_soft_allowed(reason, package_alive(pkg, cfg, fresh=True), cfg):
+    if item.get("market_peer_safe_cache_protocol"):
+        display_mode = "market-cache-protocol"
+    elif item.get("visible_home_protocol_nudge"):
+        display_mode = "home-protocol"
+    elif item.get("bubble_only_soft_wake"):
+        display_mode = "shell-soft-wake"
+    elif item.get("peer_safe_alive_soft_downgrade"):
+        display_mode = "peer-safe-soft"
+    elif _alive_recovery_soft_allowed(reason, package_alive(pkg, cfg, fresh=True), cfg):
         display_mode = "alive-soft-first"
     opening_screen(tab, target, cfg, 1, max(1, len(open_queue) + 1), mode=display_mode)
     rt_tab["note"] = f"opening -> {target}"
     core.save()
 
+    # V4.81.70: runtime.json can survive an update with a Market hard item that
+    # was queued before the combined Clear-Cache metadata existed (or was produced
+    # by the old synchronous homepage/no-state fallback). Upgrade only automatic
+    # Market session-stuck generations here; never convert manual/auth/solver/
+    # disconnect/AutoExec/Exotic actions into cache recovery.
+    if (
+        target == "market"
+        and str(mode or "").lower() not in ("soft", "route", "switch", "reuse_task")
+        and cfg.get("market_combined_stuck_recovery_enabled", True)
+        and not item.get("combined_stuck_recovery")
+        and not any(
+            item.get(k)
+            for k in (
+                "manual_option6",
+                "manual_booster_route",
+                "manual_booster_hard_route",
+                "manual_auth_open",
+                "solver_recovery",
+                "auth_result_recovery",
+                "disconnect_recovery",
+                "market_runtime_recovery",
+                "market_alive_noka_route_only",
+                "exotic_recovery",
+                "exotic_alive_noka_route_only",
+            )
+        )
+    ):
+        _legacy_reason = str(reason or "").lower()
+        if any(
+            token in _legacy_reason
+            for token in (
+                "market alive old state",
+                "market alive no-state",
+                "market alive no state",
+                "homepage/no-state hard retry",
+                "market 5m stuck",
+                "market valid-ts stale",
+            )
+        ):
+            item.update(
+                market_combined_stuck_metadata(
+                    cfg,
+                    int(item.get("market_stuck_age", 0) or 0),
+                    reason,
+                )
+            )
+            item["market_legacy_stuck_upgrade"] = True
+            log_activity(
+                "legacy Market stuck queue upgraded -> forced Clear Cache recovery",
+                pkg,
+                CYAN,
+            )
+
     combined_stuck = bool(
         item.get("combined_stuck_recovery")
-        and target == "hatcher"
+        and target in ("hatcher", "market")
         and str(mode or "").lower() not in ("soft", "route", "switch", "reuse_task")
     )
-    if combined_stuck and item.get("combined_stuck_refresh_private_link"):
+    if combined_stuck and target == "hatcher" and item.get("combined_stuck_refresh_private_link"):
         refresh_ok, refreshed_route, refresh_note, refresh_block = (
             refresh_hatcher_private_route_for_combined_stuck(tab, cfg, rt_tab)
         )
@@ -16491,17 +18808,51 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
         core.save()
 
     log_activity(f"opening -> {target} ({display_mode})", pkg)
-    ok, msg = core.open(
-        tab,
-        rt_tab,
-        target,
-        reason,
-        force=item.get("force", False),
-        mode=mode,
-        force_clear_cache=bool(
-            combined_stuck and item.get("combined_stuck_clear_cache")
-        ),
-    )
+
+    if item.get("market_peer_safe_cache_protocol"):
+        link = core.target_link(tab, target, rt_tab)
+        if not link:
+            ok, msg = False, "Market cache protocol has no target link"
+        else:
+            ok, msg = market_peer_safe_cache_protocol_restart(
+                pkg,
+                link,
+                cfg,
+                rt_tab,
+                reason=reason,
+            )
+            if ok:
+                rt_tab["target"] = target
+                rt_tab["note"] = reason
+    elif item.get("visible_home_protocol_nudge"):
+        link = core.target_link(tab, target, rt_tab)
+        if not link:
+            ok, msg = False, "protocol nudge has no target link"
+        else:
+            ok, msg = open_roblox_protocol_activity_nudge(
+                pkg,
+                link,
+                cfg,
+                rt_tab=rt_tab,
+            )
+            if ok:
+                rt_tab["target"] = target
+                rt_tab["last_open"] = now()
+                rt_tab["last_open_mode"] = "home-protocol"
+                rt_tab["note"] = reason
+    else:
+        ok, msg = core.open(
+            tab,
+            rt_tab,
+            target,
+            reason,
+            force=item.get("force", False),
+            mode=mode,
+            force_clear_cache=bool(
+                combined_stuck and item.get("combined_stuck_clear_cache")
+            ),
+        )
+
     opened_at = int(rt_tab.get("last_open", now()))
 
     if ok and item.get("manual_option6"):
@@ -16517,11 +18868,27 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
         rt_tab["hatcher_alive_old_state_hard_reason"] = str(
             item.get("hatcher_old_state_reason", reason) or reason
         )
+    if ok and item.get("market_combined_stuck_recovery"):
+        # Attempt timestamp only. Fresh clean Market state clears it. If the
+        # restart remains unhealthy, V4.81.100 allows another attempt after the
+        # failed-retry interval instead of stranding it for 15m.
+        rt_tab["market_combined_stuck_last"] = now()
+        rt_tab["market_combined_stuck_last_age"] = int(item.get("market_stuck_age", 0) or 0)
+        rt_tab["market_combined_stuck_last_reason"] = str(
+            item.get("market_stuck_reason", reason) or reason
+        )
+        rt_tab["market_no_state_since"] = 0
     # Record pool-wide hard-open time for the stagger gate.
     if is_hard and ok:
         rt["_last_pool_hard_open"] = now()
     log_activity(f"open {'ok' if ok else 'FAILED'}: {msg}", pkg,
                  GREEN if ok else RED)
+    if (
+        not ok
+        and item.get("market_combined_stuck_recovery")
+        and "forced cache FAILED" in str(msg or "")
+    ):
+        rt_tab["note"] = "Market cache FAILED; retry in 5m"
     core.save()
 
     if ok:
@@ -16536,6 +18903,64 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
             rt_tab.get("last_open_mode", mode)
             or mode
         ).lower()
+
+        background_hatcher_wait = bool(
+            target == "hatcher"
+            and cfg.get("hatcher_background_fresh_wait_enabled", True)
+            and not item.get("manual_option6")
+            and not item.get("manual_booster_route")
+            and not item.get("manual_booster_hard_route")
+            and not item.get("solver_recovery")
+            and not item.get("auth_result_recovery")
+            and not item.get("disconnect_recovery")
+            and not item.get("manual_auth_open")
+            and not item.get("exotic_recovery")
+            and not item.get("market_runtime_recovery")
+        )
+        if background_hatcher_wait:
+            background_timeout = mark_hatcher_background_fresh_wait(
+                rt_tab, opened_at, cfg, reason=reason, mode=actual_open_mode
+            )
+            rt_tab["note"] = "opened; waiting fresh in background"
+            core.finish(rt_tab, verified=False, note="background fresh wait")
+            core.save()
+            log_activity(
+                f"fresh verification backgrounded for {format_age(background_timeout)}; watchdog continues",
+                pkg,
+                CYAN,
+            )
+            return True
+
+        # V4.81.70: the automatic Market combined Clear-Cache generation must
+        # not monopolize the global queue while waiting for fresh state.
+        background_market_wait = bool(
+            target == "market"
+            and combined_stuck
+            and not item.get("manual_option6")
+            and not item.get("manual_booster_route")
+            and not item.get("manual_booster_hard_route")
+            and not item.get("solver_recovery")
+            and not item.get("auth_result_recovery")
+            and not item.get("disconnect_recovery")
+            and not item.get("manual_auth_open")
+            and not item.get("market_runtime_recovery")
+            and not item.get("exotic_recovery")
+        )
+        if background_market_wait:
+            rt_tab["market_background_fresh_opened_at"] = int(opened_at or now())
+            rt_tab["market_background_fresh_until"] = int(opened_at or now()) + max(
+                300,
+                int(cfg.get("market_combined_stuck_recovery_seconds", 300) or 300),
+            )
+            rt_tab["note"] = "opened; Market fresh check backgrounded"
+            core.finish(rt_tab, verified=False, note="Market background fresh wait")
+            core.save()
+            log_activity(
+                "Market fresh verification backgrounded for 5m; queue continues",
+                pkg,
+                CYAN,
+            )
+            return True
 
         if (
             item.get("manual_booster_route")
@@ -17348,6 +19773,9 @@ def _nomo_start_market_rejoin_original(cfg):
                 if health.get("clean_fresh"):
                     clear_manual_login_block(rt_tab)
                     clear_captcha_ui_runtime(rt_tab)
+                    if str(health.get("bad") or "") != "roblox_home":
+                        rt_tab["hatcher_visible_home_route_attempts"] = 0
+                        rt_tab["hatcher_visible_home_route_last"] = 0
                     rt_tab["hatcher_startup_observe_until"] = 0
 
             # -----------------------------------------------------
@@ -17618,7 +20046,48 @@ def _nomo_start_market_rejoin_original(cfg):
             # once, but single-flight still processes only one. Show FIFO position
             # instead of making both look actively reopening.
             qpos = core.position(pkg)
-            if qpos > 0:
+            auth_terminal = str(health.get("bad") or "") in {
+                "face_lock",
+                "account_banned",
+                "manual",
+            } or manual_login_blocked(rt_tab, cfg, pkg)
+
+            # V4.81.82: auth/moderation status outranks FIFO cosmetics. A stale
+            # queue item must never turn FACE LOCK into Waiting/Next on screen.
+            if auth_terminal:
+                if qpos > 0:
+                    removed = core.cancel(pkg)
+                    if removed:
+                        log_activity(
+                            f"auth hold removed {removed} stale Market queue item(s)",
+                            pkg,
+                            RED,
+                        )
+                    qpos = 0
+
+                bad_now = str(health.get("bad") or "")
+                if bad_now == "face_lock":
+                    status = "Face Lock"
+                    note = (
+                        health.get("note")
+                        or rt_tab.get("note")
+                        or "account locked; package held"
+                    )
+                elif bad_now == "account_banned":
+                    status = "Banned"
+                    note = (
+                        health.get("note")
+                        or rt_tab.get("note")
+                        or "account banned/moderated; package held"
+                    )
+                else:
+                    status = "Manual"
+                    note = (
+                        rt_tab.get("manual_login_reason")
+                        or rt_tab.get("note")
+                        or "needs manual login"
+                    )
+            elif qpos > 0:
                 if qpos == 1:
                     status = "Next"
                     if "queued" not in str(note).lower():
@@ -17626,9 +20095,6 @@ def _nomo_start_market_rejoin_original(cfg):
                 else:
                     status = "Waiting"
                     note = f"queue #{qpos}; {note}".strip("; ")
-            elif manual_login_blocked(rt_tab, cfg, pkg):
-                status = "Manual"
-                note = rt_tab.get("manual_login_reason") or rt_tab.get("note") or "needs manual login"
 
             update_clone_session(rt_tab, status, cfg, state)
 
@@ -21257,8 +23723,9 @@ def start_hatcher_reporter(main_cfg=None):
                 old_open_age = (now() - last_open_for_old) if last_open_for_old > 0 else 999999
                 in_old_open_grace = old_open_age < old_after_open_grace
 
-                if alive and old_enabled and age > old_max:
-                    note = f"invalid old state ignored {age}s"
+                state_ts_valid = hatcher_state_timestamp_valid(state)
+                if alive and old_enabled and age >= old_sec and not state_ts_valid:
+                    note = "invalid state timestamp ignored"
                     status = "Online"
                 elif alive and old_enabled and age >= old_sec and in_old_open_grace:
                     left = max(1, old_after_open_grace - old_open_age)
@@ -21350,6 +23817,9 @@ def start_hatcher_reporter(main_cfg=None):
                     note = "periodic hard queued"
 
             status, note = core.queue_display(pkg, status, note)
+            if background_solver_active and solver_job_running(pkg):
+                status = "Solving"
+                note = solver_job_note(pkg)
             if manual_login_blocked(rt_tab, cfg, pkg) and not core.has(pkg):
                 status = "Manual"
                 note = rt_tab.get("manual_login_reason") or rt_tab.get("note") or "needs manual login"
@@ -21808,6 +24278,12 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
     if isinstance(main_cfg, dict):
         cfg.update(main_cfg)
 
+    cfg["hatcher_surgical_stable_policy"] = True
+    cfg["hatcher_background_solver_probe_enabled"] = False
+    cfg["hatcher_post_open_5m_recovery_enabled"] = True
+    cfg["hatcher_alive_old_state_hard_force_enabled"] = False
+    cfg["prewarm_shell_only_clone_before_hard_open"] = False
+
     # Force safe behavior for hatcher mode
     cfg["no_force_stop_alive"] = True
     cfg["alive_open_mode"] = "soft"
@@ -21950,80 +24426,54 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
     else:
         pass
 
-    # Startup: queue every package that truly needs an open, in profile order.
-    # Fresh packages are untouched. A running PID with a state already older than
-    # the configured hard threshold is not treated as healthy: it is queued for
-    # one exact-PID restart immediately. Closed packages are queued normally.
-    if cfg.get("open_all_on_start", True):
-        old_enabled, old_sec, old_max, _old_cd = hatcher_alive_old_state_hard_settings(hcfg, cfg)
-        for tab in tabs:
-            pkg = tab["package"]
-            process_status, process_note = package_alive_status(pkg, cfg, fresh=True)
-            raw_alive = process_status == "ALIVE"
-            state, _state_err = read_state(tab)
-            state_age = int((state or {}).get("age", 999999) or 999999) if state else None
-            fresh_state = bool(
-                state is not None
-                and state_is_clean(state)
-                and state_age <= int(cfg.get("state_stale_seconds", 180) or 180)
-            )
-            rt_tab = get_runtime_tab(rt, pkg)
-            rt_tab["target"] = "hatcher"
+    # V4.81.97: do not perform a second expensive Android/UI recovery scan here.
+    # The normal watchdog loop below owns all recovery decisions and will queue
+    # DEAD/stale/Home/shell packages on its first cycle.  Before that scan, draw a
+    # lightweight state-only screen so Option 1 never appears frozen after cache cleanup.
+    clear()
+    banner("HATCHER: STARTING WATCHDOG", cfg)
+    print(col(
+        "Cache cleanup finished. First live health scan is starting now.",
+        CYAN,
+    ))
+    print(col(
+        "No duplicate startup PID/UI scan; recovery begins in the normal watchdog loop.",
+        DIM,
+    ))
+    print("")
+    startup_rows = []
+    for tab in tabs:
+        pkg = str(tab.get("package") or "")
+        rt_tab = get_runtime_tab(rt, pkg)
+        rt_tab["target"] = "hatcher"
+        state, _err = read_state(tab)
+        username = str(tab.get("user_name") or short_pkg(pkg))
+        pets = "-"
+        eggs = "-"
+        age_text = "no state"
+        if state:
+            detected = _usable_detected_username(state.get("username"))
+            if detected:
+                username = detected
+            pets = str(int(state.get("pet_count", 0) or 0))
+            eggs = str(int(state.get("egg_total", 0) or 0))
+            age_value = int(state.get("age", 999999) or 999999)
+            age_text = format_age(age_value) if age_value < 999999 else "bad ts"
+        rt_tab["note"] = "startup live scan pending"
+        startup_rows.append((username, short_pkg(pkg), pets, eggs, age_text))
 
-            if fresh_state:
-                rt_tab["note"] = "start fresh state"
-                continue
-
-            if process_status == "UNKNOWN":
-                rt_tab["note"] = "start deferred: process check unavailable"
-                log_activity("startup process check unavailable; no reopen queued", pkg, YELLOW)
-                continue
-
-            if raw_alive and state is not None and old_enabled and old_sec <= state_age <= old_max:
-                bubble_only, bubble_note = hatcher_bubble_only_recovery_candidate(
-                    pkg, cfg, process_status=process_status
-                )
-                if bubble_only:
-                    added, qnote = queue_hatcher_bubble_only_recovery(
-                        core, tab, rt_tab, cfg,
-                        f"startup bubble-only shell; old state {state_age}s",
-                    )
-                    rt_tab["note"] = qnote
-                    if added or core.has(pkg):
-                        continue
-
-                # NOMO may have been started while this clone was already in the
-                # Roblox loading screen. Its previous state file remains old until
-                # AutoExec reaches the game, so observe first instead of killing it.
-                startup_stale_grace = max(
-                    120,
-                    int(cfg.get("hatcher_startup_stale_grace_seconds", 240) or 240),
-                )
-                rt_tab["hatcher_startup_observe_until"] = now() + startup_stale_grace
-                rt_tab["last_open"] = now()
-                rt_tab["note"] = f"startup loading grace {startup_stale_grace}s"
-                log_activity(
-                    f"alive with old state; startup grace {format_age(startup_stale_grace)} (no stop)",
-                    pkg, CYAN,
-                )
-                continue
-
-            if raw_alive:
-                # Alive with no usable state yet: allow only the short startup
-                # grace. The normal loop then queues exact-PID no-state recovery.
-                startup_grace = int(cfg.get("hatcher_startup_grace_seconds", 75) or 75)
-                post_grace = int(cfg.get("post_open_grace_seconds", 360) or 360)
-                rt_tab["last_open"] = now() - max(0, post_grace - startup_grace)
-                rt_tab["hatcher_no_state_since"] = now()
-                rt_tab["note"] = f"start alive -> grace {startup_grace}s"
-                continue
-
-            core.queue_start_recovery(
-                tab,
-                "hatcher",
-                "hatcher start",
-            )
-        core.save()
+    for username, spkg, pets, eggs, age_text in startup_rows:
+        print(
+            f"  {spkg:<8} {cut(username, 18):<18} "
+            f"pet={pets:<4} egg={eggs:<4} state={age_text}"
+        )
+    print("")
+    print(col("Scanning live package/UI state...", YELLOW))
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass
+    core.save()
 
     while True:
         if stop_requested():
@@ -22087,6 +24537,20 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
             )
             if transition.get("dead_confirmed"):
                 alive = False
+            background_fresh = hatcher_background_fresh_wait_status(
+                tab, rt_tab, state, cfg
+            )
+
+            # V4.81.75: nonblocking replacement for the solver probe that used
+            # to live inside wait_until_fresh_after_open(). A peer Face Lock does
+            # not suppress this package-local provider check.
+            stuck_solver = maybe_start_background_stuck_solver_probe(
+                tab, "hatcher", cfg, rt, rt_tab, health, core
+            )
+            background_solver_active = bool(
+                stuck_solver is not None or solver_job_running(pkg)
+            )
+
             note = health.get("note") or "ok"
             pets = "-"
             eggs = "-"
@@ -22112,8 +24576,27 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                 # A current kick/disconnect OR verification challenge owns this cycle.
                 # Never stamp/queue old-state recovery while the solver is supposed
                 # to operate on the currently-open package in-place.
-                challenge_active = str(health.get("bad") or "") in {"ui_challenge", "challenge"}
-                recovery_age = 0 if (alive and (state_disconnect_ui(state) or challenge_active)) else age
+                challenge_active = (
+                    str(health.get("bad") or "") in {"ui_challenge", "challenge"}
+                    or background_solver_active
+                )
+                visible_home_active = bool(
+                    alive
+                    and not cfg.get("hatcher_surgical_stable_policy", False)
+                    and str(health.get("bad") or "") == "roblox_home"
+                )
+                recovery_age = (
+                    0
+                    if (
+                        alive
+                        and (
+                            state_disconnect_ui(state)
+                            or challenge_active
+                            or visible_home_active
+                        )
+                    )
+                    else age
+                )
 
                 ready_at = int((prof or {}).get("ready_pet_count", 200))
                 ready_pet = pets >= ready_at
@@ -22121,10 +24604,33 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                     clear_manual_login_block(rt_tab)
                     clear_captcha_ui_runtime(rt_tab)
 
-                problem_code, problem_note = hatcher_teleport_problem(
-                    tab, state, hcfg, cfg
-                )
-                if problem_code:
+                home_route_handled = False
+                if visible_home_active:
+                    home_status, home_note, home_handled = core.apply_rejoin_action(
+                        tab,
+                        "hatcher",
+                        rt_tab,
+                        health,
+                        hcfg=hcfg,
+                        mode="hatcher",
+                    )
+                    if home_handled:
+                        status = home_status
+                        note = home_note
+                        home_route_handled = True
+
+                if home_route_handled:
+                    problem_code, problem_note = None, ""
+                    rt_tab["hatcher_teleport_since"] = 0
+                    rt_tab["hatcher_teleport_problem"] = ""
+                else:
+                    problem_code, problem_note = hatcher_teleport_problem(
+                        tab, state, hcfg, cfg
+                    )
+
+                if home_route_handled:
+                    pass
+                elif problem_code:
                     should_q, wait_note = should_queue_hatcher_teleport_rejoin(rt_tab, hcfg, cfg, problem_code)
                     if should_q and cfg.get("rejoin_if_crash", True):
                         added, _ = core.queue_by_liveness(
@@ -22140,11 +24646,17 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                     else:
                         status = "Wrong server"
                         note = f"{problem_note} {wait_note}".strip()
-                else:
+                elif not home_route_handled:
                     rt_tab["hatcher_teleport_since"] = 0
                     rt_tab["hatcher_teleport_problem"] = ""
 
-                loading_grace = (not problem_code) and alive and in_post_open_grace(rt_tab, cfg) and state_is_old_after_open(state, rt_tab)
+                loading_grace = (
+                    not home_route_handled
+                    and not problem_code
+                    and alive
+                    and in_post_open_grace(rt_tab, cfg)
+                    and state_is_old_after_open(state, rt_tab)
+                )
 
                 # V3.76: 5m old-state hard rule
                 old_enabled, old_sec, old_max, old_cd = hatcher_alive_old_state_hard_settings(hcfg, cfg)
@@ -22171,10 +24683,12 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
 
                 bubble_rescue_handled = False
                 if (
-                    not problem_code
+                    not cfg.get("hatcher_surgical_stable_policy", False)
+                    and not problem_code
                     and alive
                     and old_enabled
-                    and old_sec <= recovery_age <= old_max
+                    and hatcher_state_timestamp_valid(state)
+                    and recovery_age >= old_sec
                     and not challenge_active
                 ):
                     bubble_only, bubble_note = hatcher_bubble_only_recovery_candidate(
@@ -22185,13 +24699,65 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                             core, tab, rt_tab, cfg,
                             f"bubble-only shell; old state {recovery_age}s",
                         )
-                        if added or core.has(pkg):
-                            status = "Queued"
+                        if (
+                            added
+                            or core.has(pkg)
+                            or str(qnote or "").startswith("shell soft-wake retry")
+                            or str(qnote or "").startswith("shell soft wake")
+                        ):
+                            if added or core.has(pkg):
+                                status = "Waking"
+                            else:
+                                status = "Shell"
                             note = qnote
                             bubble_rescue_handled = True
 
-                if problem_code:
+                if home_route_handled:
+                    # Visible package-scoped Roblox Home is authoritative.
+                    # Hidden/stale Lua state and old-state cooldown cannot
+                    # overwrite the Home route status this cycle.
                     pass
+                elif problem_code:
+                    pass
+                elif background_fresh.get("active") and not challenge_active:
+                    status = "Loading"
+                    note = "waiting fresh bg " + format_age(
+                        max(1, int(background_fresh.get("remaining", 0) or 0))
+                    )
+                elif (
+                    background_fresh.get("timed_out")
+                    and alive
+                    and not challenge_active
+                    and cfg.get("hatcher_surgical_stable_policy", False)
+                ):
+                    p_added, p_note, p_action = queue_hatcher_post_open_5m_recovery(
+                        core,
+                        tab,
+                        rt_tab,
+                        cfg,
+                        elapsed=int(background_fresh.get("elapsed", 0) or 0),
+                    )
+                    note = p_note
+                    status = (
+                        "Queued"
+                        if (p_action and (p_added or p_note == "already queued"))
+                        else "Loading"
+                    )
+                elif background_fresh.get("timed_out") and alive and old_enabled and not challenge_active:
+                    timeout_age = max(
+                        old_sec,
+                        int(background_fresh.get("elapsed", 0) or 0),
+                    )
+                    hard_added, hard_note, hard_action = core.queue_hatcher_old_state_hard(
+                        tab, rt_tab, hcfg, timeout_age, "hatcher background fresh timeout"
+                    )
+                    rt_tab["hatcher_background_fresh_timeout_due"] = False
+                    if hard_action:
+                        note = hard_note
+                        status = "Queued" if (hard_added or hard_note == "already queued") else "Stale"
+                    else:
+                        note = hard_note
+                        status = "Stale"
                 elif bubble_rescue_handled:
                     pass
                 elif in_startup_observe and recovery_age >= old_sec:
@@ -22200,9 +24766,14 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                         "startup loading grace "
                         + format_age(max(1, startup_observe_until - now()))
                     )
-                elif alive and old_enabled and recovery_age > old_max:
+                elif (
+                    alive
+                    and old_enabled
+                    and recovery_age >= old_sec
+                    and not hatcher_state_timestamp_valid(state)
+                ):
                     status = "Online"
-                    note = f"invalid old state ignored {age}s"
+                    note = "invalid state timestamp ignored"
                 elif alive and old_enabled and recovery_age >= old_sec and in_old_open_grace:
                     status = "Loading"
                     note = f"old-state open grace {max(1, old_after_open_grace - old_open_age)}s"
@@ -22224,6 +24795,8 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                     note = "loading grace"
                 else:
                     stale = recovery_age > int(cfg.get("state_stale_seconds", 180))
+                    if cfg.get("hatcher_surgical_stable_policy", False) and alive:
+                        stale = False
                     if alive and stale and cfg.get("ignore_alive_stale_state", True):
                         force_stale = stale_reopen_age(cfg)
                         disconnect_stale = should_force_disconnect_rejoin(alive, recovery_age, cfg)
@@ -22250,7 +24823,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                             # FIX V3.78: use `or 180` instead of `or 120` to avoid 0->120 falsy fallback
                             # that made 277h state appear fresh
                             if (recovery_age >= int(cfg.get("hatcher_alive_old_state_hard_force_seconds", 180) or 180)
-                                    and recovery_age <= int(cfg.get("hatcher_alive_old_state_max_valid_seconds", 86400) or 86400)
+                                    and hatcher_state_timestamp_valid(state)
                                     and cfg.get("rejoin_if_crash", True)):
                                 added, hard_note, _ = core.queue_hatcher_old_state_hard(
                                     tab,
@@ -22268,7 +24841,42 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                         status = "Online" if alive else "Offline"
             else:
                 note = f"state {err}"
-                if alive:
+                if alive and background_fresh.get("active"):
+                    status = "Loading"
+                    note = "waiting fresh bg " + format_age(
+                        max(1, int(background_fresh.get("remaining", 0) or 0))
+                    )
+                elif (
+                    alive
+                    and background_fresh.get("timed_out")
+                    and cfg.get("hatcher_surgical_stable_policy", False)
+                ):
+                    p_added, p_note, p_action = queue_hatcher_post_open_5m_recovery(
+                        core,
+                        tab,
+                        rt_tab,
+                        cfg,
+                        elapsed=int(background_fresh.get("elapsed", 0) or 0),
+                    )
+                    note = p_note
+                    status = (
+                        "Queued"
+                        if (p_action and (p_added or p_note == "already queued"))
+                        else "No state"
+                    )
+                elif alive and background_fresh.get("timed_out"):
+                    old_enabled_bg, old_sec_bg, _old_max_bg, _old_cd_bg = hatcher_alive_old_state_hard_settings(hcfg, cfg)
+                    timeout_age = max(
+                        old_sec_bg,
+                        int(background_fresh.get("elapsed", 0) or 0),
+                    )
+                    hard_added, hard_note, hard_action = core.queue_hatcher_old_state_hard(
+                        tab, rt_tab, hcfg, timeout_age, "hatcher background fresh timeout"
+                    )
+                    rt_tab["hatcher_background_fresh_timeout_due"] = False
+                    note = hard_note
+                    status = "Queued" if (hard_action and (hard_added or hard_note == "already queued")) else "No state"
+                elif alive:
                     no_state_since = int(rt_tab.get("hatcher_no_state_since", 0) or 0)
                     if no_state_since <= 0:
                         rt_tab["hatcher_no_state_since"] = now()
@@ -22297,13 +24905,23 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                         if last_no_state_hard > 0 else 0
                     )
 
-                    challenge_active = str(health.get("bad") or "") in {"ui_challenge", "challenge"}
+                    challenge_active = (
+                        str(health.get("bad") or "") in {"ui_challenge", "challenge"}
+                        or background_solver_active
+                    )
                     if challenge_active:
-                        status = "Captcha"
-                        note = "verification UI detected; solver owns package (no reopen)"
+                        status = "Solving" if background_solver_active else "Captcha"
+                        note = (
+                            (stuck_solver[1] if stuck_solver is not None else solver_job_note(pkg))
+                            if background_solver_active
+                            else "verification UI detected; solver owns package (no reopen)"
+                        )
                     elif rt_tab.get("last_open") and in_post_open_grace(rt_tab, cfg):
                         status = "Loading"
                         note = f"waiting for {expected_state_name(tab)}"
+                    elif cfg.get("hatcher_surgical_stable_policy", False):
+                        status = "No state"
+                        note = "alive no-state; no auto rejoin (unless NOMO post-open 5m timeout)"
                     elif (
                         no_state_for >= no_state_hard_after
                         and no_state_cooldown_left <= 0
@@ -22344,6 +24962,10 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
             # state again, even if it healed without NOMO opening the package.
             if state and state_is_clean(state):
                 clear_disconnect_ui_incident(rt_tab)
+                if health.get("clean_fresh"):
+                    rt_tab["bubble_shell_soft_wake_mode"] = False
+                    rt_tab["bubble_shell_soft_wake_count"] = 0
+                    rt_tab["bubble_shell_soft_wake_peer_note"] = ""
 
             # V3.53: direct Lua-detected disconnect/kick popup
             if state and alive and state_disconnect_ui(state) and cfg.get("rejoin_if_crash", True):
@@ -22457,7 +25079,8 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
         hatcher_rejoin_status_screen(rows, hcfg, cfg, session_start, loops, last_msg)
         _old_on, _old_sec, _old_max, _old_cd = hatcher_alive_old_state_hard_settings(hcfg, cfg)
         print(col(
-            f"  Hatcher: old state {format_age(_old_sec)}..{format_age(_old_max)} => exact-PID restart affected tab only; above max ignored.",
+            "  Hatcher stable policy: stale/no-state/Home/Shell alone do NOT auto-rejoin; "
+            "only NOMO post-open 5m timeout gets new-PS + Clear Cache recovery.",
             GREEN,
         ))
 
@@ -24953,6 +27576,83 @@ def _workspace_zip_members(zip_path):
     return items
 
 
+
+def inspect_exo_master_groups_in_zip(zip_path):
+    """Inspect EXO master groups.json without modifying the archive.
+
+    Returns None when this is not an EXO master-style ZIP.
+    """
+    zip_path = Path(zip_path).expanduser()
+    try:
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            group_info = None
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                relative = _workspace_zip_relative_path(info.filename)
+                if relative is None:
+                    continue
+                if str(relative).replace("\\", "/").lower() == "groups.json":
+                    group_info = info
+                    break
+            if group_info is None:
+                return None
+            try:
+                data = json.loads(archive.read(group_info).decode("utf-8"))
+            except Exception:
+                return {
+                    "valid": False,
+                    "error": "groups.json is not valid JSON",
+                }
+    except Exception as exc:
+        return {
+            "valid": False,
+            "error": f"could not inspect groups.json: {exc}",
+        }
+
+    if not isinstance(data, dict):
+        return {
+            "valid": False,
+            "error": "groups.json root is not an object",
+        }
+
+    def uid_set(key):
+        value = data.get(key, [])
+        if not isinstance(value, list):
+            return set()
+        return {str(x).strip() for x in value if str(x).strip()}
+
+    hatching = uid_set("hatching")
+    market = uid_set("market")
+    ungrouped = uid_set("ungrouped")
+    all_uids = uid_set("all")
+    hatching_auto = bool(data.get("hatchingAuto", False))
+    market_auto = bool(data.get("marketAuto", False))
+
+    auto_complement = bool(
+        hatching_auto
+        and all_uids
+        and hatching == (all_uids - market)
+        and not (hatching & market)
+    )
+
+    overlap = hatching & market
+    missing_from_all = (hatching | market | ungrouped) - all_uids if all_uids else set()
+
+    return {
+        "valid": True,
+        "hatching": len(hatching),
+        "market": len(market),
+        "ungrouped": len(ungrouped),
+        "all": len(all_uids),
+        "hatchingAuto": hatching_auto,
+        "marketAuto": market_auto,
+        "auto_complement": auto_complement,
+        "overlap": len(overlap),
+        "missing_from_all": len(missing_from_all),
+    }
+
+
 def import_workspace_zip_to_delta(zip_path, *, make_backup=True):
     """Import a supported config/workspace ZIP into Delta's global Workspace."""
     zip_path = Path(zip_path).expanduser()
@@ -25046,15 +27746,1318 @@ def export_delta_workspace_zip():
     return True, f"Exported {len(files)} files.", output, len(files)
 
 
+
+def _workspace_safe_slug(value):
+    value = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "")).strip("._-")
+    return value[:60] or "workspace"
+
+
+def _current_executor_workspace_roots_for_selection(cfg, title):
+    """Choose configured packages and resolve their current executor Workspaces.
+
+    Global/shared Workspace paths are deduplicated. Per-clone Arceus paths remain
+    independent roots, so an import can be applied to every selected clone.
+    """
+    selected = choose_packages_common(
+        cfg,
+        title,
+        multi=True,
+        include_discovered=False,
+        configured_only=True,
+    )
+    if not selected:
+        return []
+
+    tabs = {}
+    try:
+        for tab in autoexec_tabs(cfg):
+            pkg = str((tab or {}).get("package") or "")
+            if pkg:
+                tabs[pkg] = tab
+    except Exception:
+        pass
+    for tab in cfg.get("tabs", []) or []:
+        if not isinstance(tab, dict):
+            continue
+        pkg = str(tab.get("package") or "")
+        if pkg and pkg not in tabs:
+            tabs[pkg] = tab
+
+    roots_by_key = {}
+    unresolved = []
+    for pkg in selected:
+        tab = tabs.get(pkg)
+        if not tab:
+            unresolved.append((pkg, "package config missing"))
+            continue
+        root = _executor_workspace_root_for_tab(tab)
+        if root is None:
+            unresolved.append((pkg, "Workspace unresolved"))
+            continue
+
+        root = Path(root)
+        key = str(root)
+        ent = roots_by_key.setdefault(
+            key,
+            {
+                "root": root,
+                "packages": [],
+                "storage": str(
+                    tab.get("executor_storage")
+                    or cfg.get("executor_storage_mode")
+                    or "auto"
+                ),
+            },
+        )
+        ent["packages"].append(pkg)
+
+    if unresolved:
+        print("")
+        print(col("Unresolved package Workspace(s):", YELLOW))
+        for pkg, why in unresolved:
+            print(f"  {short_pkg(pkg)} -> {why}")
+        print(col("Use Option 20 to set/repair executor paths.", DIM))
+
+    return list(roots_by_key.values())
+
+
+def import_workspace_zip_to_roots(zip_path, roots, *, make_backup=True):
+    """Import supported Workspace ZIP members into one or more resolved roots."""
+    zip_path = Path(zip_path).expanduser()
+    roots = [Path(r) for r in roots if r is not None]
+
+    if not zip_path.exists() or not zip_path.is_file():
+        return False, f"ZIP not found: {zip_path}", []
+
+    # Deduplicate roots without resolving on-disk symlinks.
+    unique_roots = []
+    seen = set()
+    for root in roots:
+        key = str(root)
+        if key not in seen:
+            seen.add(key)
+            unique_roots.append(root)
+
+    if not unique_roots:
+        return False, "No current executor Workspace resolved.", []
+
+    try:
+        members = _workspace_zip_members(zip_path)
+    except zipfile.BadZipFile:
+        return False, "Invalid or damaged ZIP file.", []
+    except Exception as exc:
+        return False, f"Could not inspect ZIP: {exc}", []
+
+    if not members:
+        return False, (
+            "No workspace files found. Supported layouts: "
+            "Arceus X/Workspace/, Delta/Workspace/, Workspace/, or flat files."
+        ), []
+
+    backups = []
+    total_imported = 0
+    total_overwritten = 0
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    with zipfile.ZipFile(zip_path, "r") as archive:
+        for root_index, root in enumerate(unique_roots, start=1):
+            root.mkdir(parents=True, exist_ok=True)
+
+            overwritten = []
+            for _, relative in members:
+                target = root / relative
+                if target.exists() and target.is_file():
+                    overwritten.append(relative)
+
+            total_overwritten += len(overwritten)
+
+            if make_backup and overwritten:
+                DELTA_WORKSPACE_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+                label = _workspace_safe_slug(root)
+                backup_path = (
+                    DELTA_WORKSPACE_BACKUP_DIR
+                    / f"workspace_overwrite_backup_{stamp}_{root_index}_{label}.zip"
+                )
+                with zipfile.ZipFile(
+                    backup_path,
+                    "w",
+                    compression=zipfile.ZIP_DEFLATED,
+                    compresslevel=9,
+                ) as backup:
+                    for relative in overwritten:
+                        existing = root / relative
+                        if existing.exists() and existing.is_file():
+                            backup.write(
+                                existing,
+                                arcname=str(relative).replace("\\", "/"),
+                            )
+                backups.append(backup_path)
+
+            for info, relative in members:
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                temporary = target.with_name(target.name + ".nomo_import_tmp")
+                try:
+                    with archive.open(info, "r") as src, open(temporary, "wb") as dst:
+                        shutil.copyfileobj(src, dst, length=1024 * 1024)
+                    os.replace(str(temporary), str(target))
+                    total_imported += 1
+                finally:
+                    try:
+                        if temporary.exists():
+                            temporary.unlink()
+                    except Exception:
+                        pass
+
+    note = (
+        f"Imported {len(members)} ZIP file(s) into {len(unique_roots)} current "
+        f"Workspace(s); writes {total_imported}; overwritten {total_overwritten}"
+    )
+    return True, note, backups
+
+
+def export_workspace_root_zip(root, label="current"):
+    """Export one resolved current executor Workspace to an importable ZIP."""
+    root = Path(root)
+    if not root.exists():
+        return False, f"Workspace not found: {root}", None, 0
+
+    files = sorted(
+        path
+        for path in root.rglob("*")
+        if path.is_file() and not path.name.endswith(".nomo_import_tmp")
+    )
+    if not files:
+        return False, f"Workspace is empty: {root}", None, 0
+
+    DELTA_WORKSPACE_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    slug = _workspace_safe_slug(label)
+    output = DELTA_WORKSPACE_EXPORT_DIR / f"{slug}_workspace_{stamp}.zip"
+
+    with zipfile.ZipFile(
+        output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
+    ) as archive:
+        for path in files:
+            relative = path.relative_to(root)
+            archive.write(
+                path,
+                arcname=f"Workspace/{str(relative).replace(chr(92), '/')}",
+            )
+
+    return True, f"Exported {len(files)} files from {root}.", output, len(files)
+
+
+
+def _find_latest_exotic_master_zip():
+    """Return newest exotic_master*.zip from normal Android download locations."""
+    candidates = []
+    seen = set()
+    for folder in (
+        Path("/storage/emulated/0/Download"),
+        Path("/sdcard/Download"),
+        Path("/storage/emulated/0"),
+    ):
+        try:
+            for path in folder.glob("exotic_master*.zip"):
+                key = str(path)
+                if key in seen or not path.is_file():
+                    continue
+                seen.add(key)
+                try:
+                    stamp = float(path.stat().st_mtime)
+                except Exception:
+                    stamp = 0.0
+                candidates.append((stamp, path))
+        except Exception:
+            continue
+
+    if not candidates:
+        return EXOTIC_MASTER_DEFAULT_IMPORT_ZIP
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def _read_exotic_master_manifest(zip_path):
+    """Validate/read the small Exotic Master template bundle."""
+    zip_path = Path(zip_path).expanduser()
+    if not zip_path.exists() or not zip_path.is_file():
+        return False, f"EXO master ZIP not found: {zip_path}", None
+
+    try:
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            by_base = {}
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                base = Path(str(info.filename).replace("\\", "/")).name.lower()
+                if base:
+                    by_base[base] = info
+
+            required = (
+                "groups.json",
+                "file1_default.json",
+                "file1_hatching.json",
+                "file1_market.json",
+            )
+            missing = [name for name in required if name not in by_base]
+            if missing:
+                return False, (
+                    "Not an Exotic Master ZIP; missing: " + ", ".join(missing)
+                ), None
+
+            parsed = {}
+            for name in (
+                "groups.json",
+                "file1_default.json",
+                "file1_hatching.json",
+                "file1_market.json",
+                "file2.json",
+                "filesession.json",
+                "gag2.json",
+            ):
+                info = by_base.get(name)
+                if info is None:
+                    continue
+                raw = archive.read(info)
+                try:
+                    parsed[name] = json.loads(
+                        raw.decode("utf-8-sig")
+                    )
+                except Exception as exc:
+                    return False, f"{name} is invalid JSON: {exc}", None
+
+    except zipfile.BadZipFile:
+        return False, "Invalid/damaged Exotic Master ZIP.", None
+    except Exception as exc:
+        return False, f"Could not read Exotic Master ZIP: {exc}", None
+
+    groups = parsed.get("groups.json")
+    if not isinstance(groups, dict):
+        return False, "groups.json root is not an object.", None
+
+    def uid_set(key):
+        value = groups.get(key, [])
+        if not isinstance(value, list):
+            return set()
+        return {str(v).strip() for v in value if str(v).strip()}
+
+    hatching = uid_set("hatching")
+    market = uid_set("market")
+    ungrouped = uid_set("ungrouped")
+    all_uids = uid_set("all")
+
+    grouping_mode = str(groups.get("groupingMode") or "uid_lists").strip().lower()
+    if grouping_mode == "hatching_usernames_rest_market":
+        return False, (
+            "This master uses the discarded V4.81.84 username-grouping format. "
+            "EXO ownership is UID-based. Use a normal UID groups.json master; "
+            "Option 17 UID Group Manager can classify installed accounts."
+        ), None
+
+    overlap = hatching & market
+    if overlap:
+        return False, (
+            f"groups.json has {len(overlap)} UID(s) in both Hatching and Market."
+        ), None
+
+    auto_complement = bool(
+        groups.get("hatchingAuto")
+        and all_uids
+        and hatching == (all_uids - market)
+    )
+    if auto_complement:
+        return False, (
+            "Unsafe old groups.json: hatchingAuto=true and Hatching == ALL - MARKET. "
+            "Re-export with GAG Workspace V9.11+."
+        ), None
+
+    return True, "ok", {
+        "zip_path": zip_path,
+        "parsed": parsed,
+        "hatching": hatching,
+        "market": market,
+        "ungrouped": ungrouped,
+        "all": all_uids,
+        "grouping_mode": "uid_lists",
+    }
+
+
+def _tabs_by_package_for_workspace(cfg):
+    tabs = {}
+    try:
+        for tab in autoexec_tabs(cfg):
+            if not isinstance(tab, dict):
+                continue
+            pkg = str(tab.get("package") or "")
+            if pkg:
+                tabs[pkg] = tab
+    except Exception:
+        pass
+    for tab in cfg.get("tabs", []) or []:
+        if not isinstance(tab, dict):
+            continue
+        pkg = str(tab.get("package") or "")
+        if pkg and pkg not in tabs:
+            tabs[pkg] = tab
+    return tabs
+
+
+def _resolve_package_uid_for_exotic(pkg):
+    """Resolve exact live Roblox UID; cached identity is fallback only."""
+    pkg = str(pkg or "").strip()
+    cache = load_cookie_cache()
+    ent = cache.get(pkg) if isinstance(cache, dict) else {}
+    if not isinstance(ent, dict):
+        ent = {}
+
+    # Fresh package cookie/API is authoritative.
+    try:
+        cookie = str(get_cookie_from_package(pkg) or "").strip()
+    except Exception:
+        cookie = ""
+    if cookie:
+        try:
+            username, user_id = get_username_from_cookie(cookie, timeout=8)
+            if username and str(user_id or "").isdigit():
+                updates = {
+                    "cookie": cookie,
+                    "updated": now(),
+                    "username": str(username),
+                    "user_id": str(user_id),
+                }
+                try:
+                    _cookie_cache_update_entry(pkg, updates)
+                except Exception:
+                    pass
+                return {
+                    "ok": True,
+                    "pkg": pkg,
+                    "username": str(username),
+                    "uid": str(user_id),
+                    "source": "live_cookie_api",
+                }
+        except Exception:
+            pass
+
+    # Cache fallback is useful when Roblox API is temporarily unreachable.
+    uid = str(ent.get("user_id") or ent.get("userID") or "").strip()
+    username = str(ent.get("username") or "").strip()
+    if uid.isdigit():
+        return {
+            "ok": True,
+            "pkg": pkg,
+            "username": username or pkg,
+            "uid": uid,
+            "source": "cookie_cache",
+        }
+
+    # Cached cookie can still recover an identity if user_id wasn't stored.
+    cached_cookie = str(ent.get("cookie") or "").strip()
+    if cached_cookie:
+        try:
+            username2, user_id2 = get_username_from_cookie(cached_cookie, timeout=8)
+            if username2 and str(user_id2 or "").isdigit():
+                return {
+                    "ok": True,
+                    "pkg": pkg,
+                    "username": str(username2),
+                    "uid": str(user_id2),
+                    "source": "cached_cookie_api",
+                }
+        except Exception:
+            pass
+
+    return {
+        "ok": False,
+        "pkg": pkg,
+        "username": username or pkg,
+        "uid": "",
+        "source": "unresolved",
+    }
+
+
+
+def _normalize_exo_uid_set(values):
+    if not isinstance(values, (list, tuple, set)):
+        return set()
+    return {
+        str(value).strip()
+        for value in values
+        if str(value).strip().isdigit()
+    }
+
+
+def _load_exo_uid_groups():
+    data = load_json(EXO_UID_GROUPS_FILE, {})
+    if not isinstance(data, dict):
+        data = {}
+    hatching = _normalize_exo_uid_set(data.get("hatching", []))
+    market = _normalize_exo_uid_set(data.get("market", []))
+    overlap = hatching & market
+    if overlap:
+        # Fail deterministic: Hatching wins locally, remove overlap from Market.
+        market -= overlap
+    return {
+        "schemaVersion": 1,
+        "hatching": hatching,
+        "market": market,
+        "updatedAt": int(data.get("updatedAt", 0) or 0),
+    }
+
+
+def _save_exo_uid_groups(groups):
+    hatching = _normalize_exo_uid_set((groups or {}).get("hatching", []))
+    market = _normalize_exo_uid_set((groups or {}).get("market", []))
+    market -= hatching
+    payload = {
+        "schemaVersion": 1,
+        "hatching": sorted(hatching, key=lambda x: int(x)),
+        "market": sorted(market, key=lambda x: int(x)),
+        "updatedAt": now(),
+        "rule": "exact UID; Hatching explicit; REST = MARKET",
+    }
+    save_json(EXO_UID_GROUPS_FILE, payload)
+    return payload
+
+
+def _parse_number_selection(raw, maximum):
+    """Parse '1,3 5-7'. Returns None for invalid input."""
+    raw = str(raw or "").strip()
+    if not raw:
+        return set()
+    result = set()
+    for token in raw.replace(",", " ").split():
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            parts = token.split("-", 1)
+            if len(parts) != 2 or not all(part.strip().isdigit() for part in parts):
+                return None
+            a, b = int(parts[0]), int(parts[1])
+            if a > b:
+                a, b = b, a
+            if a < 1 or b > maximum:
+                return None
+            result.update(range(a, b + 1))
+        else:
+            if not token.isdigit():
+                return None
+            value = int(token)
+            if value < 1 or value > maximum:
+                return None
+            result.add(value)
+    return result
+
+
+def _resolve_exo_group_identities(cfg, selected):
+    tabs = _tabs_by_package_for_workspace(cfg)
+    rows = []
+    unresolved = []
+    for pkg in selected:
+        tab = tabs.get(pkg)
+        if not tab:
+            unresolved.append((pkg, "package config missing"))
+            continue
+        root = _executor_workspace_root_for_tab(tab)
+        if root is None:
+            unresolved.append((pkg, "current executor Workspace unresolved"))
+            continue
+        ident = _resolve_package_uid_for_exotic(pkg)
+        if not ident.get("ok"):
+            unresolved.append((pkg, "Roblox UID unresolved"))
+            continue
+        rows.append({
+            "pkg": pkg,
+            "username": ident["username"],
+            "uid": ident["uid"],
+            "identity_source": ident["source"],
+            "root": Path(root),
+            "exo_dir": Path(root) / "exotichub99",
+        })
+    return rows, unresolved
+
+
+def configure_exo_uid_groups_menu(cfg):
+    selected = choose_packages_common(
+        cfg,
+        "EXO UID GROUPS: SELECT INSTALLED ACCOUNTS",
+        multi=True,
+        include_discovered=False,
+        configured_only=True,
+    )
+    if not selected:
+        return
+
+    rows, unresolved = _resolve_exo_group_identities(cfg, selected)
+    if unresolved:
+        print("")
+        print(col("UNRESOLVED / SKIPPED:", RED))
+        for pkg, why in unresolved:
+            print(f"  {short_pkg(pkg)} -> {why}")
+    if not rows:
+        print(col("No selected package UID could be resolved.", RED))
+        pause()
+        return
+
+    groups = _load_exo_uid_groups()
+    saved_hatching = set(groups["hatching"])
+
+    print("")
+    print(col("EXO UID GROUP MANAGER", BOLD))
+    print(col(
+        "Classification is stored by exact Roblox UID. Username is display-only.",
+        DIM,
+    ))
+    print(col(
+        "Choose HATCHING accounts below; every other selected UID becomes MARKET.",
+        CYAN,
+    ))
+    print("")
+    current_indices = []
+    for index, row in enumerate(rows, start=1):
+        is_hatching = row["uid"] in saved_hatching
+        if is_hatching:
+            current_indices.append(index)
+        label = "HATCHING" if is_hatching else "MARKET"
+        print(
+            f"{index:>2}. {short_pkg(row['pkg']):<8} "
+            f"{row['username']:<20} UID={row['uid']}  [{label}]"
+        )
+
+    current_text = ",".join(str(i) for i in current_indices) or "none"
+    print("")
+    print(f"Current Hatching numbers on this selection: {current_text}")
+    print("Examples: 1,3   or   1-3   |  0 = none  | ENTER = keep current")
+    raw = clean_terminal_input(input("Hatching numbers: "))
+
+    if not raw:
+        print(col("No group changes made.", YELLOW))
+        pause()
+        return
+
+    if raw.strip() == "0":
+        chosen = set()
+    else:
+        chosen = _parse_number_selection(raw, len(rows))
+        if chosen is None:
+            print(col("Invalid number selection.", RED))
+            pause()
+            return
+
+    hatching = set(groups["hatching"])
+    market = set(groups["market"])
+
+    selected_uids = {row["uid"] for row in rows}
+    hatching -= selected_uids
+    market -= selected_uids
+
+    for index, row in enumerate(rows, start=1):
+        uid = row["uid"]
+        if index in chosen:
+            hatching.add(uid)
+        else:
+            market.add(uid)
+
+    saved = _save_exo_uid_groups({
+        "hatching": hatching,
+        "market": market,
+    })
+
+    print("")
+    print(col("Saved exact UID groups:", GREEN))
+    for index, row in enumerate(rows, start=1):
+        group = "HATCHING" if row["uid"] in set(saved["hatching"]) else "MARKET"
+        print(f"  {row['username']}  UID={row['uid']} -> {group}")
+    print("")
+    print(col(
+        "Future Option 17 installs use these exact UIDs. "
+        "Unclassified UIDs default to MARKET.",
+        DIM,
+    ))
+    pause()
+
+
+def _exotic_master_variant_for_uid(manifest, uid, local_groups=None):
+    """Return (variant, template, source) using exact UID ownership only."""
+    uid = str(uid or "").strip()
+    local_groups = local_groups or {"hatching": set(), "market": set()}
+
+    if uid in set(local_groups.get("hatching", set())):
+        return "hatching", "file1_hatching.json", "local_uid"
+    if uid in set(local_groups.get("market", set())):
+        return "market", "file1_market.json", "local_uid"
+
+    if uid in manifest["hatching"]:
+        return "hatching", "file1_hatching.json", "master_uid"
+    if uid in manifest["market"]:
+        return "market", "file1_market.json", "master_uid"
+
+    # User rule: only Hatching is exceptional; everything else is Market.
+    return "market", "file1_market.json", "rest_market"
+
+
+
+def _exotic_master_install_plan(cfg, selected, manifest):
+    rows, unresolved = _resolve_exo_group_identities(cfg, selected)
+    local_groups = _load_exo_uid_groups()
+    parsed = manifest["parsed"]
+    plan = []
+
+    for row in rows:
+        variant, file1_name, group_source = _exotic_master_variant_for_uid(
+            manifest,
+            row["uid"],
+            local_groups,
+        )
+        file1_obj = parsed.get(file1_name)
+        gift = file1_obj.get("giftpets", {}) if isinstance(file1_obj, dict) else {}
+
+        pets = gift.get("allow_pet_list", {})
+        targets = gift.get("allow_player_targets", {})
+        pet_count = len(pets) if isinstance(pets, (dict, list)) else 0
+        target_count = len(targets) if isinstance(targets, (dict, list)) else 0
+
+        item = dict(row)
+        item.update({
+            "variant": variant,
+            "file1_name": file1_name,
+            "group_source": group_source,
+            "pet_count": pet_count,
+            "target_count": target_count,
+        })
+        plan.append(item)
+
+    return plan, unresolved
+
+
+
+_EXO_PET_UUID_RE = re.compile(
+    r"^\{?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\}?$"
+)
+
+
+def _exo_is_uuid_string(value):
+    return isinstance(value, str) and bool(_EXO_PET_UUID_RE.match(value.strip()))
+
+
+def _exo_pet_identity_container(path, value):
+    """Identify only account-specific pet membership / pet UUID values."""
+    key = str(path[-1] if path else "").strip().lower()
+
+    # Team membership lists are per-account. Keep even if empty.
+    if isinstance(value, list) and "team" in key:
+        return True
+
+    # Explicit pet UUID selection lists.
+    if isinstance(value, list) and (
+        "uuid" in key
+        or key in {"pet_level_selected_pets", "selected_pet_uuids"}
+    ):
+        return True
+
+    # Any list actually containing UUID values is account-specific.
+    if isinstance(value, list) and any(_exo_is_uuid_string(x) for x in value):
+        return True
+
+    # Direct pet identity/runtime UUID field. Never import another account's UUID.
+    if isinstance(value, str) and key.endswith("_uuid"):
+        return True
+
+    return False
+
+
+def _exo_collect_pet_identity(obj, path=()):
+    found = {}
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            child = path + (str(key),)
+            if _exo_pet_identity_container(child, value):
+                found[child] = copy.deepcopy(value)
+                continue
+            if isinstance(value, dict):
+                found.update(_exo_collect_pet_identity(value, child))
+    return found
+
+
+def _exo_set_path(root, path, value):
+    cur = root
+    for key in path[:-1]:
+        if not isinstance(cur, dict):
+            return False
+        if key not in cur or not isinstance(cur[key], dict):
+            cur[key] = {}
+        cur = cur[key]
+    if not isinstance(cur, dict) or not path:
+        return False
+    cur[path[-1]] = copy.deepcopy(value)
+    return True
+
+
+def _exo_scrub_master_pet_identity(obj):
+    """Clear source-account pet IDs/teams before overlaying target UID identity."""
+    result = copy.deepcopy(obj)
+
+    def walk(node, path=()):
+        if not isinstance(node, dict):
+            return
+        for key in list(node.keys()):
+            value = node[key]
+            child = path + (str(key),)
+            if _exo_pet_identity_container(child, value):
+                if isinstance(value, list):
+                    node[key] = []
+                elif isinstance(value, str):
+                    node[key] = ""
+                continue
+            if isinstance(value, dict):
+                walk(value, child)
+
+    walk(result)
+    return result
+
+
+def _exo_build_identity_safe_master(master_obj, existing_obj=None):
+    """Master wins everywhere except per-account pet UUID/team identity."""
+    result = _exo_scrub_master_pet_identity(master_obj)
+    preserved = {}
+
+    if isinstance(existing_obj, dict):
+        preserved = _exo_collect_pet_identity(existing_obj)
+        for path, value in preserved.items():
+            _exo_set_path(result, path, value)
+
+    return result, preserved
+
+
+def _exo_strip_pet_identity_for_compare(obj):
+    return _exo_scrub_master_pet_identity(obj)
+
+
+def _exo_load_json_file(path):
+    try:
+        path = Path(path)
+        if not path.is_file():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _exo_get_path(root, path):
+    cur = root
+    for key in path:
+        if not isinstance(cur, dict) or key not in cur:
+            return False, None
+        cur = cur[key]
+    return True, cur
+
+
+def _exo_identity_value_nonempty(value):
+    if isinstance(value, (list, dict, tuple, set)):
+        return len(value) > 0
+    if isinstance(value, str):
+        return bool(value.strip())
+    return value not in (None, False, 0)
+
+
+def _exo_identity_summary(identity):
+    identity = identity or {}
+    nonempty_fields = 0
+    uuid_values = 0
+    team_fields = 0
+    nonempty_team_fields = 0
+
+    for path, value in identity.items():
+        key = str(path[-1] if path else "").lower()
+        if _exo_identity_value_nonempty(value):
+            nonempty_fields += 1
+        if "team" in key and isinstance(value, list):
+            team_fields += 1
+            if value:
+                nonempty_team_fields += 1
+        if isinstance(value, list):
+            uuid_values += sum(1 for item in value if _exo_is_uuid_string(item))
+        elif _exo_is_uuid_string(value):
+            uuid_values += 1
+
+    return {
+        "fields": len(identity),
+        "nonempty_fields": nonempty_fields,
+        "team_fields": team_fields,
+        "nonempty_team_fields": nonempty_team_fields,
+        "uuid_values": uuid_values,
+    }
+
+
+def _exo_preflight_existing_file1(plan):
+    """Require exact current per-UID File1 before any offline stop or write."""
+    failures = []
+    snapshots = []
+
+    for item in plan:
+        target = Path(item["exo_dir"]) / f"{item['uid']}file1.json"
+        existing = _exo_load_json_file(target)
+        if existing is None:
+            failures.append(
+                f"{item['username']} UID={item['uid']}: missing/unreadable exact "
+                f"existing File1: {target}"
+            )
+            continue
+
+        identity = _exo_collect_pet_identity(existing)
+        summary = _exo_identity_summary(identity)
+        item["_exo_preflight_file1"] = str(target)
+        item["_exo_preflight_identity_summary"] = summary
+
+        snapshots.append((item, target, summary))
+
+    return (not failures), failures, snapshots
+
+
+def _verify_exotic_install_plan(manifest, plan):
+    """Verify master settings AND exact preservation of target UID pet identity."""
+    parsed = manifest["parsed"]
+    results = []
+
+    for item in plan:
+        failures = []
+        snapshots = item.get("_exo_preserved_identity_snapshot", {}) or {}
+
+        for master_name, suffix in (
+            (item["file1_name"], "file1.json"),
+            ("file2.json", "file2.json"),
+            ("filesession.json", "filesession.json"),
+            ("gag2.json", "gag2.json"),
+        ):
+            expected = parsed.get(master_name)
+            if not isinstance(expected, dict):
+                continue
+
+            target = Path(item["exo_dir"]) / f"{item['uid']}{suffix}"
+            try:
+                actual = json.loads(target.read_text(encoding="utf-8-sig"))
+
+                # 1) Every normal setting must equal the master.
+                if (
+                    _exo_strip_pet_identity_for_compare(actual)
+                    != _exo_strip_pet_identity_for_compare(expected)
+                ):
+                    failures.append(
+                        f"{suffix}: non-pet-identity settings differ from master"
+                    )
+
+                # 2) Every preserved target-UID pet/team identity field must
+                # exactly match its pre-write value.
+                preserved = snapshots.get(suffix, {}) or {}
+                for path, before_value in preserved.items():
+                    exists, after_value = _exo_get_path(actual, path)
+                    if not exists:
+                        failures.append(
+                            f"{suffix}: preserved identity missing: {'.'.join(path)}"
+                        )
+                        continue
+                    if after_value != before_value:
+                        failures.append(
+                            f"{suffix}: preserved identity changed: {'.'.join(path)}"
+                        )
+
+                # 3) No foreign/non-empty identity may appear from the template.
+                actual_identity = _exo_collect_pet_identity(actual)
+                for path, value in actual_identity.items():
+                    if path in preserved:
+                        continue
+                    if _exo_identity_value_nonempty(value):
+                        failures.append(
+                            f"{suffix}: unexpected non-empty identity: "
+                            f"{'.'.join(path)}"
+                        )
+
+            except Exception as exc:
+                failures.append(f"{suffix}: read-back failed: {exc}")
+
+        results.append((item, not failures, "; ".join(failures)))
+
+    return results
+
+
+def _exo_stop_selected_for_offline_install(cfg, plan):
+    """Get all selected packages stably DEAD before reading/writing EXO files."""
+    stopped = []
+
+    print("")
+    print(col("OFFLINE EXO INSTALL PREP:", BOLD))
+    print(col(
+        "Stopping selected clone PIDs first so running EXO cannot keep/save stale config.",
+        CYAN,
+    ))
+
+    for item in plan:
+        pkg = str(item.get("pkg") or "").strip()
+        user = str(item.get("username") or pkg)
+        if not pkg:
+            return False, "install plan contains an empty package", stopped
+
+        status, status_note = package_alive_status(pkg, cfg, fresh=True)
+        if status == "UNKNOWN":
+            return False, (
+                f"{short_pkg(pkg)} {user}: PID state UNKNOWN; "
+                f"offline install aborted before write ({status_note})"
+            ), stopped
+
+        if status == "DEAD":
+            print(f"  {short_pkg(pkg)} {user}: already stopped")
+            continue
+
+        print(f"  {short_pkg(pkg)} {user}: exact PID stop...")
+        ok, stop_note = force_stop_package(pkg, cfg)
+        if not ok:
+            return False, (
+                f"{short_pkg(pkg)} {user}: exact PID stop failed; "
+                f"offline install aborted before write ({stop_note})"
+            ), stopped
+
+        final_status, final_note = package_alive_status(pkg, cfg, fresh=True)
+        if final_status == "UNKNOWN":
+            return False, (
+                f"{short_pkg(pkg)} {user}: PID state UNKNOWN after stop "
+                f"({final_note}); aborted before write"
+            ), stopped
+
+        if final_status == "DEAD":
+            stopped.append(pkg)
+            print(col(f"    stopped: {stop_note}", GREEN))
+        else:
+            # Do not abort yet. The bounded PRE-WRITE respawn guard below
+            # will exact-PID stop this selected package again.
+            print(col(
+                f"    immediate respawn detected after stop "
+                f"({final_status}: {final_note}); pre-write guard will handle it",
+                YELLOW,
+            ))
+
+    print("")
+    print(col(
+        "Pre-write offline hold: requiring all selected packages stably DEAD...",
+        DIM,
+    ))
+    stable_ok, stable_note, respawns = _exo_hold_stopped_with_respawn_guard(
+        cfg,
+        plan,
+        stable_seconds=2.0,
+        max_total_seconds=18.0,
+        max_respawns_per_package=3,
+        reapply_payload=False,
+    )
+    print(col(
+        f"Pre-write offline hold: {'PASS' if stable_ok else 'FAIL'} "
+        f"({stable_note})",
+        GREEN if stable_ok else RED,
+    ))
+
+    if not stable_ok:
+        return False, (
+            "offline install aborted before write because selected package(s) "
+            f"could not remain stopped: {stable_note}"
+        ), stopped
+
+    return True, (
+        f"Offline prep complete: {len(plan)} selected package(s) stably stopped."
+    ), stopped
+
+
+def _exo_atomic_write_bytes(target, content):
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + ".nomo_exotic_tmp")
+    try:
+        with open(tmp, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except Exception:
+                pass
+        os.replace(str(tmp), str(target))
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+
+
+def _exo_reapply_prepared_payloads(plan):
+    count = 0
+    for item in plan:
+        for payload in (item.get("_exo_prepared_payloads", {}) or {}).values():
+            target = payload.get("target")
+            content = payload.get("content")
+            if not target or not isinstance(content, (bytes, bytearray)):
+                continue
+            _exo_atomic_write_bytes(target, bytes(content))
+            count += 1
+    return count
+
+
+def _exo_hold_stopped_with_respawn_guard(
+    cfg,
+    plan,
+    stable_seconds=4.0,
+    max_total_seconds=18.0,
+    max_respawns_per_package=3,
+    reapply_payload=True,
+):
+    """Require a stable DEAD window; exact-PID stop/reapply on brief respawn."""
+    started = time.monotonic()
+    stable_since = time.monotonic()
+    respawns = {}
+
+    while True:
+        if time.monotonic() - started > float(max_total_seconds):
+            detail = ", ".join(
+                f"{short_pkg(pkg)}={count}"
+                for pkg, count in sorted(respawns.items())
+            ) or "none"
+            return False, (
+                "stable offline window not reached before timeout; "
+                f"respawns={detail}"
+            ), respawns
+
+        saw_respawn = False
+
+        for item in plan:
+            pkg = str(item.get("pkg") or "").strip()
+            user = str(item.get("username") or pkg)
+            status, note = package_alive_status(pkg, cfg, fresh=True)
+
+            if status == "UNKNOWN":
+                return False, (
+                    f"{short_pkg(pkg)} {user}: PID state UNKNOWN during offline hold "
+                    f"({note})"
+                ), respawns
+
+            if status == "DEAD":
+                continue
+
+            saw_respawn = True
+            count = int(respawns.get(pkg, 0) or 0) + 1
+            respawns[pkg] = count
+
+            print(col(
+                f"  Respawn detected: {short_pkg(pkg)} {user} "
+                f"(attempt {count}/{max_respawns_per_package})",
+                YELLOW,
+            ))
+
+            if count > int(max_respawns_per_package):
+                return False, (
+                    f"{short_pkg(pkg)} repeatedly respawned "
+                    f"({count} times); possible external relaunch loop"
+                ), respawns
+
+            ok, stop_note = force_stop_package(pkg, cfg)
+            if not ok:
+                return False, (
+                    f"{short_pkg(pkg)} respawn exact-PID stop failed: {stop_note}"
+                ), respawns
+
+            final_status, final_note = package_alive_status(pkg, cfg, fresh=True)
+            if final_status != "DEAD":
+                return False, (
+                    f"{short_pkg(pkg)} not confirmed DEAD after respawn stop "
+                    f"({final_status}: {final_note})"
+                ), respawns
+
+            if reapply_payload:
+                # POST-WRITE: the short-lived process may have written stale
+                # in-memory EXO state. Restore the immutable prepared payload.
+                written = _exo_reapply_prepared_payloads(plan)
+                print(col(
+                    f"    stopped again; re-applied {written} prepared EXO file(s)",
+                    GREEN,
+                ))
+            else:
+                # PRE-WRITE: nothing has been installed yet; just keep it dead.
+                print(col(
+                    "    stopped again; pre-write offline hold continues",
+                    GREEN,
+                ))
+
+        if saw_respawn:
+            stable_since = time.monotonic()
+            time.sleep(0.6)
+            continue
+
+        if time.monotonic() - stable_since >= float(stable_seconds):
+            detail = ", ".join(
+                f"{short_pkg(pkg)}={count}"
+                for pkg, count in sorted(respawns.items())
+            ) or "0"
+            return True, (
+                f"stable DEAD for {stable_seconds:.1f}s; respawns handled={detail}"
+            ), respawns
+
+        time.sleep(0.5)
+
+
+def _exo_verify_selected_still_stopped(cfg, plan):
+    failures = []
+    for item in plan:
+        pkg = str(item.get("pkg") or "").strip()
+        status, note = package_alive_status(pkg, cfg, fresh=True)
+        if status != "DEAD":
+            failures.append(
+                f"{short_pkg(pkg)}={status} ({note})"
+            )
+    if failures:
+        return False, " | ".join(failures)
+    return True, "all selected packages remain stopped"
+
+
+def _exo_option17_runtime_symbol_check():
+    required = (
+        "_exo_preflight_existing_file1",
+        "_exo_stop_selected_for_offline_install",
+        "_exo_atomic_write_bytes",
+        "_exo_reapply_prepared_payloads",
+        "_exo_hold_stopped_with_respawn_guard",
+        "_verify_exotic_install_plan",
+        "install_exotic_master_plan",
+    )
+    missing = [name for name in required if not callable(globals().get(name))]
+    if missing:
+        return False, "missing Option 17 helper(s): " + ", ".join(missing)
+    return True, "Option 17 helper symbols OK"
+
+
+def install_exotic_master_plan(manifest, plan):
+    """Install full master while preserving only each UID's pet UUID/team identity."""
+    parsed = manifest["parsed"]
+    if not plan:
+        return False, "Nothing to install.", []
+
+    writes = {}
+
+    for item in plan:
+        uid = str(item["uid"])
+        exo_dir = Path(item["exo_dir"])
+        item["preserved_identity_paths"] = {}
+
+        exact_file1 = exo_dir / f"{uid}file1.json"
+        if _exo_load_json_file(exact_file1) is None:
+            return False, (
+                f"{item['username']} UID={uid}: exact existing File1 is missing/"
+                f"unreadable after offline prep: {exact_file1}; NOTHING WRITTEN"
+            ), []
+
+        for master_name, suffix in (
+            (item["file1_name"], "file1.json"),
+            ("file2.json", "file2.json"),
+            ("filesession.json", "filesession.json"),
+            ("gag2.json", "gag2.json"),
+        ):
+            master_obj = parsed.get(master_name)
+            if master_obj is None:
+                continue
+            if not isinstance(master_obj, dict):
+                return False, f"{master_name} missing/invalid.", []
+
+            target = exo_dir / f"{uid}{suffix}"
+            existing_obj = _exo_load_json_file(target)
+            final_obj, preserved = _exo_build_identity_safe_master(
+                master_obj,
+                existing_obj,
+            )
+
+            item["preserved_identity_paths"][suffix] = [
+                ".".join(path) for path in sorted(preserved.keys())
+            ]
+            item.setdefault("_exo_preserved_identity_snapshot", {})[suffix] = (
+                copy.deepcopy(preserved)
+            )
+
+            final_bytes = json.dumps(
+                final_obj,
+                indent=2,
+                ensure_ascii=False,
+            ).encode("utf-8")
+
+            writes[str(target)] = (
+                target,
+                final_bytes,
+            )
+
+            # Keep the exact prepared payload in memory so a brief package
+            # respawn can never alter preserved team/UUID identity.
+            item.setdefault("_exo_prepared_payloads", {})[suffix] = {
+                "target": str(target),
+                "content": final_bytes,
+            }
+
+    # Back up every file that is about to be replaced.
+    existing = [target for target, _content in writes.values() if target.is_file()]
+    backups = []
+    if existing:
+        DELTA_WORKSPACE_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = (
+            DELTA_WORKSPACE_BACKUP_DIR
+            / f"exotic_master_overwrite_backup_{stamp}.zip"
+        )
+        with zipfile.ZipFile(
+            backup_path, "w",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=9,
+        ) as backup:
+            for index, target in enumerate(existing, start=1):
+                backup.write(target, arcname=f"{index:03d}_{target.name}")
+        backups.append(backup_path)
+
+    written = 0
+    for target, content in writes.values():
+        _exo_atomic_write_bytes(target, content)
+        written += 1
+
+    preserved_total = sum(
+        len(paths)
+        for item in plan
+        for paths in item.get("preserved_identity_paths", {}).values()
+    )
+
+    return True, (
+        f"EXO master installed: {written} per-UID file(s) for "
+        f"{len(plan)} selected package(s); "
+        f"preserved {preserved_total} pet UUID/team field(s)."
+    ), backups
+
+
 def workspace_zip_tools_menu(cfg):
+    symbols_ok, symbols_note = _exo_option17_runtime_symbol_check()
+    if not symbols_ok:
+        clear()
+        banner("WORKSPACE ZIP / EXO CONFIG TOOLS", cfg)
+        print(col("[OPTION 17 INTERNAL ERROR] " + symbols_note, RED))
+        pause()
+        return
+
     while True:
         clear()
-        banner("WORKSPACE ZIP TOOLS", cfg)
-        print(f"Delta Workspace: {DELTA_GLOBAL_WORKSPACE_DIR}")
+        banner("WORKSPACE ZIP / EXO CONFIG TOOLS", cfg)
+        print(col(
+            "Current executor Workspace comes from Option 20.",
+            DIM,
+        ))
         print("")
-        print("1. Import config/workspace ZIP -> Delta Workspace")
-        print("2. Export Delta Workspace -> timestamped ZIP")
-        print("3. Show supported ZIP layouts")
+        print("1. Install exotic_master.zip OFFLINE (stop selected; preserve pet UUID teams)")
+        print("2. Configure EXO UID groups from installed accounts")
+        print("3. Import generic config/workspace ZIP -> current executor Workspace(s)")
+        print("4. Export current executor Workspace(s) -> timestamped ZIP")
+        print("5. Show current executor Workspace paths")
+        print("6. Show supported ZIP layouts")
         print("0. Back")
         drain_stdin()
         choice = clean_terminal_input(input("\nChoose: "))
@@ -25063,8 +29066,235 @@ def workspace_zip_tools_menu(cfg):
             return
 
         if choice == "1":
+            selected = choose_packages_common(
+                cfg,
+                "EXOTIC MASTER INSTALL: SELECT PACKAGES",
+                multi=True,
+                include_discovered=False,
+                configured_only=True,
+            )
+            if not selected:
+                continue
+
+            auto_zip = _find_latest_exotic_master_zip()
+            print("")
+            print(col(f"Auto source: {auto_zip}", CYAN))
             raw = clean_terminal_input(input(
-                f"ZIP path [ENTER={DELTA_WORKSPACE_DEFAULT_IMPORT_ZIP}]: "
+                "EXO master ZIP path [ENTER=auto source above]: "
+            ))
+            zip_path = Path(raw) if raw else auto_zip
+
+            ok, note, manifest = _read_exotic_master_manifest(zip_path)
+            if not ok:
+                print(col(note, RED))
+                pause()
+                continue
+
+            print("")
+            print(col("EXOTIC MASTER:", BOLD))
+            print(f"  File      : {zip_path}")
+            print(f"  Master Hatching UIDs : {len(manifest['hatching'])}")
+            print(f"  Master Market UIDs   : {len(manifest['market'])}")
+            print(f"  Old Ungrouped UIDs   : {len(manifest['ungrouped'])} (REST=MARKET now)")
+            local_groups = _load_exo_uid_groups()
+            print(f"  Local Hatching UIDs  : {len(local_groups['hatching'])}")
+            print(f"  Local Market UIDs    : {len(local_groups['market'])}")
+            print(col(
+                "  Rule: local exact UID > master exact UID > REST = MARKET",
+                CYAN,
+            ))
+            print(col(
+                "  Merge: MASTER wins; only existing pet UUID/team identity is preserved",
+                CYAN,
+            ))
+            print(col(
+                "  Runtime: selected clones are exact-PID stopped BEFORE write and left stopped",
+                CYAN,
+            ))
+
+            plan, unresolved = _exotic_master_install_plan(
+                cfg, selected, manifest
+            )
+
+            print("")
+            print(col("PACKAGE INSTALL PLAN:", BOLD))
+            if plan:
+                for item in plan:
+                    print(
+                        f"  {short_pkg(item['pkg'])}  "
+                        f"{item['username']}  UID={item['uid']}  "
+                        f"-> {item['variant'].upper()} "
+                        f"[group={item['group_source']}]"
+                    )
+                    print(
+                        f"      pets={item['pet_count']}  "
+                        f"targets={item['target_count']}  "
+                        f"{item['exo_dir']}  "
+                        f"[identity={item['identity_source']}]"
+                    )
+            if unresolved:
+                print("")
+                print(col("UNRESOLVED / SKIPPED:", RED))
+                for pkg, why in unresolved:
+                    print(f"  {short_pkg(pkg)} -> {why}")
+
+            if not plan:
+                print(col("No selected package can be installed.", RED))
+                pause()
+                continue
+
+            rest_market = [
+                item for item in plan
+                if item.get("group_source") == "rest_market"
+            ]
+            if rest_market:
+                print("")
+                print(col(
+                    f"{len(rest_market)} selected UID(s) are not explicitly grouped; "
+                    "REST = MARKET applies:",
+                    CYAN,
+                ))
+                for item in rest_market:
+                    print(f"  {item['username']} ({item['uid']}) -> MARKET")
+
+            preflight_ok, preflight_failures, preflight_rows = (
+                _exo_preflight_existing_file1(plan)
+            )
+            print("")
+            print(col("PET-TEAM SOURCE PREFLIGHT:", BOLD))
+            if not preflight_ok:
+                print(col(
+                    "FAIL — exact per-UID existing File1 is required; "
+                    "no clone will be stopped and no EXO file will be modified.",
+                    RED,
+                ))
+                for failure in preflight_failures:
+                    print(col("  " + failure, RED))
+                pause()
+                continue
+
+            for pf_item, pf_path, pf_summary in preflight_rows:
+                print(
+                    f"  {pf_item['username']} UID={pf_item['uid']} -> "
+                    f"teams {pf_summary['nonempty_team_fields']}/"
+                    f"{pf_summary['team_fields']} non-empty, "
+                    f"pet UUID values={pf_summary['uuid_values']}"
+                )
+                print(col(f"      source: {pf_path}", DIM))
+
+            if not _setup_yes_no("Install EXO master now?", default=True):
+                print(col("Install cancelled.", YELLOW))
+                pause()
+                continue
+
+            offline_ok, offline_note, stopped_packages = (
+                _exo_stop_selected_for_offline_install(cfg, plan)
+            )
+            print(col(offline_note, GREEN if offline_ok else RED))
+            if not offline_ok:
+                print(col(
+                    "No EXO config file was modified because offline prep failed.",
+                    YELLOW,
+                ))
+                pause()
+                continue
+
+            ok, note, backups = install_exotic_master_plan(
+                manifest, plan
+            )
+            print(col(note, GREEN if ok else RED))
+            for backup in backups or []:
+                print(f"Backup: {backup}")
+            if ok:
+                print(col(
+                    "Installed files are under current Workspace/exotichub99/<UID>*.json",
+                    DIM,
+                ))
+                print("")
+                print(col("PRESERVED PET UUID / TEAM DATA:", BOLD))
+                for item in plan:
+                    by_file = item.get("preserved_identity_paths", {})
+                    total = sum(len(paths) for paths in by_file.values())
+                    print(
+                        f"  {item['username']} UID={item['uid']} -> "
+                        f"{total} preserved field(s)"
+                    )
+                    for suffix, paths in by_file.items():
+                        if not paths:
+                            continue
+                        preview = ", ".join(paths[:8])
+                        if len(paths) > 8:
+                            preview += f", +{len(paths)-8} more"
+                        print(f"      {suffix}: {preview}")
+
+                print("")
+                print(col(
+                    "Offline hold: watching for package respawn; "
+                    "brief respawns will be exact-PID stopped and payload re-applied.",
+                    DIM,
+                ))
+                stopped_ok, stopped_note, respawns = (
+                    _exo_hold_stopped_with_respawn_guard(
+                        cfg,
+                        plan,
+                        stable_seconds=4.0,
+                        max_total_seconds=18.0,
+                        max_respawns_per_package=3,
+                        reapply_payload=True,
+                    )
+                )
+                print(col(
+                    f"Offline hold: {'PASS' if stopped_ok else 'FAIL'} "
+                    f"({stopped_note})",
+                    GREEN if stopped_ok else RED,
+                ))
+
+                verify = _verify_exotic_install_plan(manifest, plan)
+                failures = [entry for entry in verify if not entry[1]]
+                print("")
+                if stopped_ok and not failures:
+                    print(col(
+                        f"Read-back verification: PASS ({len(verify)}/{len(verify)} "
+                        f"accounts: master settings match + preserved pet/team identity exact)",
+                        GREEN,
+                    ))
+                    print(col(
+                        "Selected clones are intentionally LEFT STOPPED. "
+                        "Start/rejoin them normally so EXO loads this config fresh.",
+                        CYAN,
+                    ))
+                elif not stopped_ok:
+                    print(col(
+                        "Offline install cannot be certified because the selected "
+                        "package(s) could not remain stably stopped.",
+                        RED,
+                    ))
+                else:
+                    print(col(
+                        f"Read-back verification: FAIL ({len(failures)} mismatch/error)",
+                        RED,
+                    ))
+                    for item, _ok, why in failures:
+                        print(f"  {item['username']} UID={item['uid']}: {why}")
+            pause()
+            continue
+
+        if choice == "2":
+            configure_exo_uid_groups_menu(cfg)
+            continue
+
+        if choice == "3":
+            destinations = _current_executor_workspace_roots_for_selection(
+                cfg,
+                "GENERIC WORKSPACE ZIP IMPORT: SELECT PACKAGES",
+            )
+            if not destinations:
+                print(col("No current executor Workspace resolved.", RED))
+                pause()
+                continue
+
+            raw = clean_terminal_input(input(
+                f"Generic ZIP path [ENTER={DELTA_WORKSPACE_DEFAULT_IMPORT_ZIP}]: "
             ))
             zip_path = Path(raw) if raw else DELTA_WORKSPACE_DEFAULT_IMPORT_ZIP
 
@@ -25080,60 +29310,113 @@ def workspace_zip_tools_menu(cfg):
                 pause()
                 continue
 
-            existing = sum(
-                1 for _, relative in members
-                if (DELTA_GLOBAL_WORKSPACE_DIR / relative).is_file()
-            )
             print("")
             print(f"Files detected : {len(members)}")
-            print(f"Will overwrite : {existing}")
-            print(f"Destination    : {DELTA_GLOBAL_WORKSPACE_DIR}")
-            print(col(
-                "Overwritten files are backed up automatically before import.",
-                DIM,
-            ))
+            print(col("Current destination Workspace(s):", BOLD))
+            total_existing = 0
+            for item in destinations:
+                root = Path(item["root"])
+                existing = sum(
+                    1 for _, relative in members
+                    if (root / relative).is_file()
+                )
+                total_existing += existing
+                pkg_text = ", ".join(short_pkg(p) for p in item["packages"])
+                print(
+                    f"  {root}  [{item['storage']}] "
+                    f"<- {pkg_text}  overwrite={existing}"
+                )
+            print(f"Total overwrite : {total_existing}")
 
-            if not _setup_yes_no("Import now?", default=True):
+            if not _setup_yes_no("Import generic Workspace ZIP now?", default=True):
                 print(col("Import cancelled.", YELLOW))
                 pause()
                 continue
 
-            ok, note, backup = import_workspace_zip_to_delta(
-                zip_path, make_backup=True
+            ok, note, backups = import_workspace_zip_to_roots(
+                zip_path,
+                [item["root"] for item in destinations],
+                make_backup=True,
             )
             print(col(note, GREEN if ok else RED))
-            if backup:
+            for backup in backups or []:
                 print(f"Backup: {backup}")
             pause()
             continue
 
-        if choice == "2":
-            print(col("Building Delta Workspace export...", CYAN))
-            try:
-                ok, note, output, count = export_delta_workspace_zip()
-            except Exception as exc:
-                ok, note, output = False, f"Export failed: {exc}", None
-            print(col(note, GREEN if ok else RED))
-            if output:
-                print(f"ZIP: {output}")
+        if choice == "6":
+            destinations = _current_executor_workspace_roots_for_selection(
+                cfg,
+                "WORKSPACE EXPORT: SELECT PACKAGES",
+            )
+            if not destinations:
+                print(col("No current executor Workspace resolved.", RED))
+                pause()
+                continue
+
+            print("")
+            for index, item in enumerate(destinations, start=1):
+                root = Path(item["root"])
+                packages = item["packages"]
+                label = (
+                    short_pkg(packages[0])
+                    if len(packages) == 1
+                    else f"shared_{index}"
+                )
+                try:
+                    ok, note, output, count = export_workspace_root_zip(
+                        root, label=label
+                    )
+                except Exception as exc:
+                    ok, note, output = False, f"Export failed: {exc}", None
+                print(col(note, GREEN if ok else RED))
+                if output:
+                    print(f"ZIP: {output}")
             pause()
             continue
 
-        if choice == "3":
+        if choice == "4":
+            destinations = _current_executor_workspace_roots_for_selection(
+                cfg,
+                "SHOW WORKSPACE PATHS: SELECT PACKAGES",
+            )
+            if not destinations:
+                print(col("No current executor Workspace resolved.", RED))
+                pause()
+                continue
             print("")
-            print("Supported input layouts:")
-            print("  Arceus X/Workspace/HolyV2/...")
-            print("  Delta/Workspace/HolyV2/...")
-            print("  Workspace/HolyV2/...")
-            print("  HolyV2/...  (already flat)")
+            print(col("Resolved current Workspace path(s):", BOLD))
+            for item in destinations:
+                pkg_text = ", ".join(short_pkg(p) for p in item["packages"])
+                print(f"  {pkg_text}")
+                print(f"    storage  : {item['storage']}")
+                print(f"    Workspace: {item['root']}")
+            pause()
+            continue
+
+        if choice == "5":
             print("")
-            print("All imported files land directly under:")
-            print(f"  {DELTA_GLOBAL_WORKSPACE_DIR}/")
+            print("EXO Master input:")
+            print("  /storage/emulated/0/Download/exotic_master.zip")
+            print("  newest exotic_master*.zip is auto-detected")
+            print("")
+            print("EXO Master destination:")
+            print("  <current Workspace>/exotichub99/<UID>file1.json")
+            print("  <current Workspace>/exotichub99/<UID>file2.json")
+            print("  <current Workspace>/exotichub99/<UID>filesession.json")
+            print("  <current Workspace>/exotichub99/<UID>gag2.json (if provided)")
+            print("")
+            print("Generic Workspace ZIP layouts:")
+            print("  Arceus X/Workspace/...")
+            print("  Delta/Workspace/...")
+            print("  Workspace/...")
+            print("  flat Workspace-relative files")
             pause()
             continue
 
         print(col("Invalid choice.", RED))
         time.sleep(1)
+
 
 
 def _delta_state_path_for_username(username):
@@ -33510,6 +37793,26 @@ def solver_response_http_status(data):
     return 0
 
 
+
+def solver_provider_failure_summary(data, cfg=None):
+    """Short sanitized reason for a provider/API failure."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    provider = solver_provider_name(cfg)
+    http_status = solver_response_http_status(data)
+    status = solver_response_status(data)
+    err = _solver_error_text(data) if "_solver_error_text" in globals() else ""
+    if not err and isinstance(data, dict):
+        err = str(data.get("error") or data.get("message") or "")
+    parts = [provider.upper()]
+    if http_status:
+        parts.append(f"HTTP {http_status}")
+    if status and status not in {"ERROR", "FAILED", "FAIL"}:
+        parts.append(status)
+    if err:
+        parts.append(cut(err, 70))
+    return " | ".join(parts[:4])
+
+
 def solver_response_provider_unavailable(data):
     if not isinstance(data, dict):
         return False
@@ -33846,6 +38149,175 @@ def start_challenge_probe_job(tab, cfg, rt, rt_tab, probe_token=0, reason="wait-
     )
     thread.start()
     return True, solver_job_note(pkg)
+
+
+
+def maybe_start_background_stuck_solver_probe(
+    tab,
+    target,
+    cfg,
+    rt,
+    rt_tab,
+    health,
+    core=None,
+):
+    """Restore the old post-open no-fresh solver probe without blocking the UI.
+
+    V4.81.75: Hatcher/Market background fresh verification replaced the old
+    synchronous wait loop, but that loop also owned the automatic CAPTCHA probe.
+    This is the nonblocking replacement.
+
+    Important safety rules:
+      * package-local only; peer Face Lock does not suppress this solver-only work
+      * never PID-stops, clears cache, routes, or opens Roblox
+      * one direct provider submission per stuck incident/open generation
+      * provider's existing >=10m package cooldown still applies
+      * own authoritative Face Lock / ban / current disconnect is not probed
+    """
+    if core is None:
+        core = RejoinCore([], cfg, rt)
+
+    pkg = str((tab or {}).get("package") or "")
+    if not pkg:
+        return None
+
+    if not cfg.get("solver_enabled", False):
+        return None
+
+    if (
+        str(target or "").lower() == "hatcher"
+        and cfg.get("hatcher_surgical_stable_policy", False)
+        and not cfg.get("hatcher_background_solver_probe_enabled", False)
+    ):
+        return None
+
+    alive = bool((health or {}).get("alive"))
+    clean_fresh = bool((health or {}).get("clean_fresh"))
+    bad = str((health or {}).get("bad") or "").strip().lower()
+
+    if clean_fresh:
+        # A healthy heartbeat closes the incident. Keep provider cooldown/history,
+        # but allow a later unrelated stuck incident to receive one new probe.
+        rt_tab["solver_background_stuck_since"] = 0
+        rt_tab["solver_background_stuck_probe_token"] = 0
+        rt_tab["solver_background_stuck_probe_started_at"] = 0
+        rt_tab["solver_background_stuck_last_note"] = ""
+        return None
+
+    if not alive:
+        rt_tab["solver_background_stuck_since"] = 0
+        return None
+
+    # Existing dedicated handlers own these states. In particular, C being a real
+    # Face Lock must hold C, but it must not prevent A/B/D from reaching this helper.
+    if bad in {
+        "face_lock",
+        "account_banned",
+        "disconnect",
+        "process_unknown",
+        "roblox_home",
+        "ui_challenge",
+        "challenge",
+    }:
+        return None
+
+    # Strong persisted auth proof on THIS package wins. Do not use peer auth here.
+    try:
+        if _authoritative_face_lock_runtime(rt_tab):
+            return None
+    except Exception:
+        pass
+
+    # Derive the current stuck incident from the package's own open/background
+    # generation. If NOMO did not open it this session, start a local observation
+    # timer now rather than blindly probing every ancient state immediately.
+    candidates = []
+    for key in (
+        "hatcher_background_fresh_opened_at",
+        "market_background_fresh_opened_at",
+        "last_open",
+    ):
+        try:
+            value = int(rt_tab.get(key, 0) or 0)
+        except Exception:
+            value = 0
+        if value > 0:
+            candidates.append(value)
+
+    try:
+        observed_since = int(rt_tab.get("solver_background_stuck_since", 0) or 0)
+    except Exception:
+        observed_since = 0
+
+    latest_open = max(candidates) if candidates else 0
+    if observed_since <= 0 or (latest_open > 0 and latest_open > observed_since):
+        observed_since = latest_open if latest_open > 0 else now()
+        rt_tab["solver_background_stuck_since"] = observed_since
+
+    elapsed = max(0, now() - observed_since)
+    probe_after = max(10, int(cfg.get("solver_probe_after_seconds", 180) or 180))
+    if elapsed < probe_after:
+        return None
+
+    # The token changes when a new open or a new post-clean stuck incident starts.
+    token = int(observed_since or latest_open or now())
+
+    # Reuse the historical solver_probe_token too, so a legacy synchronous probe
+    # and this restored background path can never both submit for the same open.
+    try:
+        previous_bg = int(rt_tab.get("solver_background_stuck_probe_token", 0) or 0)
+    except Exception:
+        previous_bg = 0
+    try:
+        previous_legacy = int(rt_tab.get("solver_probe_token", 0) or 0)
+    except Exception:
+        previous_legacy = 0
+
+    if previous_bg == token or previous_legacy == token:
+        if solver_job_running(pkg):
+            return "Solving", solver_job_note(pkg)
+        return None
+
+    if solver_job_running(pkg):
+        return "Solving", solver_job_note(pkg)
+
+    # Direct provider path on purpose. Manual Solver Test proved that invisible
+    # join CAPTCHAs can exist while Roblox's normal auth API still says VALID.
+    # challenge_confirmed=True bypasses the "API valid => provider not sent"
+    # challenge-only optimization for this one stuck incident.
+    started, note = start_solver_job(
+        tab,
+        cfg,
+        rt,
+        rt_tab,
+        reason=f"background stuck/no-fresh {format_age(elapsed)}",
+        force=False,
+        phase="probe",
+        target_override=str(target or rt_tab.get("target") or "hatcher"),
+        core=core,
+        challenge_confirmed=True,
+    )
+
+    if started:
+        rt_tab["solver_background_stuck_probe_token"] = token
+        rt_tab["solver_probe_token"] = token
+        rt_tab["solver_background_stuck_probe_started_at"] = now()
+        rt_tab["solver_background_stuck_last_note"] = str(note or "")
+        rt_tab["note"] = str(note or "solver running")
+        core.save()
+        log_activity(
+            f"stuck loading {format_age(elapsed)} -> solver provider started "
+            "(package-only; no reopen)",
+            pkg,
+            CYAN,
+        )
+        return "Solving", str(note or "solver running")
+
+    # Provider cooldown / configuration failure does not mark the incident as
+    # consumed. The normal dashboard may retry later, while start_solver_job()
+    # continues to enforce the hard provider cooldown.
+    rt_tab["solver_background_stuck_last_note"] = str(note or "")
+    return None
 
 
 def maybe_start_blocked_join_probe(tab, cfg, rt, rt_tab, state, alive, open_queue=None, mode="hatcher"):
@@ -34193,9 +38665,13 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
                     queued_item["solver_result"] = "PROVIDER_COOKIE_CLAIM_IGNORED_ROBLOX_VALID"
                     queued_item["skip_solver_once"] = True
                     queued_item["skip_solver_probe"] = True
+                    combined_desc = (
+                        "combined PS+cache recovery continues"
+                        if str((queued_item or {}).get("target") or "") == "hatcher"
+                        else "combined cache recovery continues"
+                    )
                     log_activity(
-                        "solver invalid/flagged claim ignored; Roblox auth valid; "
-                        "combined PS+cache recovery continues",
+                        "solver invalid/flagged claim ignored; Roblox auth valid; " + combined_desc,
                         pkg,
                         YELLOW,
                     )
@@ -34460,12 +38936,27 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
                 YELLOW,
             )
         elif solver_response_provider_unavailable(response):
-            retry_after = max(600, int(cfg.get("solver_min_resubmit_seconds", 600) or 600))
+            retry_after = max(
+                600,
+                int(cfg.get("solver_min_resubmit_seconds", 600) or 600),
+            )
+            summary = solver_provider_failure_summary(response, cfg)
             rt_tab["solver_busy_retry_pending"] = True
             rt_tab["solver_busy_retry_at"] = now() + retry_after
-            rt_tab["solver_retry_reason"] = "SOLVER_UNAVAILABLE"
-            rt_tab["note"] = f"solver unavailable; retry provider in {format_age(retry_after)}"
-            log_activity(f"solver provider unavailable; retry provider in {format_age(retry_after)}", pkg, YELLOW)
+            rt_tab["solver_busy_retry_seconds"] = retry_after
+            rt_tab["solver_retry_reason"] = "PROVIDER_TEMP_ERROR"
+            rt_tab["solver_last_provider_temp_error"] = summary
+            rt_tab["solver_last_provider_temp_error_at"] = now()
+            rt_tab["note"] = (
+                f"provider temp error; retry in {format_age(retry_after)}: "
+                + cut(summary, 65)
+            )
+            log_activity(
+                f"solver provider TEMP ERROR; retry in {format_age(retry_after)}: "
+                + cut(summary, 90),
+                pkg,
+                YELLOW,
+            )
         elif status_code in {"SERVER_BUSY", "BUSY", "RATE_LIMITED", "TOO_MANY_REQUESTS"}:
             retry_after = max(600, int(cfg.get("solver_min_resubmit_seconds", 600) or 600))
             rt_tab["solver_busy_retry_pending"] = True
@@ -34582,11 +39073,20 @@ def normalized_solver_endpoint(endpoint, provider="auto"):
     if provider == "auto":
         provider = solver_provider_name({}, endpoint)
 
-    # Preserve an exact user-supplied path. Only a bare host gets a provider
-    # canonical path appended.
+    # Preserve an exact user-supplied path except for the known legacy
+    # BlockSolve generic-adapter path. BlockSolve's current contract is /join.
     try:
         parsed = urllib.parse.urlparse(endpoint)
         has_path = bool(parsed.path and parsed.path not in {"", "/"})
+        host = (parsed.hostname or "").lower()
+        path = str(parsed.path or "")
+        if (
+            provider == "blocksolve"
+            and (host == "blocksolve.site" or host.endswith(".blocksolve.site"))
+            and path.rstrip("/") == "/api/captcha/solve"
+        ):
+            rebuilt = parsed._replace(path="/join", params="", query="", fragment="")
+            return urllib.parse.urlunparse(rebuilt).rstrip("/")
     except Exception:
         after_scheme = endpoint.split("://", 1)[-1]
         has_path = "/" in after_scheme
@@ -35784,6 +40284,37 @@ def resume_face_locked_package(cfg):
     print(col(("Restart started: " if ok else "Restart failed: ") + str(note), GREEN if ok else RED))
     pause()
 
+
+def mark_face_locked_package_confirmed(cfg):
+    """Persist an explicit user-confirmed Face Lock for one package."""
+    selected = choose_packages_common(
+        cfg, "MARK CONFIRMED FACE-LOCK PACKAGE", multi=False,
+        installed_only=False, include_discovered=True,
+    )
+    if not selected:
+        return
+    pkg = selected[0]
+    rt = load_runtime()
+    rt_tab = get_runtime_tab(rt, pkg)
+    retry_seconds = max(600, int(cfg.get("manual_auth_retry_seconds", 3600) or 3600))
+    detected_at = now()
+    detail = "manual confirmed Account Locked / Face Lock"
+    rt_tab["face_lock_detected"] = True
+    rt_tab["face_lock_detected_at"] = detected_at
+    rt_tab["face_lock_last_seen_at"] = detected_at
+    rt_tab["face_lock_detail"] = detail
+    rt_tab["face_lock_evidence_source"] = "manual_confirmed"
+    mark_manual_login_block(
+        rt_tab, "face_lock", detail, "FACE LOCK HOLD (manual confirmed)",
+        detected_at, retry_seconds,
+    )
+    set_hold(pkg, "face_lock", retry_seconds)
+    rt_tab["note"] = "FACE LOCK HOLD (manual confirmed)"
+    save_runtime(rt)
+    print(col(f"Confirmed Face Lock saved for {pkg}.", RED))
+    print(col("Transient HTTP/kick/loading screens will not overwrite this hold.", DIM))
+    pause()
+
 def recovery_menu(cfg):
     while True:
         clear()
@@ -35796,6 +40327,7 @@ def recovery_menu(cfg):
         print("6. Test login/CAPTCHA detection for one package")
         print("7. Test face-lock visual detection for one package")
         print("8. Clear/resume one face-locked package")
+        print("9. Mark one package as CONFIRMED Face Lock")
         print("0. Back")
         drain_stdin()
         ch = input("\nChoose: ").strip()
@@ -35871,6 +40403,8 @@ def recovery_menu(cfg):
             test_face_lock_detection_menu(cfg)
         elif ch == "8":
             resume_face_locked_package(cfg)
+        elif ch == "9":
+            mark_face_locked_package_confirmed(cfg)
         else:
             print("Invalid choice.")
             time.sleep(1)
@@ -35883,6 +40417,15 @@ def solver_menu(cfg):
         effective_endpoint = effective_solver_endpoint(cfg)
         print(f"1. Enable/disable: {cfg.get('solver_enabled', False)}")
         print(f"   Provider: {provider.upper()} | Effective endpoint: {effective_endpoint or '-'}")
+        raw_solver_endpoint = str(cfg.get("solver_endpoint", "") or "").strip()
+        if (
+            provider == "blocksolve"
+            and "/api/captcha/solve" in raw_solver_endpoint.lower()
+        ):
+            print(col(
+                "   Legacy BlockSolve path detected; NOMO will normalize it to /join.",
+                YELLOW,
+            ))
         print(f"2. Provider endpoint + API key: {cfg.get('solver_endpoint', 'https://solver.wintercode.dev')}")
         print(f"   API key: {mask_secret(cfg.get('solver_api_key', ''))}")
         if provider == "blocksolve":
@@ -35979,14 +40522,29 @@ def solver_menu(cfg):
             print(col(f"Testing solver for {pkg}...", YELLOW))
             try:
                 ok, resp = solve_captcha(cookie, cfg, place_id)
-                if ok:
-                    print(col("Solver success", GREEN))
+                response_kind = solver_response_kind(resp)
+                provider_ok = bool(ok or response_kind == "no_challenge")
+                if provider_ok:
+                    if response_kind == "no_challenge":
+                        print(col("Solver reachable: NO_CAPTCHA / no challenge", GREEN))
+                    else:
+                        print(col("Solver success", GREEN))
                     if is_on_hold(pkg):
                         clear_hold(pkg)
                         print(col("Hold cleared from captcha_hold.json.", GREEN))
                     rt = load_runtime()
                     rt_tab = get_runtime_tab(rt, pkg)
                     clear_manual_login_block(rt_tab)
+                    if str(rt_tab.get("solver_retry_reason") or "") in {
+                        "SOLVER_UNAVAILABLE",
+                        "PROVIDER_TEMP_ERROR",
+                    }:
+                        rt_tab["solver_busy_retry_pending"] = False
+                        rt_tab["solver_busy_retry_at"] = 0
+                        rt_tab["solver_retry_reason"] = ""
+                        rt_tab["solver_last_provider_temp_error"] = ""
+                        rt_tab["note"] = "manual solver test confirmed provider reachable"
+                        print(col("Cleared stale provider-temp-error label.", GREEN))
                     save_runtime(rt)
                     print(col("Manual login flag cleared from runtime.json.", GREEN))
                     status = check_cookie_challenge(cookie)
@@ -36020,8 +40578,12 @@ def solver_menu(cfg):
             if cookie:
                 print(col(f"Testing solver (timeout {cfg.get('solver_timeout_seconds', 180)}s)...", YELLOW))
                 ok, resp = solve_captcha(cookie, cfg)
-                if ok:
-                    print(col("Solver success", GREEN))
+                response_kind = solver_response_kind(resp)
+                if ok or response_kind == "no_challenge":
+                    if response_kind == "no_challenge":
+                        print(col("Solver reachable: NO_CAPTCHA / no challenge", GREEN))
+                    else:
+                        print(col("Solver success", GREEN))
                     status = check_cookie_challenge(cookie)
                     if status == "valid":
                         print(col("Cookie is now valid.", GREEN))
@@ -43295,6 +47857,16 @@ def main():
                 setup=False,
                 show_screen=True,
             )
+
+            print("")
+            print(col(
+                "Cache cleanup complete -> starting " + str(mode).upper() + " watchdog...",
+                CYAN,
+            ))
+            try:
+                sys.stdout.flush()
+            except Exception:
+                pass
 
             try:
                 start_active_rejoin_mode(cfg)
