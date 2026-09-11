@@ -14,6 +14,16 @@
 # - No recovery rule, PID policy, Home routing, shell wake, solver, or Option 17
 #   behavior is changed.
 #
+# V4.81.113 — DIRECT VISIBLE CAPTCHA -> BLOCKSOLVE / NO START-PUZZLE CLICK
+# - Intentional revert of the V4.81.112 Start Puzzle experiment.
+# - Base behavior is V4.81.111.
+# - Exact visible Security / Verifying you're not a bot / Start Puzzle UI is
+#   sent directly to BlockSolve.
+# - NOMO does NOT tap/click Start Puzzle.
+# - NOMO does NOT PID-stop, reopen, or clear cache for visible CAPTCHA handling.
+# - V4.81.111 successful-result cooldown override remains.
+# - V4.81.110 task-lost Hatcher recovery and modern Market/EXO fixes remain.
+#
 # V4.81.111 — EXACT VISIBLE CAPTCHA STARTS SOLVER / SUCCESS-COOLDOWN OVERRIDE
 # - V4.81.110 could correctly detect Security -> Verifying you're not a bot ->
 #   Start Puzzle, but display Captcha instead of starting BlockSolve.
@@ -1786,7 +1796,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.111"
+__version__ = "V4.81.113"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
