@@ -14,6 +14,35 @@
 # - No recovery rule, PID policy, Home routing, shell wake, solver, or Option 17
 #   behavior is changed.
 #
+# V4.81.116 — CAPTCHA_SUCCESS CLEAR CACHE + REOPEN / NO NEW PS
+# - After external BlockSolve success, Roblox's existing Security session can
+#   remain stale even after a plain reopen.
+# - CAPTCHA_SUCCESS now performs:
+#       exact target PID stop
+#       -> forced Clear Cache
+#       -> reopen using the EXISTING target/private-server link.
+# - It deliberately does NOT refresh/generate a new Hatcher private-server code.
+# - Solver-success recovery is exempt from the generic ALIVE->soft downgrade so
+#   its exact-PID + cache contract cannot silently turn into a soft deep-link hop.
+# - NO_CAPTCHA remains no-reopen to avoid false-negative reopen loops.
+#
+# V4.81.115 — CAPTCHA_SUCCESS ALWAYS REOPENS EXACT PACKAGE ONCE
+# - External BlockSolve success does not refresh the already-open Roblox
+#   Security/verification window. The UI can remain visually stuck on Start
+#   Puzzle even though the provider has solved the challenge.
+# - Therefore post-open CAPTCHA_SUCCESS no longer waits for the visible auth UI
+#   to disappear and no longer uses that stale UI as proof of failure.
+# - Every post-open solved result (CAPTCHA_SUCCESS/SUCCESS/SOLVED/COMPLETED/OK)
+#   queues exactly ONE package-local solver-result recovery:
+#       exact target PID stop -> normal target reopen
+#   with solver_preflight_done / skip_solver_once metadata so the reopen does
+#   not immediately send the same solved incident back to BlockSolve.
+# - NO_CAPTCHA is deliberately different: it does NOT force a reopen, because a
+#   provider false-negative plus automatic reopen could create a request/reopen
+#   loop. It stays under the incident-scoped provider cooldown logic.
+# - No Clear Cache and no new private-server generation are added merely because
+#   CAPTCHA_SUCCESS occurred; those remain reserved for the separate stuck flows.
+#
 # V4.81.114 — MULTIPLE VISIBLE CAPTCHAS / INCIDENT-SCOPED PROVIDER COOLDOWN
 # - Two clones can have visible CAPTCHA at the same time. Solver jobs are already
 #   package-local/concurrent, but an older provider retry/cooldown stored on one
@@ -1813,7 +1842,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.114"
+__version__ = "V4.81.116"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -18452,6 +18481,14 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
             core.save()
             return True
 
+    if item.get("solver_success_requires_reopen"):
+        log_activity(
+            "CAPTCHA_SUCCESS recovery executing: exact target PID -> "
+            "Clear Cache -> reopen; existing link kept (NO PS refresh)",
+            pkg,
+            CYAN,
+        )
+
     # V4.81.100: a Market item may have waited in FIFO after the original 5m
     # stuck observation. Cancel it only on STRONG proof that this exact account is
     # now genuinely running Market in the current JobId. Fresh ts alone is not proof.
@@ -18498,6 +18535,7 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
         and _is_noka_clone_package(pkg)
         and cfg.get("noka_alive_auto_hard_peer_safe_soft_enabled", True)
         and automatic_hard_item_can_soft_downgrade(item)
+        and not item.get("solver_success_requires_reopen")
         and not (
             target == "hatcher"
             and cfg.get("hatcher_surgical_stable_policy", False)
@@ -19009,7 +19047,9 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
         log_activity(f"open held by manual verification: {cut(manual_note, 70)}", pkg, YELLOW)
         return False, manual_note
     display_mode = str(mode or "hard")
-    if item.get("market_peer_safe_cache_protocol"):
+    if item.get("solver_success_requires_reopen"):
+        display_mode = "solver-success-reopen"
+    elif item.get("market_peer_safe_cache_protocol"):
         display_mode = "market-cache-protocol"
     elif item.get("visible_home_protocol_nudge"):
         display_mode = "home-protocol"
@@ -39384,9 +39424,6 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
         if no_captcha_result or solved_result:
             result_label = "NO_CAPTCHA" if no_captcha_result else "CAPTCHA_SUCCESS"
             detail = _solver_probe_detail(response)
-            solved_visible_auth = android_login_challenge_ui_detail(
-                pkg, cfg, force=True, auth_hint=_runtime_auth_hint(rt_tab)
-            ) if solved_result else None
 
             clear_hold(pkg)
             clear_manual_login_block(rt_tab)
@@ -39403,45 +39440,57 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
             else:
                 clear_solver_no_captcha_trust(rt_tab)
 
-            # Remove only stale/duplicate queue entries for this package. Never
-            # disturb another clone's queued recovery.
+            # Remove only stale/duplicate queue entries for THIS package.
             core.cancel(pkg)
 
-            # This is a post-open provider result. Never PID-stop Noka here. If a
-            # solved CAPTCHA leaves the 529/auth wrapper visible, deliver one safe
-            # task-reuse route so Roblox can retry the join without touching PIDs.
-            if solved_result and solved_visible_auth and _is_noka_clone_package(pkg):
-                meta = {
-                    "solver_preflight_done": True, "skip_solver_once": True,
-                    "skip_solver_probe": True, "no_hard_fallback": True,
-                    "auth_529_post_solver_route": True,
-                }
-                added, _ = core.queue_route_retry(
-                    tab, target, "CAPTCHA_SUCCESS; safe 529 route retry", metadata=meta, bypass_manual=True
+            # V4.81.115:
+            # BlockSolve runs externally. A successful solve does not mutate the
+            # already-open Roblox Security window, so waiting for that UI to
+            # disappear is incorrect. Always perform exactly one protected
+            # package-local reopen after a real solved result.
+            if solved_result:
+                solver_metadata = solver_result_recovery_metadata(
+                    result_label,
+                    {
+                        "solver_success_requires_reopen": True,
+                        "solver_success_completed_at": now(),
+                        # Reuse the protected exact-PID + forced-cache machinery,
+                        # but keep the existing target/private-server link.
+                        "combined_stuck_recovery": True,
+                        "combined_stuck_refresh_private_link": False,
+                        "combined_stuck_clear_cache": True,
+                    },
                 )
-                rt_tab["note"] = "CAPTCHA_SUCCESS; safe route retry queued" if added else "CAPTCHA_SUCCESS; safe route retry already queued"
-                log_activity("CAPTCHA_SUCCESS + 529/auth UI; safe route retry (no PID stop)", pkg, GREEN)
-                changed = True
-                continue
+                added, qnote = core.queue_solver_result_recovery(
+                    tab,
+                    target,
+                    result_label,
+                    solver_metadata,
+                )
+                rt_tab["solver_success_reopen_queued_at"] = now()
+                rt_tab["solver_success_reopen_target"] = target
 
-            should_rejoin = False
-
-            if should_rejoin:
-                rt_tab["note"] = f"{result_label} - rejoin queued"
-                activity = f"solver {result_label}; rejoin queued"
+                if added:
+                    rt_tab["note"] = "CAPTCHA_SUCCESS; cache+reopen queued"
+                    activity = (
+                        "solver CAPTCHA_SUCCESS; exact-PID + Clear Cache + "
+                        "reopen queued (existing link, no PS refresh)"
+                    )
+                else:
+                    rt_tab["note"] = "CAPTCHA_SUCCESS; cache+reopen already queued"
+                    activity = (
+                        "solver CAPTCHA_SUCCESS; cache+reopen already queued"
+                    )
                 if detail:
                     activity += " - " + cut(detail, 70)
                 log_activity(activity, pkg, GREEN)
 
-                solver_metadata = solver_result_recovery_metadata(result_label)
-                added, _ = core.queue_solver_result_recovery(
-                    tab, target, result_label, solver_metadata
-                )
-                if not added:
-                    rt_tab["note"] = f"{result_label} - already queued"
             else:
-                rt_tab["note"] = f"{result_label} - no reopen"
-                activity = f"solver {result_label}; no package reopen"
+                # NO_CAPTCHA is not proof that a visible challenge was solved.
+                # Do not create an automatic reopen loop from provider
+                # false-negatives; incident-scoped cooldown logic owns retry.
+                rt_tab["note"] = "NO_CAPTCHA - no reopen"
+                activity = "solver NO_CAPTCHA; no package reopen"
                 if detail:
                     activity += " - " + cut(detail, 70)
                 log_activity(activity, pkg, GREEN)
