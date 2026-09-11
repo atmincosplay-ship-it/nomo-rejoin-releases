@@ -14,6 +14,15 @@
 # - No recovery rule, PID policy, Home routing, shell wake, solver, or Option 17
 #   behavior is changed.
 #
+# V4.81.117 — VISIBLE NO_CAPTCHA ALSO CACHE+REOPENS ONCE
+# - NO_CAPTCHA can mean the challenge is already cleared server-side while the
+#   open Roblox Security wrapper remains visually stuck.
+# - NO_CAPTCHA now gets the same exact-PID + Clear Cache + reopen as success,
+#   but ONLY when exact package-scoped verification UI is still visible.
+# - No visible verification UI => NO_CAPTCHA stays no-reopen.
+# - One visible-NO_CAPTCHA reopen per CAPTCHA incident prevents loops.
+# - Existing target/private-server link is reused; NO new PS is generated.
+#
 # V4.81.116 — CAPTCHA_SUCCESS CLEAR CACHE + REOPEN / NO NEW PS
 # - After external BlockSolve success, Roblox's existing Security session can
 #   remain stale even after a plain reopen.
@@ -1842,7 +1851,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.116"
+__version__ = "V4.81.117"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -18482,8 +18491,13 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
             return True
 
     if item.get("solver_success_requires_reopen"):
+        solver_result_name = (
+            "NO_CAPTCHA+visibleUI"
+            if item.get("solver_visible_no_captcha_reopen")
+            else "CAPTCHA_SUCCESS"
+        )
         log_activity(
-            "CAPTCHA_SUCCESS recovery executing: exact target PID -> "
+            f"{solver_result_name} recovery executing: exact target PID -> "
             "Clear Cache -> reopen; existing link kept (NO PS refresh)",
             pkg,
             CYAN,
@@ -39425,6 +39439,14 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
             result_label = "NO_CAPTCHA" if no_captcha_result else "CAPTCHA_SUCCESS"
             detail = _solver_probe_detail(response)
 
+            visible_no_captcha_ui = False
+            if no_captcha_result:
+                visible_no_captcha_ui = bool(
+                    android_exact_login_challenge_text_detail(
+                        pkg, cfg, force=True
+                    )
+                )
+
             clear_hold(pkg)
             clear_manual_login_block(rt_tab)
             clear_captcha_ui_runtime(rt_tab)
@@ -39443,19 +39465,31 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
             # Remove only stale/duplicate queue entries for THIS package.
             core.cancel(pkg)
 
-            # V4.81.115:
-            # BlockSolve runs externally. A successful solve does not mutate the
-            # already-open Roblox Security window, so waiting for that UI to
-            # disappear is incorrect. Always perform exactly one protected
-            # package-local reopen after a real solved result.
-            if solved_result:
+            should_cache_reopen = bool(solved_result)
+
+            current_incident_id = str(
+                rt_tab.get("captcha_ui_incident_id", "") or ""
+            )
+            if no_captcha_result and visible_no_captcha_ui:
+                last_used_incident = str(
+                    rt_tab.get("solver_no_captcha_reopen_incident_id", "") or ""
+                )
+                if (
+                    not current_incident_id
+                    or current_incident_id != last_used_incident
+                ):
+                    should_cache_reopen = True
+
+            if should_cache_reopen:
                 solver_metadata = solver_result_recovery_metadata(
                     result_label,
                     {
                         "solver_success_requires_reopen": True,
                         "solver_success_completed_at": now(),
-                        # Reuse the protected exact-PID + forced-cache machinery,
-                        # but keep the existing target/private-server link.
+                        "solver_visible_no_captcha_reopen": bool(
+                            no_captcha_result and visible_no_captcha_ui
+                        ),
+                        "solver_captcha_incident_id": current_incident_id,
                         "combined_stuck_recovery": True,
                         "combined_stuck_refresh_private_link": False,
                         "combined_stuck_clear_cache": True,
@@ -39467,30 +39501,52 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
                     result_label,
                     solver_metadata,
                 )
+
                 rt_tab["solver_success_reopen_queued_at"] = now()
                 rt_tab["solver_success_reopen_target"] = target
 
+                if no_captcha_result and visible_no_captcha_ui:
+                    rt_tab["solver_no_captcha_reopen_incident_id"] = (
+                        current_incident_id or f"legacy:{now()}"
+                    )
+                    rt_tab["solver_no_captcha_reopen_at"] = now()
+
                 if added:
-                    rt_tab["note"] = "CAPTCHA_SUCCESS; cache+reopen queued"
-                    activity = (
-                        "solver CAPTCHA_SUCCESS; exact-PID + Clear Cache + "
-                        "reopen queued (existing link, no PS refresh)"
-                    )
+                    if no_captcha_result:
+                        rt_tab["note"] = "NO_CAPTCHA + visible UI; cache+reopen queued"
+                        activity = (
+                            "solver NO_CAPTCHA + exact verification UI still visible; "
+                            "exact-PID + Clear Cache + reopen queued "
+                            "(existing link, no PS refresh)"
+                        )
+                    else:
+                        rt_tab["note"] = "CAPTCHA_SUCCESS; cache+reopen queued"
+                        activity = (
+                            "solver CAPTCHA_SUCCESS; exact-PID + Clear Cache + "
+                            "reopen queued (existing link, no PS refresh)"
+                        )
                 else:
-                    rt_tab["note"] = "CAPTCHA_SUCCESS; cache+reopen already queued"
-                    activity = (
-                        "solver CAPTCHA_SUCCESS; cache+reopen already queued"
-                    )
+                    if no_captcha_result:
+                        rt_tab["note"] = "NO_CAPTCHA + visible UI; cache+reopen already queued"
+                        activity = "solver NO_CAPTCHA + visible UI; cache+reopen already queued"
+                    else:
+                        rt_tab["note"] = "CAPTCHA_SUCCESS; cache+reopen already queued"
+                        activity = "solver CAPTCHA_SUCCESS; cache+reopen already queued"
+
                 if detail:
                     activity += " - " + cut(detail, 70)
                 log_activity(activity, pkg, GREEN)
 
             else:
-                # NO_CAPTCHA is not proof that a visible challenge was solved.
-                # Do not create an automatic reopen loop from provider
-                # false-negatives; incident-scoped cooldown logic owns retry.
-                rt_tab["note"] = "NO_CAPTCHA - no reopen"
-                activity = "solver NO_CAPTCHA; no package reopen"
+                if no_captcha_result and visible_no_captcha_ui:
+                    rt_tab["note"] = "NO_CAPTCHA + visible UI; reopen already used for this incident"
+                    activity = "solver NO_CAPTCHA + visible UI; same-incident reopen already used"
+                else:
+                    rt_tab["note"] = "NO_CAPTCHA - no visible verification; no reopen"
+                    activity = (
+                        "solver NO_CAPTCHA; no exact visible verification UI; "
+                        "no package reopen"
+                    )
                 if detail:
                     activity += " - " + cut(detail, 70)
                 log_activity(activity, pkg, GREEN)
