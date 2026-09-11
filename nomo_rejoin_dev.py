@@ -14,6 +14,24 @@
 # - No recovery rule, PID policy, Home routing, shell wake, solver, or Option 17
 #   behavior is changed.
 #
+# V4.81.118 — NO_CAPTCHA USES SOLVER-JOB ORIGIN, NOT FLAKY RESULT-TIME UI RECHECK
+# - V4.81.117 could log both:
+#       solver NO_CAPTCHA but verification UI remains
+#       solver NO_CAPTCHA; no exact visible verification UI; no package reopen
+#   because two different UI reads disagreed a moment apart.
+# - Solver jobs now remember whether they were STARTED by the visible CAPTCHA
+#   path and snapshot that CAPTCHA incident id at submit time.
+# - If a job originated from visible CAPTCHA:
+#       CAPTCHA_SUCCESS OR NO_CAPTCHA
+#       -> exact target PID stop
+#       -> forced Clear Cache
+#       -> reopen EXISTING link
+#       -> NO new PS.
+# - This decision no longer depends on re-detecting Start Puzzle after the
+#   provider response.
+# - Background/probe NO_CAPTCHA still does NOT reopen.
+# - One reopen per saved visible CAPTCHA incident prevents loops.
+#
 # V4.81.117 — VISIBLE NO_CAPTCHA ALSO CACHE+REOPENS ONCE
 # - NO_CAPTCHA can mean the challenge is already cleared server-side while the
 #   open Roblox Security wrapper remains visually stuck.
@@ -1851,7 +1869,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.117"
+__version__ = "V4.81.118"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -18492,7 +18510,7 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
 
     if item.get("solver_success_requires_reopen"):
         solver_result_name = (
-            "NO_CAPTCHA+visibleUI"
+            "NO_CAPTCHA+visible-origin"
             if item.get("solver_visible_no_captcha_reopen")
             else "CAPTCHA_SUCCESS"
         )
@@ -38998,6 +39016,19 @@ def start_solver_job(tab, cfg, rt, rt_tab, reason, force=False, phase="solve", o
         "target": target,
         "reason": str(reason or "challenge"),
         "phase": str(phase or "solve"),
+        "challenge_confirmed": bool(challenge_confirmed),
+        # V4.81.118: phase=solve + challenge_confirmed is the package-scoped
+        # visible CAPTCHA path. Keep this proof with the job so a later UI read
+        # cannot erase the reason BlockSolve was called.
+        "visible_captcha_origin": bool(
+            challenge_confirmed and str(phase or "solve") == "solve"
+        ),
+        "captcha_ui_incident_id": str(
+            rt_tab.get("captcha_ui_incident_id", "") or ""
+        ),
+        "captcha_ui_visible_at_submit": bool(
+            rt_tab.get("captcha_ui_visible")
+        ),
         "open_generation": str(open_generation or ""),
         "started_at": now(),
         "timeout": timeout,
@@ -39404,7 +39435,12 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
                     log_activity("solver NO_CAPTCHA + 529/auth UI; FACE LOCK HOLD, no package reopen", pkg, RED)
                     changed = True
                     continue
-                log_activity("solver NO_CAPTCHA but verification UI remains; held in-place", pkg, YELLOW)
+                log_activity(
+                    "solver NO_CAPTCHA but verification UI remains; "
+                    "visible-origin cache+reopen decision follows",
+                    pkg,
+                    YELLOW,
+                )
 
         # V4.09: keep NO_CAPTCHA separate from CAPTCHA_SUCCESS. The provider
         # returning NO_CAPTCHA means there was nothing to solve, so a package that
@@ -39440,9 +39476,17 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
             detail = _solver_probe_detail(response)
 
             visible_no_captcha_ui = False
+            visible_no_captcha_origin = False
             if no_captcha_result:
+                visible_no_captcha_origin = bool(
+                    job.get("visible_captcha_origin")
+                )
+                # Compatibility fallback for a job that began before this build
+                # or for another package-scoped verification detector.
                 visible_no_captcha_ui = bool(
-                    android_exact_login_challenge_text_detail(
+                    visible_no_captcha_origin
+                    or visible_ui
+                    or android_exact_login_challenge_text_detail(
                         pkg, cfg, force=True
                     )
                 )
@@ -39468,8 +39512,18 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
             should_cache_reopen = bool(solved_result)
 
             current_incident_id = str(
-                rt_tab.get("captcha_ui_incident_id", "") or ""
+                job.get("captcha_ui_incident_id")
+                or rt_tab.get("captcha_ui_incident_id", "")
+                or ""
             )
+            if (
+                no_captcha_result
+                and visible_no_captcha_origin
+                and not current_incident_id
+            ):
+                current_incident_id = (
+                    "visible-job:" + str(job.get("started_at", 0) or 0)
+                )
             if no_captcha_result and visible_no_captcha_ui:
                 last_used_incident = str(
                     rt_tab.get("solver_no_captcha_reopen_incident_id", "") or ""
@@ -39488,6 +39542,9 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
                         "solver_success_completed_at": now(),
                         "solver_visible_no_captcha_reopen": bool(
                             no_captcha_result and visible_no_captcha_ui
+                        ),
+                        "solver_visible_captcha_origin": bool(
+                            no_captcha_result and visible_no_captcha_origin
                         ),
                         "solver_captcha_incident_id": current_incident_id,
                         "combined_stuck_recovery": True,
@@ -39513,9 +39570,9 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
 
                 if added:
                     if no_captcha_result:
-                        rt_tab["note"] = "NO_CAPTCHA + visible UI; cache+reopen queued"
+                        rt_tab["note"] = "NO_CAPTCHA from visible CAPTCHA; cache+reopen queued"
                         activity = (
-                            "solver NO_CAPTCHA + exact verification UI still visible; "
+                            "solver NO_CAPTCHA from visible CAPTCHA job; "
                             "exact-PID + Clear Cache + reopen queued "
                             "(existing link, no PS refresh)"
                         )
@@ -39527,8 +39584,11 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
                         )
                 else:
                     if no_captcha_result:
-                        rt_tab["note"] = "NO_CAPTCHA + visible UI; cache+reopen already queued"
-                        activity = "solver NO_CAPTCHA + visible UI; cache+reopen already queued"
+                        rt_tab["note"] = "NO_CAPTCHA from visible CAPTCHA; cache+reopen already queued"
+                        activity = (
+                            "solver NO_CAPTCHA from visible CAPTCHA job; "
+                            "cache+reopen already queued"
+                        )
                     else:
                         rt_tab["note"] = "CAPTCHA_SUCCESS; cache+reopen already queued"
                         activity = "solver CAPTCHA_SUCCESS; cache+reopen already queued"
@@ -39539,12 +39599,15 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
 
             else:
                 if no_captcha_result and visible_no_captcha_ui:
-                    rt_tab["note"] = "NO_CAPTCHA + visible UI; reopen already used for this incident"
-                    activity = "solver NO_CAPTCHA + visible UI; same-incident reopen already used"
-                else:
-                    rt_tab["note"] = "NO_CAPTCHA - no visible verification; no reopen"
+                    rt_tab["note"] = "NO_CAPTCHA visible incident; reopen already used"
                     activity = (
-                        "solver NO_CAPTCHA; no exact visible verification UI; "
+                        "solver NO_CAPTCHA from visible CAPTCHA job; "
+                        "same-incident reopen already used"
+                    )
+                else:
+                    rt_tab["note"] = "NO_CAPTCHA background/probe; no reopen"
+                    activity = (
+                        "solver NO_CAPTCHA from non-visible/background job; "
                         "no package reopen"
                     )
                 if detail:
