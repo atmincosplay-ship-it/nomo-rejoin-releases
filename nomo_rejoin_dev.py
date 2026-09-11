@@ -14,6 +14,24 @@
 # - No recovery rule, PID policy, Home routing, shell wake, solver, or Option 17
 #   behavior is changed.
 #
+# V4.81.119 — VISIBLE CAPTCHA INCIDENT MUST REOPEN AFTER TERMINAL SOLVER RESULT
+# - Root cause found: apply_visible_captcha_ui_action() unconditionally cancelled
+#   pending package reopens every watchdog cycle. After CAPTCHA_SUCCESS/NO_CAPTCHA
+#   queued the correct cache+reopen, the still-visible Security UI could cancel
+#   that queue item before it executed.
+# - Exact visible CAPTCHA now marks the current incident MUST-REOPEN.
+# - Visible CAPTCHA is NOT allowed to cancel a queued post-solver recovery.
+# - Flow:
+#       visible CAPTCHA -> mark must-reopen -> direct BlockSolve
+#       SUCCESS or NO_CAPTCHA -> exact target PID stop -> forced Clear Cache
+#       -> reopen EXISTING link -> NO new PS.
+# - The reopen waits for a terminal solver result. Detection alone does NOT kill
+#   the current task before BlockSolve has a chance to finish.
+# - If a terminal SUCCESS/NO_CAPTCHA from the SAME current incident is already
+#   recorded while the UI is still visible, the handler can queue the required
+#   cache+reopen immediately instead of sitting in solver cooldown.
+# - Same CAPTCHA incident can queue only one post-solver reopen.
+#
 # V4.81.118 — NO_CAPTCHA USES SOLVER-JOB ORIGIN, NOT FLAKY RESULT-TIME UI RECHECK
 # - V4.81.117 could log both:
 #       solver NO_CAPTCHA but verification UI remains
@@ -1869,7 +1887,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.118"
+__version__ = "V4.81.119"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -14447,6 +14465,76 @@ def maybe_queue_solver_busy_retry(open_queue, tab, target, rt_tab, cfg, health, 
     )
     return status, note, True
 
+
+def queue_visible_captcha_terminal_reopen(core, tab, target, rt_tab, result_label, cfg):
+    """Queue one exact-PID + cache reopen for this visible CAPTCHA incident."""
+    pkg = str((tab or {}).get("package", "") or "")
+    if not pkg:
+        return False, "missing package", False
+
+    incident_id = str(
+        rt_tab.get("captcha_reopen_required_incident_id")
+        or rt_tab.get("captcha_ui_incident_id")
+        or ""
+    )
+    if not incident_id:
+        incident_id = f"visible:{int(rt_tab.get('captcha_reopen_required_at', 0) or now())}"
+
+    last_queued = str(
+        rt_tab.get("captcha_terminal_reopen_incident_id", "") or ""
+    )
+    if last_queued == incident_id:
+        if core.has(pkg):
+            return False, "post-solver cache+reopen already queued", True
+        return False, "post-solver reopen already used for this CAPTCHA incident", True
+
+    metadata = solver_result_recovery_metadata(
+        result_label,
+        {
+            "solver_success_requires_reopen": True,
+            "solver_visible_captcha_required_reopen": True,
+            "solver_visible_no_captcha_reopen": (
+                str(result_label or "").upper() == "NO_CAPTCHA"
+            ),
+            "solver_captcha_incident_id": incident_id,
+            "combined_stuck_recovery": True,
+            "combined_stuck_refresh_private_link": False,
+            "combined_stuck_clear_cache": True,
+        },
+    )
+    added, qnote = core.queue_solver_result_recovery(
+        tab,
+        target,
+        result_label,
+        metadata,
+    )
+
+    # Reserve immediately so repeated watchdog cycles/results cannot create a loop.
+    rt_tab["captcha_terminal_reopen_incident_id"] = incident_id
+    rt_tab["captcha_terminal_reopen_queued_at"] = now()
+    rt_tab["captcha_reopen_required"] = False
+
+    if added:
+        note = (
+            f"{str(result_label or '').upper()} from visible CAPTCHA; "
+            "Clear Cache + reopen queued"
+        )
+        rt_tab["note"] = note
+        log_activity(
+            f"{str(result_label or '').upper()} visible CAPTCHA terminal result -> "
+            "exact-PID + Clear Cache + reopen EXISTING link (NO PS refresh)",
+            pkg,
+            GREEN,
+        )
+        core.save()
+        return True, note, True
+
+    note = qnote or "post-solver cache+reopen already queued"
+    rt_tab["note"] = note
+    core.save()
+    return False, note, True
+
+
 def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, health, core=None):
     """Solve one package-scoped visible challenge in-place without reopening Roblox.
 
@@ -14463,17 +14551,84 @@ def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, he
     rt_tab["captcha_ui_visible"] = True
     rt_tab["captcha_ui_last_seen_at"] = now()
 
-    # Never allow an old-state/periodic/provider-retry hard reopen to survive once
-    # the current package's verification UI is confirmed.
+    # V4.81.119: every visible CAPTCHA incident MUST reopen after a terminal
+    # provider result because the external solve does not refresh this Roblox UI.
+    current_incident = str(rt_tab.get("captcha_ui_incident_id", "") or "")
+    if not current_incident:
+        current_incident = f"visible:{now()}"
+        rt_tab["captcha_ui_incident_id"] = current_incident
+        rt_tab["captcha_ui_incident_started_at"] = now()
+    rt_tab["captcha_reopen_required"] = True
+    rt_tab["captcha_reopen_required_incident_id"] = current_incident
+    rt_tab["captcha_reopen_required_at"] = int(
+        rt_tab.get("captcha_reopen_required_at", 0) or now()
+    )
+
+    # Do NOT cancel the post-solver cache+reopen. Older builds did exactly that
+    # on the next watchdog cycle while Security/Start Puzzle was still visible.
+    queued = core.latest(pkg)
+    if queued and (
+        queued.get("solver_success_requires_reopen")
+        or queued.get("solver_visible_captcha_required_reopen")
+    ):
+        note = "post-solver Clear Cache + reopen queued"
+        rt_tab["note"] = note
+        core.save()
+        return "Queued", note, True
+
+    # Old unrelated stale/periodic/provider retry intents may still be removed.
     removed = core.cancel(pkg)
     if removed:
-        log_activity("verification UI cancelled pending package reopen", pkg, YELLOW)
+        log_activity(
+            "verification UI cancelled obsolete non-solver package reopen",
+            pkg,
+            YELLOW,
+        )
 
     if solver_job_running(pkg):
         note = solver_job_note(pkg)
         rt_tab["note"] = note
         core.save()
         return "Solving", note, True
+
+    # If BlockSolve already returned a terminal clear for THIS visible incident,
+    # there is nothing useful to wait for during the provider cooldown: the stale
+    # Roblox wrapper simply needs its mandatory cache+reopen.
+    last_provider_status = str(
+        rt_tab.get("solver_provider_last_status", "") or ""
+    ).strip().upper()
+    last_provider_incident = str(
+        rt_tab.get("solver_provider_last_incident_id", "") or ""
+    )
+    if (
+        solver_provider_status_was_success(last_provider_status)
+        and (
+            not last_provider_incident
+            or last_provider_incident == current_incident
+        )
+    ):
+        reopen_added, reopen_note, reopen_action = (
+            queue_visible_captcha_terminal_reopen(
+                core,
+                tab,
+                target,
+                rt_tab,
+                (
+                    "NO_CAPTCHA"
+                    if last_provider_status in {
+                        "NO_CAPTCHA", "NO_CHALLENGE", "NOT_REQUIRED", "CLEAR", "CLEAN"
+                    }
+                    else "CAPTCHA_SUCCESS"
+                ),
+                cfg,
+            )
+        )
+        if reopen_action:
+            return (
+                "Queued" if (reopen_added or core.has(pkg)) else "Captcha",
+                reopen_note,
+                True,
+            )
 
     busy_pending = bool(rt_tab.get("solver_busy_retry_pending"))
     busy_at = int(rt_tab.get("solver_busy_retry_at", 0) or 0)
@@ -39023,6 +39178,11 @@ def start_solver_job(tab, cfg, rt, rt_tab, reason, force=False, phase="solve", o
         "visible_captcha_origin": bool(
             challenge_confirmed and str(phase or "solve") == "solve"
         ),
+        "visible_captcha_must_reopen": bool(
+            rt_tab.get("captcha_reopen_required")
+            and challenge_confirmed
+            and str(phase or "solve") == "solve"
+        ),
         "captcha_ui_incident_id": str(
             rt_tab.get("captcha_ui_incident_id", "") or ""
         ),
@@ -39509,10 +39669,19 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
             # Remove only stale/duplicate queue entries for THIS package.
             core.cancel(pkg)
 
-            should_cache_reopen = bool(solved_result)
+            visible_job_must_reopen = bool(
+                job.get("visible_captcha_must_reopen")
+                or job.get("visible_captcha_origin")
+                or rt_tab.get("captcha_reopen_required")
+            )
+            should_cache_reopen = bool(
+                solved_result
+                or (no_captcha_result and visible_job_must_reopen)
+            )
 
             current_incident_id = str(
                 job.get("captcha_ui_incident_id")
+                or rt_tab.get("captcha_reopen_required_incident_id")
                 or rt_tab.get("captcha_ui_incident_id", "")
                 or ""
             )
@@ -39524,14 +39693,16 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
                 current_incident_id = (
                     "visible-job:" + str(job.get("started_at", 0) or 0)
                 )
-            if no_captcha_result and visible_no_captcha_ui:
+            if no_captcha_result and visible_job_must_reopen:
                 last_used_incident = str(
                     rt_tab.get("solver_no_captcha_reopen_incident_id", "") or ""
                 )
                 if (
-                    not current_incident_id
-                    or current_incident_id != last_used_incident
+                    current_incident_id
+                    and current_incident_id == last_used_incident
                 ):
+                    should_cache_reopen = False
+                else:
                     should_cache_reopen = True
 
             if should_cache_reopen:
@@ -39541,10 +39712,16 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
                         "solver_success_requires_reopen": True,
                         "solver_success_completed_at": now(),
                         "solver_visible_no_captcha_reopen": bool(
-                            no_captcha_result and visible_no_captcha_ui
+                            no_captcha_result and visible_job_must_reopen
                         ),
                         "solver_visible_captcha_origin": bool(
-                            no_captcha_result and visible_no_captcha_origin
+                            no_captcha_result and (
+                                visible_no_captcha_origin
+                                or visible_job_must_reopen
+                            )
+                        ),
+                        "solver_visible_captcha_required_reopen": bool(
+                            visible_job_must_reopen
                         ),
                         "solver_captcha_incident_id": current_incident_id,
                         "combined_stuck_recovery": True,
@@ -39562,11 +39739,12 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
                 rt_tab["solver_success_reopen_queued_at"] = now()
                 rt_tab["solver_success_reopen_target"] = target
 
-                if no_captcha_result and visible_no_captcha_ui:
+                if no_captcha_result and visible_job_must_reopen:
                     rt_tab["solver_no_captcha_reopen_incident_id"] = (
-                        current_incident_id or f"legacy:{now()}"
+                        current_incident_id or f"visible-job:{job.get('started_at', now())}"
                     )
                     rt_tab["solver_no_captcha_reopen_at"] = now()
+                rt_tab["captcha_reopen_required"] = False
 
                 if added:
                     if no_captcha_result:
@@ -39598,7 +39776,7 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
                 log_activity(activity, pkg, GREEN)
 
             else:
-                if no_captcha_result and visible_no_captcha_ui:
+                if no_captcha_result and visible_job_must_reopen:
                     rt_tab["note"] = "NO_CAPTCHA visible incident; reopen already used"
                     activity = (
                         "solver NO_CAPTCHA from visible CAPTCHA job; "
