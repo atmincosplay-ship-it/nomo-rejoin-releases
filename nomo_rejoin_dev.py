@@ -14,6 +14,17 @@
 # - No recovery rule, PID policy, Home routing, shell wake, solver, or Option 17
 #   behavior is changed.
 #
+# V4.81.122 — GENERIC VISIBLE CAPTCHA_FAILED TREATED LIKE NO_CAPTCHA
+# - BlockSolve may return CAPTCHA_FAILED with generic wording:
+#       "Captcha solve failed. Cookie may be invalid or flagged."
+# - For a solver job that originated from package-scoped VISIBLE CAPTCHA only,
+#   that narrow generic response is treated like NO_CAPTCHA for restart:
+#       exact target PID stop -> forced Clear Cache -> reopen EXISTING link
+#       NO new PS.
+# - HTTP 429/5xx/504, TRY_AGAIN, BUSY, rate-limit/unavailable, and explicit
+#   INVALID_COOKIE/AUTH_FAILED responses remain real failures.
+# - Background/probe jobs are never reclassified by this rule.
+#
 # V4.81.121 — TERMINAL SOLVER RESULT MUST PASS STALE SECURITY UI
 # - Final conflict found: after BlockSolve returned CAPTCHA_SUCCESS/NO_CAPTCHA
 #   and NOMO queued exact-PID + Clear Cache + reopen, process_open_queue() did a
@@ -1921,7 +1932,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.121"
+__version__ = "V4.81.122"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -18747,6 +18758,11 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
             if item.get("solver_visible_no_captcha_reopen")
             else "CAPTCHA_SUCCESS"
         )
+        if (
+            item.get("solver_visible_no_captcha_reopen")
+            and rt_tab.get("solver_generic_failed_as_clear")
+        ):
+            solver_result_name = "CAPTCHA_FAILED->NO_CAPTCHA"
         log_activity(
             f"{solver_result_name} TERMINAL result -> exact target PID -> "
             "Clear Cache -> reopen EXISTING link; stale Security UI will not block; "
@@ -19340,6 +19356,7 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
         display_mode = "solver-success-reopen"
         rt_tab["solver_terminal_reopen_required"] = False
         rt_tab["solver_terminal_reopen_consumed_at"] = now()
+        rt_tab["solver_generic_failed_as_clear"] = False
     elif item.get("market_peer_safe_cache_protocol"):
         display_mode = "market-cache-protocol"
     elif item.get("visible_home_protocol_nudge"):
@@ -38608,6 +38625,54 @@ def solver_response_claims_cookie_invalid_or_flagged(data):
     return any(marker in text for marker in markers)
 
 
+
+def solver_response_generic_visible_captcha_failed_clear_candidate(data):
+    """Narrow BlockSolve CAPTCHA_FAILED -> NO_CAPTCHA compatibility rule."""
+    if not isinstance(data, dict):
+        return False
+
+    status = str(solver_response_status(data) or "").strip().upper()
+    if status != "CAPTCHA_FAILED":
+        return False
+
+    http_status = int(solver_response_http_status(data) or 0)
+    if http_status == 429 or http_status >= 500:
+        return False
+
+    text_blob = solver_response_text_blob(data)
+    if any(
+        marker in text_blob
+        for marker in (
+            "try_again",
+            "try again",
+            "server_busy",
+            "server busy",
+            "rate limit",
+            "too many requests",
+            "service unavailable",
+            "provider unavailable",
+            "http 429",
+            "http 500",
+            "http 502",
+            "http 503",
+            "http 504",
+            "invalid_cookie",
+            "invalid cookies",
+            "auth_failed",
+            "unauthorized",
+        )
+    ):
+        return False
+
+    return bool(
+        "captcha solve failed" in text_blob
+        and (
+            "cookie may be invalid or flagged" in text_blob
+            or "may be invalid or flagged" in text_blob
+        )
+    )
+
+
 def verify_roblox_auth_after_provider_cookie_claim(pkg, cfg):
     """Independently verify a provider INVALID/FLAGGED claim with Roblox.
 
@@ -39489,14 +39554,37 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
             rt_tab["solver_provider_last_status"] = status_code or "UNKNOWN"
             rt_tab["solver_provider_next_submit_at"] = now() + min_submit
 
+        visible_origin_job = bool(
+            job.get("visible_captcha_must_reopen")
+            or job.get("visible_captcha_origin")
+        )
+        generic_visible_failed_as_clear = bool(
+            visible_origin_job
+            and str(job.get("phase", "")) == "solve"
+            and solver_response_generic_visible_captcha_failed_clear_candidate(response)
+        )
+
         no_captcha_result = (
             status_code in {"NO_CAPTCHA", "NO_CHALLENGE", "NOT_REQUIRED", "CLEAR", "CLEAN"}
             or bool(job.get("no_challenge"))
+            or generic_visible_failed_as_clear
         )
         solved_result = (
             status_code in {"CAPTCHA_SUCCESS", "SUCCESS", "SOLVED", "COMPLETED", "OK"}
             or bool(job.get("ok"))
         )
+
+        if generic_visible_failed_as_clear:
+            rt_tab["solver_provider_original_status"] = status_code or "CAPTCHA_FAILED"
+            rt_tab["solver_provider_last_status"] = "NO_CAPTCHA"
+            rt_tab["solver_generic_failed_as_clear_at"] = now()
+            rt_tab["solver_generic_failed_as_clear"] = True
+            log_activity(
+                "visible CAPTCHA BlockSolve CAPTCHA_FAILED generic cookie/flagged "
+                "wording -> treated as NO_CAPTCHA for cache+reopen",
+                pkg,
+                YELLOW,
+            )
 
         # V4.14: pre-open jobs do not create a second queue entry. They unlock
         # the original generation exactly once, so CAPTCHA_SUCCESS and
@@ -39753,6 +39841,12 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
         if no_captcha_result or solved_result:
             result_label = "NO_CAPTCHA" if no_captcha_result else "CAPTCHA_SUCCESS"
             detail = _solver_probe_detail(response)
+            if generic_visible_failed_as_clear:
+                detail = (
+                    "BlockSolve CAPTCHA_FAILED generic cookie/flagged response "
+                    "reclassified as NO_CAPTCHA"
+                    + ((" | " + detail) if detail else "")
+                )
 
             visible_no_captcha_ui = False
             visible_no_captcha_origin = False
