@@ -14,6 +14,40 @@
 # - No recovery rule, PID policy, Home routing, shell wake, solver, or Option 17
 #   behavior is changed.
 #
+# V4.81.121 — TERMINAL SOLVER RESULT MUST PASS STALE SECURITY UI
+# - Final conflict found: after BlockSolve returned CAPTCHA_SUCCESS/NO_CAPTCHA
+#   and NOMO queued exact-PID + Clear Cache + reopen, process_open_queue() did a
+#   last-second auth UI guard. Because external BlockSolve does not refresh the
+#   already-open Roblox Security window, that same stale Verification UI could
+#   block the queued post-solver reopen and start/hold solver logic again.
+# - For a deliberate post-solver terminal-result recovery ONLY:
+#       visible Security / Verification / Start Puzzle is EXPECTED stale UI
+#       and may NOT block the reopen.
+# - Exact Account Locked / Face Lock / banned/terminated UI still blocks.
+# - Flow is now explicit:
+#       visible CAPTCHA -> direct BlockSolve -> WAIT
+#       provider terminal SUCCESS or NO_CAPTCHA
+#       -> queue at FRONT
+#       -> exact target PID stop
+#       -> forced Clear Cache
+#       -> reopen EXISTING link
+#       -> NO new PS.
+# - Detection alone still does not reopen before BlockSolve finishes.
+#
+# V4.81.120 — NEW VISIBLE CAPTCHA BYPASSES OLD LOCAL RETRY TOO
+# - V4.81.119 correctly bypassed an OLD provider retry for a new CAPTCHA incident,
+#   but start_solver_job() could still reject that same fresh incident with the
+#   separate local `solver retry in Xm` timer.
+# - A genuinely NEW visible CAPTCHA incident now gets one fresh package-local
+#   solve attempt that bypasses:
+#       old provider retry, stale captcha_ui_retry_at, old local solver cooldown.
+# - Same-incident provider BUSY/TEMP_ERROR/429 cooldown is still enforced.
+# - CAPTCHA detection marks MUST-REOPEN but does not kill/reopen before the solver
+#   has a terminal result.
+# - SUCCESS or NO_CAPTCHA from that visible job still performs:
+#       exact target PID stop -> forced Clear Cache -> reopen EXISTING link
+#       NO new PS.
+#
 # V4.81.119 — VISIBLE CAPTCHA INCIDENT MUST REOPEN AFTER TERMINAL SOLVER RESULT
 # - Root cause found: apply_visible_captcha_ui_action() unconditionally cancelled
 #   pending package reopens every watchdog cycle. After CAPTCHA_SUCCESS/NO_CAPTCHA
@@ -1887,7 +1921,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.119"
+__version__ = "V4.81.121"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -12370,12 +12404,22 @@ class RejoinCore:
             self.save()
         return False, "solver retry is provider-only; package reopen blocked"
 
-    def queue_solver_result_recovery(self, tab, target, result_label, metadata=None):
+    def queue_solver_result_recovery(
+        self,
+        tab,
+        target,
+        result_label,
+        metadata=None,
+        front=True,
+    ):
+        # Terminal external-solver result completes this CAPTCHA incident.
+        # Its one required client restart should be the next open-queue action.
         return self.queue_exact_pid_recovery(
             tab,
             target,
             f"solver {str(result_label or '').lower()} rejoin",
             skip_if_alive=False,
+            front=bool(front),
             bypass_manual=True,
             metadata=solver_result_recovery_metadata(result_label, metadata),
         )
@@ -14633,9 +14677,12 @@ def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, he
     busy_pending = bool(rt_tab.get("solver_busy_retry_pending"))
     busy_at = int(rt_tab.get("solver_busy_retry_at", 0) or 0)
 
+    # V4.81.120: one fact controls bypasses that belong to an OLDER CAPTCHA.
+    fresh_visible_incident = solver_visible_captcha_is_new_incident(rt_tab)
+
     # V4.81.114: a provider failure belongs to the CAPTCHA incident that made
     # that request. A new exact visible challenge may try once independently.
-    if busy_pending and busy_at > now() and solver_visible_captcha_is_new_incident(rt_tab):
+    if busy_pending and busy_at > now() and fresh_visible_incident:
         old_reason = str(rt_tab.get("solver_retry_reason") or "PROVIDER")
         rt_tab["solver_busy_retry_pending"] = False
         rt_tab["solver_busy_retry_at"] = 0
@@ -14679,21 +14726,21 @@ def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, he
     )
 
     retry_at = int(rt_tab.get("captcha_ui_retry_at", 0) or 0)
-    if retry_at > now() and not exact_visible_captcha:
+    visible_retry_override = bool(
+        exact_visible_captcha or fresh_visible_incident
+    )
+    if retry_at > now() and not visible_retry_override:
         left = max(1, retry_at - now())
         note = f"verification UI; retry provider in {format_age(left)} (no reopen)"
         rt_tab["note"] = note
         core.save()
         return "Captcha", note, True
 
-    # Exact package-scoped Start Puzzle / verification text is stronger than the
-    # generic UI retry timer. Clear only that UI timer and let start_solver_job()
-    # enforce the real provider failure/busy gate.
-    if retry_at > now() and exact_visible_captcha and not busy_pending:
+    if retry_at > now() and visible_retry_override and not busy_pending:
         rt_tab["captcha_ui_retry_at"] = 0
         log_activity(
-            "exact visible CAPTCHA bypassed stale UI retry timer; "
-            "provider failure gate still enforced",
+            "new/exact visible CAPTCHA bypassed stale UI retry timer; "
+            "same-incident provider failure gate still enforced",
             pkg,
             CYAN,
         )
@@ -14709,11 +14756,22 @@ def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, he
         or (detail_obj or {}).get("reason")
         or "visible package-scoped verification UI"
     )
+    force_fresh_visible_solve = bool(
+        exact_visible_captcha or fresh_visible_incident
+    )
+    if fresh_visible_incident and not exact_visible_captcha:
+        log_activity(
+            "new visible CAPTCHA incident bypasses OLD local solver retry; "
+            "one fresh package-local solve allowed",
+            pkg,
+            CYAN,
+        )
+
     status, note = core.handle_detected_solver_challenge(
         tab,
         rt_tab,
         detail,
-        force=exact_visible_captcha,
+        force=force_fresh_visible_solve,
     )
     rt_tab["note"] = note
 
@@ -18486,6 +18544,26 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
     item_mode = str(item.get("mode", "hard") or "hard").lower()
     is_hard = item_mode not in ("soft", "route", "switch", "reuse_task")
 
+    post_solver_terminal_reopen = bool(
+        is_hard
+        and item.get("solver_success_requires_reopen")
+        and item.get("auth_result_recovery")
+        and item.get("solver_recovery")
+        and str(item.get("solver_result", "") or "").upper()
+        in {
+            "CAPTCHA_SUCCESS",
+            "SUCCESS",
+            "SOLVED",
+            "COMPLETED",
+            "OK",
+            "NO_CAPTCHA",
+            "NO_CHALLENGE",
+            "NOT_REQUIRED",
+            "CLEAR",
+            "CLEAN",
+        }
+    )
+
     if target == "hatcher" and cfg.get("hatcher_surgical_stable_policy", False):
         legacy_hatcher_experiment = bool(
             item.get("bubble_only_recovery")
@@ -18670,8 +18748,9 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
             else "CAPTCHA_SUCCESS"
         )
         log_activity(
-            f"{solver_result_name} recovery executing: exact target PID -> "
-            "Clear Cache -> reopen; existing link kept (NO PS refresh)",
+            f"{solver_result_name} TERMINAL result -> exact target PID -> "
+            "Clear Cache -> reopen EXISTING link; stale Security UI will not block; "
+            "NO PS refresh",
             pkg,
             CYAN,
         )
@@ -18998,22 +19077,38 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
                 rt_tab["captcha_ui_visible"] = True
                 rt_tab["captcha_ui_detail"] = ",".join(visible_auth.get("hits", []) or []) or detail
                 rt_tab["captcha_ui_last_seen_at"] = now()
-                solver_status, solver_note = core.handle_detected_solver_challenge(
-                    tab, rt_tab, detail
-                )
-                rt_tab["note"] = solver_note
-                log_activity(
-                    "visible 529/verification blocked queued hard recovery before PID stop; "
-                    + str(solver_status),
-                    pkg,
-                    YELLOW,
-                )
-                core.save()
-                return True
+
+                if post_solver_terminal_reopen:
+                    # External BlockSolve is already finished. The unchanged
+                    # Security/Verification window is exactly why this restart
+                    # was queued, so do NOT send the same incident back to solver.
+                    rt_tab["note"] = (
+                        "solver terminal clear; stale verification UI ignored; "
+                        "cache+reopen continuing"
+                    )
+                    log_activity(
+                        "post-solver terminal reopen ALLOWED through stale "
+                        "Security/Verification UI",
+                        pkg,
+                        GREEN,
+                    )
+                else:
+                    solver_status, solver_note = core.handle_detected_solver_challenge(
+                        tab, rt_tab, detail
+                    )
+                    rt_tab["note"] = solver_note
+                    log_activity(
+                        "visible 529/verification blocked queued hard recovery before PID stop; "
+                        + str(solver_status),
+                        pkg,
+                        YELLOW,
+                    )
+                    core.save()
+                    return True
 
             if _runtime_auth_hint(rt_tab) and not current_disconnect:
                 visual_join = visual_join_error_detail(pkg, cfg, force=True, bypass_confirm=True)
-                if visual_join:
+                if visual_join and not post_solver_terminal_reopen:
                     rt_tab["note"] = "visual Join Error after auth/face-lock; hard recovery blocked"
                     rt_tab["captcha_ui_visible"] = True
                     rt_tab["captcha_ui_last_seen_at"] = now()
@@ -19021,6 +19116,13 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
                     log_activity("visual Join Error after auth context blocked queued hard recovery before PID stop", pkg, YELLOW)
                     core.save()
                     return True
+                elif visual_join and post_solver_terminal_reopen:
+                    log_activity(
+                        "post-solver terminal reopen ALLOWED through stale visual "
+                        "529/auth wrapper",
+                        pkg,
+                        GREEN,
+                    )
 
             # V4.81.71: direct moderation API + exact Account Locked text have
             # already run above. A screenshot/color candidate alone cannot block
@@ -19236,6 +19338,8 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
     display_mode = str(mode or "hard")
     if item.get("solver_success_requires_reopen"):
         display_mode = "solver-success-reopen"
+        rt_tab["solver_terminal_reopen_required"] = False
+        rt_tab["solver_terminal_reopen_consumed_at"] = now()
     elif item.get("market_peer_safe_cache_protocol"):
         display_mode = "market-cache-protocol"
     elif item.get("visible_home_protocol_nudge"):
@@ -39060,7 +39164,19 @@ def start_solver_job(tab, cfg, rt, rt_tab, reason, force=False, phase="solve", o
     last_attempt = int(rt_tab.get("solver_last_attempt", 0) or 0)
     if not force and last_attempt > 0 and now() - last_attempt < cooldown:
         left = max(1, cooldown - (now() - last_attempt))
-        return False, f"solver retry in {format_age(left)}"
+        last_attempt_incident = str(
+            rt_tab.get("solver_last_attempt_incident_id", "") or ""
+        )
+        current_incident = str(
+            rt_tab.get("captcha_ui_incident_id", "") or ""
+        )
+        suffix = ""
+        if last_attempt_incident or current_incident:
+            suffix = (
+                f" [last={last_attempt_incident[-10:] or '-'} "
+                f"current={current_incident[-10:] or '-'}]"
+            )
+        return False, f"solver retry in {format_age(left)}{suffix}"
 
     # V4.81.3/5: check the hard provider gate before touching the package cookie
     # DB. A cooldown-only rejoin can continue without doing a root DB copy.
@@ -39207,6 +39323,9 @@ def start_solver_job(tab, cfg, rt, rt_tab, reason, force=False, phase="solve", o
     rt_tab["solver_state"] = "running"
     rt_tab["solver_started_at"] = job["started_at"]
     rt_tab["solver_last_attempt"] = job["started_at"]
+    rt_tab["solver_last_attempt_incident_id"] = str(
+        rt_tab.get("captcha_ui_incident_id", "") or ""
+    )
     rt_tab["solver_reason"] = job["reason"]
     rt_tab["note"] = "solver before open" if job["phase"] == "preopen" else "solver starting"
     if core is not None:
@@ -39738,6 +39857,8 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
 
                 rt_tab["solver_success_reopen_queued_at"] = now()
                 rt_tab["solver_success_reopen_target"] = target
+                rt_tab["solver_terminal_result"] = result_label
+                rt_tab["solver_terminal_reopen_required"] = True
 
                 if no_captcha_result and visible_job_must_reopen:
                     rt_tab["solver_no_captcha_reopen_incident_id"] = (
