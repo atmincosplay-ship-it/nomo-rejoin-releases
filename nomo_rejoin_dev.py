@@ -14,6 +14,23 @@
 # - No recovery rule, PID policy, Home routing, shell wake, solver, or Option 17
 #   behavior is changed.
 #
+# V4.81.114 — MULTIPLE VISIBLE CAPTCHAS / INCIDENT-SCOPED PROVIDER COOLDOWN
+# - Two clones can have visible CAPTCHA at the same time. Solver jobs are already
+#   package-local/concurrent, but an older provider retry/cooldown stored on one
+#   package could block a completely NEW CAPTCHA incident on that same package.
+# - Visible CAPTCHA now has a per-package incident id. A provider submission is
+#   tagged with the incident id that caused it.
+# - Same incident:
+#     BUSY / TEMP_ERROR / 429 / provider cooldown keeps the >=10m anti-spam gate.
+# - New exact visible CAPTCHA incident:
+#     may make ONE fresh BlockSolve submission even if the package still carries
+#     a cooldown from an older incident.
+# - This allows nokaC + nokaD (etc.) to solve concurrently and independently.
+# - Upgrading from older runtime.json is handled: if a visible CAPTCHA begins
+#   after a legacy provider error/submit timestamp, it is treated as a new incident.
+# - Direct-to-BlockSolve behavior remains; NOMO does NOT click Start Puzzle.
+# - No PID stop/reopen/cache action is added to visible CAPTCHA handling.
+#
 # V4.81.113 — DIRECT VISIBLE CAPTCHA -> BLOCKSOLVE / NO START-PUZZLE CLICK
 # - Intentional revert of the V4.81.112 Start Puzzle experiment.
 # - Base behavior is V4.81.111.
@@ -1796,7 +1813,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.113"
+__version__ = "V4.81.114"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -14069,9 +14086,33 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
 
     if captcha_ui:
         detail = ",".join(captcha_ui.get("hits", []) or []) or "verification UI"
+
+        # V4.81.114: one incident id per continuous visible challenge. The id
+        # changes after the UI genuinely disappeared (or after a long observation
+        # gap), so cooldowns from an older challenge cannot block a new one.
+        _captcha_now = now()
+        _was_visible = bool(rt_tab.get("captcha_ui_visible"))
+        _last_seen = int(rt_tab.get("captcha_ui_last_seen_at", 0) or 0)
+        _incident_id = str(rt_tab.get("captcha_ui_incident_id", "") or "")
+        if (
+            not _was_visible
+            or not _incident_id
+            or (_last_seen > 0 and _captcha_now - _last_seen > 30)
+        ):
+            _seq = int(rt_tab.get("captcha_ui_incident_seq", 0) or 0) + 1
+            _incident_id = f"{_captcha_now}:{_seq}"
+            rt_tab["captcha_ui_incident_seq"] = _seq
+            rt_tab["captcha_ui_incident_id"] = _incident_id
+            rt_tab["captcha_ui_incident_started_at"] = _captcha_now
+            log_activity(
+                f"new visible CAPTCHA incident #{_seq}",
+                pkg,
+                CYAN,
+            )
+
         rt_tab["captcha_ui_visible"] = True
         rt_tab["captcha_ui_detail"] = detail
-        rt_tab["captcha_ui_last_seen_at"] = now()
+        rt_tab["captcha_ui_last_seen_at"] = _captcha_now
         return {
             "pkg": pkg, "user": tab.get("user_name", pkg), "alive": bool(raw_alive),
             "state": state, "state_err": err, "fresh": False, "clean_fresh": False,
@@ -14088,10 +14129,15 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
             "ui_challenge_detail": captcha_ui,
         }
     elif rt_tab.get("captcha_ui_visible"):
-        # The shared snapshot has moved past the challenge. Fresh state below can
-        # clear any false-negative hold without reopening the package.
+        # The challenge genuinely disappeared. Close this incident; the next
+        # visible challenge gets a new id and may submit independently.
         rt_tab["captcha_ui_visible"] = False
         rt_tab["captcha_ui_detail"] = ""
+        rt_tab["captcha_ui_last_incident_id"] = str(
+            rt_tab.get("captcha_ui_incident_id", "") or ""
+        )
+        rt_tab["captcha_ui_incident_id"] = ""
+        rt_tab["captcha_ui_incident_started_at"] = 0
 
     age = state_age_seconds(state) if state else "-"
     pets = int(state.get("pet_count", 0) or 0) if state else "-"
@@ -14375,6 +14421,24 @@ def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, he
 
     busy_pending = bool(rt_tab.get("solver_busy_retry_pending"))
     busy_at = int(rt_tab.get("solver_busy_retry_at", 0) or 0)
+
+    # V4.81.114: a provider failure belongs to the CAPTCHA incident that made
+    # that request. A new exact visible challenge may try once independently.
+    if busy_pending and busy_at > now() and solver_visible_captcha_is_new_incident(rt_tab):
+        old_reason = str(rt_tab.get("solver_retry_reason") or "PROVIDER")
+        rt_tab["solver_busy_retry_pending"] = False
+        rt_tab["solver_busy_retry_at"] = 0
+        rt_tab["solver_busy_retry_seconds"] = 0
+        rt_tab["solver_retry_reason"] = ""
+        busy_pending = False
+        busy_at = 0
+        log_activity(
+            "new visible CAPTCHA incident bypassed OLD provider retry "
+            f"({old_reason}); one fresh package-local solve allowed",
+            pkg,
+            CYAN,
+        )
+
     if busy_pending and busy_at > now():
         left = max(1, busy_at - now())
         reason = str(rt_tab.get("solver_retry_reason") or "PROVIDER")
@@ -38398,6 +38462,47 @@ def solver_provider_status_was_success(status):
     }
 
 
+
+def solver_visible_captcha_is_new_incident(rt_tab):
+    """True when current visible CAPTCHA is newer than the provider state blocking it."""
+    current_id = str(rt_tab.get("captcha_ui_incident_id", "") or "")
+    if not current_id:
+        return False
+
+    last_provider_id = str(
+        rt_tab.get("solver_provider_last_incident_id", "") or ""
+    )
+    if last_provider_id:
+        return current_id != last_provider_id
+
+    # Upgrade path for runtime written before V4.81.114: compare timestamps.
+    try:
+        incident_started = int(
+            rt_tab.get("captcha_ui_incident_started_at", 0) or 0
+        )
+    except Exception:
+        incident_started = 0
+    try:
+        last_provider_at = int(
+            rt_tab.get("solver_provider_last_submit_at", 0) or 0
+        )
+    except Exception:
+        last_provider_at = 0
+    try:
+        last_temp_error_at = int(
+            rt_tab.get("solver_last_provider_temp_error_at", 0) or 0
+        )
+    except Exception:
+        last_temp_error_at = 0
+
+    prior_provider_event = max(last_provider_at, last_temp_error_at)
+    return bool(
+        incident_started > 0
+        and prior_provider_event > 0
+        and incident_started > prior_provider_event
+    )
+
+
 def solver_provider_cooldown_left(rt_tab, cfg, at=None):
     """Return seconds until this package may automatically hit the provider again."""
     current = int(at or now())
@@ -38412,12 +38517,15 @@ def solver_provider_cooldown_left(rt_tab, cfg, at=None):
 
 
 def reserve_solver_provider_submit(rt_tab, cfg, submitted_at=None, status="SUBMITTED"):
-    """Persist an automatic provider slot before the background HTTP request starts."""
+    """Persist one provider submission and the visible CAPTCHA incident that caused it."""
     submitted = int(submitted_at or now())
     min_submit = max(600, int(cfg.get("solver_min_resubmit_seconds", 600) or 600))
     rt_tab["solver_provider_last_submit_at"] = submitted
     rt_tab["solver_provider_next_submit_at"] = submitted + min_submit
     rt_tab["solver_provider_last_status"] = str(status or "SUBMITTED")
+    rt_tab["solver_provider_last_incident_id"] = str(
+        rt_tab.get("captcha_ui_incident_id", "") or ""
+    )
     return submitted
 
 
@@ -38735,12 +38843,28 @@ def start_solver_job(tab, cfg, rt, rt_tab, reason, force=False, phase="solve", o
             rt_tab.get("solver_provider_last_status", "") or ""
         ).strip().upper()
         busy_pending = bool(rt_tab.get("solver_busy_retry_pending"))
-        if (
+
+        if solver_visible_captcha_is_new_incident(rt_tab):
+            log_activity(
+                "new visible CAPTCHA incident overrides provider cooldown from "
+                f"older incident ({last_provider_status or 'UNKNOWN'})",
+                pkg,
+                CYAN,
+            )
+            provider_left = 0
+            # If an old incident left provider-retry cosmetics behind, clear only
+            # that old incident state. This request immediately reserves the new
+            # incident before its HTTP worker starts.
+            rt_tab["solver_busy_retry_pending"] = False
+            rt_tab["solver_busy_retry_at"] = 0
+            rt_tab["solver_busy_retry_seconds"] = 0
+            rt_tab["solver_retry_reason"] = ""
+
+        elif (
             not busy_pending
             and solver_provider_status_was_success(last_provider_status)
         ):
-            # A prior SUCCESS/NO_CAPTCHA is not a provider failure. If this exact
-            # package now visibly presents a fresh CAPTCHA, allow one new solve.
+            # Existing V4.81.111 behavior for the same exact visible incident.
             log_activity(
                 "exact visible CAPTCHA overrides provider cooldown left from "
                 f"successful result {last_provider_status}",
@@ -38851,7 +38975,9 @@ def start_solver_job(tab, cfg, rt, rt_tab, reason, force=False, phase="solve", o
         else ""
     )
     log_activity(
-        f"{prefix}{generation_note}: {cut(job['reason'], 60)} | cookie={cookie_source}",
+        f"{prefix}{generation_note}: {cut(job['reason'], 60)} | "
+        f"cookie={cookie_source} | incident="
+        f"{str(rt_tab.get('captcha_ui_incident_id', '') or '-')[-12:]}",
         pkg,
         CYAN,
     )
