@@ -49321,6 +49321,87 @@ def delta_key_manager_menu(cfg):
             pause()
 
 
+
+def manual_cache_cleanup_menu(cfg):
+    """Interactive cache-only cleanup; never stops apps or deletes app data."""
+    while True:
+        cfg = load_config()
+        packages = _cache_cleanup_packages_for_mode(cfg)
+        clear()
+        banner("MANUAL CLEAR CACHE", cfg)
+        print(col("Cache-only operation. No app stop/restart is performed.", CYAN))
+        print(col("Login, cookies, app data, Workspace, and AutoExec are untouched.", DIM))
+        print("")
+        if not packages:
+            print(col("No enabled package tabs found.", YELLOW))
+            pause()
+            return
+
+        for idx, package in enumerate(packages, 1):
+            print(f"{idx}. {short_pkg(package)}  {package}")
+        print(f"{len(packages) + 1}. Clear ALL listed caches")
+        print("0. Back")
+        choice = input("\nChoose: ").strip().lower()
+        if choice in {"0", "b", "back", "q"}:
+            return
+
+        selected = []
+        if choice == str(len(packages) + 1):
+            selected = list(packages)
+        else:
+            try:
+                index = int(choice) - 1
+                if 0 <= index < len(packages):
+                    selected = [packages[index]]
+            except Exception:
+                selected = []
+
+        if not selected:
+            print(col("Invalid choice.", RED))
+            pause()
+            continue
+
+        print("")
+        print(col("Selected: " + ", ".join(short_pkg(x) for x in selected), YELLOW))
+        confirm = input("Clear cache now? [y/N]: ").strip().lower()
+        if confirm not in {"y", "yes"}:
+            print(col("Cancelled.", DIM))
+            pause()
+            continue
+
+        runtime = load_runtime()
+        results = []
+        cleared = 0
+        failed = 0
+        clear()
+        banner("MANUAL CLEAR CACHE", cfg)
+        print(col("Running cache-only cleanup...", CYAN))
+        print("")
+        for package in selected:
+            rt_tab = get_runtime_tab(runtime, package)
+            ok, note = clear_package_cache(
+                package,
+                cfg,
+                rt_tab=rt_tab,
+                reason="manual clear cache",
+                force=True,
+            )
+            results.append((package, bool(ok), str(note)))
+            if ok:
+                cleared += 1
+            else:
+                failed += 1
+            print(
+                f"{short_pkg(package):<10} "
+                + col("CLEARED" if ok else "FAILED", GREEN if ok else RED)
+                + f"  {note}"
+            )
+
+        save_runtime(runtime)
+        print("")
+        print(col(f"Result: {cleared} cleared, {failed} failed.", GREEN if not failed else YELLOW))
+        pause()
+
 def advanced_tools_menu(cfg):
     """Less-used tools moved out of the daily main menu."""
     while True:
@@ -49334,15 +49415,16 @@ def advanced_tools_menu(cfg):
             ("2", "Captcha Solver", CYAN, WHITE),
             ("3", "Export diagnostics ZIP", CYAN, WHITE),
             ("4", "Send full diagnostics to webhook", CYAN, WHITE),
-            ("5", "Layout / visual CAPTCHA", CYAN, WHITE),
-            ("6", "Workspace ZIP tools", CYAN, WHITE),
-            ("7", "APK download / install", CYAN, WHITE),
+            ("5", "Manual Clear Cache", CYAN, WHITE),
+            ("6", "Layout / visual CAPTCHA", CYAN, WHITE),
+            ("7", "Workspace ZIP tools", CYAN, WHITE),
+            ("8", "APK download / install", CYAN, WHITE),
             ("0", "Back", RED, WHITE),
         ]
         draw_boxed_menu(rows, cfg)
 
         drain_stdin()
-        choice = read_menu_choice("\nAdvanced: ", {"0", "1", "2", "3", "4", "5", "6", "7", "q", "b", "back"})
+        choice = read_menu_choice("\nAdvanced: ", {"0", "1", "2", "3", "4", "5", "6", "7", "8", "q", "b", "back"})
         if choice in {"0", "q", "b", "back", None}:
             return
 
@@ -49355,10 +49437,12 @@ def advanced_tools_menu(cfg):
         elif choice == "4":
             send_manual_diagnostics_webhook(cfg)
         elif choice == "5":
-            layout_visual_menu(cfg)
+            manual_cache_cleanup_menu(cfg)
         elif choice == "6":
-            workspace_zip_tools_menu(cfg)
+            layout_visual_menu(cfg)
         elif choice == "7":
+            workspace_zip_tools_menu(cfg)
+        elif choice == "8":
             apk_download_install_menu(cfg)
 
 
