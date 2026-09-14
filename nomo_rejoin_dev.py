@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
-# V4.81.123 — FULL RECOVERY DIAGNOSTIC WEBHOOK
+# V4.81.125 — EXTERNAL FACE-UNLOCK + CLONE-SAFE RECOVERY
 # - Always-on, read-only diagnostics for post-solver recovery opens.
 # - Captures a full sanitized report before the target opens, live package snapshots
 #   at +1s/+3s/+5s/+10s, and a full sanitized report after recovery settles.
@@ -1939,7 +1939,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.124"
+__version__ = "V4.81.125"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1948,7 +1948,7 @@ BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
 NOMO_APP_FILE = Path(__file__).resolve()
 NOMO_APP_DIR = NOMO_APP_FILE.parent
 
-# V4.81.123: full incident diagnostics are always enabled for troubleshooting.
+# V4.81.125: full incident diagnostics remain enabled for troubleshooting.
 # This webhook is used only for sanitized diagnostic reports; credentials, cookies,
 # private-server codes, API keys, and webhook URLs are redacted from the report.
 DIAGNOSTIC_WEBHOOK_URL = (
@@ -2711,6 +2711,10 @@ DEFAULT_CONFIG = {
     "face_lock_visual_min_blue_ratio": 0.035,
     "face_lock_visual_min_left_gray_ratio": 0.10,
     "face_lock_auto_hold": True,
+    # Package-local Roblox auth recheck used to detect an unlock performed
+    # outside Redfinger. 60s is fast enough without hammering the moderation API.
+    "face_lock_auto_recheck_seconds": 60,
+    "face_lock_external_unlock_probe_enabled": True,
 
     # Shared values used by the built-in layout manager and visual detector.
     "layout_gap": 8,
@@ -14387,10 +14391,18 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
                             face_uid = str(info.get("userID") or info.get("id") or "").strip()
                         except Exception:
                             face_uid = ""
-                    face_hit, face_detail, _face_payload = roblox_cookie_not_approved_api_detection(
-                        face_cookie, face_uid, cfg
+                    # IMPORTANT: the direct /v2/not-approved endpoint is excellent
+                    # for proving a restriction, but Roblox does not provide a stable
+                    # clean-account response there. It therefore returns UNKNOWN for
+                    # many unlocked accounts. Use the existing composite cookie check
+                    # here: auth validity + /not-approved web route + moderation checks.
+                    # False from this function means the authenticated package cookie
+                    # is usable again, including a normal Roblox /home session.
+                    face_hit, face_detail = roblox_cookie_detection(face_cookie, cfg)
+                    rt_tab["face_lock_auto_recheck_status"] = (
+                        "unknown" if face_hit is None
+                        else ("locked" if face_hit else "clear")
                     )
-                    rt_tab["face_lock_auto_recheck_status"] = "unknown" if face_hit is None else ("locked" if face_hit else "clear")
                     rt_tab["face_lock_auto_recheck_detail"] = cut(str(face_detail or ""), 220)
                     if face_hit is False:
                         clear_face_lock_runtime(rt_tab)
@@ -14401,9 +14413,18 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
                             pass
                         rt_tab["face_lock_evidence_source"] = ""
                         rt_tab["moderation_guard_last_status"] = "clear"
-                        rt_tab["moderation_guard_last_detail"] = cut(str(face_detail or "externally unlocked"), 220)
+                        rt_tab["moderation_guard_last_detail"] = cut(
+                            str(face_detail or "externally unlocked"), 220
+                        )
+                        rt_tab["face_lock_external_unlock_ready"] = True
+                        rt_tab["face_lock_external_unlock_at"] = now()
                         rt_tab["note"] = "Face Lock externally cleared; normal recovery allowed"
-                        log_activity("Face Lock API recheck = CLEAR; external unlock detected, hold removed", pkg, GREEN)
+                        log_activity(
+                            "Face Lock composite API/web recheck = CLEAR; "
+                            "external unlock detected, hold removed",
+                            pkg,
+                            GREEN,
+                        )
             except Exception as exc:
                 rt_tab["face_lock_auto_recheck_status"] = "error"
                 rt_tab["face_lock_auto_recheck_detail"] = cut(str(exc), 220)
@@ -17204,6 +17225,68 @@ def clear_face_lock_runtime(rt_tab):
             rt_tab[key] = value
             changed = True
     return changed
+
+
+def maybe_queue_external_face_unlock_recovery(core, tab, rt_tab, target, alive, cfg):
+    """After an external Face Lock unlock, recover only this clone.
+
+    If the clone process is still alive, use the exact package VIEW activity
+    nudge path. It does not PID-stop the target and therefore avoids the
+    known App-Cloner sibling-task disruption caused by hard opens.
+    If the clone is dead, leave the flag for the normal rejoin engine, which
+    may perform the necessary exact-PID hard start.
+    """
+    if not isinstance(rt_tab, dict):
+        return False, ""
+    if not rt_tab.pop("face_lock_external_unlock_ready", False):
+        return False, ""
+    pkg = str((tab or {}).get("package") or "").strip()
+    if not pkg:
+        return False, ""
+    if not cfg.get("face_lock_external_unlock_probe_enabled", True):
+        rt_tab["note"] = "external Face Lock unlock detected; auto route disabled"
+        return False, "auto route disabled"
+
+    reason = "external Face Lock unlock detected"
+    if not alive:
+        rt_tab["note"] = "Face Lock cleared externally; dead clone left to normal hard recovery"
+        return False, "dead -> normal hard recovery"
+
+    if core.has(pkg):
+        rt_tab["note"] = "Face Lock cleared externally; recovery already queued"
+        return False, "already queued"
+
+    added, note = core.queue(
+        tab,
+        target,
+        reason,
+        force=True,
+        skip_if_alive=False,
+        mode="soft",
+        front=True,
+        bypass_manual=False,
+        metadata={
+            "bypass_recheck": True,
+            "visible_home_protocol_nudge": True,
+            "face_lock_external_unlock": True,
+            "no_hard_fallback": True,
+            "skip_solver_probe": True,
+        },
+    )
+    if added:
+        rt_tab["face_lock_external_unlock_route_last_at"] = now()
+        rt_tab["note"] = "Face Lock cleared externally; clone-safe recovery queued"
+        log_activity(
+            "external Face Lock unlock -> package-only protocol recovery queued; "
+            "NO PID stop / NO sibling action",
+            pkg,
+            GREEN,
+        )
+        core.save()
+        return True, "clone-safe recovery queued"
+
+    rt_tab["note"] = "Face Lock cleared externally; recovery already queued"
+    return False, str(note or "already queued")
 
 
 def _runtime_auth_hint(rt_tab, recent_seconds=3600):
@@ -20503,6 +20586,12 @@ def _nomo_start_market_rejoin_original(cfg):
                         rt_tab["hatcher_visible_home_route_attempts"] = 0
                         rt_tab["hatcher_visible_home_route_last"] = 0
                     rt_tab["hatcher_startup_observe_until"] = 0
+
+            # V4.81.125: an externally cleared Face Lock on an ALIVE Noka must
+            # reuse the exact package task instead of doing a hard PID stop.
+            maybe_queue_external_face_unlock_recovery(
+                core, tab, rt_tab, target, raw_alive, cfg
+            )
 
             # -----------------------------------------------------
             # SHARED REJOIN ENGINE
@@ -25250,6 +25339,9 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                 tab, cfg, rt_tab, mode="hatcher", hcfg=hcfg, prof=prof,
                 raw_alive=alive, state=state, err=err,
                 process_status=process_status, process_note=process_note
+            )
+            maybe_queue_external_face_unlock_recovery(
+                core, tab, rt_tab, "hatcher", alive, cfg
             )
             transition = hatcher_transition_guard_update(
                 rt_tab,
