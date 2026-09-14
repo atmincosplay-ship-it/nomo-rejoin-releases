@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
-# V4.81.125 — EXTERNAL FACE-UNLOCK + CLONE-SAFE RECOVERY
+# V4.81.127 — TASK/WINDOW DIAGNOSTICS + CLEAR-CACHE UI FIX
 # - Always-on, read-only diagnostics for post-solver recovery opens.
 # - Captures a full sanitized report before the target opens, live package snapshots
 #   at +1s/+3s/+5s/+10s, and a full sanitized report after recovery settles.
@@ -1939,7 +1939,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.125"
+__version__ = "V4.81.127"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1948,7 +1948,7 @@ BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
 NOMO_APP_FILE = Path(__file__).resolve()
 NOMO_APP_DIR = NOMO_APP_FILE.parent
 
-# V4.81.125: full incident diagnostics remain enabled for troubleshooting.
+# V4.81.127: task/window-level incident diagnostics remain enabled for troubleshooting.
 # This webhook is used only for sanitized diagnostic reports; credentials, cookies,
 # private-server codes, API keys, and webhook URLs are redacted from the report.
 DIAGNOSTIC_WEBHOOK_URL = (
@@ -5383,14 +5383,14 @@ def clear_package_cache(
         if ok:
             if found > 0:
                 note = (
-                    f"cache cleared ({found} path"
+                    f"CLEARED via fallback ({found} path"
                     + ("" if found == 1 else "s")
-                    + f"; system returned {system_reason})"
+                    + "; Android PM cache-only unavailable)"
                 )
             else:
                 note = (
-                    "no cache folders present "
-                    f"(system returned {system_reason})"
+                    "CLEARED via fallback (no cache folders present; "
+                    "Android PM cache-only unavailable)"
                 )
         else:
             clean_detail = re.sub(
@@ -5416,6 +5416,7 @@ def clear_package_cache(
         )
         rt_tab["last_cache_clear_method"] = method
         rt_tab["last_cache_clear_ok"] = bool(ok)
+        rt_tab["last_cache_fallback_used"] = bool(method == "redfinger_root_cache_fallback")
         rt_tab["last_cache_system_exit"] = int(
             system_code
         )
@@ -43903,6 +43904,79 @@ def _diag_script_info():
     return info
 
 
+def _diag_android_task_window_snapshot(cfg, packages=None):
+    """Collect compact Android task/window evidence for clone-sibling incidents.
+
+    PID survival is not enough on App Cloner/Redfinger: a clone process can remain
+    alive while its task/window is moved, replaced, hidden, or removed. This helper
+    therefore records ActivityTaskManager and WindowManager evidence without making
+    any recovery decision from it.
+    """
+    package_list = []
+    for pkg in (packages or _configured_clone_packages(cfg)):
+        pkg = str(pkg or "").strip()
+        if pkg and pkg not in package_list:
+            package_list.append(pkg)
+
+    activity = _diag_android_command("dumpsys activity activities", cfg, timeout=10)
+    window = _diag_android_command("dumpsys window windows", cfg, timeout=8)
+    display = _diag_android_command("dumpsys window displays", cfg, timeout=8)
+
+    def lines_for(text, pkg, limit=30):
+        low_pkg = pkg.lower()
+        out = []
+        for raw in str(text or "").splitlines():
+            low = raw.lower()
+            if low_pkg not in low:
+                continue
+            if any(key in low for key in (
+                "activityrecord{", "task{", "mresumedactivity", "topresumedactivity",
+                "mfocusedactivity", "window #", "mcurrentfocus", "mfocusedapp",
+                "windowstate", "rootwindowcontainer",
+            )):
+                out.append(_diag_redact_text(raw.strip()))
+                if len(out) >= limit:
+                    break
+        return out
+
+    def global_lines(text, limit=30):
+        out = []
+        for raw in str(text or "").splitlines():
+            low = raw.lower()
+            if any(key in low for key in (
+                "mresumedactivity", "topresumedactivity", "mfocusedactivity",
+                "mcurrentfocus", "mfocusedapp", "top task", "mfocusedroottask",
+                "mfocuseddisplay", "focusedapp",
+            )):
+                out.append(_diag_redact_text(raw.strip()))
+                if len(out) >= limit:
+                    break
+        return out
+
+    packages_out = {}
+    for pkg in package_list:
+        packages_out[pkg] = {
+            "activity_lines": lines_for(activity.get("output", ""), pkg),
+            "window_lines": lines_for(window.get("output", ""), pkg),
+            "task_ids": sorted(set(re.findall(
+                r"\bTask\{[^#\n]*#(\d+)",
+                "\n".join(lines_for(activity.get("output", ""), pkg, 80)),
+            ))),
+            "window_state_count": len(lines_for(window.get("output", ""), pkg, 80)),
+        }
+
+    return _diag_redact_obj({
+        "captured_at": now(),
+        "captured_local": date_time_text(),
+        "activity_command": activity,
+        "window_command": window,
+        "display_command": display,
+        "global_activity_focus_lines": global_lines(activity.get("output", "")),
+        "global_window_focus_lines": global_lines(window.get("output", "")),
+        "packages": packages_out,
+    })
+
+
 def _diag_package_record(entry, cfg):
     pkg = str(entry.get("package") or "")
     tab = entry.get("tab") or next(
@@ -44047,6 +44121,14 @@ def build_diagnostics_report(cfg):
             }))
 
     try:
+        android_task_window = _diag_android_task_window_snapshot(
+            cfg,
+            [str(x.get("package") or "") for x in packages if x.get("package")],
+        )
+    except Exception as e:
+        android_task_window = {"collection_error": _diag_redact_text(e)}
+
+    try:
         usage = shutil.disk_usage(BASE_DIR)
         storage = {
             "total_bytes": int(usage.total),
@@ -44130,6 +44212,7 @@ def build_diagnostics_report(cfg):
             "message": _diag_redact_text(backend_msg),
         },
         "system": system_info,
+        "android_task_window": android_task_window,
         "packages": packages,
         "issues": issues,
         "files": {
@@ -44166,12 +44249,21 @@ def _diagnostic_incident_snapshot(cfg, focus_pkg=""):
             focus = item
             break
 
+    try:
+        task_window = _diag_android_task_window_snapshot(
+            cfg,
+            [str(x.get("package") or "") for x in packages if x.get("package")],
+        )
+    except Exception as e:
+        task_window = {"collection_error": _diag_redact_text(e)}
+
     return _diag_redact_obj({
         "captured_at": now(),
         "captured_local": date_time_text(),
         "focus_package": focus_pkg,
         "focus": focus,
         "packages": packages,
+        "android_task_window": task_window,
         "activity_tail": _diag_activity_tail(500),
     })
 
@@ -44337,6 +44429,7 @@ def start_full_recovery_diagnostic(cfg, tab, rt_tab, item, reason=""):
             "last_cache_clear_forced": rt_tab.get("last_cache_clear_forced", False),
             "last_cache_clear_method": rt_tab.get("last_cache_clear_method", ""),
             "last_cache_clear_ok": rt_tab.get("last_cache_clear_ok", False),
+            "last_cache_fallback_used": rt_tab.get("last_cache_fallback_used", False),
             "last_cache_system_exit": rt_tab.get("last_cache_system_exit", 0),
             "last_cache_system_text": rt_tab.get("last_cache_system_text", ""),
         })
