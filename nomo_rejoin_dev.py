@@ -1939,7 +1939,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.123"
+__version__ = "V4.81.124"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -14359,6 +14359,54 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
             clean_fresh = False
             rt_tab["hatcher_visible_home_at"] = now()
             rt_tab["hatcher_visible_home_hits"] = ",".join(visible_home.get("hits", [])[:8])
+
+    # V4.81.124: externally unlocked Face Lock must self-heal even while the
+    # package is still held/closed. A persisted Face Lock used to be returned
+    # before the moderation API was rechecked, so an unlock performed outside
+    # Redfinger could leave the local hold until manual recovery.
+    if str(rt_tab.get("manual_login_reason", "") or "").strip().lower() == "face_lock" or bool(rt_tab.get("face_lock_detected")):
+        last_face_recheck = int(rt_tab.get("face_lock_auto_recheck_at", 0) or 0)
+        face_recheck_interval = max(30, int(cfg.get("face_lock_auto_recheck_seconds", 60) or 60))
+        if now() - last_face_recheck >= face_recheck_interval:
+            rt_tab["face_lock_auto_recheck_at"] = now()
+            try:
+                face_cookie, face_cookie_source, face_cookie_note = solver_cookie_for_package(pkg, cfg)
+                face_cookie = str(face_cookie or "").strip()
+                if face_cookie:
+                    face_uid = ""
+                    try:
+                        cache = load_cookie_cache()
+                        ent = cache.get(pkg) if isinstance(cache, dict) else {}
+                        if isinstance(ent, dict):
+                            face_uid = str(ent.get("user_id") or ent.get("userID") or "").strip()
+                    except Exception:
+                        face_uid = ""
+                    if not face_uid:
+                        try:
+                            info = get_roblox_user_info(face_cookie) or {}
+                            face_uid = str(info.get("userID") or info.get("id") or "").strip()
+                        except Exception:
+                            face_uid = ""
+                    face_hit, face_detail, _face_payload = roblox_cookie_not_approved_api_detection(
+                        face_cookie, face_uid, cfg
+                    )
+                    rt_tab["face_lock_auto_recheck_status"] = "unknown" if face_hit is None else ("locked" if face_hit else "clear")
+                    rt_tab["face_lock_auto_recheck_detail"] = cut(str(face_detail or ""), 220)
+                    if face_hit is False:
+                        clear_face_lock_runtime(rt_tab)
+                        clear_manual_login_block(rt_tab)
+                        try:
+                            clear_hold(pkg)
+                        except Exception:
+                            pass
+                        rt_tab["face_lock_evidence_source"] = ""
+                        rt_tab["moderation_guard_last_status"] = "clear"
+                        rt_tab["moderation_guard_last_detail"] = cut(str(face_detail or "externally unlocked"), 220)
+                        rt_tab["note"] = "Face Lock externally cleared; normal recovery allowed"
+                        log_activity("Face Lock API recheck = CLEAR; external unlock detected, hold removed", pkg, GREEN)
+            except Exception as exc:
+                rt_tab["face_lock_auto_recheck_status"] = "error"
+                rt_tab["face_lock_auto_recheck_detail"] = cut(str(exc), 220)
 
     if manual_login_blocked(rt_tab, cfg, pkg) and not state_login_challenge_detail(state):
         face_locked = str(rt_tab.get("manual_login_reason", "") or "") == "face_lock" or bool(rt_tab.get("face_lock_detected"))
