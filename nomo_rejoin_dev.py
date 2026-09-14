@@ -44234,6 +44234,72 @@ def start_full_recovery_diagnostic(cfg, tab, rt_tab, item, reason=""):
     return incident_id
 
 
+def send_manual_diagnostics_webhook(cfg):
+    """Collect, save, and send one sanitized full diagnostic JSON report.
+
+    Read-only: this does not open, stop, clear, relogin, or modify any Roblox package.
+    """
+    clear()
+    banner("SEND FULL DIAGNOSTICS", cfg)
+    print(col("Collecting a read-only diagnostic report...", CYAN))
+    print(col("Cookies, API keys, secrets, webhook URLs, and private-server codes are redacted.", DIM))
+    print("")
+
+    incident_id = (
+        f"manual-{datetime.now().strftime('%Y%m%d-%H%M%S')}-"
+        f"{time.time_ns() % 1000000:06d}"
+    )
+    try:
+        report = build_diagnostics_report(cfg)
+    except Exception as e:
+        report = {"collection_error": _diag_redact_text(e)}
+
+    report = _diag_redact_obj(report)
+    report["diagnostic_type"] = "MANUAL_FULL_DIAGNOSTIC"
+    report["manual_trigger"] = True
+    report["incident_id"] = incident_id
+    report["created_at"] = now()
+    report["created_local"] = date_time_text()
+
+    local_path = None
+    try:
+        out_dir = BASE_DIR / "diagnostics" / "manual"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        local_path = out_dir / f"NOMO_MANUAL_DIAGNOSTIC_{incident_id}.json"
+        local_path.write_text(
+            json.dumps(report, indent=2, ensure_ascii=False, sort_keys=True),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        print(col(f"Local JSON save failed: {_diag_redact_text(e)}", RED))
+
+    print(col("Sending JSON to diagnostic webhook...", CYAN))
+    ok, note = _send_diagnostic_webhook(report, incident_id, cfg)
+
+    if ok:
+        print(col("WEBHOOK: SENT", GREEN))
+        print(col(f"JSON: NOMO_DIAGNOSTIC_{incident_id}.json", GREEN))
+    else:
+        print(col(f"WEBHOOK: FAILED — {note}", RED))
+
+    if local_path:
+        print(col(f"Local JSON: {local_path}", WHITE))
+    else:
+        print(col("Local JSON: FAILED", RED))
+
+    try:
+        issue_count = len(report.get("issues", [])) if isinstance(report, dict) else 0
+    except Exception:
+        issue_count = 0
+    print(col(f"Issues found: {issue_count}", DIM))
+    log_activity(
+        f"manual full diagnostic {'sent' if ok else 'FAILED'}: {incident_id} ({cut(note, 100)})",
+        "",
+        GREEN if ok else RED,
+    )
+    pause()
+
+
 def export_diagnostics_zip(cfg):
     """Write a safe troubleshooting ZIP and show its full Android path."""
     clear()
@@ -49127,15 +49193,16 @@ def advanced_tools_menu(cfg):
             ("1", "Recovery tools", CYAN, WHITE),
             ("2", "Captcha Solver", CYAN, WHITE),
             ("3", "Export diagnostics ZIP", CYAN, WHITE),
-            ("4", "Layout / visual CAPTCHA", CYAN, WHITE),
-            ("5", "Workspace ZIP tools", CYAN, WHITE),
-            ("6", "APK download / install", CYAN, WHITE),
+            ("4", "Send full diagnostics to webhook", CYAN, WHITE),
+            ("5", "Layout / visual CAPTCHA", CYAN, WHITE),
+            ("6", "Workspace ZIP tools", CYAN, WHITE),
+            ("7", "APK download / install", CYAN, WHITE),
             ("0", "Back", RED, WHITE),
         ]
         draw_boxed_menu(rows, cfg)
 
         drain_stdin()
-        choice = read_menu_choice("\nAdvanced: ", {"0", "1", "2", "3", "4", "5", "6", "q", "b", "back"})
+        choice = read_menu_choice("\nAdvanced: ", {"0", "1", "2", "3", "4", "5", "6", "7", "q", "b", "back"})
         if choice in {"0", "q", "b", "back", None}:
             return
 
@@ -49146,10 +49213,12 @@ def advanced_tools_menu(cfg):
         elif choice == "3":
             export_diagnostics_zip(cfg)
         elif choice == "4":
-            layout_visual_menu(cfg)
+            send_manual_diagnostics_webhook(cfg)
         elif choice == "5":
-            workspace_zip_tools_menu(cfg)
+            layout_visual_menu(cfg)
         elif choice == "6":
+            workspace_zip_tools_menu(cfg)
+        elif choice == "7":
             apk_download_install_menu(cfg)
 
 
