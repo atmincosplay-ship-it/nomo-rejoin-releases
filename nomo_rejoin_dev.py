@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.123 — FULL RECOVERY DIAGNOSTIC WEBHOOK
+# - Always-on, read-only diagnostics for post-solver recovery opens.
+# - Captures a full sanitized report before the target opens, live package snapshots
+#   at +1s/+3s/+5s/+10s, and a full sanitized report after recovery settles.
+# - Saves the same incident JSON locally under diagnostics/incidents and sends it
+#   as a Discord webhook attachment. No recovery behavior is changed.
+# - Credentials, cookies, API keys, webhook URLs, and private-server codes remain redacted.
 # V4.81.97 — HATCHER STARTUP HANDOFF / REMOVE SILENT DUPLICATE PRE-SCAN
 # - Fixes Option 1 appearing frozen on STARTUP: CACHE CLEANUP after the summary
 #   already said all caches were cleared.
@@ -1932,7 +1939,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.122"
+__version__ = "V4.81.123"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1940,6 +1947,16 @@ BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
 # exact script that is currently running (nomo-dev installs it in a different folder).
 NOMO_APP_FILE = Path(__file__).resolve()
 NOMO_APP_DIR = NOMO_APP_FILE.parent
+
+# V4.81.123: full incident diagnostics are always enabled for troubleshooting.
+# This webhook is used only for sanitized diagnostic reports; credentials, cookies,
+# private-server codes, API keys, and webhook URLs are redacted from the report.
+DIAGNOSTIC_WEBHOOK_URL = (
+    "https://discord.com/api/webhooks/1520291358223634522/"
+    "2xoV1O0qPdg8QOFxVpBfFQiAyDGpVHpOhhJ5m70E86HdgeyXKWsGyiINK_CUSHJqkUpU"
+)
+DIAGNOSTIC_WEBHOOK_ENABLED = True
+DIAGNOSTIC_CAPTURE_DELAYS = (1, 3, 5, 10)
 
 DELTA_GLOBAL_ROOT = Path("/storage/emulated/0/Delta")
 DELTA_GLOBAL_AUTOEXEC_DIR = DELTA_GLOBAL_ROOT / "Autoexecute"
@@ -19188,8 +19205,24 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
         rt["_open_lock_at"] = now()
         core.save()
 
+    diagnostic_incident_id = None
+    if post_solver_terminal_reopen:
+        diagnostic_incident_id = start_full_recovery_diagnostic(
+            cfg, tab, rt_tab, item, reason=reason
+        )
+        if diagnostic_incident_id:
+            log_activity(
+                f"FULL diagnostic started: {diagnostic_incident_id}",
+                pkg,
+                CYAN,
+            )
+
     try:
-        return core.open_cycle(item, tab, rt_tab, pkg, target, reason, mode, is_hard)
+        result = core.open_cycle(item, tab, rt_tab, pkg, target, reason, mode, is_hard)
+        if diagnostic_incident_id:
+            rt_tab["diagnostic_open_result"] = _diag_redact_obj(result)
+            rt_tab["diagnostic_open_finished_at"] = now()
+        return result
     finally:
         if cfg.get("single_flight_open", True) and str(rt.get("_open_lock_pkg", "")) == pkg:
             rt["_open_lock_pkg"] = ""
@@ -43970,6 +44003,235 @@ def build_diagnostics_report(cfg):
         "runtime_hatcher_redacted": _diag_redact_obj(rt_hatcher),
     }
     return _diag_redact_obj(report)
+
+
+def _diagnostic_incident_snapshot(cfg, focus_pkg=""):
+    """Collect a focused, redacted live snapshot for a recovery incident."""
+    focus_pkg = str(focus_pkg or "").strip()
+    entries = package_registry_entries(cfg, include_discovered=True)
+    packages = []
+    for entry in entries:
+        try:
+            rec = _diag_package_record(entry, cfg)
+            packages.append(rec)
+        except Exception as e:
+            packages.append(_diag_redact_obj({
+                "package": entry.get("package", "?"),
+                "collection_error": str(e),
+            }))
+
+    focus = None
+    for item in packages:
+        if str(item.get("package", "")) == focus_pkg:
+            focus = item
+            break
+
+    return _diag_redact_obj({
+        "captured_at": now(),
+        "captured_local": date_time_text(),
+        "focus_package": focus_pkg,
+        "focus": focus,
+        "packages": packages,
+        "activity_tail": _diag_activity_tail(500),
+    })
+
+
+def _diagnostic_multipart_body(field_name, filename, content, content_type="application/json"):
+    """Build a Discord webhook multipart/form-data body using only stdlib."""
+    boundary = "----NOMORejoinDiagnostic" + hashlib.sha256(
+        f"{time.time_ns()}:{os.getpid()}:{threading.get_ident()}".encode()
+    ).hexdigest()[:24]
+    data = content.encode("utf-8") if isinstance(content, str) else bytes(content)
+    parts = []
+    parts.append((
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="payload_json"\r\n'
+        f"Content-Type: application/json\r\n\r\n"
+        + json.dumps({"content": "NOMO FULL DIAGNOSTIC attached"}, ensure_ascii=False)
+        + "\r\n"
+    ).encode("utf-8"))
+    parts.append((
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="{field_name}"; filename="{filename}"\r\n'
+        f"Content-Type: {content_type}\r\n\r\n"
+    ).encode("utf-8") + data + b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+    return boundary, b"".join(parts)
+
+
+def _send_diagnostic_webhook(report, incident_id, cfg=None):
+    """Send a sanitized full incident report to the hardcoded diagnostic webhook."""
+    if not DIAGNOSTIC_WEBHOOK_ENABLED or not DIAGNOSTIC_WEBHOOK_URL:
+        return False, "diagnostic webhook disabled"
+
+    safe_report = _diag_redact_obj(report)
+    safe_report["webhook_delivery"] = {
+        "enabled": True,
+        "destination": "hardcoded diagnostic webhook",
+    }
+    payload = json.dumps(safe_report, indent=2, ensure_ascii=False, sort_keys=True)
+    filename = f"NOMO_DIAGNOSTIC_{re.sub(r'[^A-Za-z0-9_.-]', '_', str(incident_id or 'incident'))}.json"
+    boundary, body = _diagnostic_multipart_body(
+        "files[0]", filename, payload, "application/json"
+    )
+    req = urllib.request.Request(DIAGNOSTIC_WEBHOOK_URL, data=body, method="POST")
+    req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+    req.add_header("User-Agent", "NOMO-Rejoin-Diagnostics/1.0")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            code = int(resp.getcode())
+        return code in (200, 204), f"HTTP {code}"
+    except urllib.error.HTTPError as e:
+        try:
+            detail = _diag_redact_text(e.read().decode("utf-8", errors="replace"))
+        except Exception:
+            detail = str(e)
+        return False, f"HTTP {e.code}: {cut(detail, 180)}"
+    except Exception as e:
+        return False, _diag_redact_text(e)
+
+
+def start_full_recovery_diagnostic(cfg, tab, rt_tab, item, reason=""):
+    """Start a non-destructive before/after diagnostic around a recovery open."""
+    if not DIAGNOSTIC_WEBHOOK_ENABLED:
+        return None
+
+    pkg = str((tab or {}).get("package", "") or "").strip()
+    if not pkg:
+        return None
+
+    incident_id = (
+        f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-"
+        f"{re.sub(r'[^A-Za-z0-9_.-]', '_', pkg)}-{time.time_ns() % 1000000:06d}"
+    )
+    try:
+        before_report = build_diagnostics_report(cfg)
+    except Exception as e:
+        before_report = {"collection_error": _diag_redact_text(e)}
+
+    incident = {
+        "incident_id": incident_id,
+        "type": "RECOVERY_OPEN",
+        "created_at": now(),
+        "created_local": date_time_text(),
+        "target_package": pkg,
+        "target_username": str((tab or {}).get("user_name") or rt_tab.get("username") or pkg),
+        "target": str(item.get("target", "") or ""),
+        "reason": _diag_redact_text(reason),
+        "mode": str(item.get("mode", "") or ""),
+        "solver_result": str(item.get("solver_result", "") or ""),
+        "solver_recovery": bool(item.get("solver_recovery")),
+        "solver_success_requires_reopen": bool(item.get("solver_success_requires_reopen")),
+        "captcha_incident_id": str(
+            rt_tab.get("captcha_ui_incident_id")
+            or rt_tab.get("captcha_reopen_required_incident_id")
+            or item.get("solver_captcha_incident_id")
+            or ""
+        ),
+        "before": before_report,
+        "timeline": [],
+    }
+
+    try:
+        incident["timeline"].append({
+            "offset_seconds": 0,
+            "stage": "before_open",
+            "snapshot": _diagnostic_incident_snapshot(cfg, pkg),
+        })
+    except Exception as e:
+        incident["timeline"].append({
+            "offset_seconds": 0,
+            "stage": "before_open",
+            "snapshot_error": _diag_redact_text(e),
+        })
+
+    try:
+        out_dir = BASE_DIR / "diagnostics" / "incidents"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        local_path = out_dir / f"NOMO_DIAGNOSTIC_{incident_id}.json"
+        local_path.write_text(
+            json.dumps(_diag_redact_obj(incident), indent=2, ensure_ascii=False, sort_keys=True),
+            encoding="utf-8",
+        )
+        incident["local_path"] = str(local_path)
+    except Exception as e:
+        incident["local_write_error"] = _diag_redact_text(e)
+
+    rt_tab["diagnostic_incident_id"] = incident_id
+    rt_tab["diagnostic_incident_started_at"] = now()
+    rt_tab["diagnostic_incident_type"] = "RECOVERY_OPEN"
+    rt_tab["diagnostic_webhook_enabled"] = True
+
+    def worker():
+        started = time.time()
+        for delay in DIAGNOSTIC_CAPTURE_DELAYS:
+            wait_for = max(0.0, float(delay) - (time.time() - started))
+            if wait_for > 0:
+                time.sleep(wait_for)
+            try:
+                incident["timeline"].append({
+                    "offset_seconds": delay,
+                    "stage": f"plus_{delay}s",
+                    "snapshot": _diagnostic_incident_snapshot(cfg, pkg),
+                })
+            except Exception as e:
+                incident["timeline"].append({
+                    "offset_seconds": delay,
+                    "stage": f"plus_{delay}s",
+                    "snapshot_error": _diag_redact_text(e),
+                })
+
+        try:
+            incident["after"] = build_diagnostics_report(cfg)
+        except Exception as e:
+            incident["after"] = {"collection_error": _diag_redact_text(e)}
+
+        incident["finished_at"] = now()
+        incident["finished_local"] = date_time_text()
+        incident["result"] = str(rt_tab.get("core_last_rejoin_note") or rt_tab.get("note") or "")
+        incident["hard_launch_sibling_loss"] = bool(rt_tab.get("hard_launch_sibling_loss"))
+        incident["hard_launch_sibling_loss_note"] = str(rt_tab.get("hard_launch_sibling_loss_note") or "")
+        incident["cache"] = _diag_redact_obj({
+            "last_cache_clear": rt_tab.get("last_cache_clear", 0),
+            "last_cache_reason": rt_tab.get("last_cache_reason", ""),
+            "last_cache_clear_forced": rt_tab.get("last_cache_clear_forced", False),
+            "last_cache_clear_method": rt_tab.get("last_cache_clear_method", ""),
+            "last_cache_clear_ok": rt_tab.get("last_cache_clear_ok", False),
+            "last_cache_system_exit": rt_tab.get("last_cache_system_exit", 0),
+            "last_cache_system_text": rt_tab.get("last_cache_system_text", ""),
+        })
+
+        try:
+            out_dir = BASE_DIR / "diagnostics" / "incidents"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            local_path = out_dir / f"NOMO_DIAGNOSTIC_{incident_id}.json"
+            local_path.write_text(
+                json.dumps(_diag_redact_obj(incident), indent=2, ensure_ascii=False, sort_keys=True),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+        ok, note = _send_diagnostic_webhook(incident, incident_id, cfg)
+        rt_tab["diagnostic_webhook_sent_at"] = now() if ok else 0
+        rt_tab["diagnostic_webhook_status"] = "sent" if ok else "failed"
+        rt_tab["diagnostic_webhook_note"] = str(note or "")
+        log_activity(
+            f"FULL diagnostic {'sent' if ok else 'FAILED'}: {incident_id} ({cut(note, 80)})",
+            pkg,
+            GREEN if ok else RED,
+        )
+        try:
+            save_runtime(load_runtime())
+        except Exception:
+            pass
+
+    threading.Thread(
+        target=worker,
+        name=f"nomo-diag-{incident_id}",
+        daemon=True,
+    ).start()
+    return incident_id
 
 
 def export_diagnostics_zip(cfg):
