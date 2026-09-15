@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.130 — SIBLING TASK-COLLAPSE SAFETY / STAGE ISOLATION
+# - Real-device diagnostics proved a sibling can keep its exact package PID while
+#   losing its Android ActivityRecord during another clone's recovery cycle.
+#   PID-only verification alone therefore cannot prove the sibling UI task survived.
+# - Every destructive Noka stop now snapshots live sibling ActivityRecords and
+#   verifies them again after the target PID stop. If a sibling task disappears,
+#   the target reopen is aborted before any new VIEW launch.
+# - Hard launches also verify sibling ActivityRecords after target start, and the
+#   Market cache+protocol path records whether peer task loss happened at STOP or
+#   LAUNCH stage instead of reporting only a generic warning.
+# - Any confirmed sibling task loss starts a 5-minute pool safety hold that drops
+#   further automatic open intents. This prevents one task collapse from
+#   cascading through A/B/C/D while normal monitoring continues.
+# - No force-stop/killall/pkill fallback is added; target stopping remains exact-PID.
+#
 # V4.81.129 — STALE SOLVER WAIT RELEASE / NO-CHALLENGE SELF-HEAL
 # - A pending provider retry is now valid only while CURRENT package-local
 #   verification evidence still exists. If the challenge is gone, the retry gate
@@ -1964,7 +1979,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.129"
+__version__ = "V4.81.130"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -5198,6 +5213,63 @@ def _verify_sibling_pid_snapshot(before, cfg, target_pkg):
     return True, "peer PIDs intact"
 
 
+def _sibling_activity_snapshot(target_pkg, cfg, sibling_pid_snapshot=None):
+    """Snapshot live sibling ActivityRecords for destructive-recovery safety."""
+    peers = []
+    if isinstance(sibling_pid_snapshot, dict):
+        peers = sorted(sibling_pid_snapshot.keys())
+    else:
+        peers = [p for p in _configured_clone_packages(cfg) if p != target_pkg]
+
+    snap = {}
+    errors = []
+    for peer in peers:
+        status, note = package_activity_status(peer, cfg)
+        if status == "UNKNOWN":
+            errors.append(f"{peer}: {note}")
+            continue
+        snap[peer] = status
+    return snap, errors
+
+
+def _verify_sibling_activity_snapshot(before, cfg, target_pkg):
+    """Require every sibling that had an ActivityRecord before to keep one."""
+    if not before:
+        return True, "peer activity snapshot empty", []
+    lost = []
+    query_errors = []
+    for peer, before_status in before.items():
+        if before_status != "ACTIVITY":
+            continue
+        after_status, after_note = package_activity_status(peer, cfg)
+        if after_status == "NO_ACTIVITY":
+            lost.append(peer)
+        elif after_status == "UNKNOWN":
+            query_errors.append(f"{peer}: {after_note}")
+    if query_errors:
+        msg = "peer ActivityRecord verification unavailable -> " + " | ".join(query_errors)
+        log_activity(msg, target_pkg, RED)
+        return False, msg, []
+    if lost:
+        msg = "peer ActivityRecord lost -> " + ", ".join(short_pkg(p) for p in lost)
+        log_activity(msg, target_pkg, RED)
+        return False, msg, lost
+    return True, "peer ActivityRecords intact", []
+
+
+def _set_peer_task_safety_hold(rt, cfg, source_pkg, detail, lost_pkgs=None, stage=""):
+    """Freeze further automatic destructive opens after a confirmed peer task loss."""
+    if not isinstance(rt, dict):
+        return
+    hold_seconds = max(60, int(cfg.get("noka_peer_task_safety_hold_seconds", 300) or 300))
+    rt["_peer_task_safety_hold_until"] = now() + hold_seconds
+    rt["_peer_task_safety_hold_at"] = now()
+    rt["_peer_task_safety_source_pkg"] = str(source_pkg or "")
+    rt["_peer_task_safety_stage"] = str(stage or "")
+    rt["_peer_task_safety_note"] = str(detail or "peer ActivityRecord lost")
+    rt["_peer_task_safety_lost_pkgs"] = [str(x) for x in (lost_pkgs or []) if str(x)]
+
+
 def force_stop_package(pkg, cfg, tries=3, wait_after=0.8, settle=1.0):
     """Stop exactly ONE clone using verified package PIDs only.
 
@@ -5211,6 +5283,17 @@ def force_stop_package(pkg, cfg, tries=3, wait_after=0.8, settle=1.0):
     sibling_before, sibling_query_errors = _sibling_pid_snapshot(pkg, cfg)
     if sibling_query_errors:
         msg = "PID safety precheck failed; sibling query unavailable -> " + " | ".join(sibling_query_errors)
+        log_activity(msg, pkg, RED)
+        return False, msg
+
+    sibling_activity_before, sibling_activity_errors = _sibling_activity_snapshot(
+        pkg, cfg, sibling_before
+    )
+    if sibling_activity_errors:
+        msg = (
+            "task safety precheck failed; sibling activity query unavailable -> "
+            + " | ".join(sibling_activity_errors)
+        )
         log_activity(msg, pkg, RED)
         return False, msg
 
@@ -5240,8 +5323,15 @@ def force_stop_package(pkg, cfg, tries=3, wait_after=0.8, settle=1.0):
             msg = "SIBLING SAFETY FAILURE; target reopen aborted: " + peer_note
             log_activity(msg, pkg, RED)
             return False, msg
+        activity_ok, activity_note, _activity_lost = _verify_sibling_activity_snapshot(
+            sibling_activity_before, cfg, pkg
+        )
+        if not activity_ok:
+            msg = "SIBLING TASK SAFETY FAILURE after target PID stop; reopen aborted: " + activity_note
+            log_activity(msg, pkg, RED)
+            return False, msg
         log_activity("PID-only stopped", pkg, YELLOW)
-        return True, "stopped (exact PID; siblings verified)"
+        return True, "stopped (exact PID; sibling PIDs+tasks verified)"
 
     for _ in range(max(1, int(tries or 1))):
         pids, err = checked_ids("before signal")
@@ -6095,6 +6185,10 @@ def market_peer_safe_cache_protocol_restart(
     link = android_launch_roblox_link(link, cfg)
     reason = str(reason or "market stuck")
 
+    rt_tab["market_protocol_peer_warning"] = ""
+    rt_tab["market_protocol_peer_loss_stage"] = ""
+    rt_tab["market_protocol_peer_loss_pkgs"] = []
+
     if not pkg or not link:
         return False, "missing package/link"
 
@@ -6119,7 +6213,23 @@ def market_peer_safe_cache_protocol_restart(
         DIM,
     )
     if not stopped:
+        if "ActivityRecord" in str(stop_note or ""):
+            rt_tab["market_protocol_peer_warning"] = str(stop_note or "")
+            rt_tab["market_protocol_peer_warning_at"] = now()
+            rt_tab["market_protocol_peer_loss_stage"] = "stop"
+            rt_tab["market_protocol_peer_loss_pkgs"] = []
         return False, "Market exact-PID stop failed: " + cut(stop_note, 70)
+
+    # The stop-stage verifier above proved sibling tasks survived the PID stop.
+    # Refresh the baseline here so any later loss is attributed to the VIEW launch.
+    sibling_activity_before, sibling_activity_errors = _sibling_activity_snapshot(
+        pkg, cfg, sibling_pids_before
+    )
+    if sibling_activity_errors:
+        return False, (
+            "Market launch task-safety snapshot unavailable: "
+            + " | ".join(sibling_activity_errors)
+        )
 
     cache_ok, cache_note = clear_package_cache(
         pkg,
@@ -6197,35 +6307,28 @@ def market_peer_safe_cache_protocol_restart(
         peer_ok, peer_note = _verify_sibling_pid_snapshot(
             sibling_pids_before, cfg, pkg
         )
-        activity_losses = []
-        for peer, (before_status, _before_note) in sibling_activity_before.items():
-            if before_status != "ACTIVITY":
-                continue
-            after_status, after_note = package_activity_status(peer, cfg)
-            if after_status == "NO_ACTIVITY":
-                activity_losses.append(short_pkg(peer) + ": ActivityRecord lost")
-            elif after_status == "UNKNOWN":
-                activity_losses.append(
-                    short_pkg(peer)
-                    + ": activity check unknown ("
-                    + cut(after_note, 35)
-                    + ")"
-                )
+        activity_ok, activity_note, activity_lost = _verify_sibling_activity_snapshot(
+            sibling_activity_before, cfg, pkg
+        )
 
-        if not peer_ok or activity_losses:
+        if not peer_ok or not activity_ok:
             detail = "; ".join(
-                ([peer_note] if not peer_ok else []) + activity_losses
+                [x for x in (peer_note if not peer_ok else "", activity_note if not activity_ok else "") if x]
             )
             rt_tab["market_protocol_peer_warning"] = str(detail or "")
             rt_tab["market_protocol_peer_warning_at"] = now()
+            rt_tab["market_protocol_peer_loss_stage"] = "launch"
+            rt_tab["market_protocol_peer_loss_pkgs"] = list(activity_lost or [])
             log_activity(
-                "MARKET PROTOCOL RESTART peer warning; no sibling action: "
+                "MARKET PROTOCOL RESTART peer TASK SAFETY warning; pool hard-open hold required: "
                 + cut(detail, 100),
                 pkg,
                 RED,
             )
         else:
             rt_tab["market_protocol_peer_warning"] = ""
+            rt_tab["market_protocol_peer_loss_stage"] = ""
+            rt_tab["market_protocol_peer_loss_pkgs"] = []
 
     return True, (
         "Market cache+protocol restart opened"
@@ -6552,6 +6655,14 @@ def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop
 
     hard_launch_peer_diag = False
     sibling_before_launch = {}
+    sibling_activity_before_launch = {}
+
+    if rt_tab is not None and not soft and require_stop and not skip_force_stop:
+        rt_tab["hard_stop_sibling_task_loss"] = False
+        rt_tab["hard_stop_sibling_task_loss_note"] = ""
+        rt_tab["hard_launch_sibling_task_loss"] = False
+        rt_tab["hard_launch_sibling_task_loss_note"] = ""
+        rt_tab["hard_launch_sibling_task_loss_pkgs"] = []
 
     if not soft and require_stop and not skip_force_stop:
         # V4.81.27 SAFETY ROLLBACK:
@@ -6564,6 +6675,10 @@ def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop
         if not stopped:
             # Never send another VIEW intent while the old exact package PID is
             # still alive. On App Cloner this creates a second/cascaded window.
+            if rt_tab is not None and "ActivityRecord" in str(stop_note or ""):
+                rt_tab["hard_stop_sibling_task_loss"] = True
+                rt_tab["hard_stop_sibling_task_loss_note"] = str(stop_note or "")
+                rt_tab["hard_stop_sibling_task_loss_at"] = now()
             log_activity(f"hard open aborted: {cut(stop_note, 80)}", pkg, RED)
             return False, f"stop failed: {cut(stop_note, 60)}"
 
@@ -6581,6 +6696,18 @@ def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop
                     YELLOW,
                 )
                 sibling_before_launch = {}
+            if sibling_before_launch:
+                sibling_activity_before_launch, sibling_activity_errors = _sibling_activity_snapshot(
+                    pkg, cfg, sibling_before_launch
+                )
+                if sibling_activity_errors:
+                    log_activity(
+                        "hard launch peer ActivityRecord snapshot unavailable: "
+                        + " | ".join(sibling_activity_errors),
+                        pkg,
+                        YELLOW,
+                    )
+                    sibling_activity_before_launch = {}
 
     # V4.81.65: combined stuck recovery must reproduce Android App Info ->
     # Clear cache AFTER the exact target PID is confirmed stopped and BEFORE the
@@ -6635,20 +6762,32 @@ def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop
             peer_ok, peer_note = _verify_sibling_pid_snapshot(
                 sibling_before_launch, cfg, pkg
             )
-            if not peer_ok:
+            activity_ok, activity_note, activity_lost = _verify_sibling_activity_snapshot(
+                sibling_activity_before_launch, cfg, pkg
+            )
+            if not peer_ok or not activity_ok:
+                combined_note = "; ".join(
+                    [x for x in (peer_note if not peer_ok else "", activity_note if not activity_ok else "") if x]
+                )
                 log_activity(
                     "HARD LAUNCH SIBLING LOSS detected after target start; "
                     "no sibling repair attempted: "
-                    + cut(peer_note, 100),
+                    + cut(combined_note, 100),
                     pkg,
                     RED,
                 )
                 if rt_tab is not None:
-                    rt_tab["hard_launch_sibling_loss"] = True
-                    rt_tab["hard_launch_sibling_loss_note"] = str(peer_note or "")
+                    rt_tab["hard_launch_sibling_loss"] = not bool(peer_ok)
+                    rt_tab["hard_launch_sibling_loss_note"] = str(peer_note or "") if not peer_ok else ""
                     rt_tab["hard_launch_sibling_loss_at"] = now()
+                    rt_tab["hard_launch_sibling_task_loss"] = not bool(activity_ok)
+                    rt_tab["hard_launch_sibling_task_loss_note"] = str(activity_note or "") if not activity_ok else ""
+                    rt_tab["hard_launch_sibling_task_loss_pkgs"] = list(activity_lost or [])
+                    rt_tab["hard_launch_sibling_task_loss_at"] = now()
             elif rt_tab is not None:
                 rt_tab["hard_launch_sibling_loss"] = False
+                rt_tab["hard_launch_sibling_task_loss"] = False
+                rt_tab["hard_launch_sibling_task_loss_pkgs"] = []
         return True, "soft hop" if soft else "opened"
 
     if (
@@ -18775,6 +18914,31 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
     item_mode = str(item.get("mode", "hard") or "hard").lower()
     is_hard = item_mode not in ("soft", "route", "switch", "reuse_task")
 
+    # V4.81.130: once a sibling loses its ActivityRecord during another clone's
+    # destructive recovery, stop the cascade. Automatic hard/cache items are
+    # dropped during the bounded pool hold; the watchdog may rediscover them later.
+    peer_task_hold_until = int(rt.get("_peer_task_safety_hold_until", 0) or 0)
+    if peer_task_hold_until > 0 and peer_task_hold_until <= now():
+        rt["_peer_task_safety_hold_until"] = 0
+        rt["_peer_task_safety_note"] = ""
+        rt["_peer_task_safety_lost_pkgs"] = []
+        rt["_peer_task_safety_stage"] = ""
+        peer_task_hold_until = 0
+    if peer_task_hold_until > now() and not item.get("manual_option6_force_override"):
+        left = max(1, peer_task_hold_until - now())
+        hold_note = str(rt.get("_peer_task_safety_note", "") or "peer task loss")
+        rt_tab["note"] = "peer task safety hold " + format_age(left) + "; " + cut(hold_note, 55)
+        last_log = int(rt_tab.get("peer_task_safety_hold_last_log", 0) or 0)
+        if now() - last_log >= 60:
+            rt_tab["peer_task_safety_hold_last_log"] = now()
+            log_activity(
+                "open intent dropped during peer-task safety hold: " + cut(hold_note, 80),
+                pkg,
+                YELLOW,
+            )
+        core.save()
+        return True
+
     post_solver_terminal_reopen = bool(
         is_hard
         and item.get("solver_success_requires_reopen")
@@ -19702,7 +19866,21 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                 rt_tab,
                 reason=reason,
             )
-            if ok:
+            peer_warning = str(rt_tab.get("market_protocol_peer_warning", "") or "")
+            peer_stage = str(rt_tab.get("market_protocol_peer_loss_stage", "") or "")
+            peer_lost = list(rt_tab.get("market_protocol_peer_loss_pkgs", []) or [])
+            if peer_warning and ("ActivityRecord" in peer_warning or peer_lost):
+                _set_peer_task_safety_hold(
+                    rt, cfg, pkg, peer_warning, peer_lost, stage=(peer_stage or "market-recovery")
+                )
+                rt_tab["note"] = "peer task loss detected; pool hard-open safety hold"
+                log_activity(
+                    "POOL HARD-OPEN HOLD armed after sibling task loss: " + cut(peer_warning, 95),
+                    pkg,
+                    RED,
+                )
+                core.save()
+            elif ok:
                 rt_tab["target"] = target
                 rt_tab["note"] = reason
     elif item.get("visible_home_protocol_nudge"):
@@ -19733,6 +19911,27 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
                 combined_stuck and item.get("combined_stuck_clear_cache")
             ),
         )
+        task_loss_note = ""
+        task_loss_pkgs = []
+        task_loss_stage = ""
+        if rt_tab.get("hard_stop_sibling_task_loss"):
+            task_loss_note = str(rt_tab.get("hard_stop_sibling_task_loss_note", "") or "")
+            task_loss_stage = "stop"
+        elif rt_tab.get("hard_launch_sibling_task_loss"):
+            task_loss_note = str(rt_tab.get("hard_launch_sibling_task_loss_note", "") or "")
+            task_loss_pkgs = list(rt_tab.get("hard_launch_sibling_task_loss_pkgs", []) or [])
+            task_loss_stage = "launch"
+        if task_loss_note:
+            _set_peer_task_safety_hold(
+                rt, cfg, pkg, task_loss_note, task_loss_pkgs, stage=task_loss_stage
+            )
+            rt_tab["note"] = "peer task loss detected; pool hard-open safety hold"
+            log_activity(
+                "POOL HARD-OPEN HOLD armed after sibling task loss: " + cut(task_loss_note, 95),
+                pkg,
+                RED,
+            )
+            core.save()
 
     opened_at = int(rt_tab.get("last_open", now()))
 
