@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.129 — STALE SOLVER WAIT RELEASE / NO-CHALLENGE SELF-HEAL
+# - A pending provider retry is now valid only while CURRENT package-local
+#   verification evidence still exists. If the challenge is gone, the retry gate
+#   is retired immediately and normal Market/Hatcher recovery resumes that pass.
+# - Fixes the V4.81.128 loop that changed an expired retry into another +60s wait
+#   forever when no challenge was visible (`solver retry due; waiting ...`).
+# - Retiring a stale wait also clears obsolete 503/400 retry cosmetics and stale
+#   CAPTCHA reopen flags; fresh clean state clears the same provider-error residue.
+# - No PID policy, sibling safety, private-server refresh policy, or cache-delete
+#   scope is widened by this build.
+#
 # V4.81.128 — STICKY VERIFICATION INCIDENT / STALE 503 CLEANUP / LOCAL AUTO DIAGS
 # - A continuously visible package-scoped verification screen keeps ONE incident id
 #   until NOMO genuinely observes that UI disappear. A watchdog observation gap no
@@ -1953,7 +1964,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.128"
+__version__ = "V4.81.129"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -14545,13 +14556,75 @@ def maybe_queue_solver_busy_retry(open_queue, tab, target, rt_tab, cfg, health, 
     if health.get("clean_fresh"):
         rt_tab["solver_busy_retry_pending"] = False
         rt_tab["solver_busy_retry_at"] = 0
+        rt_tab["solver_busy_retry_seconds"] = 0
         rt_tab["solver_retry_reason"] = ""
+        rt_tab["solver_last_error"] = ""
+        rt_tab["solver_last_provider_temp_error"] = ""
+        rt_tab["solver_last_provider_temp_error_at"] = 0
+        rt_tab["solver_provider_next_submit_at"] = 0
+        if str(rt_tab.get("solver_state", "") or "").lower() == "failed":
+            rt_tab["solver_state"] = "local_clear"
         rt_tab["note"] = "fresh state; solver retry cancelled"
         return None
 
     pkg = str((tab or {}).get("package", "") or "")
     retry_reason = str(rt_tab.get("solver_retry_reason") or "SERVER_BUSY")
     retry_at = int(rt_tab.get("solver_busy_retry_at", 0) or 0)
+
+    # V4.81.129: a persisted provider retry is valid only while the package still
+    # has CURRENT verification evidence.  Older builds could resurrect an old
+    # 503/400 retry at startup, then the due branch moved retry_at forward by 60s
+    # forever when no challenge was visible.  That left healthy/recoverable clones
+    # stuck on `Waiting` and prevented the normal Market/Hatcher recovery engine.
+    # Check current package-local evidence BEFORE honoring the retry timer.
+    alive = bool((health or {}).get("alive"))
+    state = (health or {}).get("state") or {}
+    challenge_detail = state_login_challenge_detail(state)
+    visible = (
+        android_login_challenge_ui_detail(
+            pkg, cfg, force=True, auth_hint=_runtime_auth_hint(rt_tab)
+        )
+        if alive else None
+    )
+
+    if not alive:
+        # Solver retry does not own crash recovery. Let the normal dead-package
+        # path reopen it if required, but never create a reopen solely for solver.
+        rt_tab["solver_busy_retry_pending"] = False
+        rt_tab["solver_busy_retry_at"] = 0
+        rt_tab["solver_busy_retry_seconds"] = 0
+        rt_tab["solver_retry_reason"] = ""
+        rt_tab["note"] = "solver retry cancelled; package is not alive"
+        core.save()
+        return None
+
+    if not visible and not challenge_detail:
+        # Explicit current evidence says the verification challenge is gone.
+        # Do NOT keep extending retry_at and do NOT keep the package in Waiting.
+        # Retire stale provider/captcha bookkeeping and immediately hand control
+        # back to the normal stale/crash/rejoin engine in this same watchdog pass.
+        old_reason = retry_reason
+        rt_tab["solver_busy_retry_pending"] = False
+        rt_tab["solver_busy_retry_at"] = 0
+        rt_tab["solver_busy_retry_seconds"] = 0
+        rt_tab["solver_retry_reason"] = ""
+        rt_tab["solver_last_error"] = ""
+        rt_tab["solver_last_provider_temp_error"] = ""
+        rt_tab["solver_last_provider_temp_error_at"] = 0
+        rt_tab["solver_provider_next_submit_at"] = 0
+        if str(rt_tab.get("solver_state", "") or "").lower() == "failed":
+            rt_tab["solver_state"] = "idle"
+        rt_tab["captcha_reopen_required"] = False
+        rt_tab["captcha_reopen_required_incident_id"] = ""
+        rt_tab["solver_terminal_reopen_required"] = False
+        rt_tab["note"] = "no current verification; stale solver wait cleared"
+        core.save()
+        log_activity(
+            f"stale solver wait cleared ({old_reason}); no current verification; normal recovery resumes",
+            pkg, GREEN,
+        )
+        return None
+
     if retry_at <= 0 or now() < retry_at:
         left = max(1, retry_at - now()) if retry_at else 600
         # A pending solver retry must own this package's challenge incident. Do
@@ -14574,33 +14647,6 @@ def maybe_queue_solver_busy_retry(open_queue, tab, target, rt_tab, cfg, health, 
 
     if solver_job_running(pkg):
         return "Solving", solver_job_note(pkg), True
-
-    alive = bool((health or {}).get("alive"))
-    state = (health or {}).get("state") or {}
-    challenge_detail = state_login_challenge_detail(state)
-    visible = android_login_challenge_ui_detail(pkg, cfg, force=True, auth_hint=_runtime_auth_hint(rt_tab)) if alive else None
-
-    if not alive:
-        # Solver retry does not own crash recovery. Let the normal dead-package
-        # path reopen it if required, but never create a reopen solely for solver.
-        rt_tab["solver_busy_retry_pending"] = False
-        rt_tab["solver_busy_retry_at"] = 0
-        rt_tab["solver_retry_reason"] = ""
-        rt_tab["note"] = "solver retry cancelled; package is not alive"
-        core.save()
-        return None
-
-    if not visible and not challenge_detail:
-        # Challenge-only invariant: do not blindly call the provider and do not
-        # bounce Roblox merely to rediscover a challenge. Recheck shortly.
-        wait_again = 60
-        rt_tab["solver_busy_retry_at"] = now() + wait_again
-        rt_tab["note"] = "solver retry due; waiting for current challenge (no reopen)"
-        removed = core.cancel(pkg)
-        core.save()
-        if removed:
-            log_activity("solver retry cancelled queued reopen; waiting for challenge in-place", pkg, YELLOW)
-        return "Waiting", rt_tab["note"], True
 
     removed = core.cancel(pkg)
     rt_tab["solver_busy_retry_pending"] = False
