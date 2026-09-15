@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.128 — STICKY VERIFICATION INCIDENT / STALE 503 CLEANUP / LOCAL AUTO DIAGS
+# - A continuously visible package-scoped verification screen keeps ONE incident id
+#   until NOMO genuinely observes that UI disappear. A watchdog observation gap no
+#   longer creates a fake "new CAPTCHA" incident.
+# - After the one existing post-terminal cache+reopen has already been used for that
+#   same incident, NOMO waits on the package instead of re-submitting the same
+#   verification incident to the provider.
+# - Successful/clear terminal provider results clear stale provider-temp-error/503
+#   cosmetics so the dashboard cannot show an obsolete SOLVER_UNAVAILABLE error.
+# - Automatic post-recovery diagnostics are saved locally only by default. Manual
+#   Advanced Tools -> Send full diagnostics still sends to the configured webhook.
+# - No PID policy, sibling safety, private-server refresh policy, or cache-delete
+#   scope is widened by this build.
+#
 # V4.81.127 — TASK/WINDOW DIAGNOSTICS + CLEAR-CACHE UI FIX
 # - Always-on, read-only diagnostics for post-solver recovery opens.
 # - Captures a full sanitized report before the target opens, live package snapshots
@@ -1939,7 +1953,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.127"
+__version__ = "V4.81.128"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -1956,6 +1970,9 @@ DIAGNOSTIC_WEBHOOK_URL = (
     "2xoV1O0qPdg8QOFxVpBfFQiAyDGpVHpOhhJ5m70E86HdgeyXKWsGyiINK_CUSHJqkUpU"
 )
 DIAGNOSTIC_WEBHOOK_ENABLED = True
+# V4.81.128: automatic incident captures stay local by default to avoid webhook
+# spam during repeated recovery testing. Manual full diagnostics still send.
+DIAGNOSTIC_AUTO_WEBHOOK_ENABLED = False
 DIAGNOSTIC_CAPTURE_DELAYS = (1, 3, 5, 10)
 
 DELTA_GLOBAL_ROOT = Path("/storage/emulated/0/Delta")
@@ -14238,17 +14255,16 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
     if captcha_ui:
         detail = ",".join(captcha_ui.get("hits", []) or []) or "verification UI"
 
-        # V4.81.114: one incident id per continuous visible challenge. The id
-        # changes after the UI genuinely disappeared (or after a long observation
-        # gap), so cooldowns from an older challenge cannot block a new one.
+        # V4.81.128: one incident id per continuously visible challenge. A
+        # watchdog observation gap is NOT evidence that the challenge disappeared;
+        # only the explicit no-CAPTCHA branch below closes the incident. This keeps
+        # the same stale Security wrapper from becoming incident #N+1 after a reopen.
         _captcha_now = now()
         _was_visible = bool(rt_tab.get("captcha_ui_visible"))
-        _last_seen = int(rt_tab.get("captcha_ui_last_seen_at", 0) or 0)
         _incident_id = str(rt_tab.get("captcha_ui_incident_id", "") or "")
         if (
             not _was_visible
             or not _incident_id
-            or (_last_seen > 0 and _captcha_now - _last_seen > 30)
         ):
             _seq = int(rt_tab.get("captcha_ui_incident_seq", 0) or 0) + 1
             _incident_id = f"{_captcha_now}:{_seq}"
@@ -14628,7 +14644,16 @@ def queue_visible_captcha_terminal_reopen(core, tab, target, rt_tab, result_labe
     if last_queued == incident_id:
         if core.has(pkg):
             return False, "post-solver cache+reopen already queued", True
-        return False, "post-solver reopen already used for this CAPTCHA incident", True
+        # V4.81.128: sticky same-incident stop. The same still-visible Security
+        # wrapper must not become another provider request/recovery generation.
+        rt_tab["note"] = (
+            "verification remains after one recovery; waiting for manual clear/UI change"
+        )
+        return (
+            False,
+            "verification remains after one recovery; waiting for manual clear/UI change",
+            True,
+        )
 
     metadata = solver_result_recovery_metadata(
         result_label,
@@ -14767,7 +14792,7 @@ def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, he
         )
         if reopen_action:
             return (
-                "Queued" if (reopen_added or core.has(pkg)) else "Captcha",
+                "Queued" if (reopen_added or core.has(pkg)) else "Waiting",
                 reopen_note,
                 True,
             )
@@ -39446,14 +39471,12 @@ def start_solver_job(tab, cfg, rt, rt_tab, reason, force=False, phase="solve", o
             not busy_pending
             and solver_provider_status_was_success(last_provider_status)
         ):
-            # Existing V4.81.111 behavior for the same exact visible incident.
-            log_activity(
-                "exact visible CAPTCHA overrides provider cooldown left from "
-                f"successful result {last_provider_status}",
-                pkg,
-                CYAN,
+            # V4.81.128: a successful/clear result does NOT authorize another
+            # automatic submission for the same continuously visible incident.
+            # A genuinely new incident is created only after the UI disappears.
+            return False, (
+                "same verification incident already handled; waiting for UI to clear"
             )
-            provider_left = 0
 
     if provider_left > 0:
         return False, f"provider cooldown {format_age(provider_left)}"
@@ -39779,6 +39802,8 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
                 rt_tab["solver_state"] = "success" if solved_result else "clear"
                 rt_tab["solver_last_success"] = now()
                 rt_tab["solver_last_error"] = ""
+                rt_tab["solver_last_provider_temp_error"] = ""
+                rt_tab["solver_last_provider_temp_error_at"] = 0
                 rt_tab["solver_last_probe"] = detail
                 if no_captcha_result:
                     trust_solver_no_captcha(rt_tab, cfg)
@@ -40001,6 +40026,8 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
             rt_tab["solver_state"] = "clear"
             rt_tab["solver_last_success"] = now()
             rt_tab["solver_last_error"] = ""
+            rt_tab["solver_last_provider_temp_error"] = ""
+            rt_tab["solver_last_provider_temp_error_at"] = 0
             rt_tab["solver_last_probe"] = detail
             trust_solver_no_captcha(rt_tab, cfg)
             rt_tab["note"] = "NO_CAPTCHA; still waiting for game load"
@@ -40040,13 +40067,29 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
 
             clear_hold(pkg)
             clear_manual_login_block(rt_tab)
-            clear_captcha_ui_runtime(rt_tab)
+            # V4.81.128: do not manufacture a new visible-CAPTCHA incident merely
+            # because the provider returned a terminal result. If this job came
+            # from a visible package-scoped verification screen, preserve that
+            # incident until health collection actually observes the UI disappear.
+            visible_terminal_origin = bool(
+                job.get("visible_captcha_origin")
+                or job.get("visible_captcha_must_reopen")
+            )
+            if visible_terminal_origin:
+                rt_tab["captcha_ui_false_negative"] = False
+                rt_tab["captcha_ui_retry_at"] = 0
+            else:
+                clear_captcha_ui_runtime(rt_tab)
             rt_tab["solver_busy_retry_pending"] = False
             rt_tab["solver_busy_retry_at"] = 0
+            rt_tab["solver_busy_retry_seconds"] = 0
             rt_tab["solver_retry_reason"] = ""
             rt_tab["solver_state"] = "success" if solved_result else "clear"
             rt_tab["solver_last_success"] = now()
             rt_tab["solver_last_error"] = ""
+            # A later clear/success supersedes an older provider 503/TEMP_ERROR.
+            rt_tab["solver_last_provider_temp_error"] = ""
+            rt_tab["solver_last_provider_temp_error_at"] = 0
             rt_tab["solver_last_probe"] = detail
             if no_captcha_result:
                 trust_solver_no_captcha(rt_tab, cfg)
@@ -44392,7 +44435,7 @@ def start_full_recovery_diagnostic(cfg, tab, rt_tab, item, reason=""):
     rt_tab["diagnostic_incident_id"] = incident_id
     rt_tab["diagnostic_incident_started_at"] = now()
     rt_tab["diagnostic_incident_type"] = "RECOVERY_OPEN"
-    rt_tab["diagnostic_webhook_enabled"] = True
+    rt_tab["diagnostic_webhook_enabled"] = bool(DIAGNOSTIC_AUTO_WEBHOOK_ENABLED)
 
     def worker():
         started = time.time()
@@ -44445,15 +44488,25 @@ def start_full_recovery_diagnostic(cfg, tab, rt_tab, item, reason=""):
         except Exception:
             pass
 
-        ok, note = _send_diagnostic_webhook(incident, incident_id, cfg)
-        rt_tab["diagnostic_webhook_sent_at"] = now() if ok else 0
-        rt_tab["diagnostic_webhook_status"] = "sent" if ok else "failed"
-        rt_tab["diagnostic_webhook_note"] = str(note or "")
-        log_activity(
-            f"FULL diagnostic {'sent' if ok else 'FAILED'}: {incident_id} ({cut(note, 80)})",
-            pkg,
-            GREEN if ok else RED,
-        )
+        if DIAGNOSTIC_AUTO_WEBHOOK_ENABLED:
+            ok, note = _send_diagnostic_webhook(incident, incident_id, cfg)
+            rt_tab["diagnostic_webhook_sent_at"] = now() if ok else 0
+            rt_tab["diagnostic_webhook_status"] = "sent" if ok else "failed"
+            rt_tab["diagnostic_webhook_note"] = str(note or "")
+            log_activity(
+                f"FULL diagnostic {'sent' if ok else 'FAILED'}: {incident_id} ({cut(note, 80)})",
+                pkg,
+                GREEN if ok else RED,
+            )
+        else:
+            rt_tab["diagnostic_webhook_sent_at"] = 0
+            rt_tab["diagnostic_webhook_status"] = "local_only"
+            rt_tab["diagnostic_webhook_note"] = "automatic webhook disabled; saved locally"
+            log_activity(
+                f"FULL diagnostic saved local-only: {incident_id}",
+                pkg,
+                CYAN,
+            )
         try:
             save_runtime(load_runtime())
         except Exception:
