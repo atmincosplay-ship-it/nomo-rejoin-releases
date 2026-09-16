@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.131 — JOIN-ERROR OVERRIDES STALE VERIFICATION / VISUAL 529 DECONFLICTION
+# - Fixes a real-device false hold where a dark Roblox Join Error modal was
+#   promoted to CAPTCHA/529-auth only because the same package had old verification
+#   runtime. The diagnostic literally recorded captcha_ui_detail="visual dark Join
+#   Error modal" while captcha_ui_visible=true.
+# - Screenshot-only Join Error is now treated as a generic package-local disconnect
+#   when there is no CURRENT exact verification text and no authoritative Face Lock.
+#   It must pass the normal disconnect confirmation path before recovery is queued.
+# - A confirmed non-auth disconnect clears only stale verification/manual-hold residue
+#   for that package, so an old Security incident cannot keep the dashboard on Waiting.
+# - Visual Join Error may be promoted to auth/529 only from authoritative Face-Lock
+#   evidence; old CAPTCHA/verification notes are no longer enough. Exact current
+#   verification/529 accessibility text still keeps its existing stronger behavior.
+# - Sibling task-collapse safety from V4.81.130 and exact-PID stop policy are unchanged.
+#
 # V4.81.130 — SIBLING TASK-COLLAPSE SAFETY / STAGE ISOLATION
 # - Real-device diagnostics proved a sibling can keep its exact package PID while
 #   losing its Android ActivityRecord during another clone's recovery cycle.
@@ -1979,7 +1994,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.130"
+__version__ = "V4.81.131"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -14128,6 +14143,89 @@ def clear_obsolete_age_access_hold(rt_tab, pkg):
     return True
 
 
+def clear_stale_verification_for_disconnect(rt_tab, pkg, disconnect_detail=None):
+    """V4.81.131: a current non-auth disconnect supersedes an old verification latch.
+
+    This is deliberately package-local and refuses to clear authoritative Face Lock.
+    It does not solve or interact with verification; it only prevents stale challenge
+    bookkeeping from masking a newer Join Error/kick screen.
+    """
+    if not isinstance(rt_tab, dict) or _authoritative_face_lock_runtime(rt_tab):
+        return False
+
+    old_visible = bool(rt_tab.get("captcha_ui_visible"))
+    old_detail = str(rt_tab.get("captcha_ui_detail", "") or "")
+    old_stage = str(rt_tab.get("disconnect_ui_recovery_stage", "") or "")
+    changed = False
+
+    if old_visible or old_detail or rt_tab.get("captcha_ui_incident_id"):
+        prior_id = str(rt_tab.get("captcha_ui_incident_id", "") or "")
+        clear_captcha_ui_runtime(rt_tab)
+        if prior_id:
+            rt_tab["captcha_ui_last_incident_id"] = prior_id
+        rt_tab["captcha_ui_incident_id"] = ""
+        rt_tab["captcha_ui_incident_started_at"] = 0
+        changed = True
+
+    for key, value in (
+        ("captcha_reopen_required", False),
+        ("captcha_reopen_required_incident_id", ""),
+        ("captcha_terminal_reopen_incident_id", ""),
+        ("captcha_terminal_reopen_queued_at", 0),
+        ("solver_terminal_reopen_required", False),
+        ("solver_busy_retry_pending", False),
+        ("solver_busy_retry_at", 0),
+        ("solver_busy_retry_seconds", 0),
+        ("solver_retry_reason", ""),
+        ("solver_provider_next_submit_at", 0),
+    ):
+        if rt_tab.get(key) != value:
+            rt_tab[key] = value
+            changed = True
+
+    if str(rt_tab.get("solver_state", "") or "") == "clear_ui_still_visible":
+        rt_tab["solver_state"] = "idle"
+        changed = True
+    if "auth ui remains visible" in str(rt_tab.get("solver_last_error", "") or "").lower():
+        rt_tab["solver_last_error"] = ""
+        changed = True
+    if rt_tab.get("solver_last_provider_temp_error"):
+        rt_tab["solver_last_provider_temp_error"] = ""
+        rt_tab["solver_last_provider_temp_error_at"] = 0
+        changed = True
+
+    # Clear only a verification/captcha manual latch. Never clear an unrelated
+    # login/account hold here.
+    manual_reason = str(rt_tab.get("manual_login_reason", "") or "").lower()
+    if rt_tab.get("manual_login_needed") and any(x in manual_reason for x in ("captcha", "verification", "challenge")):
+        clear_manual_login_block(rt_tab)
+        changed = True
+
+    if old_stage == "manual_hold":
+        rt_tab["disconnect_ui_recovery_stage"] = ""
+        rt_tab["disconnect_ui_hold_until"] = 0
+        changed = True
+
+    try:
+        hold_reason = str(get_hold_reason(pkg) or "").lower()
+    except Exception:
+        hold_reason = ""
+    if hold_reason and any(x in hold_reason for x in ("captcha", "verification", "challenge")) and "face_lock" not in hold_reason and "face lock" not in hold_reason:
+        try:
+            clear_hold(pkg)
+            changed = True
+        except Exception:
+            pass
+
+    if changed:
+        code = str((disconnect_detail or {}).get("code", "") or "").strip()
+        kind = "Join Error" if str((disconnect_detail or {}).get("reason", "")) == "android_package_scoped_visual_join_error" else "disconnect"
+        rt_tab["note"] = f"{kind} overrides stale verification hold" + (f" ({code})" if code else "")
+        rt_tab["verification_superseded_by_disconnect_at"] = now()
+        rt_tab["verification_superseded_by_disconnect_detail"] = old_detail[:160]
+    return changed
+
+
 def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=None, raw_alive=None, state=None, err=None, process_status=None, process_note=""):
     """One shared answer for Market/Hatcher package health.
 
@@ -14170,6 +14268,37 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
     # connected. A package-scoped Android UI hit overrides fresh/ancient state.
     if raw_alive:
         android_popup = android_disconnect_ui_detail(pkg, cfg)
+
+        # V4.81.131: App Cloner can hide Join Error text from uiautomator. A
+        # strict dark-modal visual is still useful as a generic disconnect, but
+        # it must never be promoted to auth merely because this package has old
+        # CAPTCHA runtime. Exact current verification text and authoritative
+        # Face Lock both outrank this screenshot-only fallback.
+        visual_join_eligible = bool(
+            not state_is_clean_fresh(state, cfg)
+            or rt_tab.get("captcha_ui_visible")
+            or str(rt_tab.get("disconnect_ui_recovery_stage", "") or "") == "manual_hold"
+        )
+        if (
+            not android_popup
+            and visual_join_eligible
+            and not _authoritative_face_lock_runtime(rt_tab)
+        ):
+            exact_now = android_exact_login_challenge_text_detail(pkg, cfg, force=False)
+            if not exact_now:
+                visual_join_now = visual_join_error_detail(
+                    pkg, cfg, force=False, bypass_confirm=False
+                )
+                if visual_join_now:
+                    android_popup = {
+                        "title": "Roblox Join Error",
+                        "text": str(visual_join_now.get("text") or "visual Join Error modal"),
+                        "code": "",
+                        "reason": "android_package_scoped_visual_join_error",
+                        "hits": list(visual_join_now.get("hits") or ["visual dark Join Error modal"]),
+                        "visual_only": True,
+                    }
+
         if android_popup:
             signature = "|".join([
                 str(android_popup.get("code", "") or ""),
@@ -14189,6 +14318,13 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
             is_private_524 = str(android_popup.get("reason", "") or "") == "private_server_permission_denied"
             required = 1 if is_private_524 else max(2, int(cfg.get("android_disconnect_confirmations_required", 2) or 2))
             if count >= required:
+                # A current kick/Join Error is newer evidence than a stale
+                # verification/manual_hold latch. Clear only that stale package-
+                # local residue before classifying the disconnect.
+                if str(android_popup.get("code", "") or "").strip() != "529":
+                    clear_stale_verification_for_disconnect(
+                        rt_tab, pkg, android_popup
+                    )
                 merged_state = dict(state or {})
                 merged_state["disconnected"] = True
                 merged_state["disconnect_title"] = android_popup.get("title", "Roblox Disconnect")
@@ -14399,7 +14535,7 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
     captcha_ui = exact_captcha_ui
     if captcha_ui is None and captcha_scan_eligible and not non_auth_disconnect:
         captcha_ui = android_login_challenge_ui_detail(
-            pkg, cfg, force=False, auth_hint=_runtime_auth_hint(rt_tab)
+            pkg, cfg, force=False, auth_hint=_runtime_visual_join_auth_hint(rt_tab)
         )
 
     if captcha_ui:
@@ -14721,7 +14857,7 @@ def maybe_queue_solver_busy_retry(open_queue, tab, target, rt_tab, cfg, health, 
     challenge_detail = state_login_challenge_detail(state)
     visible = (
         android_login_challenge_ui_detail(
-            pkg, cfg, force=True, auth_hint=_runtime_auth_hint(rt_tab)
+            pkg, cfg, force=True, auth_hint=_runtime_visual_join_auth_hint(rt_tab)
         )
         if alive else None
     )
@@ -15058,7 +15194,7 @@ def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, he
         rt_tab["solver_busy_retry_at"] = 0
         rt_tab["solver_retry_reason"] = ""
 
-    detail_obj = android_login_challenge_ui_detail(pkg, cfg, force=True, auth_hint=_runtime_auth_hint(rt_tab))
+    detail_obj = android_login_challenge_ui_detail(pkg, cfg, force=True, auth_hint=_runtime_visual_join_auth_hint(rt_tab))
     detail = str(
         (detail_obj or {}).get("text")
         or (detail_obj or {}).get("reason")
@@ -17527,6 +17663,18 @@ def _runtime_auth_hint(rt_tab, recent_seconds=3600):
     return False
 
 
+def _runtime_visual_join_auth_hint(rt_tab):
+    """V4.81.131: only authoritative Face-Lock proof may turn a visual Join Error into auth/529.
+
+    Old CAPTCHA/verification runtime is intentionally NOT enough. A Join Error can
+    appear after a verification screen has already disappeared; using the broad
+    _runtime_auth_hint() here caused that new error modal to be relabeled as the old
+    challenge forever. Exact current 529/verification text is detected independently
+    before this visual fallback runs.
+    """
+    return bool(_authoritative_face_lock_runtime(rt_tab))
+
+
 def android_account_status_ui_detail(pkg, cfg, force=False):
     """Exact package/rect text for Account Locked or explicit moderation/banned UI."""
     texts, _ = android_ui_text_for_package_or_rect(str(pkg or ""), cfg, force=force)
@@ -18463,7 +18611,7 @@ def wait_until_fresh_after_open(
 
         # build a status note for the table
         status_note = ""
-        visible_captcha = android_login_challenge_ui_detail(pkg, cfg, force=False, auth_hint=_runtime_auth_hint(rt_tab)) if alive else None
+        visible_captcha = android_login_challenge_ui_detail(pkg, cfg, force=False, auth_hint=_runtime_visual_join_auth_hint(rt_tab)) if alive else None
         if visible_captcha:
             rt_tab["captcha_ui_visible"] = True
             rt_tab["captcha_ui_last_seen_at"] = now()
@@ -19462,7 +19610,7 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
 
             visible_auth = (
                 android_login_challenge_ui_detail(
-                    pkg, cfg, force=True, auth_hint=_runtime_auth_hint(rt_tab)
+                    pkg, cfg, force=True, auth_hint=_runtime_visual_join_auth_hint(rt_tab)
                 )
                 if not current_disconnect
                 else None
@@ -40220,7 +40368,7 @@ def poll_solver_jobs(cfg, rt, open_queue, core=None):
                 pkg,
                 cfg,
                 force=True,
-                auth_hint=_runtime_auth_hint(rt_tab),
+                auth_hint=_runtime_visual_join_auth_hint(rt_tab),
             )
             if visible_ui:
                 rt_tab["captcha_ui_visible"] = True
