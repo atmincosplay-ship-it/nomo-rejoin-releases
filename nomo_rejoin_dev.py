@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.132 — MARKET RUNTIME HEARTBEAT WINS OVER STALE STATE WRITER
+# - Fixes a real-device false recovery loop where a clone was visibly healthy in
+#   Trade World and had a fresh same-JobId MARKET_RUNNING marker, but an old
+#   state.json timestamp (for example 277h) kept re-queuing the 5m cache recovery.
+# - A clean Trade World state may now be timestamp-stale when a CURRENT
+#   MARKET_RUNNING heartbeat matches the exact same JobId. That live heartbeat
+#   suppresses/cancels destructive Market recovery while it remains fresh.
+# - The stale-state classifier uses the same proof before queueing, so NOMO does
+#   not churn Queued/Next/solver preflight against a clone that is already running.
+# - Narrow speculative provider-error residue from an old-state Market preflight is
+#   cleared when that exact live runtime proof wins. Current verification/manual
+#   holds and sibling task-collapse safety are unchanged.
+#
 # V4.81.131 — JOIN-ERROR OVERRIDES STALE VERIFICATION / VISUAL 529 DECONFLICTION
 # - Fixes a real-device false hold where a dark Roblox Join Error modal was
 #   promoted to CAPTCHA/529-auth only because the same package had old verification
@@ -1994,7 +2007,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.131"
+__version__ = "V4.81.132"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -15261,8 +15274,12 @@ def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, he
 def market_strong_healthy_proof(tab, cfg):
     """High-confidence proof that a queued Market recovery is obsolete.
 
-    A fresh state timestamp alone is NOT enough. Require both the current Trade
-    World state and the Market loader's current-job MARKET_RUNNING heartbeat.
+    V4.81.132: the state *timestamp* may be stale here.  What matters is that the
+    target process is ALIVE, the last state is clean Trade World, and the separate
+    Market runtime heartbeat is CURRENT and names the exact same JobId.  This is
+    deliberately stronger than a fresh state timestamp alone and prevents a paused
+    state writer from turning a visibly healthy Market clone into a destructive
+    5-minute recovery.
     """
     pkg = str((tab or {}).get("package") or "")
     user = str((tab or {}).get("user_name") or pkg)
@@ -15278,8 +15295,8 @@ def market_strong_healthy_proof(tab, cfg):
     if not state_timestamp_valid(state):
         return False, "invalid state timestamp"
 
-    if not state_is_clean_fresh(state, cfg):
-        return False, f"state not clean/fresh age={format_age(state_age_seconds(state))}"
+    if not state_is_clean(state):
+        return False, "state not clean"
 
     place_id = str(state.get("place_id") or "").strip()
     if place_id != "129954712878723":
@@ -15311,10 +15328,39 @@ def market_strong_healthy_proof(tab, cfg):
     if marker_age > max_age:
         return False, f"MARKET_RUNNING marker stale {format_age(marker_age)}"
 
+    state_age = max(0, int(state_age_seconds(state) or 0))
+    if state_is_clean_fresh(state, cfg):
+        return True, (
+            f"clean Trade World + MARKET_RUNNING same JobId "
+            f"(marker {format_age(marker_age)} old)"
+        )
     return True, (
-        f"clean Trade World + MARKET_RUNNING same JobId "
-        f"(marker {format_age(marker_age)} old)"
+        f"Trade World + CURRENT MARKET_RUNNING same JobId; "
+        f"state writer stale {format_age(state_age)}, marker {format_age(marker_age)}"
     )
+
+
+def clear_speculative_market_old_state_solver(rt_tab):
+    """Retire only solver residue created by a speculative Market old-state open."""
+    if not isinstance(rt_tab, dict):
+        return False
+    reason = str(rt_tab.get("solver_reason") or rt_tab.get("solver_preflight_reason") or "").lower()
+    if "market alive old state" not in reason and "market valid-ts stale" not in reason:
+        return False
+    changed = clear_solver_runtime_block(rt_tab)
+    for key, value in (
+        ("solver_last_error", ""),
+        ("solver_last_provider_temp_error", ""),
+        ("solver_last_provider_temp_error_at", 0),
+        ("solver_provider_next_submit_at", 0),
+    ):
+        if rt_tab.get(key) != value:
+            rt_tab[key] = value
+            changed = True
+    if str(rt_tab.get("solver_state") or "").lower() in ("failed", "running"):
+        rt_tab["solver_state"] = "idle"
+        changed = True
+    return changed
 
 
 def market_combined_stuck_enabled(cfg, mode="market", target="market"):
@@ -15675,6 +15721,28 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
         # classify THIS package with the direct moderation API first; otherwise
         # one face-locked clone could hide a second face-locked clone forever.
         if age >= trigger:
+            # V4.81.132: before an ALIVE Market clone is allowed to create a
+            # destructive 5m recovery generation, honor the separate current-job
+            # MARKET_RUNNING heartbeat.  A paused state writer can be hours old
+            # while the actual Market loader is still alive and healthy.
+            if market_combined and alive:
+                strong_ok, strong_note = market_strong_healthy_proof(tab, cfg)
+                if strong_ok:
+                    core.cancel(pkg)
+                    clear_speculative_market_old_state_solver(rt_tab)
+                    rt_tab["market_runtime_healthy_suppressed_at"] = now()
+                    rt_tab["market_runtime_healthy_suppressed_note"] = str(strong_note or "")
+                    rt_tab["market_combined_stuck_last"] = 0
+                    rt_tab["market_combined_stuck_last_age"] = 0
+                    rt_tab["market_combined_stuck_last_reason"] = ""
+                    rt_tab["market_combined_stuck_failed_at"] = 0
+                    rt_tab["market_combined_stuck_failed_reason"] = ""
+                    rt_tab["note"] = "Market runtime healthy; stale state writer suppressed"
+                    core.save()
+                    return "Ingame", (
+                        "runtime healthy; state writer stale " + format_age(age)
+                    ), False
+
             if alive and _is_noka_clone_package(pkg):
                 peer_pkg, peer_reason = active_noka_auth_incident(cfg, rt, exclude_pkg=pkg)
                 if peer_pkg:
@@ -19315,6 +19383,9 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
         strong_ok, strong_note = market_strong_healthy_proof(tab, cfg)
         if strong_ok:
             rt_tab["note"] = "Market healthy - queued recovery cancelled"
+            rt_tab["market_runtime_healthy_suppressed_at"] = now()
+            rt_tab["market_runtime_healthy_suppressed_note"] = str(strong_note or "")
+            clear_speculative_market_old_state_solver(rt_tab)
             rt_tab["market_combined_stuck_last"] = 0
             rt_tab["market_combined_stuck_last_age"] = 0
             rt_tab["market_combined_stuck_last_reason"] = ""
