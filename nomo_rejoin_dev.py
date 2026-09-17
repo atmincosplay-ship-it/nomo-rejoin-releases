@@ -1,5 +1,22 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.133 — TASK-LOST RESTORE THROUGH POOL SAFETY HOLD
+# - Fixes the V4.81.130/132 containment gap where NOMO correctly detected that
+#   sibling App Cloner ActivityRecords vanished, armed the pool hard-open hold,
+#   then stranded those siblings as `PID alive / no ActivityRecord`.
+# - A confirmed lost sibling can now be restored through a dedicated NO-KILL
+#   exact-package VIEW start while the destructive pool hold remains active.
+#   The target PID is never stopped and cache is never cleared by this repair.
+# - Restores one sibling at a time after a settle delay, verifies the candidate
+#   ActivityRecord returned, and verifies every previously-live peer task/PID
+#   survived that restore before moving to the next sibling.
+# - If a restore launch makes another healthy sibling task disappear, NOMO
+#   extends the hold, merges the new loss into the repair set, and stops the
+#   restore sequence instead of cascading through the pool.
+# - The recovery source package is never auto-restored by this path; current
+#   verification/manual-auth packages remain held. Exact-PID destructive
+#   recovery policy is otherwise unchanged.
+#
 # V4.81.132 — MARKET RUNTIME HEARTBEAT WINS OVER STALE STATE WRITER
 # - Fixes a real-device false recovery loop where a clone was visibly healthy in
 #   Trade World and had a fresh same-JobId MARKET_RUNNING marker, but an old
@@ -2007,7 +2024,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.132"
+__version__ = "V4.81.133"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -5286,19 +5303,369 @@ def _verify_sibling_activity_snapshot(before, cfg, target_pkg):
 
 
 def _set_peer_task_safety_hold(rt, cfg, source_pkg, detail, lost_pkgs=None, stage=""):
-    """Freeze further automatic destructive opens after a confirmed peer task loss."""
+    """Freeze destructive opens after peer task loss and stage no-kill repair."""
     if not isinstance(rt, dict):
         return
     hold_seconds = max(60, int(cfg.get("noka_peer_task_safety_hold_seconds", 300) or 300))
+    settle_seconds = max(5, int(cfg.get("noka_peer_task_restore_settle_seconds", 30) or 30))
+    existing = [str(x) for x in (rt.get("_peer_task_safety_lost_pkgs", []) or []) if str(x)]
+    incoming = [str(x) for x in (lost_pkgs or []) if str(x)]
+    merged = []
+    for peer in existing + incoming:
+        if peer not in merged:
+            merged.append(peer)
     rt["_peer_task_safety_hold_until"] = now() + hold_seconds
     rt["_peer_task_safety_hold_at"] = now()
     rt["_peer_task_safety_source_pkg"] = str(source_pkg or "")
     rt["_peer_task_safety_stage"] = str(stage or "")
     rt["_peer_task_safety_note"] = str(detail or "peer ActivityRecord lost")
-    rt["_peer_task_safety_lost_pkgs"] = [str(x) for x in (lost_pkgs or []) if str(x)]
+    rt["_peer_task_safety_lost_pkgs"] = merged
+    rt["_peer_task_restore_next_at"] = now() + settle_seconds
+    rt["_peer_task_restore_all_restored_at"] = 0
+    rt["_peer_task_restore_last_event"] = "hold armed; waiting for Android task settle"
 
 
-def force_stop_package(pkg, cfg, tries=3, wait_after=0.8, settle=1.0):
+def _clear_peer_task_safety_hold(rt, reason=""):
+    if not isinstance(rt, dict):
+        return
+    rt["_peer_task_safety_last_cleared_at"] = now()
+    rt["_peer_task_safety_last_cleared_reason"] = str(reason or "peer tasks restored")
+    rt["_peer_task_safety_hold_until"] = 0
+    rt["_peer_task_safety_note"] = ""
+    rt["_peer_task_safety_lost_pkgs"] = []
+    rt["_peer_task_safety_stage"] = ""
+    rt["_peer_task_restore_next_at"] = 0
+
+
+def _peer_task_restore_tab(pkg, target, cfg):
+    """Find the best existing profile/tab for an exact-package task restore."""
+    pkg = str(pkg or "").strip()
+    target = str(target or "").strip().lower()
+    if not pkg:
+        return None
+
+    if target == "hatcher":
+        try:
+            hcfg = load_hatcher_config()
+            for prof in hatcher_profiles(hcfg, enabled_only=False):
+                if str((prof or {}).get("package", "") or "").strip() == pkg:
+                    return prof
+        except Exception:
+            pass
+
+    for tab in (cfg.get("tabs", []) or []):
+        if isinstance(tab, dict) and str(tab.get("package", "") or "").strip() == pkg:
+            return tab
+
+    try:
+        for tab in autoexec_tabs(cfg):
+            if isinstance(tab, dict) and str(tab.get("package", "") or "").strip() == pkg:
+                return tab
+    except Exception:
+        pass
+
+    return {"package": pkg}
+
+
+def _peer_task_restore_target(rt_tab, cfg):
+    target = str((rt_tab or {}).get("target", "") or "").strip().lower()
+    # Active mode outranks stale runtime target residue. This prevents a Hatcher
+    # sibling that lost only its Android task from being accidentally restored
+    # into Market because an old target field survived in runtime.json.
+    if cfg.get("hatcher_mode_enabled", False):
+        return "hatcher"
+    if cfg.get("booster_mode_enabled", False):
+        return target if target in ("booster", "hatcher") else "booster"
+    if cfg.get("market_mode_enabled", False):
+        return target if target in ("market", "restock") else "market"
+    if target in ("market", "hatcher", "booster", "restock"):
+        return target
+    return "market"
+
+
+def _peer_task_restore_cancel_auto_queue(core, pkg):
+    """Drop stale automatic recovery intents for a task that is healthy again."""
+    if core is None:
+        return 0
+    removed = 0
+    manual_keys = (
+        "manual_option6",
+        "manual_option6_force_override",
+        "manual_booster_route",
+        "manual_booster_hard_route",
+        "manual_auth_open",
+    )
+    for item in list(core.open_queue):
+        item_pkg = str(((item or {}).get("tab") or {}).get("package", "") or "")
+        if item_pkg != str(pkg or ""):
+            continue
+        if any(bool((item or {}).get(key)) for key in manual_keys):
+            continue
+        try:
+            core.open_queue.remove(item)
+            removed += 1
+        except ValueError:
+            pass
+    return removed
+
+
+def _peer_task_restore_auth_blocked(pkg, rt_tab, cfg, source_pkg):
+    """Never auto-materialize the recovery source or a current manual/auth hold."""
+    if str(pkg or "") == str(source_pkg or ""):
+        return True, "recovery source package is excluded from task restore"
+    if bool((rt_tab or {}).get("captcha_ui_visible")):
+        return True, "current verification hold"
+    if bool((rt_tab or {}).get("face_lock_detected")):
+        return True, "current face-lock hold"
+    if bool((rt_tab or {}).get("manual_login_needed")):
+        return True, "manual login hold"
+    return False, ""
+
+
+def _peer_task_restore_start(pkg, link, cfg, rt_tab):
+    """Materialize ONE lost exact-package task without stopping any PID."""
+    pkg = str(pkg or "").strip()
+    link = android_launch_roblox_link(link, cfg)
+    if not pkg or not link:
+        return False, "missing package/link", []
+
+    process_status, process_note = package_alive_status(pkg, cfg, fresh=True)
+    if process_status != "ALIVE":
+        return False, f"task restore requires ALIVE package; {process_status}: {cut(process_note, 60)}", []
+    activity_status, activity_note = package_activity_status(pkg, cfg)
+    if activity_status == "ACTIVITY":
+        return True, "ActivityRecord already restored", []
+    if activity_status != "NO_ACTIVITY":
+        return False, "target activity query unavailable: " + cut(activity_note, 70), []
+
+    component, resolve_note = resolve_package_view_activity(pkg, link, cfg)
+    if not component:
+        return False, resolve_note, []
+
+    sibling_pids, sibling_pid_errors = _sibling_pid_snapshot(pkg, cfg)
+    if sibling_pid_errors:
+        return False, "task restore refused; peer PID snapshot unavailable: " + " | ".join(sibling_pid_errors), []
+    sibling_activity_before, sibling_activity_errors = _sibling_activity_snapshot(
+        pkg, cfg, sibling_pids
+    )
+    if sibling_activity_errors:
+        return False, "task restore refused; peer task snapshot unavailable: " + " | ".join(sibling_activity_errors), []
+
+    cmd = (
+        "am start -W "
+        "-f 0x20000000 "
+        "-n " + shlex.quote(component) + " "
+        "-a android.intent.action.VIEW "
+        "-d " + shlex.quote(link)
+    )
+    invalidate_android_observation_caches()
+    code, output = shell_timeout(cmd, cfg, capture=True, timeout=20)
+    invalidate_android_observation_caches()
+
+    rt_tab["peer_task_restore_last_attempt_at"] = now()
+    rt_tab["peer_task_restore_last_component"] = component
+    rt_tab["peer_task_restore_last_result"] = cut(output or f"exit {code}", 140)
+    if code != 0:
+        return False, "task restore VIEW start failed: " + cut(output or f"exit {code}", 80), []
+
+    time.sleep(max(0.8, float(cfg.get("noka_peer_task_restore_verify_delay_seconds", 1.5) or 1.5)))
+    peer_pid_ok, peer_pid_note = _verify_sibling_pid_snapshot(sibling_pids, cfg, pkg)
+    peer_task_ok, peer_task_note, peer_task_lost = _verify_sibling_activity_snapshot(
+        sibling_activity_before, cfg, pkg
+    )
+    restored_status, restored_note = package_activity_status(pkg, cfg)
+
+    if not peer_pid_ok or not peer_task_ok:
+        detail = "; ".join(
+            [x for x in (peer_pid_note if not peer_pid_ok else "", peer_task_note if not peer_task_ok else "") if x]
+        )
+        return False, "task restore caused peer loss: " + cut(detail, 100), list(peer_task_lost or [])
+    if restored_status != "ACTIVITY":
+        return False, "VIEW started but ActivityRecord did not return: " + cut(restored_note, 70), []
+    return True, "task restored (no PID stop; peers verified)", []
+
+
+def maybe_restore_peer_task_loss(core):
+    """Repair siblings stranded as ALIVE + NO_ACTIVITY during the pool hold.
+
+    Returns one of: none, pending, acted, cleared. Destructive queue processing
+    pauses while this repair state is pending/acted.
+    """
+    if core is None:
+        return "none"
+    cfg = core.cfg
+    rt = core.rt
+    hold_until = int(rt.get("_peer_task_safety_hold_until", 0) or 0)
+    if hold_until <= now():
+        return "none"
+
+    source_pkg = str(rt.get("_peer_task_safety_source_pkg", "") or "")
+    lost = [str(x) for x in (rt.get("_peer_task_safety_lost_pkgs", []) or []) if str(x)]
+
+    # Migrate a V4.81.130/132 hold that did not persist exact lost packages.
+    if not lost:
+        for peer in _configured_clone_packages(cfg):
+            if peer == source_pkg:
+                continue
+            p_status, _p_note = package_alive_status(peer, cfg, fresh=True)
+            if p_status != "ALIVE":
+                continue
+            a_status, _a_note = package_activity_status(peer, cfg)
+            if a_status == "NO_ACTIVITY" and peer not in lost:
+                lost.append(peer)
+        if lost:
+            rt["_peer_task_safety_lost_pkgs"] = list(lost)
+            rt["_peer_task_restore_last_event"] = "discovered stranded peers from active legacy hold"
+            core.save()
+
+    # Prune peers whose ActivityRecord already came back by itself.
+    remaining = []
+    for peer in lost:
+        a_status, _a_note = package_activity_status(peer, cfg)
+        if a_status == "ACTIVITY":
+            peer_rt = core.runtime_tab(peer)
+            peer_rt["peer_task_restore_state"] = "restored"
+            peer_rt["peer_task_restore_restored_at"] = now()
+            removed = _peer_task_restore_cancel_auto_queue(core, peer)
+            peer_rt["peer_task_restore_cancelled_auto_queue"] = int(removed or 0)
+            peer_rt["note"] = "task restored; monitoring resumed"
+            continue
+        remaining.append(peer)
+    lost = remaining
+    rt["_peer_task_safety_lost_pkgs"] = list(lost)
+
+    if not lost:
+        all_restored_at = int(rt.get("_peer_task_restore_all_restored_at", 0) or 0)
+        if all_restored_at > 0:
+            settle = max(5, int(cfg.get("noka_peer_task_post_restore_settle_seconds", 30) or 30))
+            if now() - all_restored_at < settle:
+                rt["_peer_task_restore_last_event"] = (
+                    "all sibling tasks restored; post-restore settle "
+                    + format_age(max(1, settle - (now() - all_restored_at)))
+                )
+                return "pending"
+        log_activity("peer-task pool repair complete; destructive hold cleared", source_pkg, GREEN)
+        _clear_peer_task_safety_hold(rt, "all lost sibling ActivityRecords restored")
+        rt["_peer_task_restore_all_restored_at"] = 0
+        core.save()
+        return "cleared"
+
+    next_at = int(rt.get("_peer_task_restore_next_at", 0) or 0)
+    if next_at > now():
+        return "pending"
+
+    candidate = ""
+    candidate_rt = None
+    for peer in lost:
+        peer_rt = core.runtime_tab(peer)
+        blocked, block_note = _peer_task_restore_auth_blocked(peer, peer_rt, cfg, source_pkg)
+        if blocked:
+            peer_rt["peer_task_restore_state"] = "held"
+            peer_rt["peer_task_restore_note"] = block_note
+            continue
+        p_status, p_note = package_alive_status(peer, cfg, fresh=True)
+        if p_status == "UNKNOWN":
+            peer_rt["peer_task_restore_state"] = "deferred"
+            peer_rt["peer_task_restore_note"] = "process query unavailable: " + cut(p_note, 60)
+            continue
+        if p_status != "ALIVE":
+            peer_rt["peer_task_restore_state"] = "deferred"
+            peer_rt["peer_task_restore_note"] = "PID dead; wait for normal recovery after safety hold"
+            continue
+        a_status, a_note = package_activity_status(peer, cfg)
+        if a_status == "UNKNOWN":
+            peer_rt["peer_task_restore_state"] = "deferred"
+            peer_rt["peer_task_restore_note"] = "activity query unavailable: " + cut(a_note, 60)
+            continue
+        if a_status == "NO_ACTIVITY":
+            attempts = int(peer_rt.get("peer_task_restore_attempts", 0) or 0)
+            max_attempts = max(1, int(cfg.get("noka_peer_task_restore_max_attempts", 3) or 3))
+            if attempts >= max_attempts:
+                peer_rt["peer_task_restore_state"] = "deferred"
+                peer_rt["peer_task_restore_note"] = f"no-kill restore attempts exhausted ({attempts}); wait for safety hold expiry"
+                continue
+            candidate = peer
+            candidate_rt = peer_rt
+            break
+
+    if not candidate or candidate_rt is None:
+        rt["_peer_task_restore_next_at"] = now() + max(10, int(cfg.get("noka_peer_task_restore_retry_seconds", 60) or 60))
+        core.save()
+        return "pending"
+
+    target = _peer_task_restore_target(candidate_rt, cfg)
+    tab = _peer_task_restore_tab(candidate, target, cfg)
+    link = target_link(tab or {"package": candidate}, cfg, target, candidate_rt, rt)
+    candidate_rt["peer_task_restore_attempts"] = int(candidate_rt.get("peer_task_restore_attempts", 0) or 0) + 1
+    candidate_rt["peer_task_restore_state"] = "starting"
+    candidate_rt["peer_task_restore_note"] = f"no-kill task restore -> {target}"
+    candidate_rt["note"] = "restoring lost Android task; no PID stop"
+    log_activity(
+        f"TASK_LOST_RESTORE attempt {candidate_rt['peer_task_restore_attempts']}: no PID stop -> {target}",
+        candidate,
+        CYAN,
+    )
+
+    if not link:
+        ok, note, new_losses = False, f"no safe {target} route available for task restore", []
+    else:
+        ok, note, new_losses = _peer_task_restore_start(candidate, link, cfg, candidate_rt)
+
+    if new_losses:
+        merged = []
+        for peer in list(lost) + list(new_losses):
+            if peer and peer not in merged:
+                merged.append(peer)
+        _set_peer_task_safety_hold(
+            rt, cfg, source_pkg or candidate, note, merged, stage="task-restore"
+        )
+        candidate_rt["peer_task_restore_state"] = "peer_loss"
+        candidate_rt["peer_task_restore_note"] = str(note or "peer task loss during restore")
+        log_activity(
+            "TASK_LOST_RESTORE aborted; another peer task was lost: " + cut(note, 95),
+            candidate,
+            RED,
+        )
+        core.save()
+        return "acted"
+
+    if ok:
+        candidate_rt["peer_task_restore_state"] = "restored"
+        candidate_rt["peer_task_restore_restored_at"] = now()
+        candidate_rt["peer_task_restore_note"] = str(note or "restored")
+        removed = _peer_task_restore_cancel_auto_queue(core, candidate)
+        candidate_rt["peer_task_restore_cancelled_auto_queue"] = int(removed or 0)
+        candidate_rt["note"] = "task restored; waiting fresh telemetry"
+        rt["_peer_task_safety_lost_pkgs"] = [peer for peer in lost if peer != candidate]
+        stagger = max(5, int(cfg.get("noka_peer_task_restore_stagger_seconds", 20) or 20))
+        rt["_peer_task_restore_next_at"] = now() + stagger
+        rt["_peer_task_restore_last_event"] = f"restored {candidate}; next sibling in {stagger}s"
+        log_activity("TASK_LOST_RESTORE ok: " + cut(note, 85), candidate, GREEN)
+        if not rt.get("_peer_task_safety_lost_pkgs"):
+            rt["_peer_task_restore_all_restored_at"] = now()
+            post_settle = max(5, int(cfg.get("noka_peer_task_post_restore_settle_seconds", 30) or 30))
+            rt["_peer_task_restore_next_at"] = now() + post_settle
+            rt["_peer_task_restore_last_event"] = (
+                f"all sibling tasks restored; settling {post_settle}s before destructive queue resumes"
+            )
+            log_activity(
+                f"peer-task pool repair complete; holding destructive queue {post_settle}s to settle",
+                candidate,
+                GREEN,
+            )
+    else:
+        retry = max(10, int(cfg.get("noka_peer_task_restore_retry_seconds", 60) or 60))
+        rt["_peer_task_restore_next_at"] = now() + retry
+        candidate_rt["peer_task_restore_state"] = "retry"
+        candidate_rt["peer_task_restore_note"] = str(note or "task restore failed")
+        candidate_rt["note"] = "task restore retry in " + format_age(retry)
+        log_activity("TASK_LOST_RESTORE failed: " + cut(note, 90), candidate, YELLOW)
+
+    core.save()
+    return "acted"
+
+
+def force_stop_package(pkg, cfg, tries=3, wait_after=0.8, settle=1.0, rt_tab=None):
     """Stop exactly ONE clone using verified package PIDs only.
 
     V4.81.8 fails closed on every PID-query or sibling-verification failure.
@@ -5351,10 +5718,12 @@ def force_stop_package(pkg, cfg, tries=3, wait_after=0.8, settle=1.0):
             msg = "SIBLING SAFETY FAILURE; target reopen aborted: " + peer_note
             log_activity(msg, pkg, RED)
             return False, msg
-        activity_ok, activity_note, _activity_lost = _verify_sibling_activity_snapshot(
+        activity_ok, activity_note, activity_lost = _verify_sibling_activity_snapshot(
             sibling_activity_before, cfg, pkg
         )
         if not activity_ok:
+            if isinstance(rt_tab, dict):
+                rt_tab["hard_stop_sibling_task_loss_pkgs"] = list(activity_lost or [])
             msg = "SIBLING TASK SAFETY FAILURE after target PID stop; reopen aborted: " + activity_note
             log_activity(msg, pkg, RED)
             return False, msg
@@ -6233,7 +6602,7 @@ def market_peer_safe_cache_protocol_restart(
         sibling_activity_before[peer] = (status, note)
 
     stopped, stop_note = force_stop_package(
-        pkg, cfg, tries=3, wait_after=0.8, settle=1.0
+        pkg, cfg, tries=3, wait_after=0.8, settle=1.0, rt_tab=rt_tab
     )
     log_activity(
         "Market cache restart stop check: " + cut(stop_note, 75),
@@ -6245,7 +6614,9 @@ def market_peer_safe_cache_protocol_restart(
             rt_tab["market_protocol_peer_warning"] = str(stop_note or "")
             rt_tab["market_protocol_peer_warning_at"] = now()
             rt_tab["market_protocol_peer_loss_stage"] = "stop"
-            rt_tab["market_protocol_peer_loss_pkgs"] = []
+            rt_tab["market_protocol_peer_loss_pkgs"] = list(
+                rt_tab.get("hard_stop_sibling_task_loss_pkgs", []) or []
+            )
         return False, "Market exact-PID stop failed: " + cut(stop_note, 70)
 
     # The stop-stage verifier above proved sibling tasks survived the PID stop.
@@ -6688,6 +7059,7 @@ def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop
     if rt_tab is not None and not soft and require_stop and not skip_force_stop:
         rt_tab["hard_stop_sibling_task_loss"] = False
         rt_tab["hard_stop_sibling_task_loss_note"] = ""
+        rt_tab["hard_stop_sibling_task_loss_pkgs"] = []
         rt_tab["hard_launch_sibling_task_loss"] = False
         rt_tab["hard_launch_sibling_task_loss_note"] = ""
         rt_tab["hard_launch_sibling_task_loss_pkgs"] = []
@@ -6698,7 +7070,9 @@ def open_roblox(pkg, link, cfg, soft=False, rt_tab=None, reason="", require_stop
         # The proven-safe runtime invariant is exact target PID stop followed by
         # one plain target VIEW intent. The old launcher prewarm could reshuffle
         # sibling floating tasks even though no sibling PID was signalled.
-        stopped, stop_note = force_stop_package(pkg, cfg, tries=3, wait_after=0.8, settle=1.0)
+        stopped, stop_note = force_stop_package(
+            pkg, cfg, tries=3, wait_after=0.8, settle=1.0, rt_tab=rt_tab
+        )
         log_activity(f"hard open stop check: {cut(stop_note, 70)}", pkg, DIM)
         if not stopped:
             # Never send another VIEW intent while the old exact package PID is
@@ -12759,6 +13133,17 @@ class RejoinCore:
         )
 
     def process_once_if_enabled(self, session_start=None, loops=0):
+        # V4.81.133: peer-task safety blocks destructive queue work, but not
+        # no-kill repair of siblings stranded as ALIVE + NO_ACTIVITY.
+        restore_state = maybe_restore_peer_task_loss(self)
+        manual_override = bool(
+            self.open_queue
+            and isinstance(self.open_queue[0], dict)
+            and self.open_queue[0].get("manual_option6_force_override")
+        )
+        if restore_state in ("pending", "acted") and not manual_override:
+            return False
+
         if not self.has_work() or not self.cfg.get("smart_open_queue", True):
             return False
         if not wait_seconds(2, self.rt):
@@ -12771,6 +13156,16 @@ class RejoinCore:
             if stop_requested():
                 self.save()
                 return False
+            restore_state = maybe_restore_peer_task_loss(self)
+            manual_override = bool(
+                self.open_queue
+                and isinstance(self.open_queue[0], dict)
+                and self.open_queue[0].get("manual_option6_force_override")
+            )
+            if restore_state in ("pending", "acted") and not manual_override:
+                if not wait_seconds(int(delay_seconds or 1), self.rt):
+                    return False
+                continue
             self.process(session_start, loops)
             if self.has_work() and not wait_seconds(int(delay_seconds or 1), self.rt):
                 return False
@@ -19135,10 +19530,7 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
     # dropped during the bounded pool hold; the watchdog may rediscover them later.
     peer_task_hold_until = int(rt.get("_peer_task_safety_hold_until", 0) or 0)
     if peer_task_hold_until > 0 and peer_task_hold_until <= now():
-        rt["_peer_task_safety_hold_until"] = 0
-        rt["_peer_task_safety_note"] = ""
-        rt["_peer_task_safety_lost_pkgs"] = []
-        rt["_peer_task_safety_stage"] = ""
+        _clear_peer_task_safety_hold(rt, "bounded peer-task safety hold expired")
         peer_task_hold_until = 0
     if peer_task_hold_until > now() and not item.get("manual_option6_force_override"):
         left = max(1, peer_task_hold_until - now())
@@ -20135,6 +20527,7 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
         task_loss_stage = ""
         if rt_tab.get("hard_stop_sibling_task_loss"):
             task_loss_note = str(rt_tab.get("hard_stop_sibling_task_loss_note", "") or "")
+            task_loss_pkgs = list(rt_tab.get("hard_stop_sibling_task_loss_pkgs", []) or [])
             task_loss_stage = "stop"
         elif rt_tab.get("hard_launch_sibling_task_loss"):
             task_loss_note = str(rt_tab.get("hard_launch_sibling_task_loss_note", "") or "")
