@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.134 — VERIFICATION ACTION COORDINATE DETECTION (NO INPUT ACTION)
+# - Detects the on-screen action location for current Roblox verification UIs without
+#   clicking, tapping, holding, swiping, or otherwise interacting with the challenge.
+# - UI hierarchy is preferred: exact `Press and hold` / `Start Puzzle` nodes use their
+#   Android bounds. If WebView accessibility hides the button, a screenshot-only
+#   package-cell fallback locates the large blue press/hold bar or green Start Puzzle
+#   button inside the exact Option-16 rectangle.
+# - Stores absolute device bounds/center plus clone-relative bounds/center in runtime
+#   and diagnostics (`verification_button_*`). Dashboard notes include the detected
+#   action kind and center when available.
+# - Adds exact text recognition for the newer `Hold the button to confirm you're human`
+#   / `Press and hold` Security variant so it outranks Loading/Next like Start Puzzle.
+# - Detection only: this build deliberately performs NO automated verification input.
+#
 # V4.81.133 — TASK-LOST RESTORE THROUGH POOL SAFETY HOLD
 # - Fixes the V4.81.130/132 containment gap where NOMO correctly detected that
 #   sibling App Cloner ActivityRecords vanished, armed the pool hard-open hold,
@@ -2024,7 +2038,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.133"
+__version__ = "V4.81.134"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -14949,6 +14963,16 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
     if captcha_ui:
         detail = ",".join(captcha_ui.get("hits", []) or []) or "verification UI"
 
+        # V4.81.134: coordinate-only detection for the visible verification action.
+        # This stores location metadata only; no input event is ever issued.
+        action_loc = verification_action_location(
+            pkg, cfg, challenge_detail=captcha_ui, force=False
+        )
+        if action_loc:
+            store_verification_action_location(rt_tab, action_loc)
+            captcha_ui = dict(captcha_ui)
+            captcha_ui["action_location"] = action_loc
+
         # V4.81.128: one incident id per continuously visible challenge. A
         # watchdog observation gap is NOT evidence that the challenge disappeared;
         # only the explicit no-CAPTCHA branch below closes the incident. This keeps
@@ -14982,9 +15006,21 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
             "age": state_age_seconds(state) if state else "-",
             "status": "Captcha",
             "note": (
-                "verification UI detected (exact text)"
-                if str((captcha_ui or {}).get("evidence_source") or "") == "exact_option16_text"
-                else "verification UI detected"
+                (
+                    (
+                        "PressHold"
+                        if str((action_loc or {}).get("kind") or "") == "press_and_hold"
+                        else "StartPuzzle"
+                    )
+                    + " @ "
+                    + ",".join(str(v) for v in ((action_loc or {}).get("center") or []))
+                )
+                if action_loc and (action_loc.get("center") or [])
+                else (
+                    "verification UI detected (exact text)"
+                    if str((captcha_ui or {}).get("evidence_source") or "") == "exact_option16_text"
+                    else "verification UI detected"
+                )
             ),
             "bad": "ui_challenge", "visible_window": True,
             "ui_challenge_detail": captcha_ui,
@@ -14999,6 +15035,7 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
         )
         rt_tab["captcha_ui_incident_id"] = ""
         rt_tab["captcha_ui_incident_started_at"] = 0
+        clear_verification_action_location(rt_tab)
 
     age = state_age_seconds(state) if state else "-"
     pets = int(state.get("pet_count", 0) or 0) if state else "-"
@@ -17263,6 +17300,250 @@ def android_ui_text_for_package_or_rect(pkg, cfg, force=False):
     return values, str(snapshot.get("error", "") or "")
 
 
+
+def _verification_action_node_location(pkg, cfg, force=False):
+    """Return exact Android bounds for a visible verification action, if exposed.
+
+    Detection only. This function never sends input events.
+    """
+    pkg = str(pkg or "")
+    snapshot = capture_android_ui_snapshot(cfg, force=force)
+    if not isinstance(snapshot, dict):
+        return None
+
+    rect = _loading_visual_rect_for_package(pkg, cfg)
+    try:
+        rx1, ry1, rx2, ry2 = [int(v) for v in rect] if rect else (0, 0, 0, 0)
+    except Exception:
+        rx1 = ry1 = rx2 = ry2 = 0
+    have_rect = bool(rx2 > rx1 and ry2 > ry1)
+
+    candidates = []
+    for node in snapshot.get("text_nodes", []) or []:
+        if not isinstance(node, dict):
+            continue
+        text = str(node.get("text", "") or "").strip()
+        low = re.sub(r"\s+", " ", text.lower()).strip()
+        kind = ""
+        if low == "press and hold" or "press and hold" in low:
+            kind = "press_and_hold"
+        elif low == "start puzzle" or "start puzzle" in low:
+            kind = "start_puzzle"
+        if not kind:
+            continue
+
+        bounds = node.get("bounds")
+        if not isinstance(bounds, (list, tuple)) or len(bounds) != 4:
+            continue
+        try:
+            x1, y1, x2, y2 = [int(v) for v in bounds]
+        except Exception:
+            continue
+        if x2 <= x1 or y2 <= y1:
+            continue
+        cx = (x1 + x2) // 2
+        cy = (y1 + y2) // 2
+
+        # Exact Option-16 cell is authoritative when present. Without it, retain
+        # only exact clone-package nodes to avoid borrowing a sibling button.
+        if have_rect:
+            if not (rx1 <= cx <= rx2 and ry1 <= cy <= ry2):
+                continue
+        else:
+            node_pkg = str(node.get("package", "") or "")
+            if not (node_pkg == pkg or node_pkg.startswith(pkg + ":")):
+                continue
+
+        area = max(1, (x2 - x1) * (y2 - y1))
+        candidates.append((area, kind, [x1, y1, x2, y2]))
+
+    if not candidates:
+        return None
+    candidates.sort(reverse=True, key=lambda item: item[0])
+    _, kind, bounds = candidates[0]
+    x1, y1, x2, y2 = bounds
+    result = {
+        "kind": kind,
+        "bounds": bounds,
+        "center": [(x1 + x2) // 2, (y1 + y2) // 2],
+        "source": "uiautomator",
+    }
+    if have_rect:
+        result["relative_bounds"] = [x1 - rx1, y1 - ry1, x2 - rx1, y2 - ry1]
+        result["relative_center"] = [result["center"][0] - rx1, result["center"][1] - ry1]
+        result["cell_rect"] = [rx1, ry1, rx2, ry2]
+    return result
+
+
+def _verification_visual_button_bounds(frame, rect, kind):
+    """Locate the large verification action by color inside one saved clone cell.
+
+    This is deliberately geometry/color detection only. It returns coordinates and
+    never performs an input action.
+    """
+    if not frame or not rect:
+        return None
+    try:
+        width = int(frame["width"]); height = int(frame["height"])
+        pixels = frame["pixels"]
+        left, top, right, bottom = [int(v) for v in rect]
+    except Exception:
+        return None
+    left = max(0, min(width - 1, left)); right = max(left + 1, min(width, right))
+    top = max(0, min(height - 1, top)); bottom = max(top + 1, min(height, bottom))
+    cw, ch = right - left, bottom - top
+    if cw < 100 or ch < 100:
+        return None
+
+    # Restrict the scan to the modal's center/lower-center; this avoids App Cloner
+    # title bars and most in-game UI even when the Security panel is translucent.
+    sx1 = left + int(cw * 0.10)
+    sx2 = right - int(cw * 0.10)
+    if kind == "start_puzzle":
+        sy1 = top + int(ch * 0.42)
+        sy2 = top + int(ch * 0.90)
+    else:
+        sy1 = top + int(ch * 0.18)
+        sy2 = top + int(ch * 0.68)
+
+    step = max(2, min(5, min(cw, ch) // 100))
+    row_hits = []
+    min_required_width = max(24, int(cw * (0.12 if kind == "start_puzzle" else 0.20)))
+
+    def is_target(r, g, b):
+        if kind == "start_puzzle":
+            return bool(g >= 115 and g - r >= 24 and g - b >= 18)
+        # Current Roblox Press-and-hold bar is a saturated royal blue.
+        return bool(b >= 175 and b - r >= 70 and b - g >= 55 and r <= 145 and g <= 180)
+
+    for y in range(sy1, sy2, step):
+        row = y * width * 4
+        xs = []
+        for x in range(sx1, sx2, step):
+            i = row + x * 4
+            r = int(pixels[i]); g = int(pixels[i + 1]); b = int(pixels[i + 2])
+            if is_target(r, g, b):
+                xs.append(x)
+        if xs and (xs[-1] - xs[0] + step) >= min_required_width:
+            row_hits.append((y, xs[0], xs[-1]))
+
+    if not row_hits:
+        return None
+    y1 = row_hits[0][0]
+    y2 = row_hits[-1][0] + step
+    x1 = min(v[1] for v in row_hits)
+    x2 = max(v[2] for v in row_hits) + step
+    bw, bh = x2 - x1, y2 - y1
+    if bw < min_required_width or bh < max(8, int(ch * 0.018)):
+        return None
+    if bw > int(cw * 0.90) or bh > int(ch * 0.28):
+        return None
+
+    # Clamp and slightly pad the sampled color core to better approximate the
+    # visible button edges. Padding is small and never used for input.
+    pad = max(1, step)
+    x1 = max(left, x1 - pad); y1 = max(top, y1 - pad)
+    x2 = min(right, x2 + pad); y2 = min(bottom, y2 + pad)
+    return [int(x1), int(y1), int(x2), int(y2)]
+
+
+def verification_action_location(pkg, cfg, challenge_detail=None, force=False):
+    """Detect Press-and-hold / Start-Puzzle coordinates for diagnostics/runtime.
+
+    UI hierarchy bounds are preferred. Screenshot color/geometry is a fallback
+    inside the exact saved Option-16 cell. No tap/hold/swipe is issued here.
+    """
+    pkg = str(pkg or "")
+    exact = _verification_action_node_location(pkg, cfg, force=force)
+    if exact:
+        return exact
+
+    rect = _loading_visual_rect_for_package(pkg, cfg)
+    if not rect:
+        return None
+
+    detail = challenge_detail if isinstance(challenge_detail, dict) else {}
+    hay = " ".join(
+        [str(detail.get("text", "") or "")]
+        + [str(x or "") for x in (detail.get("hits", []) or [])]
+    ).lower()
+    order = []
+    if "press and hold" in hay or "hold the button" in hay:
+        order.append("press_and_hold")
+    if "start puzzle" in hay or "puzzle" in hay:
+        order.append("start_puzzle")
+    for fallback in ("press_and_hold", "start_puzzle"):
+        if fallback not in order:
+            order.append(fallback)
+
+    shared = _capture_loading_visual_frame(cfg, force=force)
+    frame = shared.get("frame") if isinstance(shared, dict) else None
+    if not frame:
+        return None
+    try:
+        rx1, ry1, rx2, ry2 = [int(v) for v in rect]
+    except Exception:
+        return None
+
+    for kind in order:
+        bounds = _verification_visual_button_bounds(frame, rect, kind)
+        if not bounds:
+            continue
+        x1, y1, x2, y2 = bounds
+        center = [(x1 + x2) // 2, (y1 + y2) // 2]
+        return {
+            "kind": kind,
+            "bounds": bounds,
+            "center": center,
+            "source": "visual_blue" if kind == "press_and_hold" else "visual_green",
+            "relative_bounds": [x1 - rx1, y1 - ry1, x2 - rx1, y2 - ry1],
+            "relative_center": [center[0] - rx1, center[1] - ry1],
+            "cell_rect": [rx1, ry1, rx2, ry2],
+        }
+    return None
+
+
+def store_verification_action_location(rt_tab, location):
+    """Persist coordinate-only verification metadata into runtime/diagnostics."""
+    if not isinstance(location, dict):
+        return False
+    changed = False
+    mapping = {
+        "verification_button_kind": str(location.get("kind", "") or ""),
+        "verification_button_bounds": list(location.get("bounds") or []),
+        "verification_button_center": list(location.get("center") or []),
+        "verification_button_relative_bounds": list(location.get("relative_bounds") or []),
+        "verification_button_relative_center": list(location.get("relative_center") or []),
+        "verification_button_cell_rect": list(location.get("cell_rect") or []),
+        "verification_button_source": str(location.get("source", "") or ""),
+        "verification_button_detected_at": now(),
+    }
+    for key, value in mapping.items():
+        if rt_tab.get(key) != value:
+            rt_tab[key] = value
+            changed = True
+    return changed
+
+
+def clear_verification_action_location(rt_tab):
+    changed = False
+    defaults = {
+        "verification_button_kind": "",
+        "verification_button_bounds": [],
+        "verification_button_center": [],
+        "verification_button_relative_bounds": [],
+        "verification_button_relative_center": [],
+        "verification_button_cell_rect": [],
+        "verification_button_source": "",
+        "verification_button_detected_at": 0,
+    }
+    for key, value in defaults.items():
+        if rt_tab.get(key) != value:
+            rt_tab[key] = value
+            changed = True
+    return changed
+
+
 def android_roblox_home_ui_detail(pkg, cfg, force=False, required=False):
     """Return a high-confidence clone-scoped Roblox Home/navigation signal.
 
@@ -18411,6 +18692,9 @@ def android_exact_login_challenge_text_detail(pkg, cfg, force=False):
     low = joined.lower()
 
     strong_terms = [
+        "hold the button to confirm you're human",
+        "hold the button to confirm you are human",
+        "press and hold",
         "verifying you're not a bot",
         "verifying you are not a bot",
         "please solve this challenge so we know you are a real person",
@@ -18523,6 +18807,9 @@ def android_login_challenge_ui_detail(
     low = joined.lower()
 
     strong_terms = [
+        "hold the button to confirm you're human",
+        "hold the button to confirm you are human",
+        "press and hold",
         "verifying you're not a bot",
         "verifying you are not a bot",
         "please solve this challenge so we know you are a real person",
@@ -18587,6 +18874,8 @@ def clear_captcha_ui_runtime(rt_tab):
         if rt_tab.get(key) != value:
             rt_tab[key] = value
             changed = True
+    if clear_verification_action_location(rt_tab):
+        changed = True
     return changed
 
 
