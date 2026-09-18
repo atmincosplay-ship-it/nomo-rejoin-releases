@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.135 — VERIFICATION COORDINATES VISIBLE IN STATUS/DIAGNOSTICS
+# - Builds on V4.81.134 detection-only support. Current verification action metadata
+#   now has one consistent display formatter for Press-and-hold / Start-Puzzle.
+# - Dashboard challenge rows show `Verification · Press and hold @ X,Y` or
+#   `Verification · Start Puzzle @ X,Y` whenever coordinates are available.
+# - Current visible verification outranks stale Market FIFO cosmetics, so a clone
+#   cannot be shown as Next/Waiting while an exact Security challenge is visible.
+# - Hatcher challenge rows use the same coordinate note. Runtime/diagnostics retain
+#   absolute/relative bounds, center, source, and a human-readable button note.
+# - Detection only: no tap, click, swipe, long-press, or hold input is performed.
+#
 # V4.81.134 — VERIFICATION ACTION COORDINATE DETECTION (NO INPUT ACTION)
 # - Detects the on-screen action location for current Roblox verification UIs without
 #   clicking, tapping, holding, swiping, or otherwise interacting with the challenge.
@@ -2038,7 +2049,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.134"
+__version__ = "V4.81.135"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -14972,6 +14983,20 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
             store_verification_action_location(rt_tab, action_loc)
             captcha_ui = dict(captcha_ui)
             captcha_ui["action_location"] = action_loc
+            _loc_sig = "|".join([
+                str(action_loc.get("kind") or ""),
+                ",".join(str(v) for v in (action_loc.get("center") or [])),
+                ",".join(str(v) for v in (action_loc.get("bounds") or [])),
+                str(action_loc.get("source") or ""),
+            ])
+            if str(rt_tab.get("verification_button_last_log_sig") or "") != _loc_sig:
+                rt_tab["verification_button_last_log_sig"] = _loc_sig
+                log_activity(
+                    verification_action_display_note(rt_tab)
+                    + f" [{str(action_loc.get('source') or 'detected')}]",
+                    pkg,
+                    CYAN,
+                )
 
         # V4.81.128: one incident id per continuously visible challenge. A
         # watchdog observation gap is NOT evidence that the challenge disappeared;
@@ -15005,22 +15030,13 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
             "eggs": int(state.get("egg_total", 0) or 0) if state else "-",
             "age": state_age_seconds(state) if state else "-",
             "status": "Captcha",
-            "note": (
-                (
-                    (
-                        "PressHold"
-                        if str((action_loc or {}).get("kind") or "") == "press_and_hold"
-                        else "StartPuzzle"
-                    )
-                    + " @ "
-                    + ",".join(str(v) for v in ((action_loc or {}).get("center") or []))
-                )
-                if action_loc and (action_loc.get("center") or [])
-                else (
-                    "verification UI detected (exact text)"
+            "note": verification_action_display_note(
+                rt_tab,
+                fallback=(
+                    "Verification · exact Security UI"
                     if str((captcha_ui or {}).get("evidence_source") or "") == "exact_option16_text"
-                    else "verification UI detected"
-                )
+                    else "Verification · UI detected"
+                ),
             ),
             "bad": "ui_challenge", "visible_window": True,
             "ui_challenge_detail": captcha_ui,
@@ -17518,6 +17534,10 @@ def store_verification_action_location(rt_tab, location):
         "verification_button_source": str(location.get("source", "") or ""),
         "verification_button_detected_at": now(),
     }
+    # Keep a directly inspectable note in runtime/diagnostics as well as the raw fields.
+    preview = dict(rt_tab)
+    preview.update(mapping)
+    mapping["verification_button_note"] = verification_action_display_note(preview)
     for key, value in mapping.items():
         if rt_tab.get(key) != value:
             rt_tab[key] = value
@@ -17536,12 +17556,45 @@ def clear_verification_action_location(rt_tab):
         "verification_button_cell_rect": [],
         "verification_button_source": "",
         "verification_button_detected_at": 0,
+        "verification_button_note": "",
+        "verification_button_last_log_sig": "",
     }
     for key, value in defaults.items():
         if rt_tab.get(key) != value:
             rt_tab[key] = value
             changed = True
     return changed
+
+
+def verification_action_display_note(rt_tab, fallback="Verification · UI detected"):
+    """Human-readable detection-only verification location for status/diagnostics."""
+    rt_tab = rt_tab if isinstance(rt_tab, dict) else {}
+    kind = str(rt_tab.get("verification_button_kind", "") or "")
+    label = {
+        "press_and_hold": "Press and hold",
+        "start_puzzle": "Start Puzzle",
+    }.get(kind, "")
+
+    center = rt_tab.get("verification_button_center") or []
+    if (not isinstance(center, (list, tuple)) or len(center) < 2):
+        bounds = rt_tab.get("verification_button_bounds") or []
+        if isinstance(bounds, (list, tuple)) and len(bounds) == 4:
+            try:
+                center = [
+                    (int(bounds[0]) + int(bounds[2])) // 2,
+                    (int(bounds[1]) + int(bounds[3])) // 2,
+                ]
+            except Exception:
+                center = []
+
+    if label and isinstance(center, (list, tuple)) and len(center) >= 2:
+        try:
+            return f"Verification · {label} @ {int(center[0])},{int(center[1])}"
+        except Exception:
+            pass
+    if label:
+        return f"Verification · {label}"
+    return str(fallback or "Verification · UI detected")
 
 
 def android_roblox_home_ui_detail(pkg, cfg, force=False, required=False):
@@ -22037,6 +22090,8 @@ def _nomo_start_market_rejoin_original(cfg):
                 "face_lock",
                 "account_banned",
                 "manual",
+                "ui_challenge",
+                "challenge",
             } or manual_login_blocked(rt_tab, cfg, pkg)
 
             # V4.81.82: auth/moderation status outranks FIFO cosmetics. A stale
@@ -22066,6 +22121,12 @@ def _nomo_start_market_rejoin_original(cfg):
                         health.get("note")
                         or rt_tab.get("note")
                         or "account banned/moderated; package held"
+                    )
+                elif bad_now in {"ui_challenge", "challenge"}:
+                    status = "Captcha"
+                    note = verification_action_display_note(
+                        rt_tab,
+                        fallback=(health.get("note") or "Verification · UI detected"),
                     )
                 else:
                     status = "Manual"
@@ -26938,7 +26999,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                         note = (
                             (stuck_solver[1] if stuck_solver is not None else solver_job_note(pkg))
                             if background_solver_active
-                            else "verification UI detected; solver owns package (no reopen)"
+                            else verification_action_display_note(rt_tab)
                         )
                     elif rt_tab.get("last_open") and in_post_open_grace(rt_tab, cfg):
                         status = "Loading"
