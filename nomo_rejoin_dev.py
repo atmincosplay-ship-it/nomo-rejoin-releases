@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.145 — PRESS/HOLD INCIDENT LIFECYCLE / CANCELLED WORKER RETRY
+# - Fixes a one-shot lifecycle bug: merely QUEUING the Press-and-hold worker no
+#   longer marks the visible verification incident as permanently attempted.
+# - Runtime now distinguishes queued/running/completed/cancelled hold state. A worker
+#   that cancels before the actual hold stage clears only its pending marker so the
+#   same still-visible incident may be tried again on a later detector pass.
+# - The incident becomes attempted only when the worker reaches the actual long-hold
+#   command stage. This prevents an early coordinate/focus recheck miss from poisoning
+#   that incident forever while still preventing repeated holds after a real attempt.
+# - Removes a latent non-reentrant lock deadlock in duplicate/worker-running gate logs
+#   by never calling the diagnostic helper while _VERIFICATION_HOLD_LOCK is held.
+# - No hold duration, focus-tap timing, detector geometry, solver, PID, or recovery
+#   policy is changed.
+#
 # V4.81.144 — INTEGRATED OWNED-APP PRESS/HOLD TEST + NOKA DETECTOR TEST
 # - Adds Advanced Tools -> Press/Hold test. Owned/non-Roblox app packages can run
 #   the local uiautomator-based long-press test directly from NOMO, including one
@@ -2164,7 +2178,7 @@ _VERIFICATION_HOLD_THREADS = {}
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.144"
+__version__ = "V4.81.145"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -17905,21 +17919,34 @@ def _verification_visual_button_bounds(frame, rect, kind):
 def _verification_press_hold_worker(pkg, cfg, rt_tab, incident_id, center, delay_seconds, hold_ms):
     """Focus/click the detected verification action, then perform one long hold.
 
-    On Redfinger/App Cloner, the detected verification WebView can be visible but
-    not be the active input target. A short tap on the detected action first gives
-    that clone/window an input focus opportunity. The action is then re-detected and
-    the long press is sent to the refreshed coordinate.
+    V4.81.145 lifecycle:
+      * queued/pending is NOT the same as attempted;
+      * cancellations before the actual long-hold command clear pending state;
+      * the incident is marked attempted only when the long-hold command is reached.
     """
     pkg = str(pkg or "")
-    try:
-        x, y = int(center[0]), int(center[1])
-        delay_seconds = max(1, int(delay_seconds or 3))
-        hold_ms = max(15000, min(20000, int(hold_ms or 18000)))
-        focus_tap_wait = max(0.5, float(cfg.get("verification_press_hold_focus_tap_wait_seconds", 1.0) or 1.0))
-    except Exception:
-        return
+    action_stage_reached = False
+    terminal_state = "cancelled"
+    terminal_reason = "worker ended before hold stage"
 
     try:
+        try:
+            x, y = int(center[0]), int(center[1])
+            delay_seconds = max(1, int(delay_seconds or 3))
+            hold_ms = max(15000, min(20000, int(hold_ms or 18000)))
+            focus_tap_wait = max(
+                0.5,
+                float(cfg.get("verification_press_hold_focus_tap_wait_seconds", 1.0) or 1.0),
+            )
+        except Exception as exc:
+            terminal_reason = "invalid initial hold arguments: " + cut(exc, 100)
+            log_activity("verification hold cancelled; " + terminal_reason, pkg, YELLOW)
+            return
+
+        rt_tab["verification_hold_state"] = "queued"
+        rt_tab["verification_hold_pending_incident_id"] = str(incident_id or "")
+        rt_tab["verification_hold_worker_started_at"] = now()
+
         log_activity(
             f"verification hold armed @ {x},{y}; waiting {delay_seconds}s before focus tap",
             pkg,
@@ -17927,20 +17954,16 @@ def _verification_press_hold_worker(pkg, cfg, rt_tab, incident_id, center, delay
         )
         time.sleep(delay_seconds)
 
-        # Re-detect immediately before the focus tap so a moved/closed WebView
-        # cannot receive a stale coordinate from an earlier watchdog snapshot.
         fresh = verification_action_location(pkg, cfg, force=True)
         if not isinstance(fresh, dict) or str(fresh.get("kind") or "") != "press_and_hold":
-            log_activity(
-                "verification hold cancelled; Press-and-hold no longer visible before focus tap",
-                pkg,
-                YELLOW,
-            )
+            terminal_reason = "Press-and-hold no longer visible before focus tap"
+            log_activity("verification hold cancelled; " + terminal_reason, pkg, YELLOW)
             return
 
         fresh_center = fresh.get("center") or []
         if not isinstance(fresh_center, (list, tuple)) or len(fresh_center) < 2:
-            log_activity("verification hold cancelled; refreshed focus coordinate missing", pkg, YELLOW)
+            terminal_reason = "refreshed focus coordinate missing"
+            log_activity("verification hold cancelled; " + terminal_reason, pkg, YELLOW)
             return
         x, y = int(fresh_center[0]), int(fresh_center[1])
 
@@ -17951,12 +17974,8 @@ def _verification_press_hold_worker(pkg, cfg, rt_tab, incident_id, center, delay
         except Exception:
             pass
 
-        # Do NOT launcher-start/force-start a Noka clone here. That path was
-        # deliberately disabled because materializing/foregrounding clone tasks
-        # through ActivityManager can disturb sibling floating tasks. A real tap
-        # on the already-visible challenge is the safer way to make the clone the
-        # active touch target.
         focus_command = f"input tap {x} {y}"
+        rt_tab["verification_hold_state"] = "focus_tap"
         log_activity(
             f"verification focus TAP @ {x},{y}; waiting {focus_tap_wait:.1f}s before hold",
             pkg,
@@ -17969,27 +17988,30 @@ def _verification_press_hold_worker(pkg, cfg, rt_tab, incident_id, center, delay
             timeout=10,
         )
         if code != 0:
-            log_activity(
-                f"verification focus TAP failed rc={code}: {cut(out, 120)}",
-                pkg,
-                RED,
-            )
+            terminal_reason = f"focus TAP failed rc={code}: {cut(out, 100)}"
+            log_activity("verification " + terminal_reason, pkg, RED)
             return
 
         time.sleep(focus_tap_wait)
 
-        # The focus tap itself can change the WebView state, so always refresh the
-        # action location before starting the continuous hold.
         fresh = verification_action_location(pkg, cfg, force=True)
         try:
             rt_tab["verification_hold_post_tap_recheck_at"] = now()
-            rt_tab["verification_hold_post_tap_recheck_kind"] = str((fresh or {}).get("kind") or "") if isinstance(fresh, dict) else ""
-            rt_tab["verification_hold_post_tap_recheck_source"] = str((fresh or {}).get("source") or "") if isinstance(fresh, dict) else ""
-            rt_tab["verification_hold_post_tap_recheck_center"] = list((fresh or {}).get("center") or []) if isinstance(fresh, dict) else []
+            rt_tab["verification_hold_post_tap_recheck_kind"] = (
+                str((fresh or {}).get("kind") or "") if isinstance(fresh, dict) else ""
+            )
+            rt_tab["verification_hold_post_tap_recheck_source"] = (
+                str((fresh or {}).get("source") or "") if isinstance(fresh, dict) else ""
+            )
+            rt_tab["verification_hold_post_tap_recheck_center"] = (
+                list((fresh or {}).get("center") or []) if isinstance(fresh, dict) else []
+            )
             _verification_hold_diag(
                 rt_tab,
                 pkg,
-                "post-focus-tap recheck: detected" if isinstance(fresh, dict) else "post-focus-tap recheck: no action detected",
+                "post-focus-tap recheck: detected"
+                if isinstance(fresh, dict)
+                else "post-focus-tap recheck: no action detected",
                 fresh,
                 color=CYAN if isinstance(fresh, dict) else YELLOW,
             )
@@ -17997,16 +18019,14 @@ def _verification_press_hold_worker(pkg, cfg, rt_tab, incident_id, center, delay
             pass
 
         if not isinstance(fresh, dict) or str(fresh.get("kind") or "") != "press_and_hold":
-            log_activity(
-                "verification hold cancelled; Press-and-hold changed/disappeared after focus tap",
-                pkg,
-                YELLOW,
-            )
+            terminal_reason = "Press-and-hold changed/disappeared after focus tap"
+            log_activity("verification hold cancelled; " + terminal_reason, pkg, YELLOW)
             return
 
         fresh_center = fresh.get("center") or []
         if not isinstance(fresh_center, (list, tuple)) or len(fresh_center) < 2:
-            log_activity("verification hold cancelled; post-tap coordinate missing", pkg, YELLOW)
+            terminal_reason = "post-tap coordinate missing"
+            log_activity("verification hold cancelled; " + terminal_reason, pkg, YELLOW)
             return
         x, y = int(fresh_center[0]), int(fresh_center[1])
 
@@ -18014,6 +18034,14 @@ def _verification_press_hold_worker(pkg, cfg, rt_tab, incident_id, center, delay
             store_verification_action_location(rt_tab, fresh)
         except Exception:
             pass
+
+        # The incident becomes CONSUMED only here: the actual long-hold action is
+        # about to be attempted. Pre-action cancellations remain retryable.
+        action_stage_reached = True
+        rt_tab["verification_hold_attempted_incident_id"] = str(incident_id or "")
+        rt_tab["verification_hold_action_incident_id"] = str(incident_id or "")
+        rt_tab["verification_hold_action_started_at"] = now()
+        rt_tab["verification_hold_state"] = "holding"
 
         command = f"input swipe {x} {y} {x} {y} {hold_ms}"
         log_activity(
@@ -18028,26 +18056,60 @@ def _verification_press_hold_worker(pkg, cfg, rt_tab, incident_id, center, delay
             timeout=max(25, int(hold_ms / 1000) + 8),
         )
         if code == 0:
+            terminal_state = "completed"
+            terminal_reason = "hold command completed"
+            rt_tab["verification_hold_completed_at"] = now()
             log_activity(
                 f"verification press-and-hold RELEASE @ {x},{y}; rechecking UI",
                 pkg,
                 GREEN,
             )
         else:
+            terminal_state = "attempt_failed"
+            terminal_reason = f"hold command failed rc={code}: {cut(out, 100)}"
+            rt_tab["verification_hold_failed_at"] = now()
             log_activity(
                 f"verification press-and-hold failed rc={code}: {cut(out, 120)}",
                 pkg,
                 RED,
             )
     except Exception as e:
+        terminal_state = "attempt_failed" if action_stage_reached else "cancelled"
+        terminal_reason = "exception: " + cut(e, 160)
         log_activity(
             f"verification press-and-hold exception: {cut(e, 160)}",
             pkg,
             RED,
         )
     finally:
+        # Clear pending/worker state regardless of where the worker exited. An
+        # incident that never reached the hold stage intentionally remains
+        # unattempted and may be queued again by a later detector pass.
+        rt_tab["verification_hold_last_terminal_state"] = terminal_state
+        rt_tab["verification_hold_last_terminal_reason"] = terminal_reason
+        rt_tab["verification_hold_last_terminal_at"] = now()
+        rt_tab["verification_hold_state"] = terminal_state
+
         with _VERIFICATION_HOLD_LOCK:
             _VERIFICATION_HOLD_THREADS.pop(pkg, None)
+            if str(rt_tab.get("verification_hold_pending_incident_id") or "") == str(incident_id or ""):
+                rt_tab["verification_hold_pending_incident_id"] = ""
+
+        # Do this OUTSIDE the lock: _verification_hold_diag() also reads that lock.
+        try:
+            _verification_hold_diag(
+                rt_tab,
+                pkg,
+                (
+                    "worker completed; incident consumed"
+                    if action_stage_reached
+                    else "worker cancelled before hold stage; incident remains retryable"
+                ),
+                None,
+                color=GREEN if action_stage_reached and terminal_state == "completed" else YELLOW,
+            )
+        except Exception:
+            pass
 
 
 def _verification_hold_diag(rt_tab, pkg, reason, action_loc=None, *, color=YELLOW):
@@ -18055,6 +18117,8 @@ def _verification_hold_diag(rt_tab, pkg, reason, action_loc=None, *, color=YELLO
     loc = action_loc if isinstance(action_loc, dict) else {}
     incident_id = str(rt_tab.get("captcha_ui_incident_id") or "").strip()
     attempted_id = str(rt_tab.get("verification_hold_attempted_incident_id") or "").strip()
+    pending_id = str(rt_tab.get("verification_hold_pending_incident_id") or "").strip()
+    hold_state = str(rt_tab.get("verification_hold_state") or "").strip()
     with _VERIFICATION_HOLD_LOCK:
         worker_running = bool(pkg in _VERIFICATION_HOLD_THREADS)
     center = list(loc.get("center") or [])
@@ -18069,12 +18133,14 @@ def _verification_hold_diag(rt_tab, pkg, reason, action_loc=None, *, color=YELLO
     rt_tab["verification_hold_diag_bounds"] = bounds
     rt_tab["verification_hold_diag_incident_id"] = incident_id
     rt_tab["verification_hold_diag_attempted_incident_id"] = attempted_id
+    rt_tab["verification_hold_diag_pending_incident_id"] = pending_id
+    rt_tab["verification_hold_diag_state"] = hold_state
     rt_tab["verification_hold_diag_worker_running"] = worker_running
     sig = "|".join([
         str(reason or ""), kind, source,
         ",".join(str(v) for v in center),
         ",".join(str(v) for v in bounds),
-        incident_id, attempted_id, str(int(worker_running)),
+        incident_id, attempted_id, pending_id, hold_state, str(int(worker_running)),
     ])
     if str(rt_tab.get("verification_hold_diag_last_gate_sig") or "") != sig:
         rt_tab["verification_hold_diag_last_gate_sig"] = sig
@@ -18082,7 +18148,8 @@ def _verification_hold_diag(rt_tab, pkg, reason, action_loc=None, *, color=YELLO
             "VERIFY HOLD DEBUG: "
             + str(reason or "")
             + f" | kind={kind or '-'} source={source or '-'} center={center or '-'} "
-            + f"incident={incident_id or '-'} attempted={attempted_id or '-'} "
+            + f"incident={incident_id or '-'} pending={pending_id or '-'} "
+            + f"attempted={attempted_id or '-'} state={hold_state or '-'} "
             + f"worker={'yes' if worker_running else 'no'}",
             pkg,
             color,
@@ -18106,37 +18173,64 @@ def maybe_start_verification_press_hold(pkg, cfg, rt_tab, action_loc):
         _verification_hold_diag(rt_tab, pkg, "dispatch skipped: no visible incident id yet", action_loc)
         return False
 
-    # The incident id is the dedupe key. Once this incident has had its one hold
-    # attempt, watchdog cycles do not press it again even if the UI remains visible.
+    # One-time V4.81.144 -> .145 migration. Older builds marked the incident
+    # attempted at QUEUE time and had no action_incident_id proof. If that stale
+    # marker belongs to the still-visible incident, release it once so the new
+    # lifecycle can make a real decision. New .145 attempts always stamp
+    # verification_hold_action_incident_id at the actual hold stage.
+    if (
+        str(rt_tab.get("verification_hold_attempted_incident_id") or "") == incident_id
+        and str(rt_tab.get("verification_hold_action_incident_id") or "") != incident_id
+    ):
+        rt_tab["verification_hold_attempted_incident_id"] = ""
+        rt_tab["verification_hold_state"] = "legacy_queue_marker_released"
+        _verification_hold_diag(
+            rt_tab,
+            pkg,
+            "legacy queued-as-attempted marker released for current incident",
+            action_loc,
+            color=CYAN,
+        )
+
     if str(rt_tab.get("verification_hold_attempted_incident_id") or "") == incident_id:
         _verification_hold_diag(rt_tab, pkg, "dispatch skipped: incident already attempted", action_loc)
         return False
 
+    # Never call _verification_hold_diag while holding this non-reentrant lock.
+    # Compute the gate under lock, then log after releasing it.
+    skip_reason = ""
+    thread = None
     with _VERIFICATION_HOLD_LOCK:
         if str(rt_tab.get("verification_hold_attempted_incident_id") or "") == incident_id:
-            _verification_hold_diag(rt_tab, pkg, "dispatch skipped: incident already attempted after lock", action_loc)
-            return False
-        if pkg in _VERIFICATION_HOLD_THREADS:
-            _verification_hold_diag(rt_tab, pkg, "dispatch skipped: worker already running", action_loc)
-            return False
-        rt_tab["verification_hold_attempted_incident_id"] = incident_id
-        rt_tab["verification_hold_started_at"] = now()
-        thread = threading.Thread(
-            target=_verification_press_hold_worker,
-            args=(
-                pkg,
-                dict(cfg),
-                rt_tab,
-                incident_id,
-                list(action_loc.get("center") or []),
-                max(1, int(cfg.get("verification_press_hold_delay_seconds", 3) or 3)),
-                int(cfg.get("verification_press_hold_duration_ms", 18000) or 18000),
-            ),
-            name=f"nomo-verification-hold-{pkg}",
-            daemon=True,
-        )
-        _VERIFICATION_HOLD_THREADS[pkg] = thread
-        thread.start()
+            skip_reason = "dispatch skipped: incident already attempted after lock"
+        elif str(rt_tab.get("verification_hold_pending_incident_id") or "") == incident_id:
+            skip_reason = "dispatch skipped: incident already pending"
+        elif pkg in _VERIFICATION_HOLD_THREADS:
+            skip_reason = "dispatch skipped: worker already running"
+        else:
+            rt_tab["verification_hold_pending_incident_id"] = incident_id
+            rt_tab["verification_hold_state"] = "queued"
+            rt_tab["verification_hold_started_at"] = now()
+            thread = threading.Thread(
+                target=_verification_press_hold_worker,
+                args=(
+                    pkg,
+                    dict(cfg),
+                    rt_tab,
+                    incident_id,
+                    list(action_loc.get("center") or []),
+                    max(1, int(cfg.get("verification_press_hold_delay_seconds", 3) or 3)),
+                    int(cfg.get("verification_press_hold_duration_ms", 18000) or 18000),
+                ),
+                name=f"nomo-verification-hold-{pkg}",
+                daemon=True,
+            )
+            _VERIFICATION_HOLD_THREADS[pkg] = thread
+            thread.start()
+
+    if skip_reason:
+        _verification_hold_diag(rt_tab, pkg, skip_reason, action_loc)
+        return False
 
     _verification_hold_diag(rt_tab, pkg, "dispatch queued", action_loc, color=CYAN)
     log_activity(
