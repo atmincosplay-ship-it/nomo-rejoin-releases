@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.140 — RECOVERY-EVENT PEER SETTLE + DARK PRESS/HOLD DETECTOR
+# - Sibling task collapse is tied to the recovery EVENT that triggered it, never to
+#   a fixed clone letter. After B/C/D-style lost tasks are restored, only the source
+#   package from that collapse gets a short ALIVE-only automatic-reopen settle guard.
+#   A genuinely DEAD source is still eligible for normal crash recovery immediately.
+# - This prevents the same failed-to-reach-game recovery cycle from immediately
+#   materializing/reopening the target again as soon as peer repair finishes.
+# - Press-and-hold screenshot detection now accepts both Roblox's bright royal-blue
+#   button and the much darker navy rendering seen on dimmed/unfocused Redfinger
+#   windows, while still requiring a large horizontal bar inside a mostly-white
+#   package-local Security panel. Strong press/hold geometry confirms in one frame;
+#   Start Puzzle keeps the existing multi-frame confirmation.
+# - Verification coordinate/status behavior is detection-only in this patch; the
+#   user-added V4.81.138 input worker is left unchanged.
+#
 # V4.81.139 — 529 MUST NOT BECOME FACE LOCK FROM NUMERIC RESTRICTION ALONE
 # - Fixes a false Face Lock seen after a delayed verification/Press-and-hold flow
 #   transitions into Roblox Join Error 529. 529 remains a transient verification/auth
@@ -2104,7 +2119,7 @@ _VERIFICATION_HOLD_THREADS = {}
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.139"
+__version__ = "V4.81.140"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -5723,6 +5738,19 @@ def maybe_restore_peer_task_loss(core):
                     + format_age(max(1, settle - (now() - all_restored_at)))
                 )
                 return "pending"
+        # V4.81.140: the package that triggered THIS collapse event gets only a
+        # short ALIVE-only settle window after peer repair. This is event-scoped,
+        # not tied to A/B/C/D, and DEAD crash recovery is never suppressed.
+        if source_pkg:
+            source_rt = core.runtime_tab(source_pkg)
+            settle_after_repair = max(30, int(cfg.get(
+                "noka_peer_task_source_reopen_settle_seconds", 90
+            ) or 90))
+            source_rt["peer_task_collapse_reopen_not_before"] = now() + settle_after_repair
+            source_rt["peer_task_collapse_reopen_guard_reason"] = (
+                "peer tasks restored after recovery-triggered collapse"
+            )
+            source_rt["peer_task_collapse_reopen_guard_set_at"] = now()
         log_activity("peer-task pool repair complete; destructive hold cleared", source_pkg, GREEN)
         _clear_peer_task_safety_hold(rt, "all lost sibling ActivityRecords restored")
         rt["_peer_task_restore_all_restored_at"] = 0
@@ -17707,13 +17735,24 @@ def _verification_visual_button_bounds(frame, rect, kind):
 
     step = max(2, min(5, min(cw, ch) // 100))
     row_hits = []
-    min_required_width = max(24, int(cw * (0.12 if kind == "start_puzzle" else 0.20)))
+    # Press-and-hold is a wide bar. Requiring ~28% of the clone cell keeps the
+    # darker-blue fallback from matching small in-game icons/buttons.
+    min_required_width = max(24, int(cw * (0.12 if kind == "start_puzzle" else 0.28)))
 
     def is_target(r, g, b):
         if kind == "start_puzzle":
             return bool(g >= 115 and g - r >= 24 and g - b >= 18)
-        # Current Roblox Press-and-hold bar is a saturated royal blue.
-        return bool(b >= 175 and b - r >= 70 and b - g >= 55 and r <= 145 and g <= 180)
+        # Roblox renders this action in at least two visibly different blue levels
+        # on Redfinger/App Cloner. Foreground windows are often bright royal-blue,
+        # while dimmed/unfocused floating windows can render near RGB ~30/49/109.
+        # Geometry + the mostly-white Security-panel gate below remain mandatory.
+        bright_royal = bool(
+            b >= 155 and b - r >= 60 and b - g >= 45 and r <= 160 and g <= 190
+        )
+        dark_navy = bool(
+            b >= 82 and b - r >= 42 and b - g >= 35 and r <= 95 and g <= 125
+        )
+        return bool(bright_royal or dark_navy)
 
     for y in range(sy1, sy2, step):
         row = y * width * 4
@@ -18555,11 +18594,25 @@ def capture_visual_captcha_snapshot(cfg, force=False):
             press_bounds
             and float(m.get("white_ratio", 0.0) or 0.0) >= press_white_min
         )
+        press_strong = False
+        if press_candidate and rect:
+            try:
+                _rl, _rt, _rr, _rb = [int(v) for v in rect]
+                _pb = [int(v) for v in (press_bounds or [])]
+                _cell_w = max(1, _rr - _rl)
+                _bar_w = max(0, _pb[2] - _pb[0]) if len(_pb) == 4 else 0
+                press_strong = bool(
+                    _bar_w >= int(_cell_w * 0.35)
+                    and float(m.get("white_ratio", 0.0) or 0.0) >= press_white_min
+                )
+            except Exception:
+                press_strong = False
         candidate = bool(green_candidate or press_candidate)
         m["candidate"] = candidate
         m["visual_kind"] = (
             "press_and_hold" if press_candidate else ("start_puzzle" if green_candidate else "")
         )
+        m["press_hold_strong"] = bool(press_strong)
         m["press_hold_bounds"] = list(press_bounds or [])
         m["rect"] = list(rect)
         metrics[pkg] = m
@@ -18586,10 +18639,15 @@ def visual_captcha_detail(pkg, cfg, force=False, bypass_confirm=False):
             rec["last_seen"] = snap_ts
         else:
             rec["count"] = 0
+    visual_kind = str(metrics.get("visual_kind", "") or "")
     required = max(2, int(cfg.get("captcha_visual_confirmations_required", 2) or 2))
+    # A very wide blue action bar inside the already-required white Security panel
+    # is substantially stronger than the generic color heuristic, so it does not
+    # need to wait for a second 15s screenshot. Start Puzzle keeps the old rule.
+    if visual_kind == "press_and_hold" and bool(metrics.get("press_hold_strong")):
+        required = 1
     if not candidate or (not bypass_confirm and int(rec.get("count", 0) or 0) < required):
         return None
-    visual_kind = str(metrics.get("visual_kind", "") or "")
     hits = ["visual verification panel"]
     if visual_kind == "press_and_hold":
         hits.append("blue press-and-hold button")
@@ -20306,6 +20364,36 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
 
     item_mode = str(item.get("mode", "hard") or "hard").lower()
     is_hard = item_mode not in ("soft", "route", "switch", "reuse_task")
+
+    # V4.81.140: after a recovery event collapses peer ActivityRecords and those
+    # peers are repaired, do not immediately materialize/reopen the same ALIVE
+    # source package again. This follows the recovery event, not a clone letter.
+    # A DEAD source still goes straight through normal crash recovery.
+    collapse_settle_until = int(rt_tab.get("peer_task_collapse_reopen_not_before", 0) or 0)
+    if (
+        collapse_settle_until > now()
+        and not item.get("manual_option6_force_override")
+        and not item.get("manual_option6")
+        and not item.get("manual_auth_open")
+    ):
+        _collapse_status, _collapse_note = package_alive_status(pkg, cfg, fresh=True)
+        if _collapse_status == "ALIVE":
+            left = max(1, collapse_settle_until - now())
+            rt_tab["note"] = "post-collapse target settle " + format_age(left)
+            last_log = int(rt_tab.get("peer_task_collapse_reopen_guard_last_log", 0) or 0)
+            if now() - last_log >= 30:
+                rt_tab["peer_task_collapse_reopen_guard_last_log"] = now()
+                log_activity(
+                    "automatic reopen dropped during recovery-event settle; target still ALIVE; "
+                    + format_age(left) + " left",
+                    pkg,
+                    YELLOW,
+                )
+            core.save()
+            return True
+        if _collapse_status == "DEAD":
+            # Genuine death outranks the settle guard; do not strand a crashed clone.
+            rt_tab["peer_task_collapse_reopen_not_before"] = 0
 
     # V4.81.130: once a sibling loses its ActivityRecord during another clone's
     # destructive recovery, stop the cascade. Automatic hard/cache items are
