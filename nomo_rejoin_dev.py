@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.139 — 529 MUST NOT BECOME FACE LOCK FROM NUMERIC RESTRICTION ALONE
+# - Fixes a false Face Lock seen after a delayed verification/Press-and-hold flow
+#   transitions into Roblox Join Error 529. 529 remains a transient verification/auth
+#   wrapper unless there is separate authoritative Account Locked evidence.
+# - Roblox moderation restriction source=5 + moderationStatus=2 is now advisory only.
+#   It may be present around verification/529 and is NOT enough by itself to create
+#   manual_login_reason=face_lock or a persistent FACE LOCK HOLD.
+# - Face Lock still requires exact package-scoped Account Locked UI, explicit API text
+#   (Account Locked / suspicious activity / unlock your account), or manual confirmation.
+# - Existing runtime latches whose only evidence is api_restriction_5_2 self-heal on
+#   the next health pass instead of staying Manual/Face Lock for an hour.
+# - No solver, verification-coordinate, PID, cache, or sibling-task behavior is changed.
+#
 # V4.81.138 — PRESS-AND-HOLD AUTOMATION FOR DETECTED VERIFICATION
 # - When a current package-local Press-and-hold verification action is detected,
 #   NOMO waits a few seconds, re-checks the action coordinate, then sends one
@@ -2091,7 +2104,7 @@ _VERIFICATION_HOLD_THREADS = {}
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.137"
+__version__ = "V4.81.139"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -16841,10 +16854,11 @@ def _roblox_not_approved_url(value):
 def roblox_cookie_not_approved_api_detection(cookie, expected_user_id=None, cfg=None):
     """Return (restricted, detail, payload) from Roblox's own moderation endpoint.
 
-    ``restricted`` is True only for either (a) a strong Not Approved punishment
-    payload belonging to the authenticated user, or (b) the captured exact
-    Account-Locked restriction signature source=5/moderationStatus=2. None means
-    network/schema ambiguity and must never be treated as a ban/lock by itself.
+    ``restricted`` is True only for a strong Not Approved punishment payload
+    belonging to the authenticated user or explicit Account-Locked wording.
+    The numeric restriction source=5/moderationStatus=2 shape is advisory only;
+    it is not sufficient by itself because it can appear around verification/529.
+    None means network/schema ambiguity and must never be treated as a ban/lock.
     We intentionally keep False rare because Roblox does not document a stable
     "clean account" response contract here.
     """
@@ -16902,15 +16916,17 @@ def roblox_cookie_not_approved_api_detection(cookie, expected_user_id=None, cfg=
             restriction_duration = restriction.get("durationSeconds")
 
             if restriction_source == 5 and restriction_status == 2:
-                # V4.81.76: restore the authenticated restriction signature as
-                # authoritative Face Lock evidence. This request is made with the
-                # selected package's own fresh .ROBLOSECURITY cookie, so it is
-                # package-local and independent from screenshot/App-Cloner UI
-                # aliasing that caused the earlier pool-wide false detections.
-                bits = [
-                    "api face lock",
-                    "restriction source=5 status=2",
-                ]
+                # V4.81.139: this numeric shape is NOT Face-Lock proof by itself.
+                # It can appear during/after verification and 529 flows. Promote it
+                # only when the same authenticated payload contains explicit lock
+                # wording; otherwise keep it advisory/non-destructive.
+                payload_text = json.dumps(data, ensure_ascii=False).lower()
+                explicit_lock = any(term in payload_text for term in (
+                    "account locked",
+                    "unlock your account",
+                    "suspicious activity",
+                ))
+                bits = ["restriction source=5 status=2"]
                 if restriction_start:
                     bits.append("start=" + restriction_start)
                 if restriction_end:
@@ -16919,7 +16935,11 @@ def roblox_cookie_not_approved_api_detection(cookie, expected_user_id=None, cfg=
                     bits.append("end=none")
                 if restriction_duration not in (None, ""):
                     bits.append("durationSeconds=" + str(restriction_duration))
-                return True, "; ".join(bits), data
+                if explicit_lock:
+                    bits.insert(0, "api explicit account locked")
+                    return True, "; ".join(bits), data
+                bits.insert(0, "moderation api advisory restriction")
+                return None, "; ".join(bits), data
 
             return None, (
                 "moderation api unknown restriction "
@@ -17084,10 +17104,11 @@ def poll_loading_moderation_job(pkg, rt_tab, cfg):
     retry_seconds = max(
         600, int(cfg.get("manual_auth_retry_seconds", 3600) or 3600)
     )
+    # V4.81.139: Face Lock requires explicit lock wording. The numeric
+    # source=5/status=2 restriction is advisory and must not promote a 529/
+    # verification aftermath into a persistent manual Face Lock hold.
     is_face_lock = bool(
-        "api face lock" in detail_l
-        or "restriction source=5 status=2" in detail_l
-        or "explicit account locked" in detail_l
+        "explicit account locked" in detail_l
         or "account locked" in detail_l
         or "unlock your account" in detail_l
         or "suspicious activity" in detail_l
@@ -17097,11 +17118,7 @@ def poll_loading_moderation_job(pkg, rt_tab, cfg):
         rt_tab["moderation_guard_last_status"] = "face_lock"
         rt_tab["face_lock_detected"] = True
         rt_tab["face_lock_detail"] = detail or "api face lock"
-        rt_tab["face_lock_evidence_source"] = (
-            "api_restriction_5_2"
-            if "restriction source=5 status=2" in detail_l
-            else "api_explicit_lock_text"
-        )
+        rt_tab["face_lock_evidence_source"] = "api_explicit_lock_text"
         rt_tab["face_lock_last_seen_at"] = now()
         if not int(rt_tab.get("face_lock_detected_at", 0) or 0):
             rt_tab["face_lock_detected_at"] = now()
@@ -17237,12 +17254,13 @@ def direct_moderation_guard_before_open(tab, rt_tab, cfg, reason="queued open"):
         return False, detail
 
     retry_seconds = max(600, int(cfg.get("manual_auth_retry_seconds", 3600) or 3600))
-    # V4.81.76: the authenticated source=5/status=2 signature is again
-    # authoritative Face Lock evidence for this exact package.
+    # V4.81.139: numeric source=5/status=2 is advisory only; explicit
+    # Account-Locked wording is required for a Face Lock hold.
+    # V4.81.139: Face Lock requires explicit lock wording. The numeric
+    # source=5/status=2 restriction is advisory and must not promote a 529/
+    # verification aftermath into a persistent manual Face Lock hold.
     is_face_lock = bool(
-        "api face lock" in detail_l
-        or "restriction source=5 status=2" in detail_l
-        or "explicit account locked" in detail_l
+        "explicit account locked" in detail_l
         or "account locked" in detail_l
         or "unlock your account" in detail_l
         or "suspicious activity" in detail_l
@@ -17252,11 +17270,7 @@ def direct_moderation_guard_before_open(tab, rt_tab, cfg, reason="queued open"):
         rt_tab["moderation_guard_last_status"] = "face_lock"
         rt_tab["face_lock_detected"] = True
         rt_tab["face_lock_detail"] = detail or "api face lock"
-        rt_tab["face_lock_evidence_source"] = (
-            "api_restriction_5_2"
-            if "restriction source=5 status=2" in detail_l
-            else "api_explicit_lock_text"
-        )
+        rt_tab["face_lock_evidence_source"] = "api_explicit_lock_text"
         rt_tab["face_lock_last_seen_at"] = now()
         if not int(rt_tab.get("face_lock_detected_at", 0) or 0):
             rt_tab["face_lock_detected_at"] = now()
@@ -18206,7 +18220,6 @@ def _authoritative_face_lock_runtime(rt_tab):
     if source in (
         "exact_account_locked_ui",
         "api_explicit_lock_text",
-        "api_restriction_5_2",
         "manual_confirmed",
     ):
         return True
@@ -18221,7 +18234,6 @@ def _authoritative_face_lock_runtime(rt_tab):
     # Exclude the legacy numeric-only API phrase first.
     numeric_only = (
         "restriction source=5 status=2" in detail
-        and source != "api_restriction_5_2"
         and not any(term in detail for term in (
             "suspicious activity",
             "unlock your account",
