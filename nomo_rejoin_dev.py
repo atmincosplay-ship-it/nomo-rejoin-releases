@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.142 — PRESS/HOLD GATE DIAGNOSTICS (NO INPUT BEHAVIOR CHANGE)
+# - Adds package-local diagnostics for every Press-and-hold dispatch gate: detector
+#   kind/source/bounds/center, incident id, already-attempted id, worker-running
+#   state, enabled flag, and the forced fresh recheck result.
+# - A visible Security challenge that still has no action coordinate now logs the
+#   saved Option-16 rectangle and the current challenge evidence source instead of
+#   silently remaining generic Verification.
+# - Runtime/diagnostic JSON retains the latest hold-gate reason/timestamp plus the
+#   latest fresh-recheck summary. Repeated identical gate messages are deduplicated.
+# - This build does NOT change the user-added hold command, duration, timing, or
+#   interaction behavior; it only makes the existing path observable.
+#
 # V4.81.141 — VERIFICATION ROUTING SPLIT / NO FALSE MANUAL
 # - Press-and-hold is treated as its own current Security action and no longer
 #   falls through the generic external-solver/manual-login path. The existing
@@ -2132,7 +2144,7 @@ _VERIFICATION_HOLD_THREADS = {}
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.141"
+__version__ = "V4.81.142"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -15296,6 +15308,27 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
             action_loc = verification_action_location(
                 pkg, cfg, challenge_detail=captcha_ui, force=True
             )
+        if not action_loc:
+            _rect = _loading_visual_rect_for_package(pkg, cfg)
+            _miss_sig = "|".join([
+                "no_action",
+                str((captcha_ui or {}).get("evidence_source") or ""),
+                ",".join(str(v) for v in (_rect or [])),
+                str(detail or ""),
+            ])
+            rt_tab["verification_hold_diag_reason"] = "visible challenge; action coordinate missing after forced refresh"
+            rt_tab["verification_hold_diag_at"] = now()
+            rt_tab["verification_hold_diag_cell_rect"] = list(_rect or [])
+            rt_tab["verification_hold_diag_challenge_source"] = str((captcha_ui or {}).get("evidence_source") or "")
+            if str(rt_tab.get("verification_hold_diag_last_log_sig") or "") != _miss_sig:
+                rt_tab["verification_hold_diag_last_log_sig"] = _miss_sig
+                log_activity(
+                    "VERIFY DEBUG: visible challenge but no action coordinate after fresh retry; "
+                    + f"source={str((captcha_ui or {}).get('evidence_source') or 'unknown')} "
+                    + f"rect={list(_rect or [])}",
+                    pkg,
+                    YELLOW,
+                )
         if action_loc:
             store_verification_action_location(rt_tab, action_loc)
             captcha_ui = dict(captcha_ui)
@@ -17868,6 +17901,21 @@ def _verification_press_hold_worker(pkg, cfg, rt_tab, incident_id, center, delay
         # Re-detect immediately before sending input so a moved/closed WebView
         # cannot receive a stale coordinate from an earlier watchdog snapshot.
         fresh = verification_action_location(pkg, cfg, force=True)
+        try:
+            rt_tab["verification_hold_fresh_recheck_at"] = now()
+            rt_tab["verification_hold_fresh_recheck_kind"] = str((fresh or {}).get("kind") or "") if isinstance(fresh, dict) else ""
+            rt_tab["verification_hold_fresh_recheck_source"] = str((fresh or {}).get("source") or "") if isinstance(fresh, dict) else ""
+            rt_tab["verification_hold_fresh_recheck_center"] = list((fresh or {}).get("center") or []) if isinstance(fresh, dict) else []
+            rt_tab["verification_hold_fresh_recheck_bounds"] = list((fresh or {}).get("bounds") or []) if isinstance(fresh, dict) else []
+            _verification_hold_diag(
+                rt_tab,
+                pkg,
+                "worker fresh recheck: detected" if isinstance(fresh, dict) else "worker fresh recheck: no action detected",
+                fresh,
+                color=CYAN if isinstance(fresh, dict) else YELLOW,
+            )
+        except Exception:
+            pass
         if not isinstance(fresh, dict) or str(fresh.get("kind") or "") != "press_and_hold":
             log_activity(
                 "verification hold cancelled; Press-and-hold no longer visible",
@@ -17926,28 +17974,74 @@ def _verification_press_hold_worker(pkg, cfg, rt_tab, incident_id, center, delay
             _VERIFICATION_HOLD_THREADS.pop(pkg, None)
 
 
+def _verification_hold_diag(rt_tab, pkg, reason, action_loc=None, *, color=YELLOW):
+    """Persist/log one deduplicated Press-and-hold gate decision."""
+    loc = action_loc if isinstance(action_loc, dict) else {}
+    incident_id = str(rt_tab.get("captcha_ui_incident_id") or "").strip()
+    attempted_id = str(rt_tab.get("verification_hold_attempted_incident_id") or "").strip()
+    with _VERIFICATION_HOLD_LOCK:
+        worker_running = bool(pkg in _VERIFICATION_HOLD_THREADS)
+    center = list(loc.get("center") or [])
+    bounds = list(loc.get("bounds") or [])
+    source = str(loc.get("source") or "")
+    kind = str(loc.get("kind") or "")
+    rt_tab["verification_hold_diag_reason"] = str(reason or "")
+    rt_tab["verification_hold_diag_at"] = now()
+    rt_tab["verification_hold_diag_kind"] = kind
+    rt_tab["verification_hold_diag_source"] = source
+    rt_tab["verification_hold_diag_center"] = center
+    rt_tab["verification_hold_diag_bounds"] = bounds
+    rt_tab["verification_hold_diag_incident_id"] = incident_id
+    rt_tab["verification_hold_diag_attempted_incident_id"] = attempted_id
+    rt_tab["verification_hold_diag_worker_running"] = worker_running
+    sig = "|".join([
+        str(reason or ""), kind, source,
+        ",".join(str(v) for v in center),
+        ",".join(str(v) for v in bounds),
+        incident_id, attempted_id, str(int(worker_running)),
+    ])
+    if str(rt_tab.get("verification_hold_diag_last_gate_sig") or "") != sig:
+        rt_tab["verification_hold_diag_last_gate_sig"] = sig
+        log_activity(
+            "VERIFY HOLD DEBUG: "
+            + str(reason or "")
+            + f" | kind={kind or '-'} source={source or '-'} center={center or '-'} "
+            + f"incident={incident_id or '-'} attempted={attempted_id or '-'} "
+            + f"worker={'yes' if worker_running else 'no'}",
+            pkg,
+            color,
+        )
+
+
 def maybe_start_verification_press_hold(pkg, cfg, rt_tab, action_loc):
     """Start one background hold for the current Press-and-hold incident."""
     if not isinstance(action_loc, dict):
+        _verification_hold_diag(rt_tab, pkg, "dispatch skipped: action_loc missing", action_loc)
         return False
     if str(action_loc.get("kind") or "") != "press_and_hold":
+        _verification_hold_diag(rt_tab, pkg, "dispatch skipped: action is not press_and_hold", action_loc)
         return False
     if not bool(cfg.get("verification_press_hold_enabled", True)):
+        _verification_hold_diag(rt_tab, pkg, "dispatch skipped: verification_press_hold_enabled=false", action_loc)
         return False
 
     incident_id = str(rt_tab.get("captcha_ui_incident_id") or "").strip()
     if not incident_id:
+        _verification_hold_diag(rt_tab, pkg, "dispatch skipped: no visible incident id yet", action_loc)
         return False
 
     # The incident id is the dedupe key. Once this incident has had its one hold
     # attempt, watchdog cycles do not press it again even if the UI remains visible.
     if str(rt_tab.get("verification_hold_attempted_incident_id") or "") == incident_id:
+        _verification_hold_diag(rt_tab, pkg, "dispatch skipped: incident already attempted", action_loc)
         return False
 
     with _VERIFICATION_HOLD_LOCK:
         if str(rt_tab.get("verification_hold_attempted_incident_id") or "") == incident_id:
+            _verification_hold_diag(rt_tab, pkg, "dispatch skipped: incident already attempted after lock", action_loc)
             return False
         if pkg in _VERIFICATION_HOLD_THREADS:
+            _verification_hold_diag(rt_tab, pkg, "dispatch skipped: worker already running", action_loc)
             return False
         rt_tab["verification_hold_attempted_incident_id"] = incident_id
         rt_tab["verification_hold_started_at"] = now()
@@ -17968,6 +18062,7 @@ def maybe_start_verification_press_hold(pkg, cfg, rt_tab, action_loc):
         _VERIFICATION_HOLD_THREADS[pkg] = thread
         thread.start()
 
+    _verification_hold_diag(rt_tab, pkg, "dispatch queued", action_loc, color=CYAN)
     log_activity(
         f"verification Press-and-hold queued for incident {incident_id}",
         pkg,
