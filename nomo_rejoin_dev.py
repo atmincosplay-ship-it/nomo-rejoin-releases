@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.137 — CURRENT SECURITY UI WINS + ORPHAN TASK RECONCILER
+# - Current package-scoped Security verification is checked even when an old Lua
+#   disconnect/kick state is still present. Stale 267/529/history can no longer
+#   suppress Press-and-hold / Start-Puzzle coordinate detection.
+# - Screenshot verification fallback is likewise allowed under stale disconnect
+#   history; its strict per-cell white-panel + blue/green action geometry remains
+#   the false-positive gate. Detection remains coordinate-only and sends no input.
+# - Active verification coordinates are printed on a dedicated VERIFY line below
+#   the table so narrow Termux Note columns cannot truncate the @ X,Y location.
+# - Adds an always-on orphan-task reconciler: ALIVE clone PID + NO ActivityRecord
+#   for 15s arms the existing no-kill TASK_LOST_RESTORE path even when the loss
+#   occurred outside a guarded NOMO hard-open event. Current manual/Face-Lock/
+#   verification holds are excluded; destructive PID-stop work stays contained.
+#
 # V4.81.136 — PRESS/HOLD DETECTOR PRIORITY + BOUNDED HATCHER NO-FRESH RECOVERY
 # - Current visible verification is authoritative in Hatcher rows: it overrides
 #   Stale/Loading/Next/Queued cosmetics and is shown as `Verification` with the
@@ -2062,7 +2076,7 @@ from datetime import datetime
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.135"
+__version__ = "V4.81.137"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -5559,6 +5573,63 @@ def maybe_restore_peer_task_loss(core):
     rt = core.rt
     hold_until = int(rt.get("_peer_task_safety_hold_until", 0) or 0)
     if hold_until <= now():
+        # V4.81.137: discover orphaned clone tasks even when the ActivityRecord
+        # loss happened outside NOMO's guarded hard-open sequence (for example,
+        # one App Cloner instance crashes and sibling tasks vanish with PIDs alive).
+        # Require a short continuous confirmation before arming the existing
+        # no-kill restore state machine.
+        if cfg.get("noka_peer_task_orphan_reconcile_enabled", True):
+            confirm = max(5, int(cfg.get("noka_peer_task_orphan_confirm_seconds", 15) or 15))
+            rearm_cd = max(60, int(cfg.get("noka_peer_task_orphan_rearm_cooldown_seconds", 300) or 300))
+            orphaned = []
+            t_now = now()
+            for peer in _configured_clone_packages(cfg):
+                peer_rt = core.runtime_tab(peer)
+                p_status, _p_note = package_alive_status(peer, cfg, fresh=True)
+                a_status, _a_note = package_activity_status(peer, cfg) if p_status == "ALIVE" else ("NO_ACTIVITY", "")
+
+                # Explicit manual/auth holds are intentionally not materialized.
+                auth_blocked = bool(
+                    peer_rt.get("face_lock_detected")
+                    or peer_rt.get("manual_login_needed")
+                    or peer_rt.get("captcha_ui_visible")
+                )
+                if p_status == "ALIVE" and a_status == "NO_ACTIVITY" and not auth_blocked:
+                    first = int(peer_rt.get("peer_task_orphan_seen_at", 0) or 0)
+                    if first <= 0:
+                        peer_rt["peer_task_orphan_seen_at"] = t_now
+                        peer_rt["peer_task_orphan_note"] = f"PID alive / no ActivityRecord; confirming {confirm}s"
+                        continue
+                    if t_now - first >= confirm:
+                        last_arm = int(peer_rt.get("peer_task_orphan_last_arm_at", 0) or 0)
+                        if last_arm <= 0 or t_now - last_arm >= rearm_cd:
+                            orphaned.append(peer)
+                else:
+                    if a_status == "ACTIVITY" or p_status != "ALIVE" or auth_blocked:
+                        peer_rt["peer_task_orphan_seen_at"] = 0
+                        peer_rt["peer_task_orphan_note"] = ""
+
+            if orphaned:
+                detail = "watchdog orphan reconcile -> " + ", ".join(short_pkg(x) for x in orphaned)
+                _set_peer_task_safety_hold(
+                    rt, cfg, "", detail, orphaned, stage="watchdog-orphan"
+                )
+                # This is already a confirmed orphan; use a short settle before
+                # the first no-kill task materialization rather than the full
+                # destructive-recovery settle delay.
+                rt["_peer_task_restore_next_at"] = now() + max(3, min(10, int(cfg.get("noka_peer_task_restore_settle_seconds", 30) or 30)))
+                for peer in orphaned:
+                    peer_rt = core.runtime_tab(peer)
+                    peer_rt["peer_task_orphan_last_arm_at"] = now()
+                    peer_rt["peer_task_restore_state"] = "orphan_confirmed"
+                    peer_rt["peer_task_restore_note"] = "watchdog confirmed PID alive / no ActivityRecord"
+                log_activity(
+                    "TASK_LOST_RESTORE watchdog armed: " + ", ".join(short_pkg(x) for x in orphaned),
+                    "system",
+                    YELLOW,
+                )
+                core.save()
+                return "pending"
         return "none"
 
     source_pkg = str(rt.get("_peer_task_safety_source_pkg", "") or "")
@@ -8553,6 +8624,7 @@ def status_screen(rows, cfg, session_start, loops):
         widths,
         cfg,
     )
+    render_verification_coordinate_summary(rows, cfg)
 
     render_activity_log(cfg, lines=int(cfg.get("activity_log_lines", 6) or 6))
 
@@ -8561,6 +8633,24 @@ def status_screen(rows, cfg, session_start, loops):
           + col(f"   >={cfg['ready_market_at']} market", GREEN)
           + col(f"   refresh {cfg['check_interval']}s", DIM))
     print(col("  Type Q + ENTER to stop / return to menu", DIM))
+
+
+def render_verification_coordinate_summary(rows, cfg):
+    """Show active verification coordinates outside the narrow Note column.
+
+    Detection/display only. No input action is issued.
+    """
+    items = []
+    for r in rows or []:
+        if str((r or {}).get("status", "") or "") != "Verification":
+            continue
+        note = str((r or {}).get("note", "") or "")
+        if "@" not in note:
+            continue
+        label = note.replace("Verification · ", "", 1)
+        items.append(f"{short_pkg((r or {}).get('pkg', ''))}: {label}")
+    if items:
+        print(col("  VERIFY: " + " | ".join(items), CYAN))
 
 
 def opening_screen(tab, target, cfg, index, total, mode="hard"):
@@ -15076,9 +15166,12 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
 
     # V4.81.83: exact package-scoped verification text outranks even a clean
     # heartbeat. A Security/Start Puzzle modal can coexist with a live Lua state.
+    # V4.81.137: CURRENT native Security UI outranks stale Lua disconnect history.
+    # A prior 267/529 can remain in state.json while Press-and-hold / Start-Puzzle
+    # is visibly on screen; do not let that old state suppress exact detection.
     exact_captcha_ui = (
         android_exact_login_challenge_text_detail(pkg, cfg, force=False)
-        if raw_alive and not non_auth_disconnect
+        if raw_alive
         else None
     )
 
@@ -15092,7 +15185,10 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
         clear_visual_captcha_confirmation(pkg)
 
     captcha_ui = exact_captcha_ui
-    if captcha_ui is None and captcha_scan_eligible and not non_auth_disconnect:
+    if captcha_ui is None and captcha_scan_eligible:
+        # V4.81.137: allow the strict per-cell screenshot fallback even when an
+        # old Lua disconnect is still recorded. The current Security panel/action
+        # geometry is stronger evidence than stale disconnect history.
         captcha_ui = android_login_challenge_ui_detail(
             pkg, cfg, force=False, auth_hint=_runtime_visual_join_auth_hint(rt_tab)
         )
@@ -25762,6 +25858,7 @@ def hatcher_rejoin_status_screen(rows, hcfg, cfg, session_start, loops, last_msg
 
     draw_table(["No", "Username", "Package", "Pet", "Egg", "Status", "StateAge", "RunTime", "Note"],
                table_rows, widths, cfg)
+    render_verification_coordinate_summary(rows, cfg)
 
     render_activity_log(cfg, lines=int(cfg.get("activity_log_lines", 6) or 6))
 
