@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.138 — PRESS-AND-HOLD AUTOMATION FOR DETECTED VERIFICATION
+# - When a current package-local Press-and-hold verification action is detected,
+#   NOMO waits a few seconds, re-checks the action coordinate, then sends one
+#   Android long-press at that exact center for 18 seconds.
+# - One hold is allowed per visible verification incident, so watchdog cycles do
+#   not repeatedly press the same challenge. Start Puzzle is never auto-pressed.
+# - After the hold finishes, the UI is force-rechecked so a cleared challenge can
+#   close its incident normally. The hold duration is fixed because Android's
+#   `input swipe` command cannot safely release early based on UI state.
+#
 # V4.81.137 — CURRENT SECURITY UI WINS + ORPHAN TASK RECONCILER
 # - Current package-scoped Security verification is checked even when an old Lua
 #   disconnect/kick state is still present. Stale 267/529/history can no longer
@@ -2072,6 +2082,11 @@ import traceback
 from pathlib import Path
 from datetime import datetime
 
+# V4.81.138: Android input is global to the Redfinger device. Serialize
+# verification holds so two clone challenges cannot issue overlapping touch events.
+_VERIFICATION_HOLD_LOCK = threading.Lock()
+_VERIFICATION_HOLD_THREADS = {}
+
 # Single source of truth for the build number. Bump this on every update — it is
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
@@ -2816,6 +2831,14 @@ DEFAULT_CONFIG = {
     "captcha_ui_override_enabled": True,
     "captcha_ui_retry_seconds": 600,
     "captcha_ui_require_package_scope": True,
+
+    # V4.81.138: automatic Press-and-hold only. Start Puzzle is intentionally
+    # never clicked/tapped by this feature. The delay gives the Security WebView
+    # a moment to settle after detection; the 18s hold is a conservative middle
+    # value in the requested 15-20s range.
+    "verification_press_hold_enabled": True,
+    "verification_press_hold_delay_seconds": 3,
+    "verification_press_hold_duration_ms": 18000,
 
     # V4.29: screenshot CAPTCHA fallback for Redfinger builds whose Roblox
     # verification WebView is invisible to uiautomator. It uses the clone's
@@ -4417,6 +4440,16 @@ def apply_update_migrations(cfg):
         set_cfg("captcha_ui_retry_seconds", 600)
     if "captcha_ui_require_package_scope" not in cfg:
         set_cfg("captcha_ui_require_package_scope", True)
+    # V4.81.138: repair missing/invalid verification hold defaults without
+    # overwriting a user's explicit enable/disable choice.
+    if "verification_press_hold_enabled" not in cfg:
+        set_cfg("verification_press_hold_enabled", True)
+    if _int_cfg(cfg.get("verification_press_hold_delay_seconds"), 3) < 1:
+        set_cfg("verification_press_hold_delay_seconds", 3)
+    if _int_cfg(cfg.get("verification_press_hold_duration_ms"), 18000) < 15000:
+        set_cfg("verification_press_hold_duration_ms", 18000)
+    elif _int_cfg(cfg.get("verification_press_hold_duration_ms"), 18000) > 20000:
+        set_cfg("verification_press_hold_duration_ms", 20000)
     # V4.29: visual CAPTCHA detection is cheap enough when limited to Loading.
     # Force the low-overhead defaults for existing configs and prefer the raw
     # screenshot because uiautomator cannot see Roblox WebViews on this device.
@@ -15220,6 +15253,10 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
                     CYAN,
                 )
 
+            # V4.81.138: once the visible incident has been assigned an ID below,
+            # the Press-and-hold action is performed once in a background worker.
+            # Start Puzzle is intentionally left untouched.
+
         # V4.81.128: one incident id per continuously visible challenge. A
         # watchdog observation gap is NOT evidence that the challenge disappeared;
         # only the explicit no-CAPTCHA branch below closes the incident. This keeps
@@ -15245,6 +15282,10 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
         rt_tab["captcha_ui_visible"] = True
         rt_tab["captcha_ui_detail"] = detail
         rt_tab["captcha_ui_last_seen_at"] = _captcha_now
+
+        if action_loc:
+            maybe_start_verification_press_hold(pkg, cfg, rt_tab, action_loc)
+
         return {
             "pkg": pkg, "user": tab.get("user_name", pkg), "alive": bool(raw_alive),
             "state": state, "state_err": err, "fresh": False, "clean_fresh": False,
@@ -15273,6 +15314,8 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
         )
         rt_tab["captcha_ui_incident_id"] = ""
         rt_tab["captcha_ui_incident_started_at"] = 0
+        rt_tab["verification_hold_attempted_incident_id"] = ""
+        rt_tab["verification_hold_started_at"] = 0
         clear_verification_action_location(rt_tab)
 
     age = state_age_seconds(state) if state else "-"
@@ -17687,6 +17730,142 @@ def _verification_visual_button_bounds(frame, rect, kind):
     x1 = max(left, x1 - pad); y1 = max(top, y1 - pad)
     x2 = min(right, x2 + pad); y2 = min(bottom, y2 + pad)
     return [int(x1), int(y1), int(x2), int(y2)]
+
+
+def _verification_press_hold_worker(pkg, cfg, rt_tab, incident_id, center, delay_seconds, hold_ms):
+    """Perform one bounded Android press-and-hold for a detected verification bar.
+
+    This is deliberately package-local at the detection/incident level. Android's
+    `input swipe x y x y duration` produces a continuous touch from DOWN to UP,
+    which is the closest shell-level equivalent of a long press on Redfinger.
+    It cannot safely release early based on a screenshot, so the configured hold
+    duration is used and the verification UI is rechecked after release.
+    """
+    pkg = str(pkg or "")
+    try:
+        x, y = int(center[0]), int(center[1])
+        delay_seconds = max(1, int(delay_seconds or 3))
+        hold_ms = max(15000, min(20000, int(hold_ms or 18000)))
+    except Exception:
+        return
+
+    try:
+        log_activity(
+            f"verification hold armed @ {x},{y}; waiting {delay_seconds}s before press",
+            pkg,
+            CYAN,
+        )
+        time.sleep(delay_seconds)
+
+        # Re-detect immediately before sending input so a moved/closed WebView
+        # cannot receive a stale coordinate from an earlier watchdog snapshot.
+        fresh = verification_action_location(pkg, cfg, force=True)
+        if not isinstance(fresh, dict) or str(fresh.get("kind") or "") != "press_and_hold":
+            log_activity(
+                "verification hold cancelled; Press-and-hold no longer visible",
+                pkg,
+                YELLOW,
+            )
+            return
+
+        fresh_center = fresh.get("center") or []
+        if not isinstance(fresh_center, (list, tuple)) or len(fresh_center) < 2:
+            log_activity("verification hold cancelled; refreshed coordinate missing", pkg, YELLOW)
+            return
+        x, y = int(fresh_center[0]), int(fresh_center[1])
+
+        # Persist the refreshed location for diagnostics/status if the runtime
+        # object is still the same package tab.
+        try:
+            store_verification_action_location(rt_tab, fresh)
+        except Exception:
+            pass
+
+        command = (
+            f"input swipe {int(x)} {int(y)} {int(x)} {int(y)} {int(hold_ms)}"
+        )
+        log_activity(
+            f"verification press-and-hold START @ {x},{y} for {hold_ms / 1000:.1f}s",
+            pkg,
+            CYAN,
+        )
+        code, out = shell_timeout(
+            command,
+            cfg,
+            capture=True,
+            timeout=max(25, int(hold_ms / 1000) + 8),
+        )
+        if code == 0:
+            log_activity(
+                f"verification press-and-hold RELEASE @ {x},{y}; rechecking UI",
+                pkg,
+                GREEN,
+            )
+        else:
+            log_activity(
+                f"verification press-and-hold failed rc={code}: {cut(out, 120)}",
+                pkg,
+                RED,
+            )
+    except Exception as e:
+        log_activity(
+            f"verification press-and-hold exception: {cut(e, 160)}",
+            pkg,
+            RED,
+        )
+    finally:
+        with _VERIFICATION_HOLD_LOCK:
+            _VERIFICATION_HOLD_THREADS.pop(pkg, None)
+
+
+def maybe_start_verification_press_hold(pkg, cfg, rt_tab, action_loc):
+    """Start one background hold for the current Press-and-hold incident."""
+    if not isinstance(action_loc, dict):
+        return False
+    if str(action_loc.get("kind") or "") != "press_and_hold":
+        return False
+    if not bool(cfg.get("verification_press_hold_enabled", True)):
+        return False
+
+    incident_id = str(rt_tab.get("captcha_ui_incident_id") or "").strip()
+    if not incident_id:
+        return False
+
+    # The incident id is the dedupe key. Once this incident has had its one hold
+    # attempt, watchdog cycles do not press it again even if the UI remains visible.
+    if str(rt_tab.get("verification_hold_attempted_incident_id") or "") == incident_id:
+        return False
+
+    with _VERIFICATION_HOLD_LOCK:
+        if str(rt_tab.get("verification_hold_attempted_incident_id") or "") == incident_id:
+            return False
+        if pkg in _VERIFICATION_HOLD_THREADS:
+            return False
+        rt_tab["verification_hold_attempted_incident_id"] = incident_id
+        rt_tab["verification_hold_started_at"] = now()
+        thread = threading.Thread(
+            target=_verification_press_hold_worker,
+            args=(
+                pkg,
+                dict(cfg),
+                rt_tab,
+                incident_id,
+                list(action_loc.get("center") or []),
+                max(1, int(cfg.get("verification_press_hold_delay_seconds", 3) or 3)),
+                int(cfg.get("verification_press_hold_duration_ms", 18000) or 18000),
+            ),
+            name=f"nomo-verification-hold-{pkg}",
+            daemon=True,
+        )
+        _VERIFICATION_HOLD_THREADS[pkg] = thread
+        thread.start()
+
+    log_activity(
+        f"verification Press-and-hold queued for incident {incident_id}",
+        pkg,
+        CYAN,
+    )
+    return True
 
 
 def verification_action_location(pkg, cfg, challenge_detail=None, force=False):
