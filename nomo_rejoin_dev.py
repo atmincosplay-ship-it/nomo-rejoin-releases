@@ -1,5 +1,21 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.146 — STALE PRESS/HOLD SESSION RECOVERY (5M / POST-HOLD 404-529)
+# - A Press-and-hold verification incident that stays visible for >=5 minutes is
+#   treated as a stale Security session instead of starting another hold attempt.
+# - If a real Press-and-hold attempt for the same incident transitions into exact
+#   package-scoped 404 Page Not Found or Join Error 529, NOMO classifies that as
+#   stale verification/session failure rather than Face Lock or generic solver work.
+# - Stale Press-and-hold recovery is package-local and one-at-a-time: exact target
+#   PID stop -> forced Clear Cache -> reopen the EXISTING target link. It never
+#   refreshes/generates a new private server merely because verification went stale.
+# - One stale-session recovery is consumed per verification incident. A queued item
+#   dropped before opening may be re-queued after a short retry delay; a successful
+#   stale-session reopen closes the old incident and lets any genuinely new challenge
+#   receive a new incident id. Start Puzzle remains entirely under BlockSolve logic.
+# - Exact Account Locked / ban / moderation proof still wins at the final destructive
+#   boundary, and sibling task-collapse / exact-PID safeguards are unchanged.
+#
 # V4.81.145 — PRESS/HOLD INCIDENT LIFECYCLE / CANCELLED WORKER RETRY
 # - Fixes a one-shot lifecycle bug: merely QUEUING the Press-and-hold worker no
 #   longer marks the visible verification incident as permanently attempted.
@@ -2178,7 +2194,7 @@ _VERIFICATION_HOLD_THREADS = {}
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.145"
+__version__ = "V4.81.146"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -2927,6 +2943,12 @@ DEFAULT_CONFIG = {
     "verification_press_hold_delay_seconds": 3,
     "verification_press_hold_duration_ms": 18000,
     "verification_press_hold_focus_tap_wait_seconds": 1.0,
+    # V4.81.146: stale Press-and-hold session recovery. This does not apply to
+    # Start Puzzle/provider-backed verification.
+    "verification_press_hold_stale_recovery_enabled": True,
+    "verification_press_hold_stale_seconds": 300,
+    "verification_press_hold_error_recovery_enabled": True,
+    "verification_press_hold_requeue_seconds": 30,
 
     # V4.29: screenshot CAPTCHA fallback for Redfinger builds whose Roblox
     # verification WebView is invisible to uiautomator. It uses the clone's
@@ -4546,6 +4568,16 @@ def apply_update_migrations(cfg):
         set_cfg("verification_press_hold_focus_tap_wait_seconds", 0.5)
     elif _focus_wait > 3.0:
         set_cfg("verification_press_hold_focus_tap_wait_seconds", 3.0)
+    # V4.81.146: preserve explicit enable/disable choices while repairing invalid
+    # stale-session thresholds.
+    if "verification_press_hold_stale_recovery_enabled" not in cfg:
+        set_cfg("verification_press_hold_stale_recovery_enabled", True)
+    if _int_cfg(cfg.get("verification_press_hold_stale_seconds"), 300) < 60:
+        set_cfg("verification_press_hold_stale_seconds", 300)
+    if "verification_press_hold_error_recovery_enabled" not in cfg:
+        set_cfg("verification_press_hold_error_recovery_enabled", True)
+    if _int_cfg(cfg.get("verification_press_hold_requeue_seconds"), 30) < 10:
+        set_cfg("verification_press_hold_requeue_seconds", 30)
     # V4.29: visual CAPTCHA detection is cheap enough when limited to Loading.
     # Force the low-overhead defaults for existing configs and prefer the raw
     # screenshot because uiautomator cannot see Roblox WebViews on this device.
@@ -15421,6 +15453,57 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
         rt_tab["captcha_ui_detail"] = detail
         rt_tab["captcha_ui_last_seen_at"] = _captcha_now
 
+        # V4.81.146: Press-and-hold Security sessions can expire server-side.
+        # Do not keep attempting an old Press-and-hold after five minutes, and if
+        # a real hold attempt for this SAME incident turns into exact 529, route
+        # it to package-local stale-session recovery instead of BlockSolve/Face Lock.
+        try:
+            _incident_age = max(0, _captcha_now - int(rt_tab.get("captcha_ui_incident_started_at", 0) or _captcha_now))
+        except Exception:
+            _incident_age = 0
+        _action_kind = str((action_loc or {}).get("kind") or "") if isinstance(action_loc, dict) else ""
+        _stale_after = max(60, int(cfg.get("verification_press_hold_stale_seconds", 300) or 300))
+        _stale_enabled = bool(cfg.get("verification_press_hold_stale_recovery_enabled", True))
+        _error_recovery_enabled = bool(cfg.get("verification_press_hold_error_recovery_enabled", True))
+        _hold_action_same_incident = bool(
+            str(rt_tab.get("verification_hold_action_incident_id") or "") == _incident_id
+            or str(rt_tab.get("verification_hold_attempted_incident_id") or "") == _incident_id
+        )
+        _captcha_code = str((captcha_ui or {}).get("code") or "")
+        _post_hold_529 = bool(_error_recovery_enabled and _hold_action_same_incident and _captcha_code == "529")
+        _hold_busy = bool(
+            str(rt_tab.get("verification_hold_pending_incident_id") or "") == _incident_id
+            or str(rt_tab.get("verification_hold_state") or "").strip().lower() in {"queued", "running", "holding"}
+        )
+        _stale_press_age = bool(
+            _stale_enabled
+            and _action_kind == "press_and_hold"
+            and _incident_age >= _stale_after
+            and not _hold_busy
+        )
+
+        if _stale_press_age or _post_hold_529:
+            _stale_reason = (
+                f"Press-and-hold stale {format_age(_incident_age)}"
+                if _stale_press_age
+                else "Press-and-hold transitioned to Join Error 529"
+            )
+            rt_tab["press_hold_stale_detected_at"] = _captcha_now
+            rt_tab["press_hold_stale_reason"] = _stale_reason
+            rt_tab["press_hold_stale_incident_id"] = _incident_id
+            rt_tab["note"] = _stale_reason + "; cache+reopen required"
+            return {
+                "pkg": pkg, "user": tab.get("user_name", pkg), "alive": bool(raw_alive),
+                "state": state, "state_err": err, "fresh": False, "clean_fresh": False,
+                "pets": int(state.get("pet_count", 0) or 0) if state else "-",
+                "eggs": int(state.get("egg_total", 0) or 0) if state else "-",
+                "age": state_age_seconds(state) if state else "-",
+                "status": "Stale Verify", "note": rt_tab["note"],
+                "bad": "stale_press_hold", "visible_window": True,
+                "stale_verification_reason": _stale_reason,
+                "stale_verification_detail": captcha_ui,
+            }
+
         if action_loc:
             maybe_start_verification_press_hold(pkg, cfg, rt_tab, action_loc)
 
@@ -15443,6 +15526,41 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
             "ui_challenge_detail": captcha_ui,
         }
     elif rt_tab.get("captcha_ui_visible"):
+        # V4.81.146: a completed Press-and-hold can replace Security with an
+        # exact package-scoped 404 page. That is not a clean disappearance; keep
+        # the old incident long enough for the rejoin engine to repair the stale
+        # session once.
+        _old_incident = str(rt_tab.get("captcha_ui_incident_id", "") or "")
+        _hold_action_same_incident = bool(
+            _old_incident
+            and (
+                str(rt_tab.get("verification_hold_action_incident_id") or "") == _old_incident
+                or str(rt_tab.get("verification_hold_attempted_incident_id") or "") == _old_incident
+            )
+        )
+        _stale_error = (
+            android_stale_verification_error_detail(pkg, cfg, force=True)
+            if _hold_action_same_incident and cfg.get("verification_press_hold_error_recovery_enabled", True)
+            else None
+        )
+        if _stale_error and str(_stale_error.get("kind") or "") == "404":
+            _stale_reason = "Press-and-hold transitioned to 404 Page Not Found"
+            rt_tab["press_hold_stale_detected_at"] = now()
+            rt_tab["press_hold_stale_reason"] = _stale_reason
+            rt_tab["press_hold_stale_incident_id"] = _old_incident
+            rt_tab["note"] = _stale_reason + "; cache+reopen required"
+            return {
+                "pkg": pkg, "user": tab.get("user_name", pkg), "alive": bool(raw_alive),
+                "state": state, "state_err": err, "fresh": False, "clean_fresh": False,
+                "pets": int(state.get("pet_count", 0) or 0) if state else "-",
+                "eggs": int(state.get("egg_total", 0) or 0) if state else "-",
+                "age": state_age_seconds(state) if state else "-",
+                "status": "Stale Verify", "note": rt_tab["note"],
+                "bad": "stale_press_hold", "visible_window": True,
+                "stale_verification_reason": _stale_reason,
+                "stale_verification_detail": _stale_error,
+            }
+
         # The challenge genuinely disappeared. Close this incident; the next
         # visible challenge gets a new id and may submit independently.
         rt_tab["captcha_ui_visible"] = False
@@ -16332,6 +16450,85 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
         rt_tab["note"] = str(health.get("note") or "process check unavailable; recovery deferred")
         core.save()
         return "Unknown", rt_tab["note"], True
+
+    # V4.81.146: stale Press-and-hold session recovery is distinct from solver
+    # work. It is package-local, reuses the existing target link, forces cache
+    # clear, and never refreshes/generates a private server for this reason alone.
+    if bad == "stale_press_hold":
+        incident_id = str(
+            rt_tab.get("press_hold_stale_incident_id")
+            or rt_tab.get("captcha_ui_incident_id")
+            or ""
+        )
+        consumed_id = str(rt_tab.get("press_hold_stale_recovery_consumed_incident_id") or "")
+        if incident_id and consumed_id == incident_id:
+            rt_tab["note"] = "stale verification already recovered once; waiting for UI/session change"
+            core.save()
+            return "Waiting", rt_tab["note"], True
+
+        queued = core.latest(pkg)
+        if queued and queued.get("press_hold_stale_recovery"):
+            rt_tab["note"] = "stale verification cache+reopen queued"
+            core.save()
+            return "Queued", rt_tab["note"], True
+
+        requeue_seconds = max(10, int(cfg.get("verification_press_hold_requeue_seconds", 30) or 30))
+        last_queue = int(rt_tab.get("press_hold_stale_recovery_queued_at", 0) or 0)
+        if (
+            incident_id
+            and str(rt_tab.get("press_hold_stale_recovery_incident_id") or "") == incident_id
+            and last_queue > 0
+            and now() - last_queue < requeue_seconds
+        ):
+            left = max(1, requeue_seconds - (now() - last_queue))
+            rt_tab["note"] = "stale verification recovery retry in " + format_age(left)
+            core.save()
+            return "Waiting", rt_tab["note"], True
+
+        removed = core.cancel(pkg)
+        if removed:
+            log_activity(
+                f"stale Press-and-hold cancelled {removed} obsolete package recovery item(s)",
+                pkg,
+                YELLOW,
+            )
+        reason = str(health.get("stale_verification_reason") or "stale Press-and-hold session")
+        metadata = {
+            "press_hold_stale_recovery": True,
+            "press_hold_stale_incident_id": incident_id,
+            "auth_result_recovery": True,
+            "solver_preflight_done": True,
+            "skip_solver_once": True,
+            "skip_solver_probe": True,
+            "bypass_recheck": True,
+            "combined_stuck_recovery": True,
+            "combined_stuck_refresh_private_link": False,
+            "combined_stuck_clear_cache": True,
+        }
+        added, qnote = core.queue_exact_pid_recovery(
+            tab,
+            target,
+            "stale Press-and-hold session: " + reason,
+            skip_if_alive=False,
+            front=True,
+            bypass_manual=True,
+            metadata=metadata,
+        )
+        rt_tab["press_hold_stale_recovery_incident_id"] = incident_id
+        rt_tab["press_hold_stale_recovery_queued_at"] = now()
+        rt_tab["note"] = (
+            "stale verification -> Clear Cache + reopen EXISTING link queued"
+            if added
+            else (qnote or "stale verification recovery already queued")
+        )
+        if added:
+            log_activity(
+                "stale Press-and-hold -> exact target PID + Clear Cache + reopen EXISTING link; NO PS refresh",
+                pkg,
+                CYAN,
+            )
+        core.save()
+        return ("Queued" if added or core.has(pkg) else "Waiting"), rt_tab["note"], True
 
     captcha_action = apply_visible_captcha_ui_action(
         open_queue, tab, target, rt_tab, cfg, rt, health, core
@@ -19528,6 +19725,60 @@ def join_error_529_auth_detail(
 
 
 
+def android_stale_verification_error_detail(pkg, cfg, force=False):
+    """Exact package-scoped stale verification wrapper after Press-and-hold.
+
+    Only recognizes strong UI text for 404 Page Not Found or the Roblox 529 Join
+    Error wrapper. This helper does not itself queue recovery; callers must also
+    prove that the same verification incident previously reached Press-and-hold.
+    """
+    texts, _ = android_ui_text_for_package_or_rect(
+        str(pkg or ""),
+        cfg,
+        force=force,
+    )
+    values = [str(v) for v in (texts or []) if str(v or "").strip()]
+    if not values:
+        return None
+    joined = "\n".join(values)
+    low = joined.lower()
+
+    page_404 = bool(
+        re.search(r"\b404\b", low)
+        and "page not found" in low
+        and ("something went wrong" in low or "security" in low or "back" in low)
+    )
+    if page_404:
+        return {
+            "kind": "404",
+            "code": "404",
+            "title": "Security 404 Page Not Found",
+            "text": joined,
+            "reason": "stale_verification_404",
+            "evidence_source": "exact_option16_text",
+        }
+
+    code_529 = bool(re.search(r"error\s*code\s*:?\s*529\b", low, flags=re.I))
+    wrapper_529 = bool(
+        code_529
+        and (
+            "http error" in low
+            or "please close the client and try again" in low
+            or "join error" in low
+        )
+    )
+    if wrapper_529:
+        return {
+            "kind": "529",
+            "code": "529",
+            "title": "Join Error 529",
+            "text": joined,
+            "reason": "stale_verification_529",
+            "evidence_source": "exact_option16_text",
+        }
+    return None
+
+
 def android_exact_login_challenge_text_detail(pkg, cfg, force=False):
     """High-confidence package-scoped CAPTCHA/529 from exact UI text only.
 
@@ -20756,6 +21007,14 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
             "CLEAN",
         }
     )
+    stale_press_terminal_reopen = bool(
+        is_hard
+        and item.get("press_hold_stale_recovery")
+        and item.get("auth_result_recovery")
+    )
+    verification_terminal_reopen = bool(
+        post_solver_terminal_reopen or stale_press_terminal_reopen
+    )
 
     if target == "hatcher" and cfg.get("hatcher_surgical_stable_policy", False):
         legacy_hatcher_experiment = bool(
@@ -20933,6 +21192,13 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
             )
             core.save()
             return True
+
+    if item.get("press_hold_stale_recovery"):
+        log_activity(
+            "STALE Press-and-hold -> exact target PID -> Clear Cache -> reopen EXISTING link; NO PS refresh",
+            pkg,
+            CYAN,
+        )
 
     if item.get("solver_success_requires_reopen"):
         solver_result_name = (
@@ -21279,20 +21545,31 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
                 rt_tab["captcha_ui_detail"] = ",".join(visible_auth.get("hits", []) or []) or detail
                 rt_tab["captcha_ui_last_seen_at"] = now()
 
-                if post_solver_terminal_reopen:
-                    # External BlockSolve is already finished. The unchanged
-                    # Security/Verification window is exactly why this restart
-                    # was queued, so do NOT send the same incident back to solver.
-                    rt_tab["note"] = (
-                        "solver terminal clear; stale verification UI ignored; "
-                        "cache+reopen continuing"
-                    )
-                    log_activity(
-                        "post-solver terminal reopen ALLOWED through stale "
-                        "Security/Verification UI",
-                        pkg,
-                        GREEN,
-                    )
+                if verification_terminal_reopen:
+                    # A terminal provider clear OR the dedicated stale Press-and-hold
+                    # repair intentionally restarts through the old Security wrapper.
+                    # Exact Account Locked / moderation proof was checked above.
+                    if stale_press_terminal_reopen:
+                        rt_tab["note"] = (
+                            "stale Press-and-hold recovery; old verification UI ignored; "
+                            "cache+reopen continuing"
+                        )
+                        log_activity(
+                            "stale Press-and-hold reopen ALLOWED through old Security/Verification UI",
+                            pkg,
+                            GREEN,
+                        )
+                    else:
+                        rt_tab["note"] = (
+                            "solver terminal clear; stale verification UI ignored; "
+                            "cache+reopen continuing"
+                        )
+                        log_activity(
+                            "post-solver terminal reopen ALLOWED through stale "
+                            "Security/Verification UI",
+                            pkg,
+                            GREEN,
+                        )
                 else:
                     solver_status, solver_note = core.handle_detected_solver_challenge(
                         tab, rt_tab, detail
@@ -21309,7 +21586,7 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
 
             if _runtime_auth_hint(rt_tab) and not current_disconnect:
                 visual_join = visual_join_error_detail(pkg, cfg, force=True, bypass_confirm=True)
-                if visual_join and not post_solver_terminal_reopen:
+                if visual_join and not verification_terminal_reopen:
                     rt_tab["note"] = "visual Join Error after auth/face-lock; hard recovery blocked"
                     rt_tab["captcha_ui_visible"] = True
                     rt_tab["captcha_ui_last_seen_at"] = now()
@@ -21317,10 +21594,13 @@ def process_open_queue(open_queue, cfg, rt, session_start=None, loops=0, core=No
                     log_activity("visual Join Error after auth context blocked queued hard recovery before PID stop", pkg, YELLOW)
                     core.save()
                     return True
-                elif visual_join and post_solver_terminal_reopen:
+                elif visual_join and verification_terminal_reopen:
                     log_activity(
-                        "post-solver terminal reopen ALLOWED through stale visual "
-                        "529/auth wrapper",
+                        (
+                            "stale Press-and-hold reopen ALLOWED through visual 529/auth wrapper"
+                            if stale_press_terminal_reopen
+                            else "post-solver terminal reopen ALLOWED through stale visual 529/auth wrapper"
+                        ),
                         pkg,
                         GREEN,
                     )
@@ -21553,7 +21833,9 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
         log_activity(f"open held by manual verification: {cut(manual_note, 70)}", pkg, YELLOW)
         return False, manual_note
     display_mode = str(mode or "hard")
-    if item.get("solver_success_requires_reopen"):
+    if item.get("press_hold_stale_recovery"):
+        display_mode = "stale-verification-reopen"
+    elif item.get("solver_success_requires_reopen"):
         display_mode = "solver-success-reopen"
         rt_tab["solver_terminal_reopen_required"] = False
         rt_tab["solver_terminal_reopen_consumed_at"] = now()
@@ -21774,6 +22056,32 @@ def _do_open_cycle(open_queue, item, tab, rt_tab, pkg, target, reason, mode, is_
     core.save()
 
     if ok:
+        if item.get("press_hold_stale_recovery"):
+            _stale_incident = str(
+                item.get("press_hold_stale_incident_id")
+                or rt_tab.get("press_hold_stale_recovery_incident_id")
+                or rt_tab.get("captcha_ui_incident_id")
+                or ""
+            )
+            rt_tab["press_hold_stale_recovery_consumed_incident_id"] = _stale_incident
+            rt_tab["press_hold_stale_recovery_consumed_at"] = now()
+            rt_tab["press_hold_stale_recovery_last_result"] = "opened"
+            # The old Security wrapper belongs to the pre-restart task. Close its
+            # incident so a genuinely new post-restart challenge gets a new id.
+            rt_tab["captcha_ui_last_incident_id"] = str(rt_tab.get("captcha_ui_incident_id", "") or _stale_incident)
+            rt_tab["captcha_ui_visible"] = False
+            rt_tab["captcha_ui_detail"] = ""
+            rt_tab["captcha_ui_incident_id"] = ""
+            rt_tab["captcha_ui_incident_started_at"] = 0
+            rt_tab["verification_hold_pending_incident_id"] = ""
+            rt_tab["verification_hold_attempted_incident_id"] = ""
+            clear_verification_action_location(rt_tab)
+            log_activity(
+                "stale Press-and-hold recovery OPENED; old verification incident closed",
+                pkg,
+                GREEN,
+            )
+
         if item.get("bubble_only_recovery") and target == "hatcher":
             opened_at, bubble_second_note = hatcher_bubble_second_private_intent(
                 tab, rt_tab, cfg, rt, target, reason, opened_at, core
