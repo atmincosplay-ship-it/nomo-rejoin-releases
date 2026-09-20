@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.144 — INTEGRATED OWNED-APP PRESS/HOLD TEST + NOKA DETECTOR TEST
+# - Adds Advanced Tools -> Press/Hold test. Owned/non-Roblox app packages can run
+#   the local uiautomator-based long-press test directly from NOMO, including one
+#   duration or a duration sweep with JSON reporting.
+# - Installed Noka/Roblox clones are available in the same tool as DETECTION-ONLY
+#   targets. Their current Press-and-hold / Start-Puzzle kind, source, bounds, and
+#   center are shown using NOMO's existing Option-16-aware verification detector.
+# - The test harness refuses to send synthetic input to configured Noka/Roblox
+#   packages; the existing user-added verification worker is not modified here.
+# - Fixes the runtime version label so the UI reports V4.81.144.
+#
 # V4.81.143 — PRESS/HOLD FOCUS TAP BEFORE LONG HOLD
 # - After the existing detection delay, the visible Press-and-hold button is tapped
 #   once first so the already-visible Noka/Redfinger clone gets the active touch target.
@@ -2153,7 +2164,7 @@ _VERIFICATION_HOLD_THREADS = {}
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.142"
+__version__ = "V4.81.144"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -51557,6 +51568,314 @@ def manual_cache_cleanup_menu(cfg):
         print(col(f"Result: {cleared} cleared, {failed} failed.", GREEN if not failed else YELLOW))
         pause()
 
+
+def _owned_press_hold_package_is_noka_or_roblox(package, cfg=None):
+    """Fail closed for live Roblox/Noka targets in the generic owned-app test tool."""
+    package = str(package or "").strip()
+    low = package.lower()
+    if not package:
+        return True
+    if ".noka" in low or low == "com.roblox" or low.startswith("com.roblox."):
+        return True
+    try:
+        for tab in (cfg or {}).get("tabs", []) or []:
+            if str((tab or {}).get("package") or "").strip() == package:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _owned_press_hold_find_ui_node(package, target_text, cfg):
+    """Find the largest exact-package UI node containing target_text."""
+    package = str(package or "").strip()
+    target_text = str(target_text or "Press and hold").strip().lower()
+    snapshot = capture_android_ui_snapshot(cfg, force=True)
+    candidates = []
+    for node in (snapshot or {}).get("text_nodes", []) or []:
+        if not isinstance(node, dict):
+            continue
+        node_pkg = str(node.get("package") or "").strip()
+        if not (node_pkg == package or node_pkg.startswith(package + ":")):
+            continue
+        label = str(node.get("text") or "").strip()
+        if target_text not in label.lower():
+            continue
+        bounds = node.get("bounds")
+        if not isinstance(bounds, (list, tuple)) or len(bounds) != 4:
+            continue
+        try:
+            x1, y1, x2, y2 = [int(v) for v in bounds]
+        except Exception:
+            continue
+        if x2 <= x1 or y2 <= y1:
+            continue
+        candidates.append({
+            "package": package,
+            "text": label,
+            "bounds": [x1, y1, x2, y2],
+            "center": [(x1 + x2) // 2, (y1 + y2) // 2],
+            "source": "uiautomator",
+            "area": (x2 - x1) * (y2 - y1),
+        })
+    if not candidates:
+        return None, str((snapshot or {}).get("error") or "")
+    candidates.sort(key=lambda row: int(row.get("area", 0) or 0), reverse=True)
+    result = dict(candidates[0])
+    result.pop("area", None)
+    return result, ""
+
+
+def _owned_press_hold_visible_text(package, cfg):
+    package = str(package or "").strip()
+    snapshot = capture_android_ui_snapshot(cfg, force=True)
+    out = []
+    for node in (snapshot or {}).get("text_nodes", []) or []:
+        if not isinstance(node, dict):
+            continue
+        node_pkg = str(node.get("package") or "").strip()
+        if not (node_pkg == package or node_pkg.startswith(package + ":")):
+            continue
+        value = str(node.get("text") or "").strip()
+        if value:
+            out.append(value)
+    return out
+
+
+def _owned_press_hold_wait_for_node(package, target_text, cfg, timeout_seconds=60, poll_seconds=1.0):
+    deadline = time.time() + max(1, int(timeout_seconds or 60))
+    last_error = ""
+    while time.time() < deadline:
+        node, err = _owned_press_hold_find_ui_node(package, target_text, cfg)
+        if node:
+            return node, ""
+        last_error = str(err or "")
+        time.sleep(max(0.2, float(poll_seconds or 1.0)))
+    return None, last_error or "target text not visible"
+
+
+def _owned_press_hold_run_attempt(package, target_text, duration_ms, success_texts, cfg, report_rows):
+    node, err = _owned_press_hold_wait_for_node(package, target_text, cfg, timeout_seconds=60)
+    started_at = int(time.time())
+    if not node:
+        row = {
+            "started_at": started_at,
+            "duration_ms": int(duration_ms),
+            "success": False,
+            "error": "target not found: " + str(err or ""),
+        }
+        report_rows.append(row)
+        print(col("Target not found: " + str(err or ""), RED))
+        return row
+
+    center = node.get("center") or []
+    if len(center) < 2:
+        row = {
+            "started_at": started_at,
+            "duration_ms": int(duration_ms),
+            "success": False,
+            "error": "target center missing",
+            "target_before": node,
+        }
+        report_rows.append(row)
+        print(col("Target center missing.", RED))
+        return row
+
+    x, y = int(center[0]), int(center[1])
+    print(col(f"Detected {target_text!r} @ {x},{y}  bounds={node.get('bounds')}", CYAN))
+    print(col(f"Holding {int(duration_ms)}ms...", CYAN))
+    command = f"input swipe {x} {y} {x} {y} {int(duration_ms)}"
+    code, output = shell_timeout(
+        command,
+        cfg,
+        capture=True,
+        timeout=max(15, int(duration_ms / 1000) + 10),
+    )
+    time.sleep(2.0)
+    after, after_err = _owned_press_hold_find_ui_node(package, target_text, cfg)
+    visible_text = _owned_press_hold_visible_text(package, cfg)
+    joined = "\n".join(visible_text).lower()
+    matched = ""
+    for value in success_texts or []:
+        value = str(value or "").strip()
+        if value and value.lower() in joined:
+            matched = value
+            break
+    success = bool(code == 0 and (after is None or matched))
+    row = {
+        "started_at": started_at,
+        "duration_ms": int(duration_ms),
+        "target_before": node,
+        "input_returncode": int(code),
+        "input_output": cut(output, 240),
+        "target_still_visible": bool(after),
+        "target_after": after,
+        "success_text_match": matched,
+        "success": success,
+        "after_error": str(after_err or ""),
+    }
+    report_rows.append(row)
+    if success:
+        reason = f"success text {matched!r}" if matched else "target disappeared"
+        print(col("PASS: " + reason, GREEN))
+    elif code != 0:
+        print(col(f"FAILED: input rc={code}: {cut(output, 120)}", RED))
+    else:
+        print(col("FAILED: target still visible and no success text matched", YELLOW))
+    return row
+
+
+def _owned_press_hold_write_report(package, target_text, success_texts, attempts):
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    path = Path(f"/sdcard/Download/NOMO_owned_press_hold_{stamp}.json")
+    payload = {
+        "nomo_version": __version__,
+        "created_at": int(time.time()),
+        "package": str(package or ""),
+        "target_text": str(target_text or ""),
+        "success_texts": list(success_texts or []),
+        "attempts": list(attempts or []),
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return str(path)
+    except Exception as exc:
+        return "report save failed: " + str(exc)
+
+
+def noka_verification_detector_test_menu(cfg):
+    packages = choose_packages_common(
+        cfg,
+        title="NOKA VERIFICATION DETECTOR TEST (NO INPUT)",
+        multi=True,
+        installed_only=True,
+        include_discovered=True,
+        configured_only=False,
+        allow_all=True,
+    )
+    if not packages:
+        return
+    print("")
+    print(col("Detection only for Noka/Roblox packages; no synthetic input is sent here.", YELLOW))
+    for package in packages:
+        try:
+            action = verification_action_location(package, cfg, force=True)
+        except Exception as exc:
+            action = None
+            print(f"{short_pkg(package):<10} " + col("ERROR", RED) + f"  {cut(exc, 100)}")
+            continue
+        if not isinstance(action, dict):
+            detail = android_login_challenge_ui_detail(package, cfg, force=True, auth_hint=False)
+            print(
+                f"{short_pkg(package):<10} "
+                + col("NO ACTION", YELLOW)
+                + "  challenge="
+                + cut(str((detail or {}).get("reason") or (detail or {}).get("text") or "not detected"), 90)
+            )
+            continue
+        center = action.get("center") or []
+        bounds = action.get("bounds") or []
+        kind = str(action.get("kind") or "unknown")
+        source = str(action.get("source") or "unknown")
+        print(
+            f"{short_pkg(package):<10} "
+            + col(kind, GREEN)
+            + f"  center={center} bounds={bounds} source={source}"
+        )
+    pause()
+
+
+def owned_press_hold_test_menu(cfg):
+    while True:
+        clear()
+        banner("PRESS / HOLD TEST", cfg)
+        print(col("1  Owned app: detect only", CYAN))
+        print(col("2  Owned app: one long-press", CYAN))
+        print(col("3  Owned app: duration sweep", CYAN))
+        print(col("4  Noka A-D / Roblox: detector test only", CYAN))
+        print(col("0  Back", RED))
+        print("")
+        print(col("Synthetic input is refused for configured Noka/Roblox packages in this test tool.", DIM))
+        drain_stdin()
+        choice = clean_terminal_input(input("Choose: ")).strip().lower()
+        if choice in {"0", "q", "b", "back", ""}:
+            return
+        if choice == "4":
+            noka_verification_detector_test_menu(cfg)
+            continue
+        if choice not in {"1", "2", "3"}:
+            print(col("Invalid option.", RED)); time.sleep(1); continue
+
+        package = clean_terminal_input(input("Owned app package (example com.example.app): ")).strip()
+        if not package:
+            continue
+        if _owned_press_hold_package_is_noka_or_roblox(package, cfg):
+            print(col("This target is Noka/Roblox; use option 4 for detection-only testing.", YELLOW))
+            pause()
+            continue
+        target_text = clean_terminal_input(input("Target text [Press and hold]: ")).strip() or "Press and hold"
+
+        if choice == "1":
+            node, err = _owned_press_hold_find_ui_node(package, target_text, cfg)
+            if node:
+                print(json.dumps(node, indent=2))
+            else:
+                print(col("Not detected: " + str(err or "target not visible"), YELLOW))
+            pause()
+            continue
+
+        success_raw = clean_terminal_input(input("Success text(s), comma-separated [optional]: ")).strip()
+        success_texts = [x.strip() for x in success_raw.split(",") if x.strip()]
+        durations = []
+        if choice == "2":
+            raw = clean_terminal_input(input("Hold duration ms [3000]: ")).strip() or "3000"
+            try:
+                durations = [int(raw)]
+            except Exception:
+                durations = []
+        else:
+            raw = clean_terminal_input(input("Durations ms [500,1000,1500,2000,3000,5000]: ")).strip()
+            if not raw:
+                raw = "500,1000,1500,2000,3000,5000"
+            try:
+                durations = [int(x.strip()) for x in raw.split(",") if x.strip()]
+            except Exception:
+                durations = []
+        durations = [d for d in durations if 50 <= int(d) <= 60000]
+        if not durations:
+            print(col("No valid duration(s). Allowed range: 50..60000 ms.", RED))
+            pause(); continue
+
+        attempts = []
+        for idx, duration in enumerate(durations, 1):
+            print("")
+            print(col(f"Attempt {idx}/{len(durations)}: {duration}ms", BOLD))
+            _owned_press_hold_run_attempt(
+                package,
+                target_text,
+                int(duration),
+                success_texts,
+                cfg,
+                attempts,
+            )
+            if idx < len(durations):
+                print(col("Waiting for the target to be shown again before the next attempt...", DIM))
+                time.sleep(2.0)
+        report_path = _owned_press_hold_write_report(
+            package, target_text, success_texts, attempts
+        )
+        print("")
+        print(col("Report: ", DIM) + report_path)
+        passed = [a for a in attempts if a.get("success")]
+        if passed:
+            best = min(passed, key=lambda a: int(a.get("duration_ms", 10**9) or 10**9))
+            print(col(f"Shortest successful tested hold: {best.get('duration_ms')}ms", GREEN))
+        else:
+            print(col("No tested duration was confirmed successful.", YELLOW))
+        pause()
+
+
 def advanced_tools_menu(cfg):
     """Less-used tools moved out of the daily main menu."""
     while True:
@@ -51574,12 +51893,13 @@ def advanced_tools_menu(cfg):
             ("6", "Layout / visual CAPTCHA", CYAN, WHITE),
             ("7", "Workspace ZIP tools", CYAN, WHITE),
             ("8", "APK download / install", CYAN, WHITE),
+            ("9", "Press/Hold test", CYAN, WHITE),
             ("0", "Back", RED, WHITE),
         ]
         draw_boxed_menu(rows, cfg)
 
         drain_stdin()
-        choice = read_menu_choice("\nAdvanced: ", {"0", "1", "2", "3", "4", "5", "6", "7", "8", "q", "b", "back"})
+        choice = read_menu_choice("\nAdvanced: ", {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "q", "b", "back"})
         if choice in {"0", "q", "b", "back", None}:
             return
 
@@ -51599,6 +51919,8 @@ def advanced_tools_menu(cfg):
             workspace_zip_tools_menu(cfg)
         elif choice == "8":
             apk_download_install_menu(cfg)
+        elif choice == "9":
+            owned_press_hold_test_menu(cfg)
 
 
 def main():
