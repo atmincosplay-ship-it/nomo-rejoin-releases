@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.143 — PRESS/HOLD FOCUS TAP BEFORE LONG HOLD
+# - After the existing detection delay, the visible Press-and-hold button is tapped
+#   once first so the already-visible Noka/Redfinger clone gets the active touch target.
+# - The action is re-detected after that tap, then the 18s continuous hold is sent to
+#   the refreshed coordinate. No ActivityManager/launcher foregrounding is used, which
+#   preserves the existing sibling-task safety behavior.
+# - Adds post-focus-tap diagnostics so we can distinguish focus-tap success from a
+#   stale/moved verification coordinate.
+
 # V4.81.142 — PRESS/HOLD GATE DIAGNOSTICS (NO INPUT BEHAVIOR CHANGE)
 # - Adds package-local diagnostics for every Press-and-hold dispatch gate: detector
 #   kind/source/bounds/center, incident id, already-attempted id, worker-running
@@ -2892,6 +2901,7 @@ DEFAULT_CONFIG = {
     "verification_press_hold_enabled": True,
     "verification_press_hold_delay_seconds": 3,
     "verification_press_hold_duration_ms": 18000,
+    "verification_press_hold_focus_tap_wait_seconds": 1.0,
 
     # V4.29: screenshot CAPTCHA fallback for Redfinger builds whose Roblox
     # verification WebView is invisible to uiautomator. It uses the clone's
@@ -4503,6 +4513,14 @@ def apply_update_migrations(cfg):
         set_cfg("verification_press_hold_duration_ms", 18000)
     elif _int_cfg(cfg.get("verification_press_hold_duration_ms"), 18000) > 20000:
         set_cfg("verification_press_hold_duration_ms", 20000)
+    try:
+        _focus_wait = float(cfg.get("verification_press_hold_focus_tap_wait_seconds", 1.0) or 1.0)
+    except Exception:
+        _focus_wait = 1.0
+    if _focus_wait < 0.5:
+        set_cfg("verification_press_hold_focus_tap_wait_seconds", 0.5)
+    elif _focus_wait > 3.0:
+        set_cfg("verification_press_hold_focus_tap_wait_seconds", 3.0)
     # V4.29: visual CAPTCHA detection is cheap enough when limited to Loading.
     # Force the low-overhead defaults for existing configs and prefer the raw
     # screenshot because uiautomator cannot see Roblox WebViews on this device.
@@ -17874,51 +17892,36 @@ def _verification_visual_button_bounds(frame, rect, kind):
 
 
 def _verification_press_hold_worker(pkg, cfg, rt_tab, incident_id, center, delay_seconds, hold_ms):
-    """Perform one bounded Android press-and-hold for a detected verification bar.
+    """Focus/click the detected verification action, then perform one long hold.
 
-    This is deliberately package-local at the detection/incident level. Android's
-    `input swipe x y x y duration` produces a continuous touch from DOWN to UP,
-    which is the closest shell-level equivalent of a long press on Redfinger.
-    It cannot safely release early based on a screenshot, so the configured hold
-    duration is used and the verification UI is rechecked after release.
+    On Redfinger/App Cloner, the detected verification WebView can be visible but
+    not be the active input target. A short tap on the detected action first gives
+    that clone/window an input focus opportunity. The action is then re-detected and
+    the long press is sent to the refreshed coordinate.
     """
     pkg = str(pkg or "")
     try:
         x, y = int(center[0]), int(center[1])
         delay_seconds = max(1, int(delay_seconds or 3))
         hold_ms = max(15000, min(20000, int(hold_ms or 18000)))
+        focus_tap_wait = max(0.5, float(cfg.get("verification_press_hold_focus_tap_wait_seconds", 1.0) or 1.0))
     except Exception:
         return
 
     try:
         log_activity(
-            f"verification hold armed @ {x},{y}; waiting {delay_seconds}s before press",
+            f"verification hold armed @ {x},{y}; waiting {delay_seconds}s before focus tap",
             pkg,
             CYAN,
         )
         time.sleep(delay_seconds)
 
-        # Re-detect immediately before sending input so a moved/closed WebView
+        # Re-detect immediately before the focus tap so a moved/closed WebView
         # cannot receive a stale coordinate from an earlier watchdog snapshot.
         fresh = verification_action_location(pkg, cfg, force=True)
-        try:
-            rt_tab["verification_hold_fresh_recheck_at"] = now()
-            rt_tab["verification_hold_fresh_recheck_kind"] = str((fresh or {}).get("kind") or "") if isinstance(fresh, dict) else ""
-            rt_tab["verification_hold_fresh_recheck_source"] = str((fresh or {}).get("source") or "") if isinstance(fresh, dict) else ""
-            rt_tab["verification_hold_fresh_recheck_center"] = list((fresh or {}).get("center") or []) if isinstance(fresh, dict) else []
-            rt_tab["verification_hold_fresh_recheck_bounds"] = list((fresh or {}).get("bounds") or []) if isinstance(fresh, dict) else []
-            _verification_hold_diag(
-                rt_tab,
-                pkg,
-                "worker fresh recheck: detected" if isinstance(fresh, dict) else "worker fresh recheck: no action detected",
-                fresh,
-                color=CYAN if isinstance(fresh, dict) else YELLOW,
-            )
-        except Exception:
-            pass
         if not isinstance(fresh, dict) or str(fresh.get("kind") or "") != "press_and_hold":
             log_activity(
-                "verification hold cancelled; Press-and-hold no longer visible",
+                "verification hold cancelled; Press-and-hold no longer visible before focus tap",
                 pkg,
                 YELLOW,
             )
@@ -17926,20 +17929,82 @@ def _verification_press_hold_worker(pkg, cfg, rt_tab, incident_id, center, delay
 
         fresh_center = fresh.get("center") or []
         if not isinstance(fresh_center, (list, tuple)) or len(fresh_center) < 2:
-            log_activity("verification hold cancelled; refreshed coordinate missing", pkg, YELLOW)
+            log_activity("verification hold cancelled; refreshed focus coordinate missing", pkg, YELLOW)
             return
         x, y = int(fresh_center[0]), int(fresh_center[1])
 
-        # Persist the refreshed location for diagnostics/status if the runtime
-        # object is still the same package tab.
+        try:
+            store_verification_action_location(rt_tab, fresh)
+            rt_tab["verification_hold_focus_tap_at"] = now()
+            rt_tab["verification_hold_focus_tap_center"] = [x, y]
+        except Exception:
+            pass
+
+        # Do NOT launcher-start/force-start a Noka clone here. That path was
+        # deliberately disabled because materializing/foregrounding clone tasks
+        # through ActivityManager can disturb sibling floating tasks. A real tap
+        # on the already-visible challenge is the safer way to make the clone the
+        # active touch target.
+        focus_command = f"input tap {x} {y}"
+        log_activity(
+            f"verification focus TAP @ {x},{y}; waiting {focus_tap_wait:.1f}s before hold",
+            pkg,
+            CYAN,
+        )
+        code, out = shell_timeout(
+            focus_command,
+            cfg,
+            capture=True,
+            timeout=10,
+        )
+        if code != 0:
+            log_activity(
+                f"verification focus TAP failed rc={code}: {cut(out, 120)}",
+                pkg,
+                RED,
+            )
+            return
+
+        time.sleep(focus_tap_wait)
+
+        # The focus tap itself can change the WebView state, so always refresh the
+        # action location before starting the continuous hold.
+        fresh = verification_action_location(pkg, cfg, force=True)
+        try:
+            rt_tab["verification_hold_post_tap_recheck_at"] = now()
+            rt_tab["verification_hold_post_tap_recheck_kind"] = str((fresh or {}).get("kind") or "") if isinstance(fresh, dict) else ""
+            rt_tab["verification_hold_post_tap_recheck_source"] = str((fresh or {}).get("source") or "") if isinstance(fresh, dict) else ""
+            rt_tab["verification_hold_post_tap_recheck_center"] = list((fresh or {}).get("center") or []) if isinstance(fresh, dict) else []
+            _verification_hold_diag(
+                rt_tab,
+                pkg,
+                "post-focus-tap recheck: detected" if isinstance(fresh, dict) else "post-focus-tap recheck: no action detected",
+                fresh,
+                color=CYAN if isinstance(fresh, dict) else YELLOW,
+            )
+        except Exception:
+            pass
+
+        if not isinstance(fresh, dict) or str(fresh.get("kind") or "") != "press_and_hold":
+            log_activity(
+                "verification hold cancelled; Press-and-hold changed/disappeared after focus tap",
+                pkg,
+                YELLOW,
+            )
+            return
+
+        fresh_center = fresh.get("center") or []
+        if not isinstance(fresh_center, (list, tuple)) or len(fresh_center) < 2:
+            log_activity("verification hold cancelled; post-tap coordinate missing", pkg, YELLOW)
+            return
+        x, y = int(fresh_center[0]), int(fresh_center[1])
+
         try:
             store_verification_action_location(rt_tab, fresh)
         except Exception:
             pass
 
-        command = (
-            f"input swipe {int(x)} {int(y)} {int(x)} {int(y)} {int(hold_ms)}"
-        )
+        command = f"input swipe {x} {y} {x} {y} {hold_ms}"
         log_activity(
             f"verification press-and-hold START @ {x},{y} for {hold_ms / 1000:.1f}s",
             pkg,
