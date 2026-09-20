@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.141 — VERIFICATION ROUTING SPLIT / NO FALSE MANUAL
+# - Press-and-hold is treated as its own current Security action and no longer
+#   falls through the generic external-solver/manual-login path. The existing
+#   user-added hold worker is left unchanged; this build only fixes routing/status.
+# - A visible Press-and-hold cancels obsolete non-terminal recovery for that exact
+#   package and displays Verification/Holding instead of captcha/login Manual.
+# - Start Puzzle/other provider-backed verification still uses the existing solver.
+#   If the solver is intentionally disabled, the row stays Captcha/solver disabled
+#   instead of writing a sticky manual-login flag.
+# - Current verification action location gets one forced fresh retry when the first
+#   cached action-coordinate lookup misses, improving coordinate detection without
+#   changing any input action.
+#
 # V4.81.140 — RECOVERY-EVENT PEER SETTLE + DARK PRESS/HOLD DETECTOR
 # - Sibling task collapse is tied to the recovery EVENT that triggered it, never to
 #   a fixed clone letter. After B/C/D-style lost tasks are restored, only the source
@@ -2119,7 +2132,7 @@ _VERIFICATION_HOLD_THREADS = {}
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.140"
+__version__ = "V4.81.141"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -15275,6 +15288,14 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
         action_loc = verification_action_location(
             pkg, cfg, challenge_detail=captcha_ui, force=False
         )
+        # V4.81.141: the shared UI/screenshot cache can still describe the frame
+        # just before the Security action rendered. A current challenge is rare,
+        # so one forced fresh retry is cheap and prevents a visible Press-and-hold
+        # from remaining a generic Verification with no coordinates.
+        if not action_loc:
+            action_loc = verification_action_location(
+                pkg, cfg, challenge_detail=captcha_ui, force=True
+            )
         if action_loc:
             store_verification_action_location(rt_tab, action_loc)
             captcha_ui = dict(captcha_ui)
@@ -15806,7 +15827,41 @@ def apply_visible_captcha_ui_action(open_queue, tab, target, rt_tab, cfg, rt, he
     rt_tab["captcha_ui_visible"] = True
     rt_tab["captcha_ui_last_seen_at"] = now()
 
-    # V4.81.119: every visible CAPTCHA incident MUST reopen after a terminal
+    # V4.81.141: Press-and-hold is a distinct current Security action. Health
+    # collection already owns coordinate detection and (when enabled by the user)
+    # starts the existing local hold worker. Do not also send this same incident
+    # through BlockSolve and, especially, do not turn solver-disabled into a sticky
+    # captcha/login Manual hold.
+    current_action_kind = str(rt_tab.get("verification_button_kind", "") or "")
+    if current_action_kind == "press_and_hold":
+        manual_reason = str(rt_tab.get("manual_login_reason", "") or "").strip().lower()
+        if manual_reason in {"captcha/login challenge", "api challenge"}:
+            clear_manual_login_block(rt_tab)
+            try:
+                clear_hold(pkg)
+            except Exception:
+                pass
+
+        queued = core.latest(pkg)
+        if queued and not (
+            queued.get("solver_success_requires_reopen")
+            or queued.get("solver_visible_captcha_required_reopen")
+        ):
+            removed = core.cancel(pkg)
+            if removed:
+                log_activity(
+                    "Press-and-hold cancelled obsolete package recovery; current Security UI kept in-place",
+                    pkg,
+                    YELLOW,
+                )
+
+        note = verification_action_display_note(rt_tab)
+        holding = bool(pkg in _VERIFICATION_HOLD_THREADS)
+        rt_tab["note"] = note
+        core.save()
+        return ("Holding" if holding else "Verification"), note, True
+
+    # V4.81.119: every visible provider-backed CAPTCHA incident MUST reopen after a terminal
     # provider result because the external solve does not refresh this Roblox UI.
     current_incident = str(rt_tab.get("captcha_ui_incident_id", "") or "")
     if not current_incident:
@@ -41434,6 +41489,24 @@ def handle_detected_solver_challenge(
         return "Solving", note
 
     note_l = str(note or "").lower()
+
+    # V4.81.141: an intentionally disabled solver is configuration state, not an
+    # account/manual-login failure. Keep the visible challenge package-local and
+    # non-destructive without poisoning runtime.json with a Manual auth latch.
+    if note_l.strip() == "solver disabled":
+        manual_reason = str(rt_tab.get("manual_login_reason", "") or "").strip().lower()
+        if manual_reason in {"captcha/login challenge", "api challenge"}:
+            clear_manual_login_block(rt_tab)
+            try:
+                clear_hold(pkg)
+            except Exception:
+                pass
+        rt_tab["note"] = "solver disabled"
+        if core is not None:
+            core.save()
+        else:
+            save_runtime(rt)
+        return "Captcha", "solver disabled"
 
     # A provider/local cooldown is temporary. Keep the visible CAPTCHA in-place
     # and show the countdown; do not misclassify it as a manual-login problem.
