@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.136 — PRESS/HOLD DETECTOR PRIORITY + BOUNDED HATCHER NO-FRESH RECOVERY
+# - Current visible verification is authoritative in Hatcher rows: it overrides
+#   Stale/Loading/Next/Queued cosmetics and is shown as `Verification` with the
+#   coordinate-only action note when available.
+# - Extends screenshot-only verification detection to the white Security panel +
+#   large royal-blue Press-and-hold bar. This fixes bottom-row clone layouts where
+#   the blue action sits lower in the saved Option-16 cell than the old scan band.
+# - Adds a bounded 5-minute ALIVE+ActivityRecord+stale-telemetry Hatcher fallback.
+#   If no current verification/Face-Lock/manual hold exists, one exact-package
+#   combined recovery may be queued even under the surgical stable policy, with a
+#   15-minute cooldown. Sibling/PID safety and pre-open health recheck remain intact.
+# - Detection only: no tap/click/swipe/hold action is performed.
+#
 # V4.81.135 — VERIFICATION COORDINATES VISIBLE IN STATUS/DIAGNOSTICS
 # - Builds on V4.81.134 detection-only support. Current verification action metadata
 #   now has one consistent display formatter for Press-and-hold / Start-Puzzle.
@@ -3159,6 +3172,12 @@ DEFAULT_CONFIG = {
     # V4.81.110: require continuous missing ActivityRecord before treating a
     # live PID as a genuinely lost/closed clone task.
     "hatcher_activity_lost_confirm_seconds": 60,
+    # V4.81.136: even with a live ActivityRecord, hours-old telemetry must not
+    # suppress recovery forever. Current verification/manual-auth still wins.
+    "hatcher_live_activity_stale_recovery_seconds": 300,
+    "hatcher_live_activity_stale_recovery_cooldown_seconds": 900,
+    # White Security panel + large blue Press-and-hold visual fallback.
+    "captcha_visual_press_hold_min_white_ratio": 0.58,
 
     # V4.81.66: ordinary automatic Hatcher opens are verified by the normal
     # watchdog instead of blocking the whole UI/main loop in wait_until_fresh_after_open().
@@ -3331,6 +3350,9 @@ DEFAULT_HATCHER_CONFIG = {
     "hatcher_alive_old_state_max_valid_seconds": 86400,  # FIX V3.78: was 81400
     "hatcher_alive_old_state_after_open_grace_seconds": 180,
     "hatcher_alive_old_state_hard_force_cooldown_seconds": 900,
+    "hatcher_live_activity_stale_recovery_seconds": 300,
+    "hatcher_live_activity_stale_recovery_cooldown_seconds": 900,
+    "captcha_visual_press_hold_min_white_ratio": 0.58,
 
     # Teleport/server detection. Public/private detection can false-positive on
     # some Roblox/private-server share links because game.PrivateServerId may be
@@ -4076,7 +4098,7 @@ def _cookie_cache_update_entry(pkg, updates):
     return _cookie_cache_merge_entries({pkg: dict(updates)})
 
 
-NOMO_CONFIG_MIGRATION_VERSION = 4681
+NOMO_CONFIG_MIGRATION_VERSION = 4682
 
 
 def _int_cfg(value, default=0):
@@ -4125,6 +4147,21 @@ def apply_update_migrations(cfg):
         set_cfg("hatcher_alive_old_state_hard_force_enabled", True)
     # Also enable the generic alive-stale rejoin as a second safety net.
     set_cfg("hatcher_rejoin_alive_stale", True)
+
+    # V4.81.136: repair missing/unsafe saved values for the bounded live-task
+    # stale telemetry recovery and lower-row Press-and-hold visual detector.
+    stale_live = _int_cfg(cfg.get("hatcher_live_activity_stale_recovery_seconds"), 300)
+    if stale_live < 180 or stale_live > 900:
+        set_cfg("hatcher_live_activity_stale_recovery_seconds", 300)
+    stale_live_cd = _int_cfg(cfg.get("hatcher_live_activity_stale_recovery_cooldown_seconds"), 900)
+    if stale_live_cd < 300:
+        set_cfg("hatcher_live_activity_stale_recovery_cooldown_seconds", 900)
+    try:
+        press_white = float(cfg.get("captcha_visual_press_hold_min_white_ratio", 0.58) or 0.58)
+    except Exception:
+        press_white = 0.58
+    if press_white < 0.45 or press_white > 0.90:
+        set_cfg("captcha_visual_press_hold_min_white_ratio", 0.58)
 
     # V4.16: NOMO uses one shared D1 Worker. Fresh-device setup should only
     # require NOMO_SECRET, while still preserving any real custom Worker URL.
@@ -13834,6 +13871,95 @@ def queue_hatcher_activity_lost_recovery(core, tab, rt_tab, cfg):
     return False, qnote or "task-lost recovery not queued", True
 
 
+def queue_hatcher_live_activity_stale_recovery(core, tab, rt_tab, cfg, state_age=0):
+    """V4.81.136 bounded fallback for ALIVE + ActivityRecord + stale telemetry.
+
+    This is deliberately package-local. It never acts while a current verification
+    or manual-auth hold is active, and every queued open is health-rechecked before
+    execution. It exists so the surgical stable policy cannot preserve a dead Roblox
+    Home/loading shell forever merely because Android still has an ActivityRecord.
+    """
+    pkg = str((tab or {}).get("package") or "")
+    if not pkg or not cfg.get("rejoin_if_crash", True):
+        return False, "disabled", False
+
+    manual_hold, manual_note = recovery_manual_hold_active(rt_tab, cfg, pkg)
+    if manual_hold:
+        return False, manual_note, False
+    if bool(rt_tab.get("captcha_ui_visible")):
+        return False, "current verification hold", False
+    if _authoritative_face_lock_runtime(rt_tab):
+        return False, "current face-lock hold", False
+
+    process_status, _ = package_alive_status(pkg, cfg, fresh=True)
+    if process_status != "ALIVE":
+        return False, f"process={process_status}", False
+    activity_status, activity_note = package_activity_status(pkg, cfg)
+    if activity_status != "ACTIVITY":
+        return False, str(activity_note or activity_status), False
+
+    try:
+        age_i = int(state_age or 0)
+    except Exception:
+        age_i = 0
+    try:
+        threshold = int(cfg.get("hatcher_live_activity_stale_recovery_seconds", 300) or 300)
+    except Exception:
+        threshold = 300
+    threshold = max(180, min(900, threshold))
+    if age_i < threshold:
+        return False, f"live-task stale {age_i}s/{threshold}s", False
+
+    try:
+        cooldown = int(cfg.get("hatcher_live_activity_stale_recovery_cooldown_seconds", 900) or 900)
+    except Exception:
+        cooldown = 900
+    cooldown = max(300, cooldown)
+    t = now()
+    last = int(rt_tab.get("hatcher_live_activity_stale_recovery_last", 0) or 0)
+    if last > 0 and t - last < cooldown:
+        return False, f"live-task stale cooldown {format_age(cooldown - (t - last))}", False
+
+    if core.has(pkg):
+        return False, "already queued", True
+
+    added, qnote = core.queue_exact_pid_recovery(
+        tab,
+        "hatcher",
+        f"Hatcher live ActivityRecord but telemetry stale {age_i}s",
+        front=False,
+        metadata={
+            "bypass_recheck": False,
+            "always_recheck_health": True,
+            "hatcher_live_activity_stale_recovery": True,
+            # This fallback is about a dead/no-fresh client shell, not auth solving.
+            # Current verification is detected/held before this path, so do not let
+            # a speculative provider preflight block the bounded recovery itself.
+            "skip_solver_probe": True,
+            "combined_stuck_recovery": True,
+            "combined_stuck_refresh_private_link": bool(
+                cfg.get("hatcher_combined_stuck_refresh_private_link", True)
+            ),
+            "combined_stuck_clear_cache": bool(
+                cfg.get("hatcher_combined_stuck_clear_cache", True)
+            ),
+        },
+    )
+    if added:
+        rt_tab["hatcher_live_activity_stale_recovery_last"] = t
+        rt_tab["hatcher_live_activity_stale_recovery_age"] = age_i
+        rt_tab["note"] = "live task + stale telemetry -> bounded recovery queued"
+        log_activity(
+            f"Hatcher live ActivityRecord + no fresh telemetry {age_i}s -> "
+            "package-local bounded recovery queued",
+            pkg,
+            YELLOW,
+        )
+        core.save()
+        return True, rt_tab["note"], True
+    return False, str(qnote or "bounded stale recovery not queued"), False
+
+
 def queue_hatcher_post_open_5m_recovery(core, tab, rt_tab, cfg, elapsed=0):
     """Queue the only telemetry-based ALIVE Hatcher recovery."""
     pkg = str((tab or {}).get("package") or "")
@@ -15029,7 +15155,7 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
             "pets": int(state.get("pet_count", 0) or 0) if state else "-",
             "eggs": int(state.get("egg_total", 0) or 0) if state else "-",
             "age": state_age_seconds(state) if state else "-",
-            "status": "Captcha",
+            "status": "Verification",
             "note": verification_action_display_note(
                 rt_tab,
                 fallback=(
@@ -17419,8 +17545,12 @@ def _verification_visual_button_bounds(frame, rect, kind):
         sy1 = top + int(ch * 0.42)
         sy2 = top + int(ch * 0.90)
     else:
-        sy1 = top + int(ch * 0.18)
-        sy2 = top + int(ch * 0.68)
+        # V4.81.136: the Press-and-hold Security sheet can sit much lower in
+        # bottom-row App Cloner cells. Scan most of the white panel vertically;
+        # the strict blue geometry + white-panel gate prevents in-game blue UI
+        # from becoming a verification signal.
+        sy1 = top + int(ch * 0.10)
+        sy2 = top + int(ch * 0.92)
 
     step = max(2, min(5, min(cw, ch) // 100))
     row_hits = []
@@ -18119,16 +18249,31 @@ def capture_visual_captcha_snapshot(cfg, force=False):
     green_min = float(cfg.get("captcha_visual_min_green_ratio", 0.004) or 0.004)
     strict_white_min = max(0.85, float(cfg.get("captcha_visual_strict_min_white_ratio", 0.85) or 0.85))
     strict_center_green_min = max(0.10, float(cfg.get("captcha_visual_strict_center_green_ratio", 0.10) or 0.10))
+    try:
+        press_white_min = float(cfg.get("captcha_visual_press_hold_min_white_ratio", 0.58) or 0.58)
+    except Exception:
+        press_white_min = 0.58
+    press_white_min = max(0.45, min(0.90, press_white_min))
     metrics = {}
     raw_candidates = {}
     for pkg, rect in cells.items():
         m = _visual_cell_metrics(frame, rect)
-        candidate = bool(
+        green_candidate = bool(
             m["white_ratio"] >= max(white_min, strict_white_min)
             and m["green_ratio"] >= green_min
             and float(m.get("center_green_ratio", 0.0) or 0.0) >= strict_center_green_min
         )
+        press_bounds = _verification_visual_button_bounds(frame, rect, "press_and_hold")
+        press_candidate = bool(
+            press_bounds
+            and float(m.get("white_ratio", 0.0) or 0.0) >= press_white_min
+        )
+        candidate = bool(green_candidate or press_candidate)
         m["candidate"] = candidate
+        m["visual_kind"] = (
+            "press_and_hold" if press_candidate else ("start_puzzle" if green_candidate else "")
+        )
+        m["press_hold_bounds"] = list(press_bounds or [])
         m["rect"] = list(rect)
         metrics[pkg] = m
         raw_candidates[pkg] = candidate
@@ -18157,15 +18302,23 @@ def visual_captcha_detail(pkg, cfg, force=False, bypass_confirm=False):
     required = max(2, int(cfg.get("captcha_visual_confirmations_required", 2) or 2))
     if not candidate or (not bypass_confirm and int(rec.get("count", 0) or 0) < required):
         return None
+    visual_kind = str(metrics.get("visual_kind", "") or "")
+    hits = ["visual verification panel"]
+    if visual_kind == "press_and_hold":
+        hits.append("blue press-and-hold button")
+    else:
+        hits.append("green start-puzzle button")
     return {
         "title": "Roblox Verification",
         "text": (
             f"visual white={float(metrics.get('white_ratio', 0.0)):.3f} "
             f"green={float(metrics.get('green_ratio', 0.0)):.3f} "
-            f"center={float(metrics.get('center_green_ratio', 0.0)):.3f}"
+            f"center={float(metrics.get('center_green_ratio', 0.0)):.3f} "
+            f"kind={visual_kind or 'unknown'}"
         ),
         "reason": "android_package_scoped_visual_captcha",
-        "hits": ["visual verification panel", "green start-puzzle button"],
+        "hits": hits,
+        "visual_kind": visual_kind,
         "visual_metrics": metrics,
     }
 
@@ -26780,6 +26933,13 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
 
                 if activity_lost_handled:
                     pass
+                elif str(health.get("bad") or "") in {"ui_challenge", "challenge"}:
+                    # V4.81.136: a CURRENT visible Security challenge is
+                    # authoritative. Never let stale/loading/queue cosmetics hide it.
+                    status = "Verification"
+                    note = verification_action_display_note(
+                        rt_tab, fallback=str(health.get("note") or "Verification · UI detected")
+                    )
                 elif home_route_handled:
                     # Visible package-scoped Roblox Home is authoritative.
                     # Hidden/stale Lua state and old-state cooldown cannot
@@ -26826,6 +26986,24 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                     else:
                         note = hard_note
                         status = "Stale"
+                elif (
+                    alive
+                    and recovery_age >= int(cfg.get("hatcher_live_activity_stale_recovery_seconds", 300) or 300)
+                    and not challenge_active
+                    and not home_route_handled
+                    and not problem_code
+                ):
+                    b_added, b_note, b_action = queue_hatcher_live_activity_stale_recovery(
+                        core, tab, rt_tab, cfg, recovery_age
+                    )
+                    if b_action:
+                        status = "Queued" if (b_added or core.has(pkg)) else "Stale"
+                        note = b_note
+                    elif str(b_note or "").startswith("live-task stale cooldown"):
+                        status = "Stale"
+                        note = b_note
+                    elif bubble_rescue_handled:
+                        pass
                 elif bubble_rescue_handled:
                     pass
                 elif in_startup_observe and recovery_age >= old_sec:
@@ -27056,10 +27234,25 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                     rt_tab["bubble_shell_soft_wake_peer_note"] = ""
 
             # V3.53: direct Lua-detected disconnect/kick popup
-            if state and alive and state_disconnect_ui(state) and cfg.get("rejoin_if_crash", True):
+            if (
+                state
+                and alive
+                and state_disconnect_ui(state)
+                and cfg.get("rejoin_if_crash", True)
+                and str(health.get("bad") or "") not in {"ui_challenge", "challenge"}
+            ):
                 added, dnote = core.queue_disconnect_ui_rejoin(tab, "hatcher", rt_tab)
                 status = "Queued" if (added or dnote == "already queued") else "Kicked"
                 note = f"{state_disconnect_note(state)} {dnote}".strip()
+
+            # V4.81.136: CURRENT package-scoped verification UI is the final
+            # status authority for this cycle. Old Lua disconnect/stale state may
+            # coexist underneath the native Security sheet but must not mask it.
+            if raw_alive and str(health.get("bad") or "") in {"ui_challenge", "challenge"}:
+                status = "Verification"
+                note = verification_action_display_note(
+                    rt_tab, fallback=str(health.get("note") or "Verification · UI detected")
+                )
 
             if alive:
                 rt_tab["dead_since"] = 0
