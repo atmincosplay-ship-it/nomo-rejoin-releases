@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+# V4.81.149 — FRESH-HEARTBEAT PRESS/HOLD OVERRIDE + VISUAL LOCK HOLD
+# - Strong package-local visual Press-and-hold now outranks a clean/fresh Lua heartbeat.
+#   The generic Start Puzzle screenshot heuristic remains Loading-only; only the strict
+#   white Security panel + strong wide blue Press-and-hold bar gets this always-on pass.
+# - A confirmed visual Account Locked candidate is no longer ignored while exact WebView
+#   text is hidden. It becomes a non-destructive package-local `Lock?` observation state:
+#   queued recovery for that package is cancelled, siblings continue, and no PID/input is
+#   touched while NOMO waits for exact/API proof or for the modal to disappear.
+# - Visual Lock? does NOT create a persistent Face Lock/manual-login latch. Exact current
+#   Account Locked text or explicit API wording still promotes it to authoritative Face Lock.
+# - V4.81.148 stale Press-and-hold recovery, solver routing, hold worker, and PID policy unchanged.
+#
 # NOMO REJOIN
 # V4.81.148 — UNRESOLVED POST-HOLD LINEAGE + VISUAL JOIN-ERROR FALLBACK
 # - Fixes V4.81.147 missing a visible post-hold 529 when App Cloner/WebView does not
@@ -2217,7 +2229,7 @@ _VERIFICATION_HOLD_THREADS = {}
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.148"
+__version__ = "V4.81.149"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -15382,7 +15394,10 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
         (not face_lock_loading_only) or (not loading_online_proof)
     )
     if not face_lock_scan_eligible:
-        clear_visual_face_lock_confirmation(pkg)
+        # V4.81.149: do not clear the screenshot confirmation merely because an
+        # old Lua writer still emits a clean heartbeat behind a native lock modal.
+        # The visual candidate is non-authoritative and package-local, so it is safe
+        # to keep observing while exact/API proof catches up.
         # A post-open clean heartbeat proves Roblox reached the game, so any old
         # visual face-lock hold is now obsolete and can safely self-clear.
         if str(rt_tab.get("manual_login_reason", "") or "") == "face_lock":
@@ -15409,7 +15424,7 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
     text_face = account_ui if account_ui and account_ui.get("kind") == "face_lock" else None
     visual_face = (
         visual_face_lock_detail(pkg, cfg, force=False)
-        if face_lock_scan_eligible and not non_auth_disconnect
+        if raw_alive and not non_auth_disconnect
         else None
     )
 
@@ -15460,14 +15475,41 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
             or "visual candidate"
         )
         rt_tab["visual_face_lock_candidate_last_seen_at"] = now()
+        rt_tab["visual_face_lock_candidate_active"] = True
+        # Ask the existing package-local moderation checker for authoritative proof
+        # even when the Lua heartbeat is still fresh. This remains throttled by the
+        # normal API interval and never touches sibling packages.
+        try:
+            start_loading_moderation_job(tab, cfg, rt_tab)
+        except Exception:
+            pass
+        # V4.81.149: this detector is already package-rect scoped and requires
+        # repeated strong Account-Locked geometry. Do not call it authoritative
+        # Face Lock without text/API proof, but also do not let destructive/solver
+        # recovery run through a currently visible lock modal. This observation
+        # state is ephemeral and package-local; no manual-login latch is written.
         last_log = int(rt_tab.get("visual_face_lock_candidate_last_log", 0) or 0)
         if last_log <= 0 or now() - last_log >= 60:
             rt_tab["visual_face_lock_candidate_last_log"] = now()
             log_activity(
-                "visual Face Lock candidate ignored; exact text/API proof required",
+                "visual Account Locked candidate confirmed; package held non-destructively awaiting exact/API proof",
                 pkg,
                 YELLOW,
             )
+        return {
+            "pkg": pkg, "user": tab.get("user_name", pkg), "alive": bool(raw_alive),
+            "state": state, "state_err": err, "fresh": False, "clean_fresh": False,
+            "pets": int(state.get("pet_count", 0) or 0) if state else "-",
+            "eggs": int(state.get("egg_total", 0) or 0) if state else "-",
+            "age": state_age_seconds(state) if state else "-",
+            "status": "Lock?",
+            "note": "visual Account Locked; awaiting exact/API proof",
+            "bad": "face_lock_candidate",
+            "visible_window": True,
+            "face_lock_detail": visual_face,
+        }
+    else:
+        rt_tab["visual_face_lock_candidate_active"] = False
 
     # V4.81.62: age/access banner is informational in this client and must not
     # create a hold or suppress normal join/recovery.
@@ -15493,6 +15535,25 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
         clear_visual_captcha_confirmation(pkg)
 
     captcha_ui = exact_captcha_ui
+
+    # V4.81.149: a clean Lua heartbeat can keep running behind the native/WebView
+    # Security wrapper. When accessibility text is hidden, the old Loading-only
+    # screenshot rule therefore mislabeled a visible Press-and-hold as Ingame.
+    # Run only the STRICT Press-and-hold visual signature in this case; Start Puzzle
+    # remains Loading-only to preserve the existing false-positive protection.
+    if captcha_ui is None and raw_alive and not captcha_scan_eligible:
+        _fresh_visual = visual_captcha_detail(pkg, cfg, force=False)
+        _fresh_kind = str((_fresh_visual or {}).get("visual_kind") or "")
+        _fresh_metrics = ((_fresh_visual or {}).get("visual_metrics") or {}) if isinstance(_fresh_visual, dict) else {}
+        if (
+            isinstance(_fresh_visual, dict)
+            and _fresh_kind == "press_and_hold"
+            and bool(_fresh_metrics.get("press_hold_strong"))
+        ):
+            captcha_ui = dict(_fresh_visual)
+            captcha_ui["reason"] = "android_package_scoped_visual_press_hold_over_fresh_heartbeat"
+            captcha_ui["evidence_source"] = "visual_press_hold_strong_over_fresh"
+
     if captcha_ui is None and captcha_scan_eligible:
         # V4.81.137: allow the strict per-cell screenshot fallback even when an
         # old Lua disconnect is still recorded. The current Security panel/action
@@ -16699,6 +16760,21 @@ def apply_rejoin_action(open_queue, tab, target, rt_tab, cfg, rt, health, hcfg=N
         grace = min(grace, trigger)
 
     # --- package-local auth/moderation holds outrank EVERY recovery queue ---
+    # V4.81.149: confirmed screenshot geometry is not authoritative Face Lock,
+    # but a currently visible Account-Locked-shaped modal must still fail closed
+    # for THIS package while exact/API proof catches up. No persistent hold/latch.
+    if bad == "face_lock_candidate":
+        removed = core.cancel(pkg)
+        rt_tab["note"] = str(health.get("note") or "visual Account Locked; awaiting exact/API proof")
+        if removed:
+            log_activity(
+                f"visual Account Locked candidate cancelled {removed} queued recovery item(s) for this package",
+                pkg,
+                YELLOW,
+            )
+        core.save()
+        return "Lock?", rt_tab["note"], True
+
     if bad == "face_lock":
         removed = core.cancel(pkg)
         rt_tab["note"] = (
@@ -41794,6 +41870,7 @@ def maybe_start_background_stuck_solver_probe(
     # Face Lock must hold C, but it must not prevent A/B/D from reaching this helper.
     if bad in {
         "face_lock",
+        "face_lock_candidate",
         "account_banned",
         "disconnect",
         "process_unknown",
