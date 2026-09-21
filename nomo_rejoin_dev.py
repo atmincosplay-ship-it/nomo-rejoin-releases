@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.147 — POST-HOLD 404/529 PREEMPTS GENERIC CHALLENGE CLASSIFICATION
+# - Fixes V4.81.146 case where a real post-hold Join Error 529 was caught by the older
+#   generic challenge/moderation path before stale Press-and-hold recovery could claim it.
+# - A recent completed/attempted Press-and-hold action plus exact package-scoped 404/529
+#   now becomes stale_press_hold BEFORE loading moderation / generic challenge routing.
+# - Correlation uses persisted hold-action incident/timestamp, so a NOMO restart between
+#   the hold and the 404/529 does not lose the recovery lineage.
+# - Recovery contract is unchanged: exact target PID + Clear Cache + EXISTING link; NO PS refresh.
+# - Start Puzzle, Face Lock/Account Locked, ban handling, sibling-task safety, and the hold worker are unchanged.
+#
 # V4.81.146 — STALE PRESS/HOLD SESSION RECOVERY (5M / POST-HOLD 404-529)
 # - A Press-and-hold verification incident that stays visible for >=5 minutes is
 #   treated as a stale Security session instead of starting another hold attempt.
@@ -2194,7 +2204,7 @@ _VERIFICATION_HOLD_THREADS = {}
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.146"
+__version__ = "V4.81.147"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -2948,6 +2958,10 @@ DEFAULT_CONFIG = {
     "verification_press_hold_stale_recovery_enabled": True,
     "verification_press_hold_stale_seconds": 300,
     "verification_press_hold_error_recovery_enabled": True,
+    # V4.81.147: exact 404/529 may render after the Security action has already
+    # closed its visible CAPTCHA incident. Keep a bounded package-local lineage
+    # from the actual hold stage so the stale wrapper can still be repaired.
+    "verification_press_hold_error_lineage_seconds": 1800,
     "verification_press_hold_requeue_seconds": 30,
 
     # V4.29: screenshot CAPTCHA fallback for Redfinger builds whose Roblox
@@ -15226,6 +15240,77 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
         state_is_clean_fresh(state, cfg)
         and not state_is_old_after_open(state, rt_tab)
     )
+
+    # V4.81.147: a Press-and-hold that already reached the real hold stage may
+    # transition into exact Security 404 / Join Error 529. Older challenge or
+    # moderation classifiers run below and can otherwise swallow that state first.
+    # Correlate against the persisted package-local hold action, not only the
+    # current captcha_ui_incident_id, so this survives a NOMO restart/UI handoff.
+    if (
+        raw_alive
+        and cfg.get("verification_press_hold_error_recovery_enabled", True)
+        and not _authoritative_face_lock_runtime(rt_tab)
+    ):
+        _hold_lineage_incident = str(
+            rt_tab.get("verification_hold_action_incident_id")
+            or rt_tab.get("verification_hold_attempted_incident_id")
+            or ""
+        )
+        try:
+            _hold_lineage_at = max(
+                int(rt_tab.get("verification_hold_action_started_at", 0) or 0),
+                int(rt_tab.get("verification_hold_completed_at", 0) or 0),
+                int(rt_tab.get("verification_hold_last_terminal_at", 0) or 0),
+            )
+        except Exception:
+            _hold_lineage_at = 0
+        try:
+            _hold_lineage_window = max(60, int(
+                cfg.get("verification_press_hold_error_lineage_seconds", 1800) or 1800
+            ))
+        except Exception:
+            _hold_lineage_window = 1800
+        _hold_lineage_recent = bool(
+            _hold_lineage_incident
+            and _hold_lineage_at > 0
+            and now() - _hold_lineage_at <= _hold_lineage_window
+        )
+        if _hold_lineage_recent:
+            _post_hold_error = android_stale_verification_error_detail(
+                pkg, cfg, force=False
+            )
+            if _post_hold_error and str(_post_hold_error.get("kind") or "") in {"404", "529"}:
+                _error_kind = str(_post_hold_error.get("kind") or "")
+                _stale_reason = (
+                    "Press-and-hold transitioned to 404 Page Not Found"
+                    if _error_kind == "404"
+                    else "Press-and-hold transitioned to Join Error 529"
+                )
+                rt_tab["press_hold_stale_detected_at"] = now()
+                rt_tab["press_hold_stale_reason"] = _stale_reason
+                rt_tab["press_hold_stale_incident_id"] = _hold_lineage_incident
+                rt_tab["press_hold_stale_error_kind"] = _error_kind
+                rt_tab["press_hold_stale_lineage_at"] = _hold_lineage_at
+                rt_tab["note"] = _stale_reason + "; cache+reopen required"
+                log_sig = "|".join([_hold_lineage_incident, _error_kind, str(_hold_lineage_at)])
+                if str(rt_tab.get("press_hold_stale_preempt_log_sig") or "") != log_sig:
+                    rt_tab["press_hold_stale_preempt_log_sig"] = log_sig
+                    log_activity(
+                        f"post-hold {_error_kind} matched recent Press-and-hold lineage -> stale verification recovery",
+                        pkg,
+                        CYAN,
+                    )
+                return {
+                    "pkg": pkg, "user": tab.get("user_name", pkg), "alive": bool(raw_alive),
+                    "state": state, "state_err": err, "fresh": False, "clean_fresh": False,
+                    "pets": int(state.get("pet_count", 0) or 0) if state else "-",
+                    "eggs": int(state.get("egg_total", 0) or 0) if state else "-",
+                    "age": state_age_seconds(state) if state else "-",
+                    "status": "Stale Verify", "note": rt_tab["note"],
+                    "bad": "stale_press_hold", "visible_window": True,
+                    "stale_verification_reason": _stale_reason,
+                    "stale_verification_detail": _post_hold_error,
+                }
 
     # V4.81.77: moderation API is no longer only a recovery/open-boundary check.
     # While an ALIVE clone is unhealthy/loading, poll a package-local background
