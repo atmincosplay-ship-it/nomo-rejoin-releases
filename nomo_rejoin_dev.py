@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+# V4.81.150 — TASK-LOST REPAIR MUST NOT STARVE FRONT RECOVERY
+# - Fixes a queue starvation case where stale Press-and-hold recovery was already
+#   `Next`/front-of-queue but never executed because TASK_LOST_RESTORE kept the
+#   pool-wide destructive hold alive for sibling tasks that were no longer actionable.
+# - Peer no-kill task restore still gets first priority and remains one-at-a-time.
+#   However, peers whose restore attempts are exhausted, whose PID is already DEAD,
+#   or which are intentionally under package-local auth/manual hold are parked out of
+#   the current pool hold instead of blocking every other queued recovery forever.
+# - UNKNOWN process/activity observations remain fail-closed and continue to hold the
+#   destructive queue. Parked peers retain diagnostic state and may be rediscovered by
+#   the normal watchdog later; no force-stop/killall/pkill fallback is added.
+# - V4.81.149 verification detection, stale Press-and-hold cache+existing-link recovery,
+#   solver routing, visual Lock? observation, and the user hold worker are unchanged.
+#
 # V4.81.149 — FRESH-HEARTBEAT PRESS/HOLD OVERRIDE + VISUAL LOCK HOLD
 # - Strong package-local visual Press-and-hold now outranks a clean/fresh Lua heartbeat.
 #   The generic Start Puzzle screenshot heuristic remains Loading-only; only the strict
@@ -2229,7 +2243,7 @@ _VERIFICATION_HOLD_THREADS = {}
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.149"
+__version__ = "V4.81.150"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -5902,39 +5916,92 @@ def maybe_restore_peer_task_loss(core):
 
     candidate = ""
     candidate_rt = None
+    parked = []
+    uncertain = []
     for peer in lost:
         peer_rt = core.runtime_tab(peer)
         blocked, block_note = _peer_task_restore_auth_blocked(peer, peer_rt, cfg, source_pkg)
         if blocked:
+            # Package-local auth/manual holds must not become a pool-wide deadlock.
+            # Leave that package held by its own auth state and release it from this
+            # bounded no-kill repair generation.
             peer_rt["peer_task_restore_state"] = "held"
             peer_rt["peer_task_restore_note"] = block_note
+            peer_rt["peer_task_restore_parked_at"] = now()
+            parked.append((peer, "auth/manual hold: " + str(block_note or "held")))
             continue
         p_status, p_note = package_alive_status(peer, cfg, fresh=True)
         if p_status == "UNKNOWN":
             peer_rt["peer_task_restore_state"] = "deferred"
             peer_rt["peer_task_restore_note"] = "process query unavailable: " + cut(p_note, 60)
+            uncertain.append(peer)
             continue
         if p_status != "ALIVE":
-            peer_rt["peer_task_restore_state"] = "deferred"
-            peer_rt["peer_task_restore_note"] = "PID dead; wait for normal recovery after safety hold"
+            # A DEAD package no longer needs an ALIVE-task materialization repair.
+            # Normal crash/closed recovery owns it after the pool hold is released.
+            peer_rt["peer_task_restore_state"] = "parked_dead"
+            peer_rt["peer_task_restore_note"] = "PID dead; released to normal recovery"
+            peer_rt["peer_task_restore_parked_at"] = now()
+            parked.append((peer, "PID dead"))
             continue
         a_status, a_note = package_activity_status(peer, cfg)
         if a_status == "UNKNOWN":
             peer_rt["peer_task_restore_state"] = "deferred"
             peer_rt["peer_task_restore_note"] = "activity query unavailable: " + cut(a_note, 60)
+            uncertain.append(peer)
             continue
         if a_status == "NO_ACTIVITY":
             attempts = int(peer_rt.get("peer_task_restore_attempts", 0) or 0)
             max_attempts = max(1, int(cfg.get("noka_peer_task_restore_max_attempts", 3) or 3))
             if attempts >= max_attempts:
-                peer_rt["peer_task_restore_state"] = "deferred"
-                peer_rt["peer_task_restore_note"] = f"no-kill restore attempts exhausted ({attempts}); wait for safety hold expiry"
+                # V4.81.150: exhausted no-kill repair is package-local failure, not
+                # permission to starve the entire open queue forever. Park it for
+                # this generation; the ordinary watchdog can classify it again.
+                peer_rt["peer_task_restore_state"] = "exhausted"
+                peer_rt["peer_task_restore_note"] = f"no-kill restore attempts exhausted ({attempts}); pool hold released"
+                peer_rt["peer_task_restore_exhausted_at"] = now()
+                peer_rt["peer_task_restore_parked_at"] = now()
+                # Prevent immediate orphan-reconcile re-arm from recreating the
+                # same global starvation loop on the very next watchdog tick.
+                peer_rt["peer_task_orphan_last_arm_at"] = now()
+                peer_rt["peer_task_orphan_seen_at"] = 0
+                parked.append((peer, f"restore attempts exhausted ({attempts})"))
                 continue
             candidate = peer
             candidate_rt = peer_rt
             break
 
     if not candidate or candidate_rt is None:
+        if parked:
+            parked_names = {peer for peer, _reason in parked}
+            remaining_lost = [peer for peer in lost if peer not in parked_names]
+            rt["_peer_task_safety_lost_pkgs"] = list(remaining_lost)
+            rt["_peer_task_restore_deferred_pkgs"] = [
+                {"package": peer, "reason": reason, "at": now()}
+                for peer, reason in parked
+            ]
+            if not remaining_lost:
+                detail = "; ".join(
+                    short_pkg(peer) + ": " + cut(reason, 55)
+                    for peer, reason in parked
+                )
+                log_activity(
+                    "TASK_LOST_RESTORE released pool hold; no actionable lost peers: "
+                    + cut(detail, 140),
+                    "system",
+                    YELLOW,
+                )
+                _clear_peer_task_safety_hold(
+                    rt,
+                    "no actionable lost peers; package-local deferred/exhausted state retained",
+                )
+                rt["_peer_task_restore_all_restored_at"] = 0
+                core.save()
+                return "cleared"
+            lost = remaining_lost
+
+        # UNKNOWN Android process/activity observations remain fail-closed.
+        # They are the only no-candidate state allowed to keep the global hold.
         rt["_peer_task_restore_next_at"] = now() + max(10, int(cfg.get("noka_peer_task_restore_retry_seconds", 60) or 60))
         core.save()
         return "pending"
