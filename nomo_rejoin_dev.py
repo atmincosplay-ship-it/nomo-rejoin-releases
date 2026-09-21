@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
 # NOMO REJOIN
+# V4.81.148 — UNRESOLVED POST-HOLD LINEAGE + VISUAL JOIN-ERROR FALLBACK
+# - Fixes V4.81.147 missing a visible post-hold 529 when App Cloner/WebView does not
+#   expose the Join Error text through package/Option-16 accessibility nodes.
+# - While a completed Press-and-hold has NOT yet been followed by a newer clean/fresh
+#   game heartbeat, the strict package-cell dark Join Error visual detector may stand
+#   in for missing 529 text and route the session to stale verification recovery.
+# - Post-hold lineage is now resolved by real healthy telemetry, not a short 30-minute
+#   timer. A 24-hour safety cap remains so ancient abandoned runtime cannot classify
+#   unrelated future Join Errors as the old verification incident.
+# - Recovery contract is unchanged: exact target PID -> Clear Cache -> reopen EXISTING
+#   saved link, NO private-server regeneration. Start Puzzle/BlockSolve and real
+#   Account Locked/ban evidence remain separate and authoritative.
+#
 # V4.81.147 — POST-HOLD 404/529 PREEMPTS GENERIC CHALLENGE CLASSIFICATION
 # - Fixes V4.81.146 case where a real post-hold Join Error 529 was caught by the older
 #   generic challenge/moderation path before stale Press-and-hold recovery could claim it.
@@ -2204,7 +2217,7 @@ _VERIFICATION_HOLD_THREADS = {}
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.147"
+__version__ = "V4.81.148"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -2961,7 +2974,7 @@ DEFAULT_CONFIG = {
     # V4.81.147: exact 404/529 may render after the Security action has already
     # closed its visible CAPTCHA incident. Keep a bounded package-local lineage
     # from the actual hold stage so the stale wrapper can still be repaired.
-    "verification_press_hold_error_lineage_seconds": 1800,
+    "verification_press_hold_error_lineage_seconds": 86400,
     "verification_press_hold_requeue_seconds": 30,
 
     # V4.29: screenshot CAPTCHA fallback for Redfinger builds whose Roblox
@@ -15264,28 +15277,64 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
             )
         except Exception:
             _hold_lineage_at = 0
+        # V4.81.148: lineage is resolved by evidence that this package genuinely
+        # returned to a clean/fresh game state AFTER the hold. Time alone must not
+        # discard lineage while a clone sits on the same stale Security/Join Error
+        # for hours. Keep a 24h minimum hard cap only as abandoned-runtime hygiene.
         try:
-            _hold_lineage_window = max(60, int(
-                cfg.get("verification_press_hold_error_lineage_seconds", 1800) or 1800
+            _hold_lineage_window = max(86400, int(
+                cfg.get("verification_press_hold_error_lineage_seconds", 86400) or 86400
             ))
         except Exception:
-            _hold_lineage_window = 1800
+            _hold_lineage_window = 86400
+        try:
+            _state_ts = int((state or {}).get("ts", 0) or 0)
+        except Exception:
+            _state_ts = 0
+        _fresh_after_hold = bool(
+            _hold_lineage_at > 0
+            and state_timestamp_valid(state)
+            and _state_ts > _hold_lineage_at
+            and state_is_clean_fresh(state, cfg)
+        )
+        if _fresh_after_hold:
+            rt_tab["verification_hold_lineage_resolved_incident_id"] = _hold_lineage_incident
+            rt_tab["verification_hold_lineage_resolved_at"] = now()
+            rt_tab["verification_hold_lineage_resolved_reason"] = "fresh clean state after hold"
+
         _hold_lineage_recent = bool(
             _hold_lineage_incident
             and _hold_lineage_at > 0
+            and not _fresh_after_hold
             and now() - _hold_lineage_at <= _hold_lineage_window
         )
         if _hold_lineage_recent:
+            # Prefer exact package/Option-16 text. Some App Cloner WebViews expose
+            # the modal visually but not its 529 text, so under unresolved post-hold
+            # lineage only, the already-strict dark Join Error visual detector is
+            # sufficient stale-session evidence. It still does NOT create Face Lock.
             _post_hold_error = android_stale_verification_error_detail(
-                pkg, cfg, force=False
+                pkg, cfg, force=True
             )
-            if _post_hold_error and str(_post_hold_error.get("kind") or "") in {"404", "529"}:
-                _error_kind = str(_post_hold_error.get("kind") or "")
-                _stale_reason = (
-                    "Press-and-hold transitioned to 404 Page Not Found"
-                    if _error_kind == "404"
-                    else "Press-and-hold transitioned to Join Error 529"
+            if not _post_hold_error:
+                _visual_join = visual_join_error_detail(
+                    pkg, cfg, force=True, bypass_confirm=True
                 )
+                if _visual_join:
+                    _post_hold_error = dict(_visual_join)
+                    _post_hold_error["kind"] = "join_error_visual"
+                    _post_hold_error["code"] = ""
+                    _post_hold_error["reason"] = "stale_verification_visual_join_error"
+                    _post_hold_error["evidence_source"] = "visual_join_error_after_press_hold"
+
+            if _post_hold_error and str(_post_hold_error.get("kind") or "") in {"404", "529", "join_error_visual"}:
+                _error_kind = str(_post_hold_error.get("kind") or "")
+                if _error_kind == "404":
+                    _stale_reason = "Press-and-hold transitioned to 404 Page Not Found"
+                elif _error_kind == "529":
+                    _stale_reason = "Press-and-hold transitioned to Join Error 529"
+                else:
+                    _stale_reason = "Press-and-hold transitioned to visual Join Error"
                 rt_tab["press_hold_stale_detected_at"] = now()
                 rt_tab["press_hold_stale_reason"] = _stale_reason
                 rt_tab["press_hold_stale_incident_id"] = _hold_lineage_incident
@@ -15296,7 +15345,7 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
                 if str(rt_tab.get("press_hold_stale_preempt_log_sig") or "") != log_sig:
                     rt_tab["press_hold_stale_preempt_log_sig"] = log_sig
                     log_activity(
-                        f"post-hold {_error_kind} matched recent Press-and-hold lineage -> stale verification recovery",
+                        f"post-hold {_error_kind} matched unresolved Press-and-hold lineage -> stale verification recovery",
                         pkg,
                         CYAN,
                     )
