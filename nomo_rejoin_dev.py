@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+# V4.81.151 — IMMEDIATE PACKAGE-LOCAL MODERATION RESULT CONSUMPTION
+# - Face Lock / banned API results are now polled for every ALIVE package, not only
+#   while telemetry says loading/no-fresh. A stale clean Lua heartbeat can no longer
+#   leave a completed moderation result stranded and the row stuck on Next/Waiting.
+# - Exact Account Locked / banned accessibility text is checked regardless of fresh
+#   telemetry and immediately outranks queue cosmetics.
+# - A confirmed package-rect visual Account Locked candidate may start one immediate
+#   package-local moderation API check (bounded to >=60s) instead of waiting behind
+#   the generic 5-minute loading moderation throttle. Siblings are never held/stopped.
+# - Numeric restriction source=5/status=2 remains advisory; Face Lock still requires
+#   explicit lock wording or exact Account Locked UI, preserving the V4.81.139 guard.
+#
 # V4.81.150 — TASK-LOST REPAIR MUST NOT STARVE FRONT RECOVERY
 # - Fixes a queue starvation case where stale Press-and-hold recovery was already
 #   `Next`/front-of-queue but never executed because TASK_LOST_RESTORE kept the
@@ -2243,7 +2255,7 @@ _VERIFICATION_HOLD_THREADS = {}
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.150"
+__version__ = "V4.81.151"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -15440,15 +15452,21 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
                     "stale_verification_detail": _post_hold_error,
                 }
 
-    # V4.81.77: moderation API is no longer only a recovery/open-boundary check.
-    # While an ALIVE clone is unhealthy/loading, poll a package-local background
-    # Not Approved check without blocking the dashboard.
-    if raw_alive and not loading_online_proof:
+    # V4.81.151: always consume a completed package-local moderation job for an
+    # ALIVE clone, even when stale Lua telemetry still claims a clean/online state.
+    # Previously a visual Account Locked candidate could start the API worker while
+    # a fresh heartbeat was present, but the result was only polled in loading/no-fresh
+    # state and could remain stranded forever.
+    if raw_alive:
         loading_mod = poll_loading_moderation_job(pkg, rt_tab, cfg)
         if loading_mod is not None:
             return _moderation_health_result(
                 tab, rt_tab, state, err, raw_alive, loading_mod
             )
+
+    # Generic proactive moderation polling remains limited to unhealthy/loading
+    # ALIVE clones so normal healthy accounts do not spam Roblox's endpoint.
+    if raw_alive and not loading_online_proof:
         if start_loading_moderation_job(tab, cfg, rt_tab):
             log_activity(
                 "loading/no-fresh -> moderation API check started (package-only)",
@@ -15471,7 +15489,10 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
             clear_manual_login_block(rt_tab)
             clear_hold(pkg)
             log_activity("clean in-game state; face-lock hold cleared", pkg, GREEN)
-    account_ui = android_account_status_ui_detail(pkg, cfg, force=False) if face_lock_scan_eligible else None
+    # V4.81.151: exact Account Locked / banned text is authoritative and must
+    # outrank even a stale clean Lua heartbeat. Keep only screenshot heuristics
+    # subject to their own false-positive gates.
+    account_ui = android_account_status_ui_detail(pkg, cfg, force=False) if raw_alive else None
     if account_ui and account_ui.get("kind") == "account_banned":
         detail = str(account_ui.get("text") or "account banned/terminated")
         retry_seconds = max(3600, int(cfg.get("manual_auth_retry_seconds", 3600) or 3600))
@@ -15547,7 +15568,15 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
         # even when the Lua heartbeat is still fresh. This remains throttled by the
         # normal API interval and never touches sibling packages.
         try:
-            start_loading_moderation_job(tab, cfg, rt_tab)
+            started_visual_api = start_loading_moderation_job(
+                tab, cfg, rt_tab, force=True, reason="visual_account_locked"
+            )
+            if started_visual_api:
+                log_activity(
+                    "visual Account Locked -> immediate moderation API check started (package-only)",
+                    pkg,
+                    CYAN,
+                )
         except Exception:
             pass
         # V4.81.149: this detector is already package-rect scoped and requires
@@ -17666,8 +17695,15 @@ def _loading_moderation_worker(package, cfg_snapshot):
             job.update(result)
 
 
-def start_loading_moderation_job(tab, cfg, rt_tab):
-    """Start one nonblocking API moderation check for an unhealthy ALIVE clone."""
+def start_loading_moderation_job(tab, cfg, rt_tab, force=False, reason="loading"):
+    """Start one nonblocking package-local Roblox moderation check.
+
+    Normal unhealthy/loading probes keep the historical >=5m throttle. A confirmed
+    package-rect visual Account Locked candidate may request ``force=True`` so one
+    immediate check is not blocked by an unrelated recent loading probe. Forced
+    checks still obey a separate >=60s package-local interval and never duplicate an
+    already-running/completed-unconsumed job.
+    """
     if not cfg.get("api_precheck_not_approved_enabled", True):
         return False
 
@@ -17680,6 +17716,13 @@ def start_loading_moderation_job(tab, cfg, rt_tab):
         int(cfg.get("api_loading_moderation_interval_seconds", 300) or 300),
     )
     last_started = int(rt_tab.get("loading_moderation_last_started_at", 0) or 0)
+    force_interval = max(
+        60,
+        int(cfg.get("api_visual_lock_moderation_interval_seconds", 60) or 60),
+    )
+    force_last_started = int(
+        rt_tab.get("visual_lock_moderation_last_started_at", 0) or 0
+    )
 
     with _LOADING_MODERATION_LOCK:
         existing = _LOADING_MODERATION_JOBS.get(pkg)
@@ -17689,7 +17732,10 @@ def start_loading_moderation_job(tab, cfg, rt_tab):
             # Let the dashboard consume the completed result first.
             return False
 
-        if last_started > 0 and now() - last_started < interval:
+        if force:
+            if force_last_started > 0 and now() - force_last_started < force_interval:
+                return False
+        elif last_started > 0 and now() - last_started < interval:
             return False
 
         _LOADING_MODERATION_JOBS[pkg] = {
@@ -17697,8 +17743,12 @@ def start_loading_moderation_job(tab, cfg, rt_tab):
             "hit": None,
             "detail": "",
             "started_at": now(),
+            "reason": str(reason or "loading"),
         }
         rt_tab["loading_moderation_last_started_at"] = now()
+        rt_tab["loading_moderation_last_reason"] = str(reason or "loading")
+        if force:
+            rt_tab["visual_lock_moderation_last_started_at"] = now()
 
     thread = threading.Thread(
         target=_loading_moderation_worker,
