@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+# V4.81.152 — GLOBAL PRESS/HOLD FOCUS SLOT / ONE-BY-ONE DEVICE INPUT
+# - Press-and-hold detection remains concurrent across nokaA-D, but foreground-dependent
+#   verification interaction is now globally serialized per Redfinger device. Only one
+#   package may own the focus/recheck/hold slot at a time; additional detected packages
+#   wait without tapping or stealing focus from the active package.
+# - Waiting workers re-detect their own Press-and-hold only after they acquire the slot,
+#   so a challenge that disappears while queued cancels cleanly and remains retryable.
+# - Slot ownership is released on every exit path (success, cancellation, exception), and
+#   diagnostic state records waiting/acquired/released transitions for multi-challenge tests.
+# - No hold duration, detector geometry, solver, stale-session recovery, Face Lock/ban,
+#   PID/cache, sibling-task, or private-server behavior is changed.
+#
 # V4.81.151 — IMMEDIATE PACKAGE-LOCAL MODERATION RESULT CONSUMPTION
 # - Face Lock / banned API results are now polled for every ALIVE package, not only
 #   while telemetry says loading/no-fresh. A stale clean Lua heartbeat can no longer
@@ -2246,16 +2258,22 @@ import traceback
 from pathlib import Path
 from datetime import datetime
 
-# V4.81.138: Android input is global to the Redfinger device. Serialize
-# verification holds so two clone challenges cannot issue overlapping touch events.
+# Registry/state lock for package-local verification worker bookkeeping.
 _VERIFICATION_HOLD_LOCK = threading.Lock()
 _VERIFICATION_HOLD_THREADS = {}
+
+# V4.81.152: Android foreground/input is device-global. This mutex is intentionally
+# separate from the registry lock: workers for multiple packages may be detected and
+# queued concurrently, but only ONE package may focus/recheck/hold at a time.
+_VERIFICATION_FOCUS_LOCK = threading.Lock()
+_VERIFICATION_FOCUS_OWNER = ""
+_VERIFICATION_FOCUS_INCIDENT = ""
 
 # Single source of truth for the build number. Bump this on every update — it is
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.151"
+__version__ = "V4.81.152"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -3004,6 +3022,7 @@ DEFAULT_CONFIG = {
     "verification_press_hold_delay_seconds": 3,
     "verification_press_hold_duration_ms": 18000,
     "verification_press_hold_focus_tap_wait_seconds": 1.0,
+    "verification_press_hold_slot_wait_seconds": 120,
     # V4.81.146: stale Press-and-hold session recovery. This does not apply to
     # Start Puzzle/provider-backed verification.
     "verification_press_hold_stale_recovery_enabled": True,
@@ -4633,6 +4652,13 @@ def apply_update_migrations(cfg):
         set_cfg("verification_press_hold_focus_tap_wait_seconds", 0.5)
     elif _focus_wait > 3.0:
         set_cfg("verification_press_hold_focus_tap_wait_seconds", 3.0)
+    # V4.81.152: keep the one-by-one device focus queue bounded but long enough
+    # for several simultaneous 18-second holds to finish sequentially.
+    _slot_wait = _int_cfg(cfg.get("verification_press_hold_slot_wait_seconds"), 120)
+    if _slot_wait < 30:
+        set_cfg("verification_press_hold_slot_wait_seconds", 120)
+    elif _slot_wait > 300:
+        set_cfg("verification_press_hold_slot_wait_seconds", 300)
     # V4.81.146: preserve explicit enable/disable choices while repairing invalid
     # stale-session thresholds.
     if "verification_press_hold_stale_recovery_enabled" not in cfg:
@@ -18443,13 +18469,19 @@ def _verification_visual_button_bounds(frame, rect, kind):
 def _verification_press_hold_worker(pkg, cfg, rt_tab, incident_id, center, delay_seconds, hold_ms):
     """Focus/click the detected verification action, then perform one long hold.
 
+    V4.81.152 adds one device-global focus/input slot so simultaneous package
+    challenges cannot steal foreground focus from each other.
+
     V4.81.145 lifecycle:
       * queued/pending is NOT the same as attempted;
       * cancellations before the actual long-hold command clear pending state;
       * the incident is marked attempted only when the long-hold command is reached.
     """
+    global _VERIFICATION_FOCUS_OWNER, _VERIFICATION_FOCUS_INCIDENT
+
     pkg = str(pkg or "")
     action_stage_reached = False
+    slot_acquired = False
     terminal_state = "cancelled"
     terminal_reason = "worker ended before hold stage"
 
@@ -18467,17 +18499,42 @@ def _verification_press_hold_worker(pkg, cfg, rt_tab, incident_id, center, delay
             log_activity("verification hold cancelled; " + terminal_reason, pkg, YELLOW)
             return
 
-        rt_tab["verification_hold_state"] = "queued"
+        rt_tab["verification_hold_state"] = "waiting_focus_slot"
         rt_tab["verification_hold_pending_incident_id"] = str(incident_id or "")
         rt_tab["verification_hold_worker_started_at"] = now()
+        rt_tab["verification_hold_focus_slot_wait_started_at"] = now()
+
+        try:
+            slot_wait = max(30, min(300, int(cfg.get("verification_press_hold_slot_wait_seconds", 120) or 120)))
+        except Exception:
+            slot_wait = 120
 
         log_activity(
-            f"verification hold armed @ {x},{y}; waiting {delay_seconds}s before focus tap",
+            f"verification hold waiting for exclusive device focus slot (max {slot_wait}s)",
+            pkg,
+            CYAN,
+        )
+        slot_acquired = _VERIFICATION_FOCUS_LOCK.acquire(timeout=slot_wait)
+        if not slot_acquired:
+            terminal_reason = f"device focus slot wait timed out after {slot_wait}s"
+            rt_tab["verification_hold_focus_slot_timeout_at"] = now()
+            log_activity("verification hold cancelled; " + terminal_reason, pkg, YELLOW)
+            return
+
+        _VERIFICATION_FOCUS_OWNER = pkg
+        _VERIFICATION_FOCUS_INCIDENT = str(incident_id or "")
+        rt_tab["verification_hold_focus_slot_acquired_at"] = now()
+        rt_tab["verification_hold_state"] = "slot_owned"
+        rt_tab["verification_hold_focus_slot_owner"] = pkg
+        log_activity(
+            f"verification focus slot ACQUIRED; waiting {delay_seconds}s before focus tap",
             pkg,
             CYAN,
         )
         time.sleep(delay_seconds)
 
+        # Re-detect only AFTER this package owns the device focus slot. A challenge
+        # may have disappeared while waiting behind another package.
         fresh = verification_action_location(pkg, cfg, force=True)
         if not isinstance(fresh, dict) or str(fresh.get("kind") or "") != "press_and_hold":
             terminal_reason = "Press-and-hold no longer visible before focus tap"
@@ -18614,6 +18671,21 @@ def _verification_press_hold_worker(pkg, cfg, rt_tab, incident_id, center, delay
         rt_tab["verification_hold_last_terminal_at"] = now()
         rt_tab["verification_hold_state"] = terminal_state
 
+        if slot_acquired:
+            try:
+                rt_tab["verification_hold_focus_slot_released_at"] = now()
+                rt_tab["verification_hold_focus_slot_owner"] = ""
+                _VERIFICATION_FOCUS_OWNER = ""
+                _VERIFICATION_FOCUS_INCIDENT = ""
+                _VERIFICATION_FOCUS_LOCK.release()
+                log_activity("verification focus slot RELEASED", pkg, CYAN)
+            except Exception as exc:
+                log_activity(
+                    "verification focus slot release warning: " + cut(exc, 120),
+                    pkg,
+                    YELLOW,
+                )
+
         with _VERIFICATION_HOLD_LOCK:
             _VERIFICATION_HOLD_THREADS.pop(pkg, None)
             if str(rt_tab.get("verification_hold_pending_incident_id") or "") == str(incident_id or ""):
@@ -18643,6 +18715,8 @@ def _verification_hold_diag(rt_tab, pkg, reason, action_loc=None, *, color=YELLO
     attempted_id = str(rt_tab.get("verification_hold_attempted_incident_id") or "").strip()
     pending_id = str(rt_tab.get("verification_hold_pending_incident_id") or "").strip()
     hold_state = str(rt_tab.get("verification_hold_state") or "").strip()
+    focus_owner = str(_VERIFICATION_FOCUS_OWNER or "")
+    focus_incident = str(_VERIFICATION_FOCUS_INCIDENT or "")
     with _VERIFICATION_HOLD_LOCK:
         worker_running = bool(pkg in _VERIFICATION_HOLD_THREADS)
     center = list(loc.get("center") or [])
@@ -18660,11 +18734,14 @@ def _verification_hold_diag(rt_tab, pkg, reason, action_loc=None, *, color=YELLO
     rt_tab["verification_hold_diag_pending_incident_id"] = pending_id
     rt_tab["verification_hold_diag_state"] = hold_state
     rt_tab["verification_hold_diag_worker_running"] = worker_running
+    rt_tab["verification_hold_diag_focus_owner"] = focus_owner
+    rt_tab["verification_hold_diag_focus_incident"] = focus_incident
     sig = "|".join([
         str(reason or ""), kind, source,
         ",".join(str(v) for v in center),
         ",".join(str(v) for v in bounds),
         incident_id, attempted_id, pending_id, hold_state, str(int(worker_running)),
+        focus_owner, focus_incident,
     ])
     if str(rt_tab.get("verification_hold_diag_last_gate_sig") or "") != sig:
         rt_tab["verification_hold_diag_last_gate_sig"] = sig
@@ -18674,7 +18751,8 @@ def _verification_hold_diag(rt_tab, pkg, reason, action_loc=None, *, color=YELLO
             + f" | kind={kind or '-'} source={source or '-'} center={center or '-'} "
             + f"incident={incident_id or '-'} pending={pending_id or '-'} "
             + f"attempted={attempted_id or '-'} state={hold_state or '-'} "
-            + f"worker={'yes' if worker_running else 'no'}",
+            + f"worker={'yes' if worker_running else 'no'} "
+            + f"focus_owner={focus_owner or '-'}",
             pkg,
             color,
         )
