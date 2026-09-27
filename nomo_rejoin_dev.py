@@ -1,4 +1,15 @@
 #!/usr/bin/env python3
+# V4.81.153 — OWNED-APP ADAPTIVE PRESS/HOLD VISUAL RELEASE HARNESS
+# - Advanced Tools -> Press/Hold test gains an owned/non-Roblox adaptive hold mode.
+#   It captures the idle button as a visual baseline, sends explicit DOWN, watches the
+#   same button bounds for the brighter progress fill, and releases immediately after
+#   a stable COMPLETE/full-progress visual instead of sleeping for a fixed duration.
+# - The report records IDLE -> HOLDING -> COMPLETE transition timings, progress ratios,
+#   release reason, and post-release success text/target visibility. A hard timeout always
+#   sends UP in finally so a failed detector cannot leave the owned test UI pressed.
+# - Configured Noka/Roblox packages remain refused for synthetic input in this test tool;
+#   their menu entry remains detector-only. Live NOMO verification behavior is unchanged.
+#
 # V4.81.152 — GLOBAL PRESS/HOLD FOCUS SLOT / ONE-BY-ONE DEVICE INPUT
 # - Press-and-hold detection remains concurrent across nokaA-D, but foreground-dependent
 #   verification interaction is now globally serialized per Redfinger device. Only one
@@ -2273,7 +2284,7 @@ _VERIFICATION_FOCUS_INCIDENT = ""
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.152"
+__version__ = "V4.81.153"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -52462,6 +52473,280 @@ def _owned_press_hold_wait_for_node(package, target_text, cfg, timeout_seconds=6
     return None, last_error or "target text not visible"
 
 
+def _owned_press_hold_visual_progress(frame, baseline_frame, bounds):
+    """Estimate brighter-blue progress fill inside one owned-app button.
+
+    This deliberately compares the current frame against the same button's idle
+    baseline instead of assuming one exact app/theme color. White text/spinners are
+    excluded by the blue-dominance gate. Returned progress_ratio is approximately
+    the fraction of the button interior that changed from the idle blue to a
+    materially brighter blue.
+    """
+    if not frame or not baseline_frame or not bounds:
+        return {"ok": False, "progress_ratio": 0.0, "samples": 0, "reason": "frame/bounds missing"}
+    try:
+        width = int(frame["width"]); height = int(frame["height"])
+        bwidth = int(baseline_frame["width"]); bheight = int(baseline_frame["height"])
+        if width != bwidth or height != bheight:
+            return {"ok": False, "progress_ratio": 0.0, "samples": 0, "reason": "frame size changed"}
+        cur = frame["pixels"]; base = baseline_frame["pixels"]
+        x1, y1, x2, y2 = [int(v) for v in bounds]
+    except Exception as exc:
+        return {"ok": False, "progress_ratio": 0.0, "samples": 0, "reason": cut(exc, 80)}
+
+    x1 = max(0, min(width - 1, x1)); x2 = max(x1 + 1, min(width, x2))
+    y1 = max(0, min(height - 1, y1)); y2 = max(y1 + 1, min(height, y2))
+    bw, bh = x2 - x1, y2 - y1
+    if bw < 20 or bh < 8:
+        return {"ok": False, "progress_ratio": 0.0, "samples": 0, "reason": "button bounds too small"}
+
+    # Ignore rounded edges and most label/spinner pixels. The middle band is where
+    # the progress fill is visually stable in the owned-app test UI.
+    sx1 = x1 + max(2, int(bw * 0.05)); sx2 = x2 - max(2, int(bw * 0.05))
+    sy1 = y1 + max(1, int(bh * 0.20)); sy2 = y2 - max(1, int(bh * 0.20))
+    step = max(1, min(3, bw // 180 if bw >= 180 else 1))
+    changed = 0
+    blue_now = 0
+    samples = 0
+    delta_sum = 0.0
+    for y in range(sy1, sy2, step):
+        row = y * width * 4
+        for x in range(sx1, sx2, step):
+            i = row + x * 4
+            br = int(base[i]); bg = int(base[i + 1]); bb = int(base[i + 2])
+            r = int(cur[i]); g = int(cur[i + 1]); b = int(cur[i + 2])
+            samples += 1
+            # Saturated blue-like current pixels only. This rejects white text,
+            # neutral panel background, and the small white completion spinner.
+            blue_like = bool(b >= 75 and b - r >= 35 and b - g >= 20)
+            if blue_like:
+                blue_now += 1
+            # The example owned UI changes the progress portion to a much brighter
+            # royal blue. Compare to its own baseline so dim/bright displays both work.
+            db = b - bb; dg = g - bg; dr = r - br
+            if blue_like and db >= 28 and dg >= 12 and (db + dg + max(0, dr)) >= 48:
+                changed += 1
+                delta_sum += float(db + dg + max(0, dr))
+
+    ratio = (changed / samples) if samples else 0.0
+    return {
+        "ok": bool(samples),
+        "progress_ratio": float(ratio),
+        "blue_ratio": (blue_now / samples) if samples else 0.0,
+        "changed_samples": int(changed),
+        "samples": int(samples),
+        "mean_progress_delta": (delta_sum / changed) if changed else 0.0,
+        "reason": "",
+    }
+
+
+def _owned_press_hold_motion_event(action, x, y, cfg):
+    action = str(action or "").strip().upper()
+    if action not in {"DOWN", "MOVE", "UP"}:
+        return 2, "invalid motion action"
+    return shell_timeout(
+        f"input motionevent {action} {int(x)} {int(y)}",
+        cfg,
+        capture=True,
+        timeout=8,
+    )
+
+
+def _owned_press_hold_run_adaptive_attempt(
+    package,
+    target_text,
+    timeout_ms,
+    success_texts,
+    cfg,
+    report_rows,
+    *,
+    poll_ms=120,
+    holding_threshold=0.05,
+    complete_threshold=0.78,
+    complete_confirmations=2,
+):
+    """Owned-app visual progress hold: DOWN -> watch fill -> UP at COMPLETE.
+
+    Synthetic input is only reachable from owned_press_hold_test_menu(), which
+    rejects configured Noka/Roblox package names before this function is called.
+    """
+    node, err = _owned_press_hold_wait_for_node(package, target_text, cfg, timeout_seconds=60)
+    started_wall = int(time.time())
+    started_mono = time.monotonic()
+    if not node:
+        row = {
+            "mode": "adaptive_visual_release",
+            "started_at": started_wall,
+            "timeout_ms": int(timeout_ms),
+            "success": False,
+            "error": "target not found: " + str(err or ""),
+        }
+        report_rows.append(row)
+        print(col("Target not found: " + str(err or ""), RED))
+        return row
+
+    bounds = list(node.get("bounds") or [])
+    center = list(node.get("center") or [])
+    if len(bounds) != 4 or len(center) < 2:
+        row = {
+            "mode": "adaptive_visual_release",
+            "started_at": started_wall,
+            "timeout_ms": int(timeout_ms),
+            "success": False,
+            "error": "target bounds/center missing",
+            "target_before": node,
+        }
+        report_rows.append(row)
+        print(col("Target bounds/center missing.", RED))
+        return row
+
+    x, y = int(center[0]), int(center[1])
+    baseline, baseline_err = _capture_screencap_raw(cfg, timeout=10)
+    if not baseline:
+        row = {
+            "mode": "adaptive_visual_release",
+            "started_at": started_wall,
+            "timeout_ms": int(timeout_ms),
+            "success": False,
+            "error": "baseline screenshot failed: " + str(baseline_err or ""),
+            "target_before": node,
+        }
+        report_rows.append(row)
+        print(col(row["error"], RED))
+        return row
+
+    transitions = [{"stage": "IDLE", "elapsed_ms": 0, "progress_ratio": 0.0}]
+    samples = []
+    stage = "IDLE"
+    complete_hits = 0
+    release_reason = "timeout"
+    down_sent = False
+    down_rc = -1
+    down_out = ""
+    up_rc = -1
+    up_out = ""
+    last_move_at = 0.0
+
+    print(col(f"Detected {target_text!r} @ {x},{y}  bounds={bounds}", CYAN))
+    print(col(
+        f"Adaptive hold: watching visual progress; timeout={int(timeout_ms)}ms, "
+        f"complete>={float(complete_threshold):.0%}",
+        CYAN,
+    ))
+
+    try:
+        down_rc, down_out = _owned_press_hold_motion_event("DOWN", x, y, cfg)
+        if down_rc != 0:
+            release_reason = "down_failed"
+            print(col(f"DOWN failed rc={down_rc}: {cut(down_out, 120)}", RED))
+        else:
+            down_sent = True
+            deadline = time.monotonic() + max(0.5, int(timeout_ms) / 1000.0)
+            while time.monotonic() < deadline:
+                frame, ferr = _capture_screencap_raw(cfg, timeout=5)
+                elapsed_ms = int((time.monotonic() - started_mono) * 1000)
+                if frame:
+                    metrics = _owned_press_hold_visual_progress(frame, baseline, bounds)
+                    ratio = float(metrics.get("progress_ratio", 0.0) or 0.0)
+                    samples.append({
+                        "elapsed_ms": elapsed_ms,
+                        "progress_ratio": round(ratio, 4),
+                        "blue_ratio": round(float(metrics.get("blue_ratio", 0.0) or 0.0), 4),
+                        "changed_samples": int(metrics.get("changed_samples", 0) or 0),
+                        "samples": int(metrics.get("samples", 0) or 0),
+                    })
+                    if stage == "IDLE" and ratio >= float(holding_threshold):
+                        stage = "HOLDING"
+                        transitions.append({"stage": stage, "elapsed_ms": elapsed_ms, "progress_ratio": round(ratio, 4)})
+                        print(col(f"HOLDING detected @ {elapsed_ms}ms  progress={ratio:.0%}", CYAN))
+                    if ratio >= float(complete_threshold):
+                        complete_hits += 1
+                    else:
+                        complete_hits = 0
+                    if complete_hits >= max(1, int(complete_confirmations)):
+                        stage = "COMPLETE"
+                        transitions.append({"stage": stage, "elapsed_ms": elapsed_ms, "progress_ratio": round(ratio, 4)})
+                        release_reason = "visual_complete"
+                        print(col(f"COMPLETE detected @ {elapsed_ms}ms  progress={ratio:.0%}; releasing", GREEN))
+                        break
+                else:
+                    samples.append({"elapsed_ms": elapsed_ms, "capture_error": str(ferr or "")})
+
+                # Send an occasional stationary MOVE while the pointer is down. This
+                # keeps owned test UIs that expect a continuing gesture updated.
+                now_mono = time.monotonic()
+                if now_mono - last_move_at >= 0.45:
+                    _owned_press_hold_motion_event("MOVE", x, y, cfg)
+                    last_move_at = now_mono
+                time.sleep(max(0.05, int(poll_ms) / 1000.0))
+            else:
+                elapsed_ms = int((time.monotonic() - started_mono) * 1000)
+                transitions.append({"stage": "TIMEOUT", "elapsed_ms": elapsed_ms, "progress_ratio": round(float(samples[-1].get("progress_ratio", 0.0)) if samples else 0.0, 4)})
+                print(col(f"Adaptive hold timeout @ {elapsed_ms}ms; releasing", YELLOW))
+    finally:
+        if down_sent:
+            up_rc, up_out = _owned_press_hold_motion_event("UP", x, y, cfg)
+            if up_rc != 0:
+                print(col(f"UP warning rc={up_rc}: {cut(up_out, 120)}", YELLOW))
+
+    released_ms = int((time.monotonic() - started_mono) * 1000)
+    time.sleep(0.8)
+    after, after_err = _owned_press_hold_find_ui_node(package, target_text, cfg)
+    visible_text = _owned_press_hold_visible_text(package, cfg)
+    joined = "\n".join(visible_text).lower()
+    matched = ""
+    for value in success_texts or []:
+        value = str(value or "").strip()
+        if value and value.lower() in joined:
+            matched = value
+            break
+
+    success = bool(
+        down_rc == 0
+        and up_rc == 0
+        and (
+            release_reason == "visual_complete"
+            or matched
+            or after is None
+        )
+    )
+    row = {
+        "mode": "adaptive_visual_release",
+        "started_at": started_wall,
+        "timeout_ms": int(timeout_ms),
+        "poll_ms": int(poll_ms),
+        "holding_threshold": float(holding_threshold),
+        "complete_threshold": float(complete_threshold),
+        "complete_confirmations": int(complete_confirmations),
+        "target_before": node,
+        "down_returncode": int(down_rc),
+        "down_output": cut(down_out, 240),
+        "release_reason": release_reason,
+        "released_at_ms": int(released_ms),
+        "up_returncode": int(up_rc),
+        "up_output": cut(up_out, 240),
+        "transitions": transitions,
+        "progress_samples": samples[-120:],
+        "target_still_visible": bool(after),
+        "target_after": after,
+        "success_text_match": matched,
+        "visible_text_after": visible_text[-40:],
+        "success": success,
+        "after_error": str(after_err or ""),
+    }
+    report_rows.append(row)
+    if success:
+        why = "visual COMPLETE" if release_reason == "visual_complete" else (f"success text {matched!r}" if matched else "target disappeared")
+        print(col("PASS: " + why + f"; released @ {released_ms}ms", GREEN))
+    else:
+        print(col(
+            f"FAILED: release={release_reason}, DOWN rc={down_rc}, UP rc={up_rc}, "
+            f"target_visible={'yes' if after else 'no'}",
+            YELLOW,
+        ))
+    return row
+
+
 def _owned_press_hold_run_attempt(package, target_text, duration_ms, success_texts, cfg, report_rows):
     node, err = _owned_press_hold_wait_for_node(package, target_text, cfg, timeout_seconds=60)
     started_at = int(time.time())
@@ -52601,7 +52886,8 @@ def owned_press_hold_test_menu(cfg):
         print(col("1  Owned app: detect only", CYAN))
         print(col("2  Owned app: one long-press", CYAN))
         print(col("3  Owned app: duration sweep", CYAN))
-        print(col("4  Noka A-D / Roblox: detector test only", CYAN))
+        print(col("4  Owned app: adaptive visual release", CYAN))
+        print(col("5  Noka A-D / Roblox: detector test only", CYAN))
         print(col("0  Back", RED))
         print("")
         print(col("Synthetic input is refused for configured Noka/Roblox packages in this test tool.", DIM))
@@ -52609,20 +52895,40 @@ def owned_press_hold_test_menu(cfg):
         choice = clean_terminal_input(input("Choose: ")).strip().lower()
         if choice in {"0", "q", "b", "back", ""}:
             return
-        if choice == "4":
+        if choice == "5":
             noka_verification_detector_test_menu(cfg)
             continue
-        if choice not in {"1", "2", "3"}:
+        if choice not in {"1", "2", "3", "4"}:
             print(col("Invalid option.", RED)); time.sleep(1); continue
 
         package = clean_terminal_input(input("Owned app package (example com.example.app): ")).strip()
         if not package:
             continue
         if _owned_press_hold_package_is_noka_or_roblox(package, cfg):
-            print(col("This target is Noka/Roblox; use option 4 for detection-only testing.", YELLOW))
+            print(col("This target is Noka/Roblox; use option 5 for detection-only testing.", YELLOW))
             pause()
             continue
         target_text = clean_terminal_input(input("Target text [Press and hold]: ")).strip() or "Press and hold"
+
+        if choice == "4":
+            success_raw = clean_terminal_input(input("Success text(s), comma-separated [optional]: ")).strip()
+            success_texts = [x.strip() for x in success_raw.split(",") if x.strip()]
+            raw_timeout = clean_terminal_input(input("Hard timeout ms [12000]: ")).strip() or "12000"
+            raw_poll = clean_terminal_input(input("Visual poll ms [120]: ")).strip() or "120"
+            try:
+                timeout_ms = max(1000, min(30000, int(raw_timeout)))
+                poll_ms = max(60, min(1000, int(raw_poll)))
+            except Exception:
+                print(col("Invalid timeout/poll value.", RED)); pause(); continue
+            attempts = []
+            _owned_press_hold_run_adaptive_attempt(
+                package, target_text, timeout_ms, success_texts, cfg, attempts, poll_ms=poll_ms
+            )
+            report_path = _owned_press_hold_write_report(package, target_text, success_texts, attempts)
+            print("")
+            print(col("Report: ", DIM) + report_path)
+            pause()
+            continue
 
         if choice == "1":
             node, err = _owned_press_hold_find_ui_node(package, target_text, cfg)
