@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+# V4.81.155 — REAL GAME-NAME SLUG FOR PRIVATE-SERVER BROWSER LINKS
+# - Fixes the cosmetic /NOMO slug used in generated Roblox browser links. Known Grow a Garden
+#   places now use their real slugs: Grow-a-Garden and Grow-a-Garden-Trade-World.
+# - Manual Hatcher Discord sharing also prefers the saved private_server_game_name when present,
+#   sanitized into a Roblox-style URL slug, with the known PlaceId mapping as fallback.
+# - Actual Android private-server joining is unchanged: NOMO still converts private routes to
+#   roblox://placeId=<id>&linkCode=<code> (or accessCode) immediately before launch, so the old
+#   /NOMO text was never used as routing authority.
+#
 # V4.81.154 — MANUAL HATCHER PRIVATE-SERVER DISCORD SHARE
 # - Advanced Tools adds a manual-only "Send Hatcher PS to webhook" action beside
 #   full diagnostics. It uses the same hardcoded diagnostic Discord webhook.
@@ -2293,7 +2302,7 @@ _VERIFICATION_FOCUS_INCIDENT = ""
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.154"
+__version__ = "V4.81.155"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -6697,6 +6706,21 @@ def roblox_server_share_deep_link(link):
     return ""
 
 
+def roblox_game_url_slug(place_id, game_name=""):
+    """Return a human-readable Roblox /games/<id>/<slug> segment."""
+    pid = str(place_id or "").strip()
+    raw_name = str(game_name or "").strip()
+    if not raw_name:
+        raw_name = {
+            "126884695634066": "Grow a Garden",
+            "129954712878723": "Grow a Garden Trade World",
+        }.get(pid, "")
+    if not raw_name:
+        return "Game"
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", raw_name).strip("-")
+    return slug or "Game"
+
+
 def _private_route_from_text(text):
     raw = str(text or "").strip()
     if not raw:
@@ -6742,14 +6766,14 @@ def _private_route_from_text(text):
         return (
             "https://www.roblox.com/games/"
             + str(place_id)
-            + "/NOMO?privateServerLinkCode="
+            + "/" + roblox_game_url_slug(place_id) + "?privateServerLinkCode="
             + urllib.parse.quote(code, safe="")
         )
     if access:
         return (
             "https://www.roblox.com/games/"
             + str(place_id)
-            + "/NOMO?accessCode="
+            + "/" + roblox_game_url_slug(place_id) + "?accessCode="
             + urllib.parse.quote(access, safe="")
         )
     return ""
@@ -47497,15 +47521,18 @@ def _hatcher_private_server_discord_link(profile, hcfg, cfg):
     if not place_id:
         place_id = expected_place
 
+    saved_game_name = str(profile.get("private_server_game_name") or "").strip()
+    game_slug = roblox_game_url_slug(place_id, saved_game_name)
+
     if place_id and link_code:
         clickable = (
-            f"https://www.roblox.com/games/{place_id}/NOMO?privateServerLinkCode="
+            f"https://www.roblox.com/games/{place_id}/{game_slug}?privateServerLinkCode="
             f"{urllib.parse.quote(link_code, safe='')}"
         )
         return clickable, exact_route
     if place_id and access_code:
         clickable = (
-            f"https://www.roblox.com/games/{place_id}/NOMO?accessCode="
+            f"https://www.roblox.com/games/{place_id}/{game_slug}?accessCode="
             f"{urllib.parse.quote(access_code, safe='')}"
         )
         return clickable, exact_route
