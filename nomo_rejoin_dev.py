@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+# V4.81.154 — MANUAL HATCHER PRIVATE-SERVER DISCORD SHARE
+# - Advanced Tools adds a manual-only "Send Hatcher PS to webhook" action beside
+#   full diagnostics. It uses the same hardcoded diagnostic Discord webhook.
+# - The user selects one or more configured packages; NOMO reads each saved Hatcher/
+#   Booster profile without refreshing/regenerating anything and sends a clickable
+#   browser equivalent of the exact saved linkCode/accessCode route Hatcher uses.
+# - No private-server link is sent automatically, no watchdog/recovery path calls this,
+#   and Activity logging records only counts/package names rather than secret join codes.
+#
 # V4.81.153 — OWNED-APP ADAPTIVE PRESS/HOLD VISUAL RELEASE HARNESS
 # - Advanced Tools -> Press/Hold test gains an owned/non-Roblox adaptive hold mode.
 #   It captures the idle button as a visual baseline, sends explicit DOWN, watches the
@@ -2284,7 +2293,7 @@ _VERIFICATION_FOCUS_INCIDENT = ""
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.153"
+__version__ = "V4.81.154"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -47425,6 +47434,204 @@ def send_manual_diagnostics_webhook(cfg):
     pause()
 
 
+def _send_manual_discord_text_same_diagnostic_webhook(content):
+    """Send manual plaintext to the same Discord webhook used by full diagnostics.
+
+    Unlike diagnostic JSON, this helper deliberately does NOT redact the supplied
+    content. Callers must only pass data the user explicitly chose to send.
+    """
+    if not DIAGNOSTIC_WEBHOOK_ENABLED or not DIAGNOSTIC_WEBHOOK_URL:
+        return False, "diagnostic webhook disabled"
+    payload = json.dumps(
+        {
+            "content": str(content or ""),
+            "allowed_mentions": {"parse": []},
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    req = urllib.request.Request(DIAGNOSTIC_WEBHOOK_URL, data=payload, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("User-Agent", "NOMO-Rejoin-Manual-Hatcher-PS/1.0")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            code = int(resp.getcode())
+        return code in (200, 204), f"HTTP {code}"
+    except urllib.error.HTTPError as e:
+        try:
+            detail = _diag_redact_text(e.read().decode("utf-8", errors="replace"))
+        except Exception:
+            detail = str(e)
+        return False, f"HTTP {e.code}: {cut(detail, 180)}"
+    except Exception as e:
+        return False, _diag_redact_text(e)
+
+
+def _hatcher_private_server_discord_link(profile, hcfg, cfg):
+    """Return (clickable_link, exact_route) for the saved Hatcher route, read-only."""
+    profile = profile if isinstance(profile, dict) else {}
+    expected_place = str(
+        (hcfg or {}).get("expected_place_id")
+        or profile.get("private_server_place_id")
+        or "126884695634066"
+    ).strip()
+
+    # refresh_vip=False is intentional: manual Discord sharing must never rotate,
+    # regenerate, fetch, or mutate the Hatcher private-server route.
+    exact_route = hatcher_profile_private_link(
+        profile,
+        hcfg=hcfg,
+        cfg=cfg,
+        refresh_vip=False,
+    )
+    if not exact_route:
+        exact_route = str(profile.get("server_link") or "").strip()
+
+    place_id, link_code, access_code = private_join_parts(
+        exact_route,
+        default_place_id=expected_place,
+    )
+    if not link_code:
+        link_code = str(profile.get("private_server_link_code") or "").strip()
+    if not access_code:
+        access_code = str(profile.get("private_server_access_code") or "").strip()
+    if not place_id:
+        place_id = expected_place
+
+    if place_id and link_code:
+        clickable = (
+            f"https://www.roblox.com/games/{place_id}/NOMO?privateServerLinkCode="
+            f"{urllib.parse.quote(link_code, safe='')}"
+        )
+        return clickable, exact_route
+    if place_id and access_code:
+        clickable = (
+            f"https://www.roblox.com/games/{place_id}/NOMO?accessCode="
+            f"{urllib.parse.quote(access_code, safe='')}"
+        )
+        return clickable, exact_route
+
+    browser_link = str(profile.get("private_server_browser_link") or "").strip()
+    if browser_link.lower().startswith(("https://", "http://")):
+        return browser_link, exact_route
+    if str(exact_route).lower().startswith(("https://", "http://")):
+        return exact_route, exact_route
+    return exact_route, exact_route
+
+
+def send_hatcher_private_servers_webhook(cfg):
+    """Manual-only: send selected saved Hatcher private-server links to Discord."""
+    selected = choose_packages_common(
+        cfg,
+        "SEND HATCHER PRIVATE SERVER TO DISCORD",
+        multi=True,
+        enabled_only=False,
+        installed_only=False,
+        include_discovered=False,
+        configured_only=True,
+        allow_all=True,
+    )
+    if not selected:
+        return
+
+    hcfg = load_hatcher_config()
+    profiles = {
+        str(prof.get("package") or "").strip(): prof
+        for prof in hatcher_profiles(hcfg, enabled_only=False)
+        if isinstance(prof, dict) and str(prof.get("package") or "").strip()
+    }
+    tabs = {
+        str(tab.get("package") or "").strip(): tab
+        for tab in cfg.get("tabs", [])
+        if isinstance(tab, dict) and str(tab.get("package") or "").strip()
+    }
+
+    clear()
+    banner("SEND HATCHER PRIVATE SERVER", cfg)
+    print(col("Manual send only. Nothing is refreshed, regenerated, or sent automatically.", DIM))
+    print(col("Destination: same Discord webhook used by Send full diagnostics.", DIM))
+    print("")
+
+    blocks = []
+    skipped = []
+    sent_pkgs = []
+    for pkg in selected:
+        prof = profiles.get(pkg)
+        if not prof:
+            skipped.append((pkg, "no Hatcher profile"))
+            continue
+        clickable, exact_route = _hatcher_private_server_discord_link(prof, hcfg, cfg)
+        if not clickable:
+            skipped.append((pkg, "no saved private-server link"))
+            continue
+
+        tab = tabs.get(pkg, {})
+        username = str(
+            tab.get("user_name")
+            or prof.get("username")
+            or prof.get("hatcher_name")
+            or pkg
+        ).strip()
+        hatcher_name = str(prof.get("hatcher_name") or username or pkg).strip()
+        block = (
+            f"**{short_pkg(pkg)} · {username}**\n"
+            f"Hatcher: `{hatcher_name}`\n"
+            f"{clickable}"
+        )
+        blocks.append(block)
+        sent_pkgs.append(pkg)
+        print(col(f"READY: {short_pkg(pkg)}", GREEN) + f"  {short_link(clickable)}")
+
+    for pkg, reason in skipped:
+        print(col(f"SKIP : {short_pkg(pkg)} — {reason}", YELLOW))
+
+    if not blocks:
+        print(col("\nNothing to send.", YELLOW))
+        pause()
+        return
+
+    # Discord content is capped at 2000 chars. Keep a little headroom and split
+    # only between complete package blocks so no private link is truncated.
+    heading = "**NOMO Hatcher Private Server**\n"
+    chunks = []
+    current = heading
+    for block in blocks:
+        candidate = current + ("\n\n" if current != heading else "") + block
+        if len(candidate) > 1850 and current != heading:
+            chunks.append(current)
+            current = heading + block
+        else:
+            current = candidate
+    if current.strip() != heading.strip():
+        chunks.append(current)
+
+    ok_count = 0
+    fail_notes = []
+    for idx, chunk in enumerate(chunks, 1):
+        ok, note = _send_manual_discord_text_same_diagnostic_webhook(chunk)
+        if ok:
+            ok_count += 1
+        else:
+            fail_notes.append(f"part {idx}: {note}")
+
+    if ok_count == len(chunks):
+        print(col(f"\nWEBHOOK: SENT ({len(sent_pkgs)} Hatcher link(s))", GREEN))
+        log_activity(
+            f"manual Hatcher PS webhook sent: {len(sent_pkgs)} link(s) "
+            f"[{','.join(short_pkg(x) for x in sent_pkgs)}]",
+            "",
+            GREEN,
+        )
+    else:
+        note = "; ".join(fail_notes) or "unknown webhook error"
+        print(col(f"\nWEBHOOK: FAILED/PARTIAL — {cut(note, 160)}", RED))
+        log_activity(
+            f"manual Hatcher PS webhook FAILED/PARTIAL: {len(sent_pkgs)} selected ({cut(note, 100)})",
+            "",
+            RED,
+        )
+    pause()
+
+
 def export_diagnostics_zip(cfg):
     """Write a safe troubleshooting ZIP and show its full Android path."""
     clear()
@@ -53008,12 +53215,13 @@ def advanced_tools_menu(cfg):
             ("7", "Workspace ZIP tools", CYAN, WHITE),
             ("8", "APK download / install", CYAN, WHITE),
             ("9", "Press/Hold test", CYAN, WHITE),
+            ("10", "Send Hatcher PS to webhook", CYAN, WHITE),
             ("0", "Back", RED, WHITE),
         ]
         draw_boxed_menu(rows, cfg)
 
         drain_stdin()
-        choice = read_menu_choice("\nAdvanced: ", {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "q", "b", "back"})
+        choice = read_menu_choice("\nAdvanced: ", {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "q", "b", "back"})
         if choice in {"0", "q", "b", "back", None}:
             return
 
@@ -53035,6 +53243,8 @@ def advanced_tools_menu(cfg):
             apk_download_install_menu(cfg)
         elif choice == "9":
             owned_press_hold_test_menu(cfg)
+        elif choice == "10":
+            send_hatcher_private_servers_webhook(cfg)
 
 
 def main():
