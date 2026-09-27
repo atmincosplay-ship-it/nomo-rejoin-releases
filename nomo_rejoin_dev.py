@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+# V4.81.157 — DISCORD PS GAME SLUG RESOLVED FROM PLACEID
+# - Manual Hatcher private-server sharing now resolves the experience name dynamically from
+#   the selected PlaceId: PlaceId -> UniverseId -> public Roblox game metadata -> experience name.
+# - The resolved API name is sanitized into the /games/<place>/<game-name> slug. Known Grow a Garden
+#   names are fallback-only if the public lookup fails; stale VIP server display names such as
+#   NOMO-username are never preferred over PlaceId metadata.
+# - One manual send caches the PlaceId lookup across selected packages, so four Hatcher links for
+#   the same place do not repeat the same public API requests. Private-server codes are unchanged.
+#
 # V4.81.155 — REAL GAME-NAME SLUG FOR PRIVATE-SERVER BROWSER LINKS
 # - Fixes the cosmetic /NOMO slug used in generated Roblox browser links. Known Grow a Garden
 #   places now use their real slugs: Grow-a-Garden and Grow-a-Garden-Trade-World.
@@ -79,6 +88,20 @@
 # - V4.81.148 stale Press-and-hold recovery, solver routing, hold worker, and PID policy unchanged.
 #
 # NOMO REJOIN
+# V4.81.156 — MANUAL HATCHER DISCORD LINK: REAL GAME SLUG + LINKCODE-ONLY WEB URL
+# - Fixes the manual Discord sender using a saved VIP server name (for example NOMO-username)
+#   as the Roblox /games/<id>/<slug> segment. Known Grow a Garden place IDs now always use
+#   the canonical game slug, regardless of stale profile metadata.
+# - Fixes a broken browser URL being synthesized as ?accessCode=... . Roblox documents accessCode
+#   and linkCode as distinct private-server deep-link parameters; the normal browser share form
+#   requested here uses privateServerLinkCode. The sender now never invents an accessCode web URL.
+# - If the profile has no saved linkCode, the manual sender makes read-only recovery attempts from
+#   saved browser/share metadata and the owned server metadata GET. It never rotates/regenerates the
+#   private server or join code. If no privateServerLinkCode can be recovered, that package is skipped
+#   with an explicit reason instead of posting a broken link.
+# - Private-server response normalization no longer mistakes the VIP server's display name for the
+#   experience/game name. Existing stale NOMO-username metadata is harmless because canonical place
+#   slugs take priority immediately.
 # V4.81.148 — UNRESOLVED POST-HOLD LINEAGE + VISUAL JOIN-ERROR FALLBACK
 # - Fixes V4.81.147 missing a visible post-hold 529 when App Cloner/WebView does not
 #   expose the Join Error text through package/Option-16 accessibility nodes.
@@ -2302,7 +2325,7 @@ _VERIFICATION_FOCUS_INCIDENT = ""
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.155"
+__version__ = "V4.81.157"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -6706,19 +6729,93 @@ def roblox_server_share_deep_link(link):
     return ""
 
 
+_KNOWN_ROBLOX_GAME_NAMES_BY_PLACE = {
+    "126884695634066": "Grow a Garden",
+    "129954712878723": "Grow a Garden Trade World",
+}
+
+
 def roblox_game_url_slug(place_id, game_name=""):
-    """Return a human-readable Roblox /games/<id>/<slug> segment."""
+    """Return a human-readable Roblox /games/<id>/<slug> segment.
+
+    A caller-supplied game name (normally resolved from PlaceId metadata) wins.
+    Known NOMO place names are fallback-only when no resolved name is available.
+    """
     pid = str(place_id or "").strip()
     raw_name = str(game_name or "").strip()
     if not raw_name:
-        raw_name = {
-            "126884695634066": "Grow a Garden",
-            "129954712878723": "Grow a Garden Trade World",
-        }.get(pid, "")
+        raw_name = _KNOWN_ROBLOX_GAME_NAMES_BY_PLACE.get(pid, "")
     if not raw_name:
         return "Game"
     slug = re.sub(r"[^A-Za-z0-9]+", "-", raw_name).strip("-")
     return slug or "Game"
+
+
+def resolve_roblox_game_name_from_place(place_id, fallback_name="", cache=None):
+    """Resolve the public experience name from PlaceId, with safe fallbacks.
+
+    Returns (name, source_note). This is intended for manual/browser presentation;
+    private-server routing continues to use PlaceId + link/access code directly.
+    """
+    pid = str(place_id or "").strip()
+    if not pid:
+        return "Game", "missing PlaceId"
+
+    if isinstance(cache, dict) and pid in cache:
+        cached = cache.get(pid)
+        if isinstance(cached, (tuple, list)) and len(cached) >= 2:
+            return str(cached[0] or "Game"), str(cached[1] or "cached")
+        if cached:
+            return str(cached), "cached PlaceId metadata"
+
+    name = ""
+    source = ""
+    error_notes = []
+    try:
+        universe_id = get_universe_id_from_place(pid)
+    except Exception as exc:
+        universe_id = None
+        error_notes.append("universe lookup failed: " + cut(exc, 80))
+
+    if universe_id:
+        try:
+            info, info_err = get_universe_game_info(universe_id)
+        except Exception as exc:
+            info, info_err = {}, str(exc)
+        if isinstance(info, dict):
+            name = str(info.get("name") or info.get("Name") or "").strip()
+        if name:
+            source = f"Roblox PlaceId metadata (universe {universe_id})"
+        elif info_err:
+            error_notes.append("game info: " + cut(info_err, 80))
+    elif not error_notes:
+        error_notes.append("PlaceId -> UniverseId unavailable")
+
+    if not name:
+        known = _KNOWN_ROBLOX_GAME_NAMES_BY_PLACE.get(pid, "")
+        if known:
+            name = known
+            source = "known PlaceId fallback"
+
+    if not name:
+        saved = str(fallback_name or "").strip()
+        # A VIP server display name is not the experience name. Old NOMO profiles
+        # commonly used NOMO-<username> here, so do not reuse that as a game slug.
+        if saved and not saved.lower().startswith("nomo-"):
+            name = saved
+            source = "saved game-name fallback"
+
+    if not name:
+        name = "Game"
+        source = "generic fallback"
+
+    if error_notes and source != "Roblox PlaceId metadata":
+        source = source + "; " + "; ".join(error_notes[:2])
+
+    result = (name, source)
+    if isinstance(cache, dict):
+        cache[pid] = result
+    return result
 
 
 def _private_route_from_text(text):
@@ -39562,9 +39659,11 @@ def _normalize_private_server_item(item):
         universe_id = _first_value(game, ("id", "Id", "universeId", "UniverseId"))
     if not universe_id:
         universe_id = _first_value(universe, ("id", "Id", "universeId", "UniverseId"))
+    # `item.name` is the VIP/private-server display name (often NOMO-username),
+    # not the experience name. Never use it as game_name.
     game_name = (
         _first_value(game, ("name", "Name"))
-        or _first_value(item, ("gameName", "universeName", "name"))
+        or _first_value(item, ("gameName", "universeName"))
         or ""
     )
     owner = item.get("owner") if isinstance(item.get("owner"), dict) else {}
@@ -47490,8 +47589,14 @@ def _send_manual_discord_text_same_diagnostic_webhook(content):
         return False, _diag_redact_text(e)
 
 
-def _hatcher_private_server_discord_link(profile, hcfg, cfg):
-    """Return (clickable_link, exact_route) for the saved Hatcher route, read-only."""
+def _hatcher_private_server_discord_link(profile, hcfg, cfg, package="", game_name_cache=None):
+    """Return (browser_link, exact_route, note) for a saved Hatcher server.
+
+    This manual Discord helper is intentionally read-only. It will recover an
+    existing privateServerLinkCode when possible, but will never request a new
+    join code or mutate the Hatcher profile. A raw accessCode is valid for Roblox
+    deep-link routing, but is not synthesized into the /games/... browser URL.
+    """
     profile = profile if isinstance(profile, dict) else {}
     expected_place = str(
         (hcfg or {}).get("expected_place_id")
@@ -47499,8 +47604,8 @@ def _hatcher_private_server_discord_link(profile, hcfg, cfg):
         or "126884695634066"
     ).strip()
 
-    # refresh_vip=False is intentional: manual Discord sharing must never rotate,
-    # regenerate, fetch, or mutate the Hatcher private-server route.
+    # refresh_vip=False is intentional: sending to Discord must not rotate,
+    # regenerate, fetch a new join code, or mutate the Hatcher route.
     exact_route = hatcher_profile_private_link(
         profile,
         hcfg=hcfg,
@@ -47521,28 +47626,143 @@ def _hatcher_private_server_discord_link(profile, hcfg, cfg):
     if not place_id:
         place_id = expected_place
 
+    # Recover an already-existing browser linkCode from any saved browser/share
+    # route before making a network request.
+    browser_candidates = [
+        str(profile.get("private_server_browser_link") or "").strip(),
+        str(profile.get("server_link") or "").strip(),
+        str(exact_route or "").strip(),
+    ]
+    for candidate in browser_candidates:
+        if not candidate:
+            continue
+        c_place, c_link, _c_access = private_join_parts(
+            candidate,
+            default_place_id=place_id or expected_place,
+        )
+        if c_place and not place_id:
+            place_id = c_place
+        if c_link and not link_code:
+            link_code = c_link
+            break
+
+    recovery_notes = []
+
+    # If the saved profile only has an accessCode, try a READ-ONLY metadata GET
+    # for the same owned private server. This does not call the permissions
+    # newJoinCode endpoint and therefore does not rotate the Hatcher join code.
+    if not link_code:
+        server_id = str(profile.get("private_server_id") or "").strip()
+        pkg = str(package or profile.get("package") or "").strip()
+        if server_id and pkg:
+            cookie = ""
+            try:
+                cookie = str(get_cookie_from_package(pkg) or "").strip()
+            except Exception:
+                cookie = ""
+            if not cookie:
+                try:
+                    cache = load_cookie_cache()
+                    cookie = str((cache.get(pkg) or {}).get("cookie") or "").strip()
+                except Exception:
+                    cookie = ""
+            if cookie:
+                try:
+                    fresh = fetch_private_server_metadata(cookie, server_id)
+                except Exception as exc:
+                    fresh = None
+                    recovery_notes.append("metadata GET failed: " + cut(exc, 80))
+                if isinstance(fresh, dict):
+                    fresh_link = str(fresh.get("link_code") or "").strip()
+                    fresh_browser = str(fresh.get("browser_link") or "").strip()
+                    fresh_place = str(fresh.get("root_place_id") or "").strip()
+                    if fresh_place:
+                        place_id = fresh_place
+                    if fresh_link:
+                        link_code = fresh_link
+                        recovery_notes.append("linkCode recovered from server metadata")
+                    elif fresh_browser:
+                        _p, recovered_link, _a = private_join_parts(
+                            fresh_browser,
+                            default_place_id=place_id or expected_place,
+                        )
+                        if recovered_link:
+                            link_code = recovered_link
+                            recovery_notes.append("linkCode recovered from metadata browser link")
+                        elif is_roblox_server_share_link(fresh_browser):
+                            try:
+                                resolved, resolve_note = resolve_roblox_server_share_link(fresh_browser)
+                            except Exception as exc:
+                                resolved, resolve_note = "", str(exc)
+                            _p2, recovered_link2, _a2 = private_join_parts(
+                                resolved,
+                                default_place_id=place_id or expected_place,
+                            )
+                            if recovered_link2:
+                                link_code = recovered_link2
+                                recovery_notes.append("linkCode recovered from saved share link")
+                            elif resolve_note:
+                                recovery_notes.append("share resolve: " + cut(resolve_note, 80))
+            else:
+                recovery_notes.append("no cookie available for read-only metadata recovery")
+
+    # Also attempt to resolve any already-saved Roblox share link. This remains
+    # read-only and does not change private-server permissions or codes.
+    if not link_code:
+        for candidate in browser_candidates:
+            if not is_roblox_server_share_link(candidate):
+                continue
+            try:
+                resolved, resolve_note = resolve_roblox_server_share_link(candidate)
+            except Exception as exc:
+                resolved, resolve_note = "", str(exc)
+            _p, recovered_link, _a = private_join_parts(
+                resolved,
+                default_place_id=place_id or expected_place,
+            )
+            if recovered_link:
+                link_code = recovered_link
+                recovery_notes.append("linkCode recovered from saved share link")
+                break
+            if resolve_note:
+                recovery_notes.append("share resolve: " + cut(resolve_note, 80))
+
+    if not place_id:
+        place_id = expected_place
+
+    # Resolve the experience name from PlaceId first. This prevents a VIP server
+    # display name such as NOMO-username from becoming the /games/... slug.
     saved_game_name = str(profile.get("private_server_game_name") or "").strip()
-    game_slug = roblox_game_url_slug(place_id, saved_game_name)
+    resolved_game_name, game_name_source = resolve_roblox_game_name_from_place(
+        place_id,
+        fallback_name=saved_game_name,
+        cache=game_name_cache,
+    )
+    game_slug = roblox_game_url_slug(place_id, resolved_game_name)
+    if game_name_source:
+        recovery_notes.append("game name: " + game_name_source)
 
     if place_id and link_code:
         clickable = (
             f"https://www.roblox.com/games/{place_id}/{game_slug}?privateServerLinkCode="
             f"{urllib.parse.quote(link_code, safe='')}"
         )
-        return clickable, exact_route
-    if place_id and access_code:
-        clickable = (
-            f"https://www.roblox.com/games/{place_id}/{game_slug}?accessCode="
-            f"{urllib.parse.quote(access_code, safe='')}"
-        )
-        return clickable, exact_route
+        note = "; ".join(recovery_notes) if recovery_notes else "saved privateServerLinkCode"
+        return clickable, exact_route, note
 
-    browser_link = str(profile.get("private_server_browser_link") or "").strip()
-    if browser_link.lower().startswith(("https://", "http://")):
-        return browser_link, exact_route
-    if str(exact_route).lower().startswith(("https://", "http://")):
-        return exact_route, exact_route
-    return exact_route, exact_route
+    if access_code:
+        note = (
+            "saved server currently exposes accessCode only; no browser "
+            "privateServerLinkCode was available"
+        )
+        if recovery_notes:
+            note += " (" + "; ".join(recovery_notes[:2]) + ")"
+        return "", exact_route, note
+
+    note = "no saved privateServerLinkCode"
+    if recovery_notes:
+        note += " (" + "; ".join(recovery_notes[:2]) + ")"
+    return "", exact_route, note
 
 
 def send_hatcher_private_servers_webhook(cfg):
@@ -47574,21 +47794,24 @@ def send_hatcher_private_servers_webhook(cfg):
 
     clear()
     banner("SEND HATCHER PRIVATE SERVER", cfg)
-    print(col("Manual send only. Nothing is refreshed, regenerated, or sent automatically.", DIM))
+    print(col("Manual send only. No server/code is rotated or regenerated; metadata recovery is read-only.", DIM))
     print(col("Destination: same Discord webhook used by Send full diagnostics.", DIM))
     print("")
 
     blocks = []
     skipped = []
     sent_pkgs = []
+    game_name_cache = {}
     for pkg in selected:
         prof = profiles.get(pkg)
         if not prof:
             skipped.append((pkg, "no Hatcher profile"))
             continue
-        clickable, exact_route = _hatcher_private_server_discord_link(prof, hcfg, cfg)
+        clickable, exact_route, link_note = _hatcher_private_server_discord_link(
+            prof, hcfg, cfg, package=pkg, game_name_cache=game_name_cache
+        )
         if not clickable:
-            skipped.append((pkg, "no saved private-server link"))
+            skipped.append((pkg, link_note or "no browser privateServerLinkCode"))
             continue
 
         tab = tabs.get(pkg, {})
