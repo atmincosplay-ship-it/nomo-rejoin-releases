@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+# V4.81.159 — CURRENT PRESS/HOLD UI OVERRIDES HATCHER BACKGROUND-LOADING COSMETICS
+# - Fixes a Hatcher display/recovery race where a package could visibly sit on the strong
+#   Security -> Press and hold screen while an old post-open background-fresh generation
+#   kept the row at Loading / waiting fresh bg.
+# - After the normal health pass, Hatcher performs one forced fresh STRICT visual check when
+#   an ALIVE package is otherwise classified as ordinary Online/Ingame/Loading. A confirmed
+#   white Security panel + strong wide blue Press-and-hold bar overrides background-fresh
+#   cosmetics as Verification and suppresses stale/background recovery for that cycle.
+# - This fallback is detection/status only: it does not add, retry, retime, or otherwise
+#   change the live verification input worker.
+# - Owned/test-app adaptive visual-release menu default hard timeout is reduced from 12s to 10s.
+#
 # V4.81.158 — POST-HOLD PLEASE-TRY-AGAIN DETECTION + IMMEDIATE STALE RECOVERY
 # - A Press-and-hold incident that already reached the real hold stage is no longer left
 #   stuck as "incident already attempted" when the Security sheet returns "Please try again".
@@ -2337,7 +2349,7 @@ _VERIFICATION_FOCUS_INCIDENT = ""
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.158"
+__version__ = "V4.81.159"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -28441,6 +28453,71 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                 tab, rt_tab, state, cfg
             )
 
+            # V4.81.159: do not let a post-open background-fresh cosmetic hide a
+            # CURRENT strong Press-and-hold Security sheet. evaluate_package_health()
+            # already has a conservative over-fresh visual pass, but its screenshot
+            # cache can still describe the previous frame while a floating WebView
+            # renders. One forced fresh STRICT visual probe here is display/recovery
+            # arbitration only; it does not dispatch any synthetic input.
+            _health_bad_now = str((health or {}).get("bad") or "").strip().lower()
+            _health_status_now = str((health or {}).get("status") or "").strip().lower()
+            _skip_force_visual = _health_bad_now in {
+                "ui_challenge", "challenge", "stale_press_hold",
+                "face_lock", "face_lock_candidate", "account_banned", "banned",
+                "manual_login", "process_unknown", "disconnect", "roblox_home",
+            }
+            if alive and not _skip_force_visual and _health_status_now in {
+                "", "online", "ingame", "loading", "stale", "no state"
+            }:
+                try:
+                    _forced_visual = visual_captcha_detail(pkg, cfg, force=True)
+                except Exception:
+                    _forced_visual = None
+                _forced_kind = str((_forced_visual or {}).get("visual_kind") or "")
+                _forced_metrics = (
+                    ((_forced_visual or {}).get("visual_metrics") or {})
+                    if isinstance(_forced_visual, dict) else {}
+                )
+                if (
+                    isinstance(_forced_visual, dict)
+                    and _forced_kind == "press_and_hold"
+                    and bool(_forced_metrics.get("press_hold_strong"))
+                ):
+                    try:
+                        _forced_loc = verification_action_location(
+                            pkg, cfg, challenge_detail=_forced_visual, force=True
+                        )
+                    except Exception:
+                        _forced_loc = None
+                    if _forced_loc:
+                        store_verification_action_location(rt_tab, _forced_loc)
+                    _forced_note = verification_action_display_note(
+                        rt_tab, fallback="Verification · Press and hold (visual)"
+                    )
+                    health = dict(health or {})
+                    health.update({
+                        "alive": True,
+                        "fresh": False,
+                        "clean_fresh": False,
+                        "status": "Verification",
+                        "note": _forced_note,
+                        "bad": "ui_challenge",
+                        "visible_window": True,
+                        "ui_challenge_detail": dict(_forced_visual),
+                    })
+                    _forced_sig = "|".join([
+                        str((_forced_loc or {}).get("kind") or "press_and_hold"),
+                        ",".join(str(v) for v in ((_forced_loc or {}).get("center") or [])),
+                        str((_forced_visual or {}).get("evidence_source") or "visual"),
+                    ])
+                    if str(rt_tab.get("hatcher_forced_press_hold_last_sig") or "") != _forced_sig:
+                        rt_tab["hatcher_forced_press_hold_last_sig"] = _forced_sig
+                        rt_tab["hatcher_forced_press_hold_seen_at"] = now()
+                        log_activity(
+                            "current visual Press-and-hold overrides Hatcher Loading/background-fresh state",
+                            pkg, CYAN,
+                        )
+
             # V4.81.75: nonblocking replacement for the solver probe that used
             # to live inside wait_until_fresh_after_open(). A peer Face Lock does
             # not suppress this package-local provider check.
@@ -53516,7 +53593,7 @@ def owned_press_hold_test_menu(cfg):
         if choice == "4":
             success_raw = clean_terminal_input(input("Success text(s), comma-separated [optional]: ")).strip()
             success_texts = [x.strip() for x in success_raw.split(",") if x.strip()]
-            raw_timeout = clean_terminal_input(input("Hard timeout ms [12000]: ")).strip() or "12000"
+            raw_timeout = clean_terminal_input(input("Hard timeout ms [10000]: ")).strip() or "10000"
             raw_poll = clean_terminal_input(input("Visual poll ms [120]: ")).strip() or "120"
             try:
                 timeout_ms = max(1000, min(30000, int(raw_timeout)))
