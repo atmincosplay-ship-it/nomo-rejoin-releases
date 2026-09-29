@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+# V4.81.160 — NO-STATE CHALLENGE PRIORITY + MOVED-WINDOW ACTION DETECTION
+# - Fixes the remaining V4.81.159 ordering bug: in Hatcher's `state is None` branch,
+#   `background_fresh.active` was evaluated before `challenge_active`. A current Press-and-hold
+#   could be detected by health and then immediately overwritten as Loading / waiting fresh bg.
+# - Current verification now owns that no-state branch before background-fresh active/timeout
+#   handling, suppressing stale post-open cosmetics/recovery for the visible challenge cycle.
+# - App-Cloner floating windows can move away from the saved Option-16 rectangle after task-loss/
+#   restore. If uiautomator exposes an action node under the EXACT clone package, detection may now
+#   accept that exact-package Press-and-hold node outside the stale saved rect. Shared/com.roblox
+#   aliases are still rejected; screenshot-only detection remains rect-scoped.
+# - Hatcher's forced current-challenge arbitration checks that exact package action node first,
+#   then falls back to the existing strict white-panel + wide-blue visual detector. Detection only;
+#   the live verification input worker and timing are unchanged.
+#
 # V4.81.159 — CURRENT PRESS/HOLD UI OVERRIDES HATCHER BACKGROUND-LOADING COSMETICS
 # - Fixes a Hatcher display/recovery race where a package could visibly sit on the strong
 #   Security -> Press and hold screen while an old post-open background-fresh generation
@@ -2349,7 +2363,7 @@ _VERIFICATION_FOCUS_INCIDENT = ""
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.159"
+__version__ = "V4.81.160"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -18540,6 +18554,7 @@ def _verification_action_node_location(pkg, cfg, force=False):
     have_rect = bool(rx2 > rx1 and ry2 > ry1)
 
     candidates = []
+    moved_pkg_candidates = []
     for node in snapshot.get("text_nodes", []) or []:
         if not isinstance(node, dict):
             continue
@@ -18565,19 +18580,29 @@ def _verification_action_node_location(pkg, cfg, force=False):
         cx = (x1 + x2) // 2
         cy = (y1 + y2) // 2
 
-        # Exact Option-16 cell is authoritative when present. Without it, retain
-        # only exact clone-package nodes to avoid borrowing a sibling button.
+        # Exact Option-16 cell remains authoritative for shared/aliased Roblox
+        # accessibility nodes. However, App-Cloner can move a floating window after
+        # task-loss/restore while Option-16 still contains the old rectangle. In that
+        # narrow case an action node carrying the EXACT clone package is safe to keep
+        # as a fallback even when its center moved outside the saved rectangle.
+        node_pkg = str(node.get("package", "") or "")
+        exact_pkg_node = bool(node_pkg == pkg or node_pkg.startswith(pkg + ":"))
+        area = max(1, (x2 - x1) * (y2 - y1))
         if have_rect:
             if not (rx1 <= cx <= rx2 and ry1 <= cy <= ry2):
+                if exact_pkg_node:
+                    moved_pkg_candidates.append((area, kind, [x1, y1, x2, y2]))
                 continue
         else:
-            node_pkg = str(node.get("package", "") or "")
-            if not (node_pkg == pkg or node_pkg.startswith(pkg + ":")):
+            if not exact_pkg_node:
                 continue
 
-        area = max(1, (x2 - x1) * (y2 - y1))
         candidates.append((area, kind, [x1, y1, x2, y2]))
 
+    moved_fallback = False
+    if not candidates and moved_pkg_candidates:
+        candidates = moved_pkg_candidates
+        moved_fallback = True
     if not candidates:
         return None
     candidates.sort(reverse=True, key=lambda item: item[0])
@@ -18587,9 +18612,9 @@ def _verification_action_node_location(pkg, cfg, force=False):
         "kind": kind,
         "bounds": bounds,
         "center": [(x1 + x2) // 2, (y1 + y2) // 2],
-        "source": "uiautomator",
+        "source": "uiautomator_pkg_moved" if moved_fallback else "uiautomator",
     }
-    if have_rect:
+    if have_rect and not moved_fallback:
         result["relative_bounds"] = [x1 - rx1, y1 - ry1, x2 - rx1, y2 - ry1]
         result["relative_center"] = [result["center"][0] - rx1, result["center"][1] - ry1]
         result["cell_rect"] = [rx1, ry1, rx2, ry2]
@@ -28469,8 +28494,20 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
             if alive and not _skip_force_visual and _health_status_now in {
                 "", "online", "ingame", "loading", "stale", "no state"
             }:
+                # V4.81.160: first accept only an EXACT-package accessibility action
+                # node. This survives a moved floating window without trusting shared
+                # com.roblox aliases or unscoped screenshot color.
                 try:
-                    _forced_visual = visual_captcha_detail(pkg, cfg, force=True)
+                    _forced_loc = verification_action_location(pkg, cfg, force=True)
+                except Exception:
+                    _forced_loc = None
+                _forced_exact = bool(
+                    isinstance(_forced_loc, dict)
+                    and str(_forced_loc.get("kind") or "") == "press_and_hold"
+                    and str(_forced_loc.get("source") or "").startswith("uiautomator")
+                )
+                try:
+                    _forced_visual = None if _forced_exact else visual_captcha_detail(pkg, cfg, force=True)
                 except Exception:
                     _forced_visual = None
                 _forced_kind = str((_forced_visual or {}).get("visual_kind") or "")
@@ -28478,21 +28515,34 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                     ((_forced_visual or {}).get("visual_metrics") or {})
                     if isinstance(_forced_visual, dict) else {}
                 )
-                if (
+                _forced_visual_strong = bool(
                     isinstance(_forced_visual, dict)
                     and _forced_kind == "press_and_hold"
                     and bool(_forced_metrics.get("press_hold_strong"))
-                ):
-                    try:
-                        _forced_loc = verification_action_location(
-                            pkg, cfg, challenge_detail=_forced_visual, force=True
-                        )
-                    except Exception:
-                        _forced_loc = None
+                )
+                if _forced_exact or _forced_visual_strong:
+                    if not _forced_exact:
+                        try:
+                            _forced_loc = verification_action_location(
+                                pkg, cfg, challenge_detail=_forced_visual, force=True
+                            )
+                        except Exception:
+                            _forced_loc = None
                     if _forced_loc:
                         store_verification_action_location(rt_tab, _forced_loc)
                     _forced_note = verification_action_display_note(
-                        rt_tab, fallback="Verification · Press and hold (visual)"
+                        rt_tab, fallback="Verification · Press and hold"
+                    )
+                    _forced_detail = (
+                        {
+                            "title": "Roblox Verification",
+                            "text": "exact package Press-and-hold action node",
+                            "reason": "android_exact_package_press_hold_action",
+                            "hits": ["press and hold"],
+                            "evidence_source": str((_forced_loc or {}).get("source") or "uiautomator"),
+                        }
+                        if _forced_exact
+                        else dict(_forced_visual or {})
                     )
                     health = dict(health or {})
                     health.update({
@@ -28503,18 +28553,19 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                         "note": _forced_note,
                         "bad": "ui_challenge",
                         "visible_window": True,
-                        "ui_challenge_detail": dict(_forced_visual),
+                        "ui_challenge_detail": _forced_detail,
                     })
                     _forced_sig = "|".join([
                         str((_forced_loc or {}).get("kind") or "press_and_hold"),
                         ",".join(str(v) for v in ((_forced_loc or {}).get("center") or [])),
-                        str((_forced_visual or {}).get("evidence_source") or "visual"),
+                        str((_forced_loc or {}).get("source") or (_forced_detail or {}).get("evidence_source") or "visual"),
                     ])
                     if str(rt_tab.get("hatcher_forced_press_hold_last_sig") or "") != _forced_sig:
                         rt_tab["hatcher_forced_press_hold_last_sig"] = _forced_sig
                         rt_tab["hatcher_forced_press_hold_seen_at"] = now()
                         log_activity(
-                            "current visual Press-and-hold overrides Hatcher Loading/background-fresh state",
+                            "current Press-and-hold overrides Hatcher Loading/background-fresh state "
+                            + f"[{str((_forced_loc or {}).get('source') or 'visual')} ]",
                             pkg, CYAN,
                         )
 
@@ -28860,7 +28911,24 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                         status = "Online" if alive else "Offline"
             else:
                 note = f"state {err}"
-                if alive and background_fresh.get("active"):
+                # V4.81.160: current package-local verification must outrank the
+                # post-open background-fresh waiter even when Lua has NO state yet.
+                # V4.81.159 fixed the health result, but this branch immediately
+                # overwrote it as Loading before reaching the older challenge check.
+                challenge_active = (
+                    str(health.get("bad") or "") in {"ui_challenge", "challenge"}
+                    or background_solver_active
+                )
+                if challenge_active:
+                    status = "Solving" if background_solver_active else "Verification"
+                    note = (
+                        (stuck_solver[1] if stuck_solver is not None else solver_job_note(pkg))
+                        if background_solver_active
+                        else verification_action_display_note(
+                            rt_tab, fallback=str(health.get("note") or "Verification · UI detected")
+                        )
+                    )
+                elif alive and background_fresh.get("active"):
                     status = "Loading"
                     note = "waiting fresh bg " + format_age(
                         max(1, int(background_fresh.get("remaining", 0) or 0))
