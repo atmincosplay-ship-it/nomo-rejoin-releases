@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+# V4.81.158 — POST-HOLD PLEASE-TRY-AGAIN DETECTION + IMMEDIATE STALE RECOVERY
+# - A Press-and-hold incident that already reached the real hold stage is no longer left
+#   stuck as "incident already attempted" when the Security sheet returns "Please try again".
+# - Exact package/Option-16 text is preferred. If WebView accessibility hides the caption,
+#   a narrow screenshot fallback looks only for red failure text immediately below the
+#   currently detected Press-and-hold button in that exact clone cell.
+# - The failure does NOT submit another verification attempt. It is classified as
+#   Verification Failed / stale_press_hold and immediately reuses the existing package-local
+#   recovery: exact target PID -> Clear Cache -> reopen EXISTING link, NO PS refresh.
+# - Start Puzzle/BlockSolve, Face Lock/ban detection, global one-by-one focus serialization,
+#   private-server sharing, sibling-task safety, and the existing hold gesture are unchanged.
+#
 # V4.81.157 — DISCORD PS GAME SLUG RESOLVED FROM PLACEID
 # - Manual Hatcher private-server sharing now resolves the experience name dynamically from
 #   the selected PlaceId: PlaceId -> UniverseId -> public Roblox game metadata -> experience name.
@@ -2325,7 +2337,7 @@ _VERIFICATION_FOCUS_INCIDENT = ""
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.157"
+__version__ = "V4.81.158"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -15933,6 +15945,58 @@ def evaluate_package_health(tab, cfg, rt_tab, mode="market", hcfg=None, prof=Non
             str(rt_tab.get("verification_hold_pending_incident_id") or "") == _incident_id
             or str(rt_tab.get("verification_hold_state") or "").strip().lower() in {"queued", "running", "holding"}
         )
+
+        # V4.81.158: the Security sheet can keep the SAME Press-and-hold button
+        # visible after a completed attempt and add a red `Please try again`
+        # caption. The old one-attempt-per-incident guard then intentionally
+        # refuses another hold, which previously left the row stuck until the
+        # generic 5m stale timer. Detect that terminal failure explicitly and
+        # route it to the existing cache+EXISTING-link stale-session recovery.
+        _post_hold_retry_failure = None
+        if (
+            _error_recovery_enabled
+            and _hold_action_same_incident
+            and _action_kind == "press_and_hold"
+            and not _hold_busy
+        ):
+            _post_hold_retry_failure = verification_press_hold_try_again_detail(
+                pkg, cfg, action_loc=action_loc, force=True
+            )
+            if _post_hold_retry_failure:
+                _stale_reason = "Press-and-hold returned Please try again"
+                rt_tab["verification_hold_retry_failed_at"] = _captcha_now
+                rt_tab["verification_hold_retry_failed_incident_id"] = _incident_id
+                rt_tab["verification_hold_retry_failed_source"] = str(
+                    _post_hold_retry_failure.get("evidence_source") or ""
+                )
+                rt_tab["verification_hold_state"] = "failed_retry"
+                rt_tab["press_hold_stale_detected_at"] = _captcha_now
+                rt_tab["press_hold_stale_reason"] = _stale_reason
+                rt_tab["press_hold_stale_incident_id"] = _incident_id
+                rt_tab["note"] = _stale_reason + "; cache+reopen required"
+                _retry_sig = "|".join([
+                    _incident_id,
+                    str(_post_hold_retry_failure.get("evidence_source") or ""),
+                ])
+                if str(rt_tab.get("verification_hold_retry_failed_log_sig") or "") != _retry_sig:
+                    rt_tab["verification_hold_retry_failed_log_sig"] = _retry_sig
+                    log_activity(
+                        "post-hold Please try again detected -> stale verification recovery",
+                        pkg,
+                        CYAN,
+                    )
+                return {
+                    "pkg": pkg, "user": tab.get("user_name", pkg), "alive": bool(raw_alive),
+                    "state": state, "state_err": err, "fresh": False, "clean_fresh": False,
+                    "pets": int(state.get("pet_count", 0) or 0) if state else "-",
+                    "eggs": int(state.get("egg_total", 0) or 0) if state else "-",
+                    "age": state_age_seconds(state) if state else "-",
+                    "status": "Verify Failed", "note": rt_tab["note"],
+                    "bad": "stale_press_hold", "visible_window": True,
+                    "stale_verification_reason": _stale_reason,
+                    "stale_verification_detail": _post_hold_retry_failure,
+                }
+
         _stale_press_age = bool(
             _stale_enabled
             and _action_kind == "press_and_hold"
@@ -20321,6 +20385,88 @@ def android_stale_verification_error_detail(pkg, cfg, force=False):
             "text": joined,
             "reason": "stale_verification_529",
             "evidence_source": "exact_option16_text",
+        }
+    return None
+
+
+def verification_press_hold_try_again_detail(pkg, cfg, action_loc=None, force=False):
+    """Detect the post-hold `Please try again` failure for one clone.
+
+    This helper is observation-only. Callers must already prove that the SAME
+    Press-and-hold incident reached the actual hold stage before using it as
+    recovery evidence. Exact package/Option-16 text is preferred. The visual
+    fallback is intentionally narrow: red caption pixels immediately below the
+    currently detected blue Press-and-hold button in the exact saved clone cell.
+    """
+    pkg = str(pkg or "")
+    texts, _ = android_ui_text_for_package_or_rect(pkg, cfg, force=force)
+    values = [str(v) for v in (texts or []) if str(v or "").strip()]
+    joined = "\n".join(values)
+    if "please try again" in joined.lower():
+        return {
+            "kind": "please_try_again",
+            "title": "Verification Failed",
+            "text": joined,
+            "reason": "press_hold_please_try_again_text",
+            "evidence_source": "exact_option16_text",
+        }
+
+    loc = action_loc if isinstance(action_loc, dict) else {}
+    if str(loc.get("kind") or "") != "press_and_hold":
+        return None
+    bounds = loc.get("bounds") or []
+    rect = loc.get("cell_rect") or _loading_visual_rect_for_package(pkg, cfg)
+    if not (isinstance(bounds, (list, tuple)) and len(bounds) == 4):
+        return None
+    if not (isinstance(rect, (list, tuple)) and len(rect) == 4):
+        return None
+
+    shared = _capture_loading_visual_frame(cfg, force=force)
+    frame = shared.get("frame") if isinstance(shared, dict) else None
+    if not frame:
+        return None
+    try:
+        width = int(frame["width"]); height = int(frame["height"]); pixels = frame["pixels"]
+        bx1, by1, bx2, by2 = [int(v) for v in bounds]
+        rx1, ry1, rx2, ry2 = [int(v) for v in rect]
+    except Exception:
+        return None
+    if bx2 <= bx1 or by2 <= by1 or rx2 <= rx1 or ry2 <= ry1:
+        return None
+
+    # Failure caption sits directly below the blue action. Scan only a shallow
+    # package-local strip so unrelated red game UI elsewhere cannot classify it.
+    cw = max(1, rx2 - rx1); ch = max(1, ry2 - ry1)
+    x1 = max(rx1, bx1 - int(cw * 0.06))
+    x2 = min(rx2, bx2 + int(cw * 0.06))
+    y1 = max(ry1, by2)
+    y2 = min(ry2, by2 + max(12, int(ch * 0.10)))
+    x1 = max(0, min(width - 1, x1)); x2 = max(x1 + 1, min(width, x2))
+    y1 = max(0, min(height - 1, y1)); y2 = max(y1 + 1, min(height, y2))
+    step = max(1, min(3, max(1, min(x2 - x1, y2 - y1) // 20)))
+    red = total = 0
+    for y in range(y1, y2, step):
+        row = y * width * 4
+        for x in range(x1, x2, step):
+            i = row + x * 4
+            r = int(pixels[i]); g = int(pixels[i + 1]); b = int(pixels[i + 2])
+            total += 1
+            # Covers Roblox's dark-red/red anti-aliased failure caption on a
+            # light Security background while rejecting neutral text/shadows.
+            if r >= 95 and (r - g) >= 20 and (r - b) >= 20 and g <= 190 and b <= 190:
+                red += 1
+    ratio = (red / total) if total else 0.0
+    if total >= 20 and red >= 8 and ratio >= 0.004:
+        return {
+            "kind": "please_try_again",
+            "title": "Verification Failed",
+            "text": f"visual red-caption ratio={ratio:.4f} red={red}/{total}",
+            "reason": "press_hold_please_try_again_visual",
+            "evidence_source": "visual_red_caption_below_press_hold",
+            "visual_red_ratio": ratio,
+            "visual_red_samples": red,
+            "visual_total_samples": total,
+            "visual_region": [x1, y1, x2, y2],
         }
     return None
 
