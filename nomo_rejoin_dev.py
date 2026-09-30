@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+# V4.81.161 — LIVE WINDOW-RECT PRESS/HOLD DETECTION FALLBACK
+# - Fixes the remaining Hatcher status regression where a visible Security -> Press and hold
+#   could still remain Loading when App-Cloner had moved/resized the floating window away from
+#   the saved Option-16 rectangle and WebView accessibility exposed no action text.
+# - Hatcher's late display/recovery arbitration can now read the CURRENT exact-package floating
+#   window frame from WindowManager and run the existing strict white-panel + wide-blue-bar
+#   detector inside that live frame. Saved Option-16 cells remain the primary detector boundary.
+# - The live-window fallback is exact-package and display/recovery arbitration only. It stores
+#   coordinate diagnostics and makes the row Verification, but does not add/retry/retime the
+#   live Roblox verification input worker.
+# - Logs the detection source as visual_blue_live_window so moved-window misses are diagnosable.
+#
 # V4.81.160 — NO-STATE CHALLENGE PRIORITY + MOVED-WINDOW ACTION DETECTION
 # - Fixes the remaining V4.81.159 ordering bug: in Hatcher's `state is None` branch,
 #   `background_fresh.active` was evaluated before `challenge_active`. A current Press-and-hold
@@ -2363,7 +2375,7 @@ _VERIFICATION_FOCUS_INCIDENT = ""
 # stamped into the Termux banner so each Redfinger instance shows which build it
 # runs. If two RF instances behave differently (one 11h session, one rejoin loop)
 # this line tells you at a glance whether they're even on the same code.
-__version__ = "V4.81.160"
+__version__ = "V4.81.161"
 
 LEGACY_BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin")
 BASE_DIR = Path("/storage/emulated/0/Download/nomo_rejoin_dev_source")
@@ -5596,6 +5608,144 @@ def package_visible_window(pkg, cfg):
     if pkg.lower() in low:
         return True, "visible window"
     return False, "minimized/no visible window"
+
+
+def _current_window_rect_for_package(pkg, cfg, force=False):
+    """Best-effort CURRENT floating-window frame for one exact clone package.
+
+    This is intentionally separate from Option-16 saved detector cells. It exists
+    only as a late diagnostic/display fallback for App-Cloner windows that moved
+    after task loss/restore. Shared Roblox aliases are never accepted here.
+    """
+    pkg = str(pkg or "").strip()
+    if not pkg:
+        return None
+
+    global _WINDOW_DUMP_CACHE
+    cache_age = now() - int(_WINDOW_DUMP_CACHE.get("ts", 0) or 0)
+    if force or cache_age > 2:
+        code, out = shell_timeout("dumpsys window windows", cfg, capture=True, timeout=5)
+        _WINDOW_DUMP_CACHE["ts"] = now()
+        _WINDOW_DUMP_CACHE["ok"] = code == 0 and bool(out)
+        _WINDOW_DUMP_CACHE["text"] = out or ""
+    if not _WINDOW_DUMP_CACHE.get("ok"):
+        return None
+
+    text = str(_WINDOW_DUMP_CACHE.get("text", "") or "")
+    lines = text.splitlines()
+    pkg_low = pkg.lower()
+    blocks = []
+    cur = []
+    for line in lines:
+        low = line.lower()
+        if "window #" in low or "window{" in low or "windowstate{" in low:
+            if cur:
+                blocks.append(cur)
+            cur = [line]
+        elif cur:
+            cur.append(line)
+    if cur:
+        blocks.append(cur)
+
+    def frames_from_block(block):
+        joined = "\n".join(block)
+        out = []
+        patterns = [
+            r"\bmFrame=\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]",
+            r"\bframe=\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]",
+            r"\bFrame=\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]",
+            r"\bmBounds=Rect\((-?\d+),\s*(-?\d+)\s*-\s*(-?\d+),\s*(-?\d+)\)",
+        ]
+        for pat in patterns:
+            for m in re.finditer(pat, joined):
+                try:
+                    x1, y1, x2, y2 = [int(v) for v in m.groups()]
+                except Exception:
+                    continue
+                if x2 > x1 and y2 > y1 and (x2 - x1) >= 120 and (y2 - y1) >= 100:
+                    out.append([x1, y1, x2, y2])
+        return out
+
+    candidates = []
+    for block in blocks:
+        header = " ".join(block[:3]).lower()
+        if pkg_low not in header:
+            continue
+        for rect in frames_from_block(block):
+            area = max(1, (rect[2] - rect[0]) * (rect[3] - rect[1]))
+            candidates.append((area, rect))
+    if not candidates:
+        return None
+
+    # A package can expose child/dialog windows in addition to the main floating
+    # frame. Prefer the largest sane exact-package frame; later screenshot code
+    # clamps it to the real display bounds.
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return list(candidates[0][1])
+
+
+def _live_window_press_hold_visual_detail(pkg, cfg, force=False):
+    """Strict Press-and-hold visual signal inside CURRENT exact-package window.
+
+    Detection/status only. No input is emitted here.
+    """
+    rect = _current_window_rect_for_package(pkg, cfg, force=force)
+    if not rect:
+        return None, None
+    shared = _capture_loading_visual_frame(cfg, force=force)
+    frame = shared.get("frame") if isinstance(shared, dict) else None
+    if not frame:
+        return None, rect
+
+    try:
+        width = int(frame["width"]); height = int(frame["height"])
+        l, t, r, b = [int(v) for v in rect]
+    except Exception:
+        return None, rect
+    l = max(0, min(width - 1, l)); r = max(l + 1, min(width, r))
+    t = max(0, min(height - 1, t)); b = max(t + 1, min(height, b))
+    rect = [l, t, r, b]
+    if (r - l) < 120 or (b - t) < 100:
+        return None, rect
+
+    metrics = _visual_cell_metrics(frame, rect)
+    bounds = _verification_visual_button_bounds(frame, rect, "press_and_hold")
+    try:
+        white_min = float(cfg.get("captcha_visual_press_hold_min_white_ratio", 0.58) or 0.58)
+    except Exception:
+        white_min = 0.58
+    white_min = max(0.45, min(0.90, white_min))
+    white_ratio = float(metrics.get("white_ratio", 0.0) or 0.0)
+    strong = False
+    if bounds:
+        try:
+            bw = int(bounds[2]) - int(bounds[0])
+            strong = bool(bw >= int((r - l) * 0.35) and white_ratio >= white_min)
+        except Exception:
+            strong = False
+    if not strong:
+        return None, rect
+
+    x1, y1, x2, y2 = [int(v) for v in bounds]
+    loc = {
+        "kind": "press_and_hold",
+        "bounds": [x1, y1, x2, y2],
+        "center": [(x1 + x2) // 2, (y1 + y2) // 2],
+        "source": "visual_blue_live_window",
+        "relative_bounds": [x1 - l, y1 - t, x2 - l, y2 - t],
+        "relative_center": [((x1 + x2) // 2) - l, ((y1 + y2) // 2) - t],
+        "cell_rect": list(rect),
+    }
+    detail = {
+        "title": "Roblox Verification",
+        "text": f"live-window visual white={white_ratio:.3f} kind=press_and_hold",
+        "reason": "android_exact_package_live_window_visual_captcha",
+        "hits": ["visual verification panel", "blue press-and-hold button"],
+        "visual_kind": "press_and_hold",
+        "visual_metrics": dict(metrics, press_hold_strong=True, press_hold_bounds=list(bounds), rect=list(rect)),
+        "evidence_source": "visual_blue_live_window",
+    }
+    return (loc, detail), rect
 
 
 def _kill_exact_package_pids(pkg, pids, signal_name, cfg):
@@ -28520,8 +28670,32 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                     and _forced_kind == "press_and_hold"
                     and bool(_forced_metrics.get("press_hold_strong"))
                 )
+
+                # V4.81.161: if the saved Option-16 rectangle no longer contains
+                # the App-Cloner window, use WindowManager's CURRENT exact-package
+                # frame for one strict visual arbitration pass. This path is display/
+                # recovery state only and never dispatches verification input.
+                _forced_live_visual = False
+                if not _forced_exact and not _forced_visual_strong:
+                    try:
+                        _live_result, _live_rect = _live_window_press_hold_visual_detail(
+                            pkg, cfg, force=True
+                        )
+                    except Exception:
+                        _live_result, _live_rect = None, None
+                    if _live_result:
+                        try:
+                            _forced_loc, _forced_visual = _live_result
+                        except Exception:
+                            _forced_loc, _forced_visual = None, None
+                        _forced_live_visual = bool(_forced_loc and _forced_visual)
+                        if _forced_live_visual:
+                            _forced_kind = "press_and_hold"
+                            _forced_metrics = ((_forced_visual or {}).get("visual_metrics") or {})
+                            _forced_visual_strong = True
+
                 if _forced_exact or _forced_visual_strong:
-                    if not _forced_exact:
+                    if not _forced_exact and not _forced_live_visual:
                         try:
                             _forced_loc = verification_action_location(
                                 pkg, cfg, challenge_detail=_forced_visual, force=True
@@ -28565,7 +28739,7 @@ def start_hatcher_safe_rejoiner(main_cfg=None):
                         rt_tab["hatcher_forced_press_hold_seen_at"] = now()
                         log_activity(
                             "current Press-and-hold overrides Hatcher Loading/background-fresh state "
-                            + f"[{str((_forced_loc or {}).get('source') or 'visual')} ]",
+                            + f"[{str((_forced_loc or {}).get('source') or 'visual')}]",
                             pkg, CYAN,
                         )
 
